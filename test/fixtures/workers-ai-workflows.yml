@@ -1,0 +1,62 @@
+# .specify/workers.yml — perfiles de workers por rol y familia (sdd-flow)
+# Local y untracked: no se trackea ni se commitea (regla #10).
+# `model` admite un string no vacío o `heredado`.
+# `effort` admite `heredado` o uno de: bajo | medio | alto | muy_alto | maximo.
+schema_version: 1
+roles:
+  explore:
+    claude:
+      model: opus
+      effort: alto
+    codex:
+      model: gpt-6-sol
+      effort: alto
+  counter-plan:
+    claude:
+      model: opus
+      effort: alto
+    codex:
+      model: gpt-6-sol
+      effort: alto
+  investigate:
+    claude:
+      model: opus
+      effort: muy_alto
+    codex:
+      model: gpt-6-sol
+      effort: muy_alto
+  debate:
+    claude:
+      model: opus
+      effort: alto
+    codex:
+      model: gpt-6-sol
+      effort: alto
+  design-review:
+    claude:
+      model: opus
+      effort: muy_alto
+    codex:
+      model: gpt-6-sol
+      effort: muy_alto
+  implement:
+    claude:
+      model: sonnet
+      effort: medio
+    codex:
+      model: gpt-5.6-terra
+      effort: medio
+  refute:
+    claude:
+      model: opus
+      effort: alto
+    codex:
+      model: gpt-6-sol
+      effort: alto
+  pr:
+    claude:
+      model: opus
+      effort: alto
+    codex:
+      model: gpt-6-sol
+      effort: alto

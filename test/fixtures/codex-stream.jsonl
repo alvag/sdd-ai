@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a0d50b-9af4-7e53-b865-7e4250ac277a"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc 'env | grep -iE \"''^(codex|openai)\" | cut -d= -f1 | sort'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc 'env | grep -iE \"''^(codex|openai)\" | cut -d= -f1 | sort'","aggregated_output":"CODEX_CI\nCODEX_COMPANION_SESSION_ID\nCODEX_COMPANION_TRANSCRIPT_PATH\nCODEX_SANDBOX\nCODEX_SANDBOX_NETWORK_DISABLED\nCODEX_SESSION_ID\nCODEX_THREAD_ID\nCODEX_VERSION\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"CODEX_CI\nCODEX_COMPANION_SESSION_ID\nCODEX_COMPANION_TRANSCRIPT_PATH\nCODEX_SANDBOX\nCODEX_SANDBOX_NETWORK_DISABLED\nCODEX_SESSION_ID\nCODEX_THREAD_ID\nCODEX_VERSION"}}
+{"type":"turn.completed","usage":{"input_tokens":41121,"cached_input_tokens":31616,"cache_write_input_tokens":0,"output_tokens":109,"reasoning_output_tokens":0}}

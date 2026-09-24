@@ -1,0 +1,5 @@
+node_modules/
+.claude/agents/sdd-worker.md
+.codex/agents/sdd-worker.toml
+.claude/skills/sdd-ai/
+.agents/skills/sdd-ai/

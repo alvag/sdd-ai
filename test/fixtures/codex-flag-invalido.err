@@ -1,0 +1,8 @@
+error: unexpected argument '--flag-inexistente' found
+
+  tip: to pass '--flag-inexistente' as a value, use '-- --flag-inexistente'
+
+Usage: codex exec [OPTIONS] [PROMPT]
+       codex exec [OPTIONS] <COMMAND> [ARGS]
+
+For more information, try '--help'.

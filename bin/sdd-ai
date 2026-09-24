@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+import { main } from '../src/cli.ts'
+
+const { code, out } = await main(process.argv.slice(2), process.env, process.cwd())
+process.stdout.write(`${JSON.stringify(out)}\n`)
+process.exitCode = code

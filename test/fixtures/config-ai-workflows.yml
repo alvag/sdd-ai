@@ -1,0 +1,8 @@
+cross_model:
+  schema_version: 1
+  families: [codex, claude]
+  selection: full
+knowledge-vault:
+  path_vault: "/Users/max/vaults/dev-memory"
+vault_archive:
+  mode: "on"   # respuesta persistida: rescatar el flujo al vault al archivarlo
