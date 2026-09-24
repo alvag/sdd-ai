@@ -17,9 +17,17 @@ function rejects(text: string) {
     e instanceof SddError && e.code === 'workers_invalid' && e.message.includes(PATH))
 }
 
-test('el workers.yml real de ai-workflows valida', () => {
-  const w = parseWorkers(readFileSync(FIXTURE, 'utf8'), FIXTURE)
+test('pr: da el error de migración', () => {
+  assert.throws(() => parseWorkers(readFileSync(FIXTURE, 'utf8'), FIXTURE), (e: unknown) =>
+    e instanceof SddError && e.code === 'workers_invalid' && /`pr`/.test(e.message)
+    && /code-review/.test(`${e.message} ${e.next}`))
+})
+
+test('el fixture de ai-workflows con pr renombrado valida', () => {
+  const text = readFileSync(FIXTURE, 'utf8').replace(/^ {2}pr:$/m, '  code-review:')
+  const w = parseWorkers(text, FIXTURE)
   assert.deepEqual(w.roles.explore?.codex, { model: 'gpt-6-sol', effort: 'alto' })
+  assert.deepEqual(w.roles['code-review']?.claude, { model: 'opus', effort: 'alto' })
 })
 
 test('esfuerzo fuera del enum', () => rejects(base('      model: opus\n      effort: turbo\n')))

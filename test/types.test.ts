@@ -1,6 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { SddError, opposite, toNativeEffort } from '../src/types.ts'
+import { READ_ONLY_ROLES, RETIRED_ROLES, ROLES, SddError, opposite, toNativeEffort } from '../src/types.ts'
+
+test('los roles de solo lectura son todos menos implement', () => {
+  assert.equal(READ_ONLY_ROLES.length, 7)
+  assert.equal((READ_ONLY_ROLES as readonly string[]).includes('implement'), false)
+  assert.deepEqual([...READ_ONLY_ROLES, 'implement'].sort(), [...ROLES].sort())
+})
+
+test('pr es un rol retirado que ahora se llama code-review', () => {
+  assert.equal(RETIRED_ROLES.pr, 'code-review')
+  assert.equal((ROLES as readonly string[]).includes('pr'), false)
+})
 
 test('toNativeEffort traduce el vocabulario portable', () => {
   assert.equal(toNativeEffort('bajo'), 'low')

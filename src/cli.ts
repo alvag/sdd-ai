@@ -4,7 +4,7 @@ import { accessSync, constants, existsSync, readFileSync, writeFileSync } from '
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
-import { agentsState, syncAgents } from './agents.ts'
+import { type RoleProfiles, agentName, agentsState, syncAgents } from './agents.ts'
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, parseFamiliesFlag } from './config.ts'
 import { doctor } from './doctor.ts'
@@ -14,8 +14,8 @@ import { nativeProfile, resolve } from './resolve.ts'
 import { createRun, isAlive, newRunId, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
 import { supervise } from './supervisor.ts'
 import {
-  type Conductor, type Family, type Profile, type Role, ROLES, SddError, type Status, TERMINAL, type WorkerTask,
-  toNativeEffort,
+  type Conductor, type Family, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
+  SddError, type Status, TERMINAL, type WorkerTask, isReadOnlyRole, toNativeEffort,
 } from './types.ts'
 import { claudeLaunch } from './workers/claude.ts'
 import { codexLaunch } from './workers/codex.ts'
@@ -49,10 +49,13 @@ function definedEnv(env: Env): Record<string, string> {
   return Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined))
 }
 
-function nativeProfiles(root: string, env: Env): Record<Family, Profile> {
+function nativeProfiles(root: string, env: Env): RoleProfiles {
   const workers = loadWorkers(root)
   const codexRoot = loadCodexRoot(env)
-  return { claude: nativeProfile('claude', workers, codexRoot), codex: nativeProfile('codex', workers, codexRoot) }
+  const entries = READ_ONLY_ROLES.map((role) => [role, {
+    claude: nativeProfile('claude', role, workers, codexRoot), codex: nativeProfile('codex', role, workers, codexRoot),
+  }])
+  return Object.fromEntries(entries) as RoleProfiles
 }
 
 /** La caída propone la familia, el modelo y el esfuerzo del conductor; el usuario decide. */
@@ -83,8 +86,15 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   if (env.SDD_AI_WORKER === '1') {
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   }
-  const role = values.role as Role
-  if (!ROLES.includes(role)) throw new SddError('usage', `rol desconocido: ${values.role}`, { next: `usa uno de: ${ROLES.join(', ')}` })
+  const renamed = RETIRED_ROLES[values.role]
+  if (renamed) throw new SddError('usage', `el rol \`${values.role}\` ahora se llama \`${renamed}\``, { next: `usa --role ${renamed}` })
+  if (values.role === 'implement') {
+    throw new SddError('usage', 'el rol implement necesita un worker que escriba, y sdd-ai todavía solo tiene workers de solo lectura', {
+      next: `usa uno de: ${READ_ONLY_ROLES.join(', ')}`,
+    })
+  }
+  if (!isReadOnlyRole(values.role)) throw new SddError('usage', `rol desconocido: ${values.role}`, { next: `usa uno de: ${READ_ONLY_ROLES.join(', ')}` })
+  const role = values.role
   const deadline = Number(values.deadline)
   if (!Number.isFinite(deadline) || deadline <= 0) throw new SddError('usage', `--deadline inválido: ${values.deadline}`)
 
@@ -124,17 +134,17 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
 
   if (resolution.via === 'native') {
     const profiles = nativeProfiles(root, env)
-    const state = agentsState(root, PKG_DIR, resolution.family, profiles)
+    const state = agentsState(root, PKG_DIR, resolution.family, role, profiles)
     if (state !== 'ok') {
       const detail = state === 'missing' ? 'no existe el agente generado' : 'el agente generado no coincide con sus fuentes'
       setStatus(dir, { state: 'launch_failed', reason: 'agents_stale', detail })
       return { code: 1, out: { id, state: 'launch_failed', reason: 'agents_stale', detail, next: './bin/sdd-ai agents sync y reabrir la sesión' } }
     }
     setStatus(dir, { state: 'delegated' })
-    const out: Record<string, unknown> = { id, via: 'native', family: resolution.family, agent: 'sdd-worker', prompt_file: promptFile }
-    // El agente generado trae el perfil de `explore`. Lo que la corrida resolvió distinto (otro rol, un
-    // override, la caída al conductor) viaja para que el conductor lo pase a su herramienta.
-    const agent = profiles[resolution.family]
+    const out: Record<string, unknown> = { id, via: 'native', family: resolution.family, agent: agentName(role), prompt_file: promptFile }
+    // El agente generado trae el perfil de su rol. Lo que la corrida resolvió distinto (un override, la
+    // caída al conductor) viaja para que el conductor lo pase a su herramienta.
+    const agent = profiles[role][resolution.family]
     const warnings: string[] = []
     if (resolution.model !== undefined && resolution.model !== agent.model) out.model = resolution.model
     if (resolution.effort !== undefined && resolution.effort !== agent.effort) {
@@ -175,12 +185,23 @@ function readSupervisorPid(dir: string): number | undefined {
   return Number.isInteger(pid) && pid > 0 ? pid : undefined
 }
 
+const FIELD_NAMES: Record<RejectedField, string> = { model: 'el modelo', effort: 'el esfuerzo' }
+
+/** El reintento cambió el perfil pedido: el usuario tiene que verlo, con el diagnóstico tal cual. */
+function retryWarning(r: RetryInfo): string {
+  return `el CLI rechazó ${FIELD_NAMES[r.field]} ${r.requested}; se reintentó sin él (efectivo: ${r.effective}). Diagnóstico: ${r.diagnostic}`
+}
+
 function report(id: string, dir: string, s: Status): Result {
   const out: Record<string, unknown> = { id, state: s.state }
   if (s.reason) out.reason = s.reason
   if (s.detail) out.detail = s.detail
   if (s.session_id) out.session_id = s.session_id
   if (s.state === 'done') out.result = readFileSync(join(dir, 'result.md'), 'utf8')
+  if (s.retry) {
+    out.retry = s.retry
+    out.warnings = [retryWarning(s.retry)]
+  }
   if (s.state === 'launch_failed' && s.fallback) {
     out.fallback = s.fallback
     out.next = fallbackNext(id, s.fallback)
@@ -243,7 +264,8 @@ function cancel(args: string[], cwd: string): Result {
 function agents(args: string[], env: Env, cwd: string): Result {
   if (args[0] !== 'sync') throw new SddError('usage', `subcomando desconocido: agents ${args[0] ?? ''}`, { next: './bin/sdd-ai agents sync' })
   const root = repoRoot(cwd)
-  return { code: 0, out: { written: syncAgents(root, PKG_DIR, nativeProfiles(root, env)), next: 'reabre la sesión para que el CLI cargue el agente y la skill' } }
+  const { written, removed } = syncAgents(root, PKG_DIR, nativeProfiles(root, env))
+  return { code: 0, out: { written, removed, next: 'reabre la sesión para que el CLI cargue los agentes y la skill' } }
 }
 
 export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {

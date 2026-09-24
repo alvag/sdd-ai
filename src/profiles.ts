@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parse } from 'yaml'
-import { type Family, type Profile, type Role, ROLES, SddError, isFamily, isNativeEffort } from './types.ts'
+import { type Family, type Profile, RETIRED_ROLES, type Role, ROLES, SddError, isFamily, isNativeEffort } from './types.ts'
 
 export type PortableEffort = 'bajo' | 'medio' | 'alto' | 'muy_alto' | 'maximo'
 export interface FamilyProfile { model?: string; effort?: PortableEffort | 'heredado' }
@@ -44,6 +44,10 @@ export function parseWorkers(text: string, path: string): WorkersFile {
   const roles: WorkersFile['roles'] = {}
   if (doc.roles === undefined) return { roles }
   if (!isMap(doc.roles)) throw invalid(path, 'roles tiene que ser un mapa', 'roles: { explore: { claude: { model, effort } } }')
+  for (const key of Object.keys(doc.roles)) {
+    const renamed = RETIRED_ROLES[key]
+    if (renamed) throw invalid(path, `el rol \`${key}\` ahora se llama \`${renamed}\``, `renombra la clave ${key}: a ${renamed}:`)
+  }
   onlyKeys(doc.roles, ROLES, path, 'roles')
 
   for (const [role, families] of Object.entries(doc.roles)) {

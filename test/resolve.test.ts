@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { effectiveFamilies } from '../src/config.ts'
 import { nativeProfile, resolve } from '../src/resolve.ts'
 import type { WorkersFile } from '../src/profiles.ts'
-import type { Family, Via } from '../src/types.ts'
+import { type Family, type Role, ROLES, type Via } from '../src/types.ts'
 
 type Row = [config: Family[], flag: Family[] | undefined, conductor: Family, family: Family, via: Via]
 
@@ -39,14 +39,23 @@ describe('matriz families × conductor', () => {
 describe('perfil', () => {
   const input = (over: Partial<Parameters<typeof resolve>[0]>) => ({
     families: ['claude'] as Family[], conductor: { family: 'codex' as Family },
-    workers: null, role: 'explore' as const, flags: {}, codexRoot: {}, ...over,
+    workers: null, role: 'explore' as Role, flags: {}, codexRoot: {}, ...over,
   })
 
-  test('Claude sin archivo hereda opus y ningún esfuerzo', () => {
-    const r = resolve(input({}))
-    assert.equal(r.model, 'opus')
-    assert.equal(r.effort, undefined)
-    assert.deepEqual(r.origin, { model: 'heredado', effort: 'heredado' })
+  test('Claude hereda sonnet en implement y opus en el resto, sin esfuerzo', () => {
+    for (const role of ROLES) {
+      const r = resolve(input({ role }))
+      assert.equal(r.model, role === 'implement' ? 'sonnet' : 'opus', role)
+      assert.equal(r.effort, undefined, role)
+      assert.deepEqual(r.origin, { model: 'heredado', effort: 'heredado' }, role)
+    }
+  })
+
+  test('Codex hereda la raíz de su config en cualquier rol', () => {
+    for (const role of ROLES) {
+      const r = resolve(input({ role, families: ['codex'], conductor: { family: 'claude' }, codexRoot: { model: 'gpt-6-sol' } }))
+      assert.equal(r.model, 'gpt-6-sol', role)
+    }
   })
 
   test('Codex sin archivo hereda la raíz de su config', () => {
@@ -81,7 +90,9 @@ describe('perfil', () => {
 
   test('nativeProfile aplica las mismas reglas para los agentes generados', () => {
     const workers: WorkersFile = { roles: { explore: { codex: { effort: 'muy_alto' } } } }
-    assert.deepEqual(nativeProfile('claude', null, {}), { model: 'opus' })
-    assert.deepEqual(nativeProfile('codex', workers, { model: 'gpt-6-sol' }), { model: 'gpt-6-sol', effort: 'xhigh' })
+    assert.deepEqual(nativeProfile('claude', 'explore', null, {}), { model: 'opus' })
+    assert.deepEqual(nativeProfile('claude', 'implement', null, {}), { model: 'sonnet' })
+    assert.deepEqual(nativeProfile('codex', 'explore', workers, { model: 'gpt-6-sol' }), { model: 'gpt-6-sol', effort: 'xhigh' })
+    assert.deepEqual(nativeProfile('codex', 'refute', workers, { model: 'gpt-6-sol' }), { model: 'gpt-6-sol' })
   })
 })

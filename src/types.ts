@@ -4,8 +4,16 @@ export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type Origin = 'flag' | 'workers' | 'heredado'
 
 export const ROLES = ['explore', 'counter-plan', 'investigate', 'debate',
-  'design-review', 'implement', 'refute', 'pr'] as const
+  'design-review', 'implement', 'refute', 'code-review'] as const
 export type Role = typeof ROLES[number]
+/** Hasta que exista un worker que escriba, `implement` no se despacha. */
+export type ReadOnlyRole = Exclude<Role, 'implement'>
+export const READ_ONLY_ROLES: readonly ReadOnlyRole[] = ROLES.filter((r): r is ReadOnlyRole => r !== 'implement')
+/** Roles que cambiaron de nombre: el viejo da un error de migración, nunca funciona como alias. */
+export const RETIRED_ROLES: Readonly<Record<string, Role>> = { pr: 'code-review' }
+
+export type RejectedField = 'model' | 'effort'
+export interface RetryInfo { field: RejectedField; requested: string; effective: string; diagnostic: string }
 
 export interface Conductor { family: Family; model?: string; effort?: Effort }
 export interface Profile { model?: string; effort?: Effort }
@@ -27,7 +35,7 @@ export const TERMINAL: ReadonlySet<RunState> = new Set<RunState>(
 export interface Status {
   state: RunState; reason?: string; detail?: string
   supervisor_pid?: number; worker_pid?: number; session_id?: string
-  started_at?: string; ended_at?: string; fallback?: Conductor
+  started_at?: string; ended_at?: string; fallback?: Conductor; retry?: RetryInfo
 }
 
 export class SddError extends Error {
@@ -50,6 +58,10 @@ const PORTABLE_EFFORTS: Record<string, Effort> = {
 
 export function isFamily(v: unknown): v is Family {
   return typeof v === 'string' && (FAMILIES as readonly string[]).includes(v)
+}
+
+export function isReadOnlyRole(v: unknown): v is ReadOnlyRole {
+  return typeof v === 'string' && (READ_ONLY_ROLES as readonly string[]).includes(v)
 }
 
 export function isNativeEffort(v: unknown): v is Effort {

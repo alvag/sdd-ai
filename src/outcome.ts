@@ -1,12 +1,16 @@
-import type { Family, RunState } from './types.ts'
+import type { Family, RejectedField, RunState } from './types.ts'
 
 export interface StreamFacts {
   /**
    * El modelo produjo algo. Los eventos de apertura del hilo no cuentan (Codex los emite antes de
-   * autenticarse), ni los items de tipo `error`.
+   * autenticarse), ni los items de tipo `error`, ni los mensajes de error de la API de Claude.
    */
   started: boolean
   sessionId?: string
+  /** Modelo que informa el CLI al abrir la sesión (Claude). */
+  model?: string
+  /** El proveedor rechazó el modelo o el esfuerzo pedido; `diagnostic` es su mensaje textual. */
+  rejected?: { field: RejectedField; diagnostic: string }
   result?: string
   isError?: boolean
   errors: string[]
@@ -35,9 +39,19 @@ export function scanLine(family: Family, facts: StreamFacts, line: string): void
   }
   if (typeof e !== 'object' || e === null) return
   if (family === 'claude') {
-    if (e.type === 'system' && e.subtype === 'init' && typeof e.session_id === 'string') facts.sessionId = e.session_id
-    else if (e.type === 'assistant') facts.started = true
-    else if (e.type === 'result') {
+    if (e.type === 'system' && e.subtype === 'init') {
+      if (typeof e.session_id === 'string') facts.sessionId = e.session_id
+      if (typeof e.model === 'string') facts.model = e.model
+    } else if (e.type === 'assistant') {
+      // Claude entrega los errores de la API como un mensaje del asistente: no es trabajo del modelo.
+      if (e.is_api_error_message === true) {
+        const text = assistantText(e)
+        facts.errors.push(text)
+        if (e.error === 'model_not_found') facts.rejected ??= { field: 'model', diagnostic: text }
+      } else {
+        facts.started = true
+      }
+    } else if (e.type === 'result') {
       if (typeof e.result === 'string') facts.result = e.result
       if (typeof e.is_error === 'boolean') facts.isError = e.is_error
       if (typeof e.session_id === 'string') facts.sessionId = e.session_id
@@ -52,8 +66,40 @@ export function scanLine(family: Family, facts: StreamFacts, line: string): void
     } else {
       facts.started = true
     }
-  } else if (e.type === 'error' && typeof e.message === 'string') facts.errors.push(e.message)
-  else if (e.type === 'turn.failed' && typeof e.error?.message === 'string') facts.errors.push(e.error.message)
+  } else if (e.type === 'error' && typeof e.message === 'string') noteCodexError(facts, e.message)
+  else if (e.type === 'turn.failed' && typeof e.error?.message === 'string') noteCodexError(facts, e.error.message)
+}
+
+function assistantText(e: Record<string, any>): string {
+  const content: unknown[] = Array.isArray(e.message?.content) ? e.message.content : []
+  return content
+    .filter((c): c is { text: string } => typeof c === 'object' && c !== null && typeof (c as { text?: unknown }).text === 'string')
+    .map((c) => c.text)
+    .join('\n')
+}
+
+function noteCodexError(facts: StreamFacts, message: string): void {
+  facts.errors.push(message)
+  facts.rejected ??= codexRejection(message)
+}
+
+/**
+ * Codex anida el error del proveedor como JSON dentro de `message`. Solo se reconocen los rechazos
+ * observados en salidas reales; cualquier otro queda como error sin clasificar.
+ */
+function codexRejection(message: string): StreamFacts['rejected'] {
+  let err: { code?: unknown; param?: unknown; message?: unknown } | undefined
+  try {
+    const parsed: unknown = JSON.parse(message)
+    const inner = (parsed as { error?: unknown } | null)?.error
+    if (typeof inner === 'object' && inner !== null) err = inner
+  } catch {
+    return undefined
+  }
+  if (typeof err?.message !== 'string') return undefined
+  if (err.code === 'unsupported_value' && err.param === 'reasoning.effort') return { field: 'effort', diagnostic: err.message }
+  if (/\bmodel is not supported\b/.test(err.message)) return { field: 'model', diagnostic: err.message }
+  return undefined
 }
 
 /** Solo patrones observados en salidas reales de los CLIs; lo demás es `unknown`. */
@@ -67,6 +113,7 @@ export function classify(_family: Family, facts: StreamFacts, end: Ending): Outc
   if (end.cancelled) return { state: 'cancelled' }
   if (end.timedOut) return { state: 'timeout' }
   if (!facts.started) {
+    if (facts.rejected) return { state: 'launch_failed', reason: `${facts.rejected.field}_rejected`, detail: facts.rejected.diagnostic }
     const text = [...facts.errors, end.stderr].filter(Boolean).join('\n').trim()
     return { state: 'launch_failed', reason: launchReason(text), detail: text.slice(-500) }
   }

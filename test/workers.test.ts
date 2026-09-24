@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { claudeLaunch } from '../src/workers/claude.ts'
-import { codexLaunch } from '../src/workers/codex.ts'
+import { claudeLaunch, claudeRetry } from '../src/workers/claude.ts'
+import { codexLaunch, codexRetry } from '../src/workers/codex.ts'
 import type { WorkerTask } from '../src/types.ts'
 
 const t: WorkerTask = {
@@ -43,4 +43,27 @@ test('el prompt viaja por stdin, nunca en el argv', () => {
     assert.equal(l.stdinFile, t.promptFile)
     assert.equal(l.args.includes(t.promptFile), false)
   }
+})
+
+const bare: WorkerTask = { cwd: '/r', promptFile: '/r/p.md', resultFile: '/r/out.md', sessionId: 'S' }
+
+test('claudeRetry quita el campo rechazado y cambia la sesión', () => {
+  const args = claudeLaunch(t).args
+  const head = ['-p', '--safe-mode', '--tools=Read,Grep,Glob', '--permission-prompts', 'none', '--output-format', 'stream-json', '--verbose']
+  assert.deepEqual(claudeRetry(args, 'model', 'S2'), { requested: 'opus', args: [...head, '--session-id', 'S2', '--effort', 'high'] })
+  assert.deepEqual(claudeRetry(args, 'effort', 'S2'), { requested: 'high', args: [...head, '--session-id', 'S2', '--model', 'opus'] })
+  assert.equal(claudeRetry(claudeLaunch(bare).args, 'model', 'S2'), null)
+  assert.equal(claudeRetry(claudeLaunch(bare).args, 'effort', 'S2'), null)
+})
+
+test('codexRetry quita -m o el par -c model_reasoning_effort', () => {
+  const args = codexLaunch(t).args
+  const head = [
+    'exec', '--ignore-user-config', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
+    '-s', 'read-only', '-C', '/r', '--json', '--output-last-message', '/r/out.md',
+  ]
+  assert.deepEqual(codexRetry(args, 'model'), { requested: 'opus', args: [...head, '-c', 'model_reasoning_effort=high', '-'] })
+  assert.deepEqual(codexRetry(args, 'effort'), { requested: 'high', args: [...head, '-m', 'opus', '-'] })
+  assert.equal(codexRetry(codexLaunch(bare).args, 'model'), null)
+  assert.equal(codexRetry(codexLaunch(bare).args, 'effort'), null)
 })

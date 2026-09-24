@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -75,7 +75,7 @@ test('vía nativa: sin agentes sincronizados es agents_stale; tras sync, delegat
   assert.equal(cli(s, ['agents', 'sync']).code, 0)
   const r = cli(s, ['run', '--prompt-file', s.prompt])
   assert.equal(r.code, 0)
-  assert.deepEqual([r.out.via, r.out.family, r.out.agent], ['native', 'claude', 'sdd-worker'])
+  assert.deepEqual([r.out.via, r.out.family, r.out.agent], ['native', 'claude', 'sdd-ai-explore'])
   assert.equal(readFileSync(r.out.prompt_file, 'utf8'), readFileSync(s.prompt, 'utf8'))
   assert.equal(readStatus(join(s.repo, '.sdd-ai', 'runs', r.out.id)).state, 'delegated')
 })
@@ -102,12 +102,25 @@ test('vía nativa Claude: el modelo distinto al del agente viaja; el esfuerzo se
   assert.match(r.out.warnings.join(' '), /esfuerzo/)
 })
 
-test('vía nativa: el perfil de otro rol viaja si difiere del agente', () => {
-  const s = setup({ families: '[claude]', workers: 'schema_version: 1\nroles:\n  design-review:\n    claude:\n      model: sonnet\n' })
+test('vía nativa: el perfil del rol vive en su agente', () => {
+  const s = setup({ families: '[claude]', workers: 'schema_version: 1\nroles:\n  design-review:\n    claude:\n      model: sonnet\n      effort: muy_alto\n' })
   cli(s, ['agents', 'sync'])
+  assert.match(readFileSync(join(s.repo, '.claude/agents/sdd-ai-design-review.md'), 'utf8'), /\nmodel: sonnet\neffort: xhigh\n/)
   const r = cli(s, ['run', '--prompt-file', s.prompt, '--role', 'design-review'])
   assert.equal(r.code, 0)
-  assert.equal(r.out.model, 'sonnet')
+  assert.equal(r.out.agent, 'sdd-ai-design-review')
+  assert.equal('model' in r.out || 'effort' in r.out || 'warnings' in r.out, false)
+})
+
+test('vía nativa: cada rol responde con su agente', () => {
+  const claude = setup({ families: '[claude]' })
+  cli(claude, ['agents', 'sync'])
+  const c = cli(claude, ['run', '--prompt-file', claude.prompt, '--role', 'code-review'])
+  assert.deepEqual([c.code, c.out.family, c.out.agent], [0, 'claude', 'sdd-ai-code-review'])
+  const codex = setup({ families: '[codex]' })
+  cli(codex, ['agents', 'sync'], AS_CODEX)
+  const x = cli(codex, ['run', '--prompt-file', codex.prompt, '--role', 'code-review'], AS_CODEX)
+  assert.deepEqual([x.code, x.out.family, x.out.agent], [0, 'codex', 'sdd-ai-code-review'])
 })
 
 test('vía nativa Codex: el esfuerzo viaja para spawn_agent', () => {
@@ -116,6 +129,17 @@ test('vía nativa Codex: el esfuerzo viaja para spawn_agent', () => {
   const r = cli(s, ['run', '--prompt-file', s.prompt, '--effort', 'maximo'], AS_CODEX)
   assert.equal(r.code, 0)
   assert.deepEqual([r.out.via, r.out.effort], ['native', 'max'])
+})
+
+test('wait informa el reintento', () => {
+  const s = setup({ families: '[claude]', bins: ['claude'], mode: 'reject-model-claude' })
+  const r = cli(s, ['run', '--prompt-file', s.prompt, '--model', 'no-existe'], AS_CODEX)
+  assert.deepEqual([r.code, r.out.via], [0, 'process'])
+  const w = cli(s, ['wait', r.out.id, '--max', '10'], AS_CODEX)
+  assert.equal(w.code, 0)
+  assert.equal(w.out.state, 'done')
+  assert.deepEqual([w.out.retry.field, w.out.retry.requested], ['model', 'no-existe'])
+  assert.match(w.out.warnings.join(' '), /modelo no-existe/)
 })
 
 test('la caída desde Codex conserva el esfuerzo que declara el conductor', () => {
@@ -136,6 +160,37 @@ test('retry reutiliza el prompt congelado y sale por la vía nativa', () => {
   const runs = join(s.repo, '.sdd-ai', 'runs')
   assert.equal(JSON.parse(readFileSync(join(runs, retry.out.id, 'request.json'), 'utf8')).retry_of, first.out.id)
   assert.equal(readFileSync(join(runs, retry.out.id, 'prompt.md'), 'utf8'), readFileSync(join(runs, first.out.id, 'prompt.md'), 'utf8'))
+})
+
+const runsIn = (repo: string) => {
+  const runs = join(repo, '.sdd-ai', 'runs')
+  return existsSync(runs) ? readdirSync(runs) : []
+}
+
+test('--role pr da el aviso de migración', () => {
+  const s = setup({ families: '[codex]', bins: ['codex'] })
+  const r = cli(s, ['run', '--prompt-file', s.prompt, '--role', 'pr'])
+  assert.equal(r.code, 2)
+  assert.equal(r.out.code, 'usage')
+  assert.match(`${r.out.message} ${r.out.next}`, /code-review/)
+  assert.deepEqual(runsIn(s.repo), [])
+})
+
+test('implement: error de uso sin corrida', () => {
+  const s = setup({ families: '[codex]', bins: ['codex'] })
+  const r = cli(s, ['run', '--prompt-file', s.prompt, '--role', 'implement'])
+  assert.equal(r.code, 2)
+  assert.equal(r.out.code, 'usage')
+  assert.match(r.out.message, /worker que escriba/)
+  assert.deepEqual(runsIn(s.repo), [])
+})
+
+test('--role code-review despacha', () => {
+  const s = setup({ families: '[codex]', bins: ['codex'] })
+  const r = cli(s, ['run', '--prompt-file', s.prompt, '--role', 'code-review'])
+  assert.equal(r.code, 0)
+  assert.equal(r.out.via, 'process')
+  cli(s, ['wait', r.out.id, '--max', '10'])
 })
 
 test('un worker no puede lanzar otro sdd-ai', () => {

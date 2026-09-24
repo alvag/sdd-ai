@@ -82,3 +82,39 @@ test('las líneas que no son JSON se ignoran', () => {
   assert.equal(f.sessionId, 't')
   assert.equal(f.started, false)
 })
+
+test('claude con un modelo rechazado: no arrancó y es model_rejected', () => {
+  const facts = scan('claude', fixture('claude-modelo-rechazado.jsonl'))
+  assert.equal(facts.started, false)
+  const o = classify('claude', facts, end({ exitCode: 1, stderr: fixture('claude-modelo-rechazado.err') }))
+  assert.deepEqual([o.state, o.reason], ['launch_failed', 'model_rejected'])
+  assert.match(o.detail ?? '', /issue with the selected model \(no-existe-xyz\)/)
+})
+
+test('codex con un modelo rechazado: model_rejected con el diagnóstico textual', () => {
+  const facts = scan('codex', fixture('codex-modelo-rechazado.jsonl'))
+  assert.equal(facts.started, false)
+  const o = classify('codex', facts, end({ exitCode: 1 }))
+  assert.deepEqual([o.state, o.reason], ['launch_failed', 'model_rejected'])
+  assert.equal(o.detail, "The 'no-existe-xyz' model is not supported when using Codex with a ChatGPT account.")
+})
+
+test('codex con un esfuerzo rechazado: effort_rejected con los valores admitidos', () => {
+  const facts = scan('codex', fixture('codex-esfuerzo-rechazado.jsonl'))
+  assert.equal(facts.started, false)
+  const o = classify('codex', facts, end({ exitCode: 1 }))
+  assert.deepEqual([o.state, o.reason], ['launch_failed', 'effort_rejected'])
+  assert.match(o.detail ?? '', /'max' is not supported with the 'gpt-5\.5' model\. Supported values are/)
+})
+
+test('un error de la API de Claude no cuenta como arranque', () => {
+  const line = JSON.stringify({ type: 'assistant', is_api_error_message: true, error: 'authentication_failed', message: { content: [{ type: 'text', text: 'Invalid API key' }] } })
+  const facts = scan('claude', line)
+  assert.equal(facts.started, false)
+  assert.equal(facts.rejected, undefined)
+  assert.deepEqual(facts.errors, ['Invalid API key'])
+})
+
+test('el init de Claude trae el modelo', () => {
+  assert.equal(scan('claude', fixture('claude-stream.jsonl')).model, 'claude-haiku-4-5-20251001')
+})

@@ -14,11 +14,13 @@ export interface ResolveInput {
 }
 
 /**
- * Lo que significa `heredado`, igual que en sdd-flow: Claude usa el modelo de la ruta de juicio y
- * el esfuerzo por defecto del CLI; Codex, lo que declare la raíz del config personal.
+ * Lo que significa `heredado`, igual que en sdd-flow: Claude usa el modelo de su ruta (`sonnet` para
+ * implementar, `opus` para las de juicio) y el esfuerzo por defecto del CLI; Codex, lo que declare la
+ * raíz del config personal.
  */
-function inherited(family: Family, codexRoot: Profile): Profile {
-  return family === 'claude' ? { model: 'opus' } : { ...codexRoot }
+function inherited(family: Family, role: Role, codexRoot: Profile): Profile {
+  if (family === 'codex') return { ...codexRoot }
+  return { model: role === 'implement' ? 'sonnet' : 'opus' }
 }
 
 function pick<T>(flag: T | undefined, fromFile: T | undefined, fromInheritance: T | undefined): { value?: T; origin: Origin } {
@@ -41,7 +43,7 @@ export function resolve(input: ResolveInput): Resolution {
   const via = family === conductor.family ? 'native' : 'process'
 
   const file = fileProfile(workers, role, family)
-  const base = inherited(family, codexRoot)
+  const base = inherited(family, role, codexRoot)
   const model = pick<string>(flags.model, file.model, base.model)
   const effort = pick<Effort>(flags.effort, file.effort, base.effort)
 
@@ -51,9 +53,9 @@ export function resolve(input: ResolveInput): Resolution {
   return r
 }
 
-/** Perfil de `explore` con el que se generan los agentes nativos de cada familia. */
-export function nativeProfile(family: Family, workers: WorkersFile | null, codexRoot: Profile): Profile {
-  const r = resolve({ conductor: { family }, families: [family], workers, role: 'explore', flags: {}, codexRoot })
+/** Perfil con el que se genera el agente nativo de un rol en una familia. */
+export function nativeProfile(family: Family, role: Role, workers: WorkersFile | null, codexRoot: Profile): Profile {
+  const r = resolve({ conductor: { family }, families: [family], workers, role, flags: {}, codexRoot })
   const p: Profile = {}
   if (r.model !== undefined) p.model = r.model
   if (r.effort !== undefined) p.effort = r.effort
