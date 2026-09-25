@@ -1,7 +1,7 @@
 // CLI falso para probar el supervisor. El comportamiento sale de FAKE_MODE; las salidas son las
 // muestras reales de test/fixtures.
 import { spawn } from 'node:child_process'
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')
@@ -50,11 +50,53 @@ function reviewer(kind: 'ok' | 'bad' | 'unavailable'): void {
   }
 }
 
+const claudeInit = () => fixture('claude-stream.jsonl').split('\n')[0]
+const codexThread = '{"type":"thread.started","thread_id":"T1"}'
+
 /** Cuántas veces se invocó el CLI falso en esta corrida, contando la actual. */
 const callCount = () => (process.env.FAKE_CALLS_FILE ? readFileSync(process.env.FAKE_CALLS_FILE, 'utf8').trim().split('\n').length : 1)
 
-const claudeInit = () => fixture('claude-stream.jsonl').split('\n')[0]
-const codexThread = '{"type":"thread.started","thread_id":"T1"}'
+/**
+ * Guion de respuestas: la invocación k usa `answers[k-1]` de FAKE_ANSWERS. Un texto es la respuesta,
+ * con `$HASH` (el hash del prompt) y `$PATHS` (las rutas del manifiesto) reemplazados; `__hang__` abre
+ * la sesión y se cuelga; `__fail__` sale con 1 sin stream.
+ */
+function scripted(): void {
+  const answers = JSON.parse(readFileSync(process.env.FAKE_ANSWERS ?? '', 'utf8')) as string[]
+  const answer = answers[callCount() - 1] ?? '__fail__'
+  const codex = args[0] === 'exec'
+  const prompt = readFileSync(0, 'utf8')
+  // Una reanudación solo recibe el mensaje de cierre: como la sesión real, recuerda el candidato anterior.
+  const memory = `${process.env.FAKE_CALLS_FILE ?? '/dev/null'}.memoria`
+  let hash = /sha256:[0-9a-f]{64}/.exec(prompt)?.[0]
+  let paths = [...prompt.matchAll(/^[AMDRT] (\S+)(?: \(antes [^)]+\))? — /gm)].map((m) => m[1])
+  if (hash) {
+    if (process.env.FAKE_CALLS_FILE) writeFileSync(memory, JSON.stringify({ hash, paths }))
+  } else if (process.env.FAKE_CALLS_FILE && existsSync(memory)) {
+    ({ hash, paths } = JSON.parse(readFileSync(memory, 'utf8')) as { hash: string; paths: string[] })
+  }
+  if (answer === '__fail__') {
+    process.stderr.write('fake-cli: falla guionada\n')
+    process.exitCode = 1
+    return
+  }
+  if (answer === '__hang__') {
+    hang(codex ? codexThread : claudeInit())
+    return
+  }
+  const text = answer.replaceAll('$HASH', hash ?? '').replaceAll('$PATHS', JSON.stringify(paths))
+  if (codex) {
+    process.stdout.write(`${codexThread}\n{"type":"item.completed","item":{"type":"agent_message","text":"."}}\n`)
+    process.stdout.write('{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n')
+    const i = args.indexOf('--output-last-message')
+    if (i >= 0) writeFileSync(args[i + 1], text)
+  } else {
+    process.stdout.write('{"type":"system","subtype":"init","session_id":"s","model":"claude-falso","tools":[]}\n')
+    process.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"."}]}}\n')
+    process.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: text, usage: { input_tokens: 10, output_tokens: 5 } })}\n`)
+  }
+}
+
 
 function fail(stdout: string, stderr = ''): void {
   process.stdout.write(fixture(stdout))
@@ -98,6 +140,9 @@ switch (process.env.FAKE_MODE) {
     break
   case 'review-ok':
     reviewer('ok')
+    break
+  case 'scripted':
+    scripted()
     break
   case 'review-unavailable':
     reviewer('unavailable')

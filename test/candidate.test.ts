@@ -2,10 +2,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { type Candidate, freeze, freezeStable, readContext } from '../src/review/candidate.ts'
+import { type Candidate, changedRanges, freeze, freezeStable, readContext, snapshot } from '../src/review/candidate.ts'
 import { SddError } from '../src/types.ts'
 import { makeRepo } from './helpers.ts'
 
@@ -158,4 +158,102 @@ test('un contexto que cambió después de congelar da candidate_unstable al leer
   const c = freeze(repo, { base, context: ['ctx.md'] })
   writeFileSync(join(repo, 'ctx.md'), 'dos\n')
   assert.throws(() => readContext(repo, c), (e: unknown) => e instanceof SddError && e.code === 'candidate_unstable')
+})
+
+/** Congela la ronda y guarda sus blobs en `dir`, como hace cada ronda de una revisión. */
+function round(repo: string, base: string, dir: string, head?: string): Candidate {
+  const c = freeze(repo, { base, ...(head ? { head } : {}), context: [] })
+  snapshot(repo, c, dir)
+  return c
+}
+const runDir = () => mkdtempSync(join(tmpdir(), 'sdd-ai-run-'))
+
+test('snapshot guarda los bytes de cada archivo por su hash; un borrado, con los de la base', () => {
+  const { repo, base } = repoWithBase()
+  writeFileSync(join(repo, 'a.txt'), lines(21))
+  rmSync(join(repo, 'b.txt'))
+  const dir = runDir()
+  const c = round(repo, base, dir)
+  assert.equal(readFileSync(join(dir, 'blobs', sha(lines(21))), 'utf8'), lines(21))
+  assert.equal(readFileSync(join(dir, 'blobs', sha(lines(5, 'b'))), 'utf8'), lines(5, 'b'))
+  assert.equal(c.files.length, 2)
+})
+
+test('snapshot da candidate_unstable si un archivo cambió después de congelarse', () => {
+  const { repo, base } = repoWithBase()
+  writeFileSync(join(repo, 'a.txt'), lines(21))
+  const c = freeze(repo, { base, context: [] })
+  writeFileSync(join(repo, 'a.txt'), lines(22))
+  const dir = runDir()
+  assert.throws(() => snapshot(repo, c, dir), (e: unknown) => e instanceof SddError && e.code === 'candidate_unstable')
+  assert.equal(existsSync(join(dir, 'blobs', sha(lines(22)))), false)
+})
+
+test('changedRanges: solo las líneas añadidas o sustituidas entre candidatos, sin el contexto de los hunks', () => {
+  const { repo, base } = repoWithBase()
+  const dir = runDir()
+  writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 3\n', 'línea tres\n'))
+  writeFileSync(join(repo, 'b.txt'), lines(5, 'b').replace('b 2\n', 'b dos\n'))
+  const prev = round(repo, base, dir)
+  writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 3\n', 'línea tres\n').replace('línea 12\n', 'línea doce\nextra\n'))
+  const next = round(repo, base, dir)
+  assert.deepEqual(changedRanges(prev, next, dir), { 'a.txt': [[12, 13]] })
+})
+
+test('changedRanges: un archivo nuevo o que antes estaba borrado cambia entero', () => {
+  const { repo, base } = repoWithBase()
+  const dir = runDir()
+  rmSync(join(repo, 'b.txt'))
+  const prev = round(repo, base, dir)
+  writeFileSync(join(repo, 'b.txt'), lines(6, 'b'))
+  writeFileSync(join(repo, 'nuevo.txt'), lines(2, 'n'))
+  git(repo, 'add', '-N', 'nuevo.txt')
+  const next = round(repo, base, dir)
+  assert.deepEqual(changedRanges(prev, next, dir), { 'b.txt': [[1, 6]], 'nuevo.txt': [[1, 2]] })
+})
+
+test('changedRanges: un binario que cambió se cita por ruta; un borrado en la ronda nueva no deja entrada', () => {
+  const { repo, base } = repoWithBase()
+  const dir = runDir()
+  writeFileSync(join(repo, 'bin.dat'), Buffer.from([0, 7, 0]))
+  writeFileSync(join(repo, 'c.txt'), lines(4, 'c'))
+  const prev = round(repo, base, dir)
+  writeFileSync(join(repo, 'bin.dat'), Buffer.from([0, 8, 0]))
+  rmSync(join(repo, 'c.txt'))
+  const next = round(repo, base, dir)
+  assert.deepEqual(changedRanges(prev, next, dir), { 'bin.dat': 'binary' })
+})
+
+test('changedRanges: un hunk que solo borra marca la línea anterior al borrado, o la 1', () => {
+  const { repo, base } = repoWithBase()
+  const dir = runDir()
+  writeFileSync(join(repo, 'a.txt'), `cero\n${lines(20)}`)
+  const prev = round(repo, base, dir)
+  writeFileSync(join(repo, 'a.txt'), `cero\n${lines(20).replace('línea 8\n', '')}`)
+  assert.deepEqual(changedRanges(prev, round(repo, base, dir), dir), { 'a.txt': [[8, 8]] })
+  writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 8\n', ''))
+  assert.deepEqual(changedRanges(prev, round(repo, base, dir), dir), { 'a.txt': [[1, 1], [7, 7]] })
+})
+
+test('changedRanges: con --head compara los contenidos de los dos commits', () => {
+  const { repo, base } = repoWithBase()
+  const dir = runDir()
+  writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 2\n', 'línea dos\n'))
+  git(repo, 'commit', '-qam', 'primera')
+  const prev = round(repo, base, dir, 'HEAD')
+  writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 2\n', 'línea dos\n').replace('línea 18\n', 'línea dieciocho\n'))
+  git(repo, 'commit', '-qam', 'segunda')
+  writeFileSync(join(repo, 'a.txt'), 'el árbol no cuenta\n')
+  assert.deepEqual(changedRanges(prev, round(repo, base, dir, 'HEAD'), dir), { 'a.txt': [[18, 18]] })
+})
+
+test('changedRanges: un cambio que solo toca el modo no deja líneas citables', () => {
+  const { repo, base } = repoWithBase()
+  const dir = runDir()
+  writeFileSync(join(repo, 'a.txt'), lines(21))
+  const prev = round(repo, base, dir)
+  chmodSync(join(repo, 'a.txt'), 0o755)
+  const next = round(repo, base, dir)
+  assert.notEqual(prev.hash, next.hash)
+  assert.deepEqual(changedRanges(prev, next, dir), {})
 })

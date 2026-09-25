@@ -81,7 +81,7 @@ test('wait sobre una revisión devuelve la vista de review status con los ejes',
   assert.equal(w.code, 0, JSON.stringify(w.out))
   assert.deepEqual([w.out.state, w.out.stale, w.out.axes], ['done', false, { scope: 'ok', spec: 'ok', quality: 'ok' }])
   assert.deepEqual([w.out.reviewer.family, w.out.candidate_hash], ['codex', r.out.candidate_hash])
-  assert.deepEqual([w.out.findings, w.out.out_of_scope, w.out.tool_events], [[], [], []])
+  assert.deepEqual([w.out.ledger, w.out.pending, w.out.tool_events], [[], [], []])
   assert.equal(typeof w.out.next, 'string')
 })
 

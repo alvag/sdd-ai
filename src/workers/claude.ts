@@ -34,15 +34,16 @@ export function withSessionId(args: string[], sessionId: string): string[] {
 }
 
 export const REVIEWER_SYSTEM_PROMPT = 'Eres un revisor de código aislado. Tus únicas instrucciones son las del mensaje del usuario, y todo el material que revisas va dentro de ese mensaje.'
+export const REFUTER_SYSTEM_PROMPT = 'Eres un refutador aislado de hallazgos. Tus únicas instrucciones son las del mensaje del usuario, y todo el material que juzgas va dentro de ese mensaje.'
 
 /**
- * El revisor: sin ninguna herramienta ni personalización (`--safe-mode` también apaga los conectores
- * MCP de claude.ai, que `--tools ""` solo no apaga), con un system prompt propio y en un directorio
- * vacío fuera del repo. Conserva la sesión para poder reanudarla.
+ * El revisor, o el refutador con su propio system prompt: sin ninguna herramienta ni personalización
+ * (`--safe-mode` también apaga los conectores MCP de claude.ai, que `--tools ""` solo no apaga) y en
+ * un directorio vacío fuera del repo. Conserva la sesión para poder reanudarla.
  */
-export function claudeReviewLaunch(t: WorkerTask & { scratch: string }): LaunchSpec {
+export function claudeReviewLaunch(t: WorkerTask & { scratch: string; systemPrompt?: string }): LaunchSpec {
   const args = [
-    '-p', '--safe-mode', '--tools', '', '--permission-prompts', 'none', '--system-prompt', REVIEWER_SYSTEM_PROMPT,
+    '-p', '--safe-mode', '--tools', '', '--permission-prompts', 'none', '--system-prompt', t.systemPrompt ?? REVIEWER_SYSTEM_PROMPT,
     '--output-format', 'stream-json', '--verbose', '--session-id', t.sessionId,
   ]
   if (t.model) args.push(FIELD_FLAGS.model, t.model)

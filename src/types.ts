@@ -37,8 +37,9 @@ export interface Usage {
   input_tokens?: number; output_tokens?: number
   cache_read_input_tokens?: number; cache_creation_input_tokens?: number; reasoning_output_tokens?: number
 }
-export type AttemptKind = 'initial' | 'profile_retry' | 'resume' | 'correction'
+export type AttemptKind = 'initial' | 'profile_retry' | 'resume' | 'correction' | 'refutation'
 export interface AttemptMetrics {
+  round: number
   kind: AttemptKind; suffix: string; started_at: string; ended_at: string; duration_ms: number
   prompt_bytes: number; usage?: Usage; outcome: RunState; reason?: string; admission?: string
   raw: { stdout: string; stderr: string; result: string }
@@ -48,6 +49,8 @@ export interface Status {
   supervisor_pid?: number; worker_pid?: number; session_id?: string
   started_at?: string; ended_at?: string; fallback?: Conductor; retry?: RetryInfo; resume?: ResumeInfo
   result_file?: string
+  /** En una revisión, la ronda a la que corresponde este estado. */
+  round?: number
 }
 
 export class SddError extends Error {

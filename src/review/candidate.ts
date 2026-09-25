@@ -1,8 +1,9 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { lstatSync, readFileSync, readlinkSync, realpathSync } from 'node:fs'
-import { isAbsolute, relative, resolve } from 'node:path'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { SddError } from '../types.ts'
+import type { ChangedRanges } from './ledger.ts'
 
 export interface Selection { base: string; head?: string; context: string[] }
 export interface CandidateFile {
@@ -188,6 +189,71 @@ export function freezeStable(root: string, sel: Selection, freezeFn: typeof free
     })
   }
   return first
+}
+
+/**
+ * Guarda en `<dir>/blobs/<sha256>` los bytes de cada archivo del candidato (de un borrado, los de la
+ * base), para que la ronda siguiente pueda compararlos aunque el árbol ya haya cambiado. Devuelve los
+ * blobs que escribió, para poder quitarlos si la ronda no llega a lanzarse.
+ */
+export function snapshot(root: string, c: Candidate, dir: string): string[] {
+  const blobs = join(dir, 'blobs')
+  mkdirSync(blobs, { recursive: true })
+  const pending = c.files.map((f) => {
+    const bytes = contentOf(root, f.path, f.status === 'D' ? c.base_sha : c.head_sha)
+    if (sha256(bytes) !== f.sha256) {
+      throw new SddError('candidate_unstable', `el archivo cambió después de congelarse: ${f.path}`, {
+        next: 'vuelve a lanzar la ronda cuando nadie esté escribiendo en el repo',
+      })
+    }
+    return { file: join(blobs, f.sha256), bytes }
+  })
+  const written: string[] = []
+  for (const { file, bytes } of pending) {
+    if (existsSync(file) || written.includes(file)) continue
+    writeFileSync(`${file}.tmp`, bytes)
+    renameSync(`${file}.tmp`, file)
+    written.push(file)
+  }
+  return written
+}
+
+/** Rangos del lado nuevo que cambiaron; un hunk que solo borra marca la línea anterior al borrado, o la 1. */
+function changedSide(diff: string): Array<[number, number]> {
+  const out: Array<[number, number]> = []
+  for (const line of diff.split('\n')) {
+    const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line)
+    if (!m) continue
+    const start = Number(m[1])
+    const count = m[2] === undefined ? 1 : Number(m[2])
+    out.push(count > 0 ? [start, start + count - 1] : [Math.max(start, 1), Math.max(start, 1)])
+  }
+  return out
+}
+
+/**
+ * Qué cambió de un candidato al siguiente, archivo por archivo: las líneas donde una ronda puede
+ * encontrar una regresión de la corrección. Compara los blobs que `snapshot` guardó de cada ronda.
+ */
+export function changedRanges(prev: Candidate, next: Candidate, dir: string): ChangedRanges {
+  const out: ChangedRanges = {}
+  for (const f of next.files) {
+    if (f.status === 'D' || f.sha256 === null) continue
+    const before = prev.files.find((p) => p.path === f.path && p.status !== 'D')
+    if (before?.sha256 === f.sha256) continue
+    if (f.binary) {
+      out[f.path] = 'binary'
+    } else if (!before || before.sha256 === null) {
+      if (f.lines > 0) out[f.path] = [[1, f.lines]]
+    } else {
+      const r = spawnSync('git', ['diff', '--no-index', '--no-color', '--no-ext-diff', '--no-textconv', '-U0',
+        join(dir, 'blobs', before.sha256), join(dir, 'blobs', f.sha256)], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
+      if (r.status !== 0 && r.status !== 1) throw new Error(`git diff --no-index falló sobre ${f.path}: ${r.stderr}`)
+      const ranges = changedSide(r.stdout)
+      if (ranges.length > 0) out[f.path] = ranges
+    }
+  }
+  return out
 }
 
 /** El texto de cada archivo de contexto, comprobado contra el hash con que se congeló. */

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { accessSync, constants, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -12,16 +12,18 @@ import { doctor } from './doctor.ts'
 import { repoRoot } from './git.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { nativeProfile, resolve } from './resolve.ts'
-import type { Verdict } from './review/admit.ts'
-import { type Candidate, type Selection, freeze, freezeStable, readContext } from './review/candidate.ts'
-import { checkBudget, renderReviewPrompt } from './review/prompt.ts'
-import { createRun, isAlive, newRunId, readJson, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
-import { type ArgvFile, supervise } from './supervisor.ts'
 import {
-  type Conductor, type Family, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
+  type Candidate, type Selection, changedRanges, freeze, freezeStable, readContext, snapshot,
+} from './review/candidate.ts'
+import { type Ledger, type RoundPlan, axesOf, decide, targets, undecided } from './review/ledger.ts'
+import { checkBudget, renderMaterial, renderReviewPrompt, renderRoundPrompt } from './review/prompt.ts'
+import { createRun, isAlive, newRunId, readJson, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
+import { type ArgvFile, type RoundRecord, supervise, writeReceipt } from './supervisor.ts'
+import {
+  type Conductor, type Family, type LaunchSpec, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
   type Resolution, SddError, type Status, TERMINAL, type WorkerTask, isFamily, isReadOnlyRole, opposite, toNativeEffort,
 } from './types.ts'
-import { claudeLaunch, claudeReviewLaunch } from './workers/claude.ts'
+import { REFUTER_SYSTEM_PROMPT, claudeLaunch, claudeReviewLaunch } from './workers/claude.ts'
 import { codexLaunch, codexReviewLaunch } from './workers/codex.ts'
 
 type Env = Record<string, string | undefined>
@@ -30,6 +32,8 @@ interface Result { code: number; out: unknown }
 const PKG_DIR = resolvePath(import.meta.dirname, '..')
 const BIN_PATH = join(PKG_DIR, 'bin', 'sdd-ai')
 const FAMILIES: Family[] = ['claude', 'codex']
+/** Rondas de una revisión antes del checkpoint; cada `--extra` concede una más. */
+const ROUND_CAP = 3
 
 /** Tope por defecto de `wait`, por debajo del timeout del shell de cada conductor. */
 export function defaultWaitMax(conductor: Family): number {
@@ -177,16 +181,38 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
 }
 
 /** Deja la corrida en `launching` y lanza al supervisor desprendido, que sobrevive al shell del conductor. */
-function launchSupervisor(dir: string, argv: ArgvFile, env: Env, fallback?: Conductor): void {
-  writeJsonAtomic(join(dir, 'argv.json'), argv)
+function launchSupervisor(dir: string, argv: ArgvFile, env: Env, fallback?: Conductor, argvName = 'argv.json'): void {
+  writeJsonAtomic(join(dir, argvName), argv)
   setStatus(dir, fallback ? { state: 'launching', fallback } : { state: 'launching' })
-  const supervisor = spawn(process.execPath, [BIN_PATH, '__supervise', dir], { detached: true, stdio: 'ignore', env: definedEnv(env) })
+  const supervisor = spawn(process.execPath, [BIN_PATH, '__supervise', dir, argvName], { detached: true, stdio: 'ignore', env: definedEnv(env) })
   supervisor.unref()
   // En un archivo propio y no en status.json: el supervisor ya puede estar escribiendo ese estado.
   if (supervisor.pid !== undefined) writeFileSync(join(dir, 'supervisor.pid'), String(supervisor.pid))
 }
 
-interface ReviewRequest { kind: 'review'; selection: Selection; author: Family; degradations: string[] }
+interface ReviewRequest {
+  kind: 'review'; selection: Selection; author: Family; degradations: string[]
+  overrides?: { families?: string; model?: string; effort?: string; deadline_sec?: number }
+}
+
+/** Revisor y refutador de una ronda, cada uno con su sesión y su directorio vacío. */
+function reviewLaunches(root: string, dir: string, tag: string, reviewer: Resolution, refuter: Resolution): { launch: LaunchSpec; refuter_launch: LaunchSpec } {
+  const task = (name: string, p: Resolution): WorkerTask & { scratch: string } => {
+    const t: WorkerTask & { scratch: string } = {
+      cwd: root, promptFile: join(dir, `prompt${name}.md`), resultFile: join(dir, `result${name}.md`), sessionId: randomUUID(),
+      scratch: mkdtempSync(join(tmpdir(), 'sdd-ai-review-')),
+    }
+    if (p.model) t.model = p.model
+    if (p.effort) t.effort = p.effort
+    return t
+  }
+  const r = task(tag, reviewer)
+  const f = task(`${tag}-refute`, refuter)
+  return {
+    launch: reviewer.family === 'claude' ? claudeReviewLaunch(r) : codexReviewLaunch(r),
+    refuter_launch: refuter.family === 'claude' ? claudeReviewLaunch({ ...f, systemPrompt: REFUTER_SYSTEM_PROMPT }) : codexReviewLaunch(f),
+  }
+}
 
 /**
  * Congela el candidato, arma el prompt y lanza al revisor por proceso, siempre aislado y de la familia
@@ -228,17 +254,20 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   const flags: Profile = {}
   if (values.model) flags.model = values.model
   if (values.effort) flags.effort = toNativeEffort(values.effort)
+  const workers = loadWorkers(root)
+  const codexRoot = loadCodexRoot(env)
   // El autor ocupa el lugar del conductor: la familia opuesta a él es la que revisa.
-  const resolution = resolve({
-    conductor: { family: author }, families, workers: loadWorkers(root), role: 'code-review', flags, codexRoot: loadCodexRoot(env),
-  })
+  const resolution = resolve({ conductor: { family: author }, families, workers, role: 'code-review', flags, codexRoot })
   const family = resolution.family
   const degradations = family === author ? ['same_family'] : []
+  // El refutador es de la familia del revisor, con el perfil de su propio rol.
+  const refuter = resolve({ conductor: { family: opposite(family) }, families: [family], workers, role: 'refute', flags: {}, codexRoot })
 
   const selection: Selection = { base: values.base, context: values.context.map((p) => (isAbsolute(p) ? p : resolvePath(cwd, p))) }
   if (values.head) selection.head = values.head
   const candidate = freezeStable(root, selection)
-  const prompt = renderReviewPrompt(candidate, readContext(root, candidate))
+  const contextTexts = readContext(root, candidate)
+  const prompt = renderReviewPrompt(candidate, contextTexts)
   checkBudget(prompt)
   if (!inPath(family, env)) {
     throw new SddError('cli_missing', `${family} no está en PATH`, { next: `revisa con --families ${opposite(family)} y acepta la degradación` })
@@ -246,8 +275,7 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
 
   const id = newRunId()
   const dir = createRun(root, id)
-  const promptFile = join(dir, 'prompt.md')
-  writeFileSync(promptFile, prompt)
+  writeFileSync(join(dir, 'prompt.md'), prompt)
   writeJsonAtomic(join(dir, 'candidate.json'), candidate)
   const request: ReviewRequest & Record<string, unknown> = {
     kind: 'review', selection, author, degradations, conductor,
@@ -255,15 +283,15 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   }
   writeJsonAtomic(join(dir, 'request.json'), request)
   writeJsonAtomic(join(dir, 'resolved.json'), resolution)
+  writeJsonAtomic(join(dir, 'resolved-refute.json'), refuter)
+  writeFileSync(join(dir, 'material.md'), renderMaterial(candidate, contextTexts))
+  snapshot(root, candidate, dir)
 
-  const task: WorkerTask & { scratch: string } = {
-    cwd: root, promptFile, resultFile: join(dir, 'result.md'), sessionId: randomUUID(),
-    scratch: mkdtempSync(join(tmpdir(), 'sdd-ai-review-')),
-  }
-  if (resolution.model) task.model = resolution.model
-  if (resolution.effort) task.effort = resolution.effort
-  const launch = family === 'claude' ? claudeReviewLaunch(task) : codexReviewLaunch(task)
-  launchSupervisor(dir, { family, launch, deadline_sec: deadline, kind: 'review', candidate: join(dir, 'candidate.json') }, env)
+  const { launch, refuter_launch } = reviewLaunches(root, dir, '', resolution, refuter)
+  launchSupervisor(dir, {
+    family, launch, deadline_sec: deadline, kind: 'review', candidate: join(dir, 'candidate.json'),
+    round: 1, tag: '', material: join(dir, 'material.md'), refuter_launch,
+  }, env)
   return {
     code: 0,
     out: {
@@ -297,55 +325,240 @@ function resolvesTo(root: string, ref: string | undefined, sha: string | null): 
 
 /**
  * Vigencia del candidato: con `--head`, reconstruye con los SHAs congelados y solo informa si el ref
- * se movió; sin `--head`, reconstruye con la misma selección. Si la reconstrucción falla, cuenta como
- * `stale`.
+ * se movió; sin `--head`, reconstruye con la misma base y el mismo contexto sobre el árbol. Si la
+ * reconstrucción falla, cuenta como `stale`.
  */
-function freshness(root: string, req: ReviewRequest, c: Candidate): { stale: boolean; ref_moved?: boolean } {
+function freshness(root: string, req: ReviewRequest, c: Candidate, head: string | undefined): { stale: boolean; ref_moved?: boolean } {
   try {
     if (c.head_sha) {
       const again = freeze(root, { base: c.base_sha, head: c.head_sha, context: req.selection.context })
-      const moved = !resolvesTo(root, req.selection.head, c.head_sha) || !resolvesTo(root, req.selection.base, c.base_sha)
+      const moved = !resolvesTo(root, head, c.head_sha) || !resolvesTo(root, req.selection.base, c.base_sha)
       return { stale: again.hash !== c.hash, ref_moved: moved }
     }
-    return { stale: freeze(root, req.selection).hash !== c.hash }
+    return { stale: freeze(root, { base: req.selection.base, context: req.selection.context }).hash !== c.hash }
   } catch {
     return { stale: true }
   }
 }
 
-/** Lo que el conductor necesita de una revisión: estado, revisor, veredicto, vigencia y el paso siguiente. */
+const tagOf = (n: number) => (n === 1 ? '' : `-r${n}`)
+
+/** El ref que revisó la ronda `n`: el de `review start` en la 1, el de su `round-r<n>.json` después. */
+function headOf(dir: string, req: ReviewRequest, n: number): string | undefined {
+  if (n === 1) return req.selection.head
+  const file = join(dir, `round${tagOf(n)}.json`)
+  return existsSync(file) ? readJson<RoundPlan>(file).head : undefined
+}
+
+/**
+ * El paso siguiente, por prioridad: esperar, relanzar una ronda que no terminó, decidir, preguntar
+ * por las disputas, el checkpoint del tope, corregir y lanzar, y por último la vigencia.
+ */
+function roundNext(id: string, dir: string, req: ReviewRequest, s: Status, round: number, ledger: Ledger, stale: boolean): string {
+  if (!TERMINAL.has(s.state)) return `./bin/sdd-ai wait ${id}`
+  if (s.state !== 'done') {
+    const head = headOf(dir, req, round)
+    const parts = [`./bin/sdd-ai review round ${id}`]
+    if (head) parts.push(`--head ${shellArg(head)}`)
+    if (ledger.completed >= ROUND_CAP) parts.push('--extra')
+    return `la ronda ${round} terminó en ${s.state}; pregunta al usuario si la relanza: ${parts.join(' ')}`
+  }
+  const disputes = ledger.entries.filter((e) => e.state === 'en-disputa').map((e) => e.id)
+  const pending = undecided(ledger).filter((x) => !disputes.includes(x))
+  if (pending.length > 0) {
+    return `decide cada hallazgo (${pending.join(', ')}): ./bin/sdd-ai review decide ${id} accept <F-n>… para corregirlo, o reject <F-n>… --reason "<motivo verificable>"`
+  }
+  if (disputes.length > 0) {
+    return `pregunta al usuario por cada disputa (${disputes.join(', ')}): aceptar el hallazgo (./bin/sdd-ai review decide ${id} accept <F-n>) o mantener el rechazo (./bin/sdd-ai review decide ${id} reject <F-n> --reason "<motivo>")`
+  }
+  const goals = targets(ledger)
+  if (goals.length > 0 && ledger.completed >= ROUND_CAP) {
+    return `se completaron ${ledger.completed} rondas y quedan hallazgos vigentes: pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está`
+  }
+  const verify = goals.filter((t) => t.kind === 'verify').map((t) => t.id)
+  if (verify.length > 0) return `corrige los aceptados (${verify.join(', ')}) y lanza ./bin/sdd-ai review round ${id}`
+  if (goals.length > 0) return `lanza ./bin/sdd-ai review round ${id} para que el revisor responda los rechazos`
+  if (stale) return `el diff cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
+  return 'la revisión está vigente; el recibo informa y no autoriza commit ni push'
+}
+
+interface Receipt { tool_events: string[]; degradations: string[]; reviewer: { model_effective: string | null } }
+
+/** Lo que el conductor necesita de una revisión: estado, revisor, ledger, ejes, vigencia y el paso siguiente. */
 function reviewView(root: string, id: string, dir: string, s: Status): Result {
   const req = readJson<ReviewRequest>(join(dir, 'request.json'))
-  const c = readJson<Candidate>(join(dir, 'candidate.json'))
   const resolved = readJson<Resolution>(join(dir, 'resolved.json'))
-  const out: Record<string, unknown> = {
-    id, state: s.state, candidate_hash: c.hash,
-    reviewer: { family: resolved.family, model: resolved.model ?? null, effort: resolved.effort ?? null },
-    degradations: req.degradations, ...freshness(root, req, c),
-  }
-  if (s.reason) out.reason = s.reason
-  if (s.detail) out.detail = s.detail
+  const round = s.round ?? 1
+  const reviewer = { family: resolved.family, model: resolved.model ?? null, effort: resolved.effort ?? null }
+  const code = s.state === 'done' || !TERMINAL.has(s.state) ? 0 : 1
+  const common: Record<string, unknown> = {}
+  if (s.reason) common.reason = s.reason
+  if (s.detail) common.detail = s.detail
   const warnings = profileWarnings(s)
-  if (warnings.length > 0) out.warnings = warnings
-  if (s.state === 'done' && existsSync(join(dir, 'verdict.json'))) {
-    const v = readJson<Verdict>(join(dir, 'verdict.json'))
-    const receipt = readJson<{ tool_events: string[]; degradations: string[]; reviewer: { model_effective: string | null } }>(join(dir, 'receipt.json'))
-    Object.assign(out, {
-      reviewer: { ...(out.reviewer as object), model_effective: receipt.reviewer.model_effective },
-      axes: { scope: v.scope, spec: v.spec, quality: v.quality }, findings: v.findings, out_of_scope: v.out_of_scope,
-      tool_events: receipt.tool_events, degradations: receipt.degradations,
+  if (warnings.length > 0) common.warnings = warnings
+  if (s.resume) common.resume = s.resume
+
+  const ledgerFile = join(dir, 'ledger.json')
+  if (!existsSync(ledgerFile)) {
+    const c = readJson<Candidate>(join(dir, 'candidate.json'))
+    const out: Record<string, unknown> = {
+      id, state: s.state, round, candidate_hash: c.hash, reviewer, degradations: req.degradations,
+      ...freshness(root, req, c, req.selection.head), ...common,
+    }
+    if (!TERMINAL.has(s.state)) out.next = `./bin/sdd-ai wait ${id}`
+    else if (out.stale === true) out.next = `el diff cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
+    else out.next = `pregunta al usuario si revisa de nuevo: ${restartCommand(req)}`
+    return { code, out }
+  }
+
+  const ledger = readJson<Ledger>(ledgerFile)
+  const c = readJson<Candidate>(join(dir, `candidate${tagOf(ledger.completed)}.json`))
+  const receipt = readJson<Receipt>(join(dir, 'receipt.json'))
+  const rounds = existsSync(join(dir, 'rounds.json')) ? readJson<{ rounds: RoundRecord[] }>(join(dir, 'rounds.json')).rounds : []
+  const fresh = freshness(root, req, c, headOf(dir, req, ledger.completed))
+  const disputes = ledger.entries.filter((e) => e.state === 'en-disputa').map((e) => e.id)
+  const out: Record<string, unknown> = {
+    id, state: s.state, round, completed: ledger.completed, candidate_hash: c.hash,
+    reviewer: { ...reviewer, model_effective: receipt.reviewer.model_effective },
+    degradations: receipt.degradations, ...fresh,
+    axes: axesOf(ledger), ledger: ledger.entries,
+    pending: undecided(ledger).filter((x) => !disputes.includes(x)), disputes,
+    refuted: ledger.entries.filter((e) => e.state === 'refutado').map((e) => e.id),
+    inconclusive: ledger.entries.filter((e) => e.state !== 'refutado' && e.refutation?.result === 'inconclusive').map((e) => e.id),
+    tool_events: rounds.filter((r) => r.state === 'done').at(-1)?.tool_events ?? receipt.tool_events,
+    ...common,
+    next: roundNext(id, dir, req, s, round, ledger, fresh.stale),
+  }
+  return { code, out }
+}
+
+/** Registra la decisión del conductor (o de la persona, en una disputa) y devuelve la vista actualizada. */
+function reviewDecide(args: string[], cwd: string): Result {
+  const { values, positionals } = parseArgs({ args, strict: true, allowPositionals: true, options: { reason: { type: 'string' } } })
+  const [id, action, ...ids] = positionals
+  if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review decide <id> accept|reject <F-n>… [--reason <motivo>]' })
+  const root = repoRoot(cwd)
+  const dir = runDir(root, id)
+  if (!TERMINAL.has(readStatus(dir).state)) {
+    throw new SddError('usage', 'la ronda está en curso: se decide cuando termine', { next: `./bin/sdd-ai wait ${id}` })
+  }
+  const file = join(dir, 'ledger.json')
+  if (!existsSync(file)) throw new SddError('usage', 'la revisión no tiene hallazgos admitidos que decidir', { next: `./bin/sdd-ai review status ${id}` })
+  if (action !== 'accept' && action !== 'reject') {
+    throw new SddError('usage', `acción desconocida: ${action ?? ''}`, { next: 'usa accept o reject' })
+  }
+  writeJsonAtomic(file, decide(readJson<Ledger>(file), action, ids, values.reason))
+  writeReceipt(dir)
+  return reviewView(root, id, dir, readStatus(dir))
+}
+
+/**
+ * La ronda siguiente: congela el candidato corregido con la base y el contexto de la ronda 1 y lanza
+ * la pasada dirigida con el mismo revisor, en una sesión nueva. Todo lo que puede impedirla se
+ * comprueba antes de escribir un archivo de la ronda.
+ */
+async function reviewRound(args: string[], env: Env, cwd: string): Promise<Result> {
+  const { values, positionals } = parseArgs({
+    args, strict: true, allowPositionals: true, options: { head: { type: 'string' }, extra: { type: 'boolean', default: false } },
+  })
+  const id = positionals[0]
+  if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review round <id> [--head <ref>] [--extra]' })
+  if (env.SDD_AI_WORKER === '1') {
+    throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
+  }
+  const root = repoRoot(cwd)
+  const dir = runDir(root, id)
+  if (!TERMINAL.has(readStatus(dir).state)) {
+    throw new SddError('usage', 'la ronda anterior sigue en curso', { next: `./bin/sdd-ai wait ${id}` })
+  }
+  const req = readJson<ReviewRequest>(join(dir, 'request.json'))
+  const ledgerFile = join(dir, 'ledger.json')
+  if (!existsSync(ledgerFile)) {
+    throw new SddError('usage', 'la revisión no tiene una ronda 1 completada', { next: `pregunta al usuario si revisa de nuevo: ${restartCommand(req)}` })
+  }
+  const ledger = readJson<Ledger>(ledgerFile)
+  if (values.extra && ledger.completed < ROUND_CAP) {
+    throw new SddError('usage', `--extra solo concede una ronda más allá del tope de ${ROUND_CAP}; esta revisión completó ${ledger.completed}`, {
+      next: `./bin/sdd-ai review round ${id}`,
     })
   }
-  if (!TERMINAL.has(s.state)) out.next = `./bin/sdd-ai wait ${id}`
-  else if (out.stale === true) out.next = `el diff cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
-  else if (s.state === 'done') out.next = 'la revisión está vigente; el recibo informa y no autoriza commit ni push'
-  else out.next = `pregunta al usuario si revisa de nuevo: ${restartCommand(req)}`
-  return { code: s.state === 'done' || !TERMINAL.has(s.state) ? 0 : 1, out }
+  const pending = undecided(ledger)
+  if (pending.length > 0) {
+    throw new SddError('usage', `hay hallazgos sin decidir: ${pending.join(', ')}`, {
+      next: `./bin/sdd-ai review decide ${id} accept|reject ${pending.join(' ')} [--reason <motivo>]`,
+    })
+  }
+  const goals = targets(ledger)
+  if (goals.length === 0) {
+    throw new SddError('usage', 'no hay nada que verificar ni responder', { next: `./bin/sdd-ai review status ${id}` })
+  }
+  if (ledger.completed >= ROUND_CAP && !values.extra) {
+    throw new SddError('round_cap', `la revisión ya hizo ${ROUND_CAP} rondas y quedan hallazgos vigentes`, {
+      next: `pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está`,
+    })
+  }
+
+  const n = ledger.completed + 1
+  const tag = `-r${n}`
+  const prev = readJson<Candidate>(join(dir, `candidate${ledger.completed === 1 ? '' : `-r${ledger.completed}`}.json`))
+  const first = readJson<Candidate>(join(dir, 'candidate.json'))
+  const selection: Selection = { base: first.base_sha, context: req.selection.context }
+  if (values.head) selection.head = values.head
+  const candidate = freezeStable(root, selection)
+  const identical = candidate.hash === prev.hash
+  if (identical && goals.some((t) => t.kind === 'verify')) {
+    throw new SddError('usage', 'el candidato es idéntico al de la ronda anterior y hay aceptados que verificar', {
+      next: 'corrige los aceptados antes de lanzar la ronda siguiente',
+    })
+  }
+  // Los blobs son lo único que se escribe antes de las últimas comprobaciones: la comparación con la
+  // ronda anterior los necesita. Si la ronda no se lanza, se quitan.
+  const written = snapshot(root, candidate, dir)
+  let plan: RoundPlan
+  let material: string
+  let prompt: string
+  const resolved = readJson<Resolution>(join(dir, 'resolved.json'))
+  try {
+    plan = { n, prev_hash: prev.hash, identical, targets: goals, changed: identical ? {} : changedRanges(prev, candidate, dir) }
+    if (values.head) plan.head = values.head
+    material = renderMaterial(candidate, readContext(root, candidate))
+    prompt = renderRoundPrompt(candidate, material, plan, ledger.entries, ROUND_CAP)
+    checkBudget(prompt)
+    if (!inPath(resolved.family, env)) {
+      throw new SddError('cli_missing', `${resolved.family} no está en PATH`, { next: 'instala o expone el CLI del revisor de la ronda 1' })
+    }
+  } catch (e) {
+    for (const f of written) rmSync(f, { force: true })
+    throw e
+  }
+
+  writeJsonAtomic(join(dir, `candidate${tag}.json`), candidate)
+  writeFileSync(join(dir, `material${tag}.md`), material)
+  writeFileSync(join(dir, `prompt${tag}.md`), prompt)
+  writeJsonAtomic(join(dir, `round${tag}.json`), plan)
+  const { launch, refuter_launch } = reviewLaunches(root, dir, tag, resolved, readJson<Resolution>(join(dir, 'resolved-refute.json')))
+  // La ronda arranca con un estado limpio: nada de la anterior (motivo, reanudación, cancelación) la alcanza.
+  writeJsonAtomic(join(dir, 'status.json'), { state: 'launching', round: n })
+  rmSync(join(dir, 'cancel.request'), { force: true })
+  launchSupervisor(dir, {
+    family: resolved.family, launch, deadline_sec: req.overrides?.deadline_sec ?? 1800, kind: 'review',
+    candidate: join(dir, `candidate${tag}.json`), round: n, tag, plan: join(dir, `round${tag}.json`),
+    material: join(dir, `material${tag}.md`), refuter_launch, extra: values.extra,
+  }, env, undefined, `argv${tag}.json`)
+  return {
+    code: 0,
+    out: {
+      id, round: n, family: resolved.family, candidate_hash: candidate.hash, identical, targets: goals,
+      changed: Object.keys(plan.changed), left_out: candidate.left_out, next: `./bin/sdd-ai wait ${id}`,
+    },
+  }
 }
 
 async function review(args: string[], env: Env, cwd: string): Promise<Result> {
   const [sub, ...rest] = args
   if (sub === 'start') return reviewStart(rest, env, cwd)
+  if (sub === 'decide') return reviewDecide(rest, cwd)
+  if (sub === 'round') return reviewRound(rest, env, cwd)
   if (sub === 'status') {
     const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: {} })
     const id = positionals[0]
@@ -354,7 +567,7 @@ async function review(args: string[], env: Env, cwd: string): Promise<Result> {
     const dir = runDir(root, id)
     return reviewView(root, id, dir, readStatus(dir))
   }
-  throw new SddError('usage', `subcomando desconocido: review ${sub ?? ''}`, { next: 'usa review start | review status' })
+  throw new SddError('usage', `subcomando desconocido: review ${sub ?? ''}`, { next: 'usa review start | status | decide | round' })
 }
 
 /** PID que `run` anotó al lanzar el supervisor, para cubrir el tramo previo a `running`. */
@@ -471,7 +684,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
         const report = doctor()
         return { code: report.ok ? 0 : 1, out: report }
       }
-      case '__supervise': return { code: 0, out: await supervise(rest[0]) }
+      case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }
       default:
         throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa run | review | wait | cancel | agents sync | doctor' })
     }

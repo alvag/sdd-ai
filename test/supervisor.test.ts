@@ -7,11 +7,12 @@ import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createRun, readStatus, writeJsonAtomic } from '../src/runs.ts'
 import type { Candidate } from '../src/review/candidate.ts'
-import { REVIEW_PROMPT_BUDGET, renderReviewPrompt } from '../src/review/prompt.ts'
+import { type Ledger, type RoundPlan, decide, openLedger, targets } from '../src/review/ledger.ts'
+import { REVIEW_PROMPT_BUDGET, renderMaterial, renderReviewPrompt, renderRoundPrompt } from '../src/review/prompt.ts'
 import { type ArgvFile, cleanEnv, supervise } from '../src/supervisor.ts'
-import { claudeReviewLaunch } from '../src/workers/claude.ts'
+import { REFUTER_SYSTEM_PROMPT, claudeReviewLaunch } from '../src/workers/claude.ts'
 import { codexReviewLaunch } from '../src/workers/codex.ts'
-import type { Family } from '../src/types.ts'
+import { type Family, opposite } from '../src/types.ts'
 import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
 const FAKE = join(import.meta.dirname, 'fake-cli.ts')
@@ -328,6 +329,7 @@ function prepareReview(family: Family, mode: string, pad = 0): string {
     deadline_sec: 30, resume_sec: 5,
   }
   writeJsonAtomic(join(dir, 'argv.json'), argv)
+  writeJsonAtomic(join(dir, 'resolved.json'), { family, via: 'process', origin: { model: 'heredado', effort: 'heredado' } })
   process.env.FAKE_MODE = mode
   process.env.FAKE_CALLS_FILE = join(dir, 'calls')
   process.env.FAKE_PID_FILE = join(dir, 'pids')
@@ -341,6 +343,7 @@ test('una revisión admitida deja veredicto y recibo, y el recibo no autoriza na
   const s = await supervise(dir)
   assert.equal(s.state, 'done')
   assert.deepEqual(readRunJson(dir, 'verdict.json'), { scope: 'ok', spec: 'ok', quality: 'ok', findings: [], out_of_scope: [] })
+  assert.deepEqual(readRunJson(dir, 'ledger.json'), { completed: 1, next_id: 1, entries: [] })
   const r = readRunJson(dir, 'receipt.json')
   assert.equal(r.candidate_hash, HASH)
   assert.deepEqual([r.reviewer.family, r.reviewer.model_effective], ['claude', 'claude-falso'])
@@ -405,4 +408,213 @@ test('cleanEnv quita las señales de sesión del conductor y marca al worker', (
     CODEX_SESSION_ID: 's', CODEX_SANDBOX: 'seatbelt', CODEX_SANDBOX_NETWORK_DISABLED: '1', CODEX_CI: '1', CODEX_HOME: 'c',
   })
   assert.deepEqual(env, { PATH: 'p', HOME: 'h', CODEX_HOME: 'c', SDD_AI_WORKER: '1' })
+})
+
+const ROUND_CANDIDATE: Candidate = {
+  base_sha: 'b'.repeat(40), head_sha: null, hash: HASH, left_out: [], context: [], diff: 'diff --git a/a.txt b/a.txt\n',
+  files: [{ path: 'a.txt', status: 'M', mode: '100644', sha256: 'x', binary: false, lines: 3, visible: [[1, 3]] }],
+}
+const inferential = { axis: 'quality', severity: 'CRITICAL', location: 'a.txt:2', claim: 'puede fallar con una lista vacía', causality: 'introduced', evidence: 'inferential' }
+const deterministic = { ...inferential, claim: 'la línea 2 no valida', evidence: 'deterministic' }
+const firstRound = (findings: unknown[]) =>
+  `{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":$PATHS},"findings":${JSON.stringify(findings)}}`
+const nextRound = (responses: unknown[], findings: unknown[] = []) =>
+  `{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":$PATHS},"responses":${JSON.stringify(responses)},"findings":${JSON.stringify(findings)}}`
+const refutation = (results: unknown[]) => `{"candidate_hash":"$HASH","results":${JSON.stringify(results)}}`
+
+interface RoundSetup { round?: number; ledger?: Ledger; plan?: RoundPlan; deadline_sec?: number; materialPad?: number }
+
+/** Una ronda preparada como la deja la CLI: candidato, material, prompt, revisor y refutador apuntados al CLI falso guionado. */
+function prepareRound(family: Family, answers: string[], o: RoundSetup = {}): { dir: string; argvName: string } {
+  const dir = createRun(makeRepo(), 'r')
+  const n = o.round ?? 1
+  const tag = n === 1 ? '' : `-r${n}`
+  writeJsonAtomic(join(dir, `candidate${tag}.json`), ROUND_CANDIDATE)
+  const material = renderMaterial(ROUND_CANDIDATE, new Map()) + 'x'.repeat(o.materialPad ?? 0)
+  writeFileSync(join(dir, `material${tag}.md`), material)
+  const prompt = o.plan && o.ledger
+    ? renderRoundPrompt(ROUND_CANDIDATE, material, o.plan, o.ledger.entries, 3)
+    : renderReviewPrompt(ROUND_CANDIDATE, new Map())
+  writeFileSync(join(dir, `prompt${tag}.md`), prompt)
+  if (o.ledger) writeJsonAtomic(join(dir, 'ledger.json'), o.ledger)
+  if (o.plan) writeJsonAtomic(join(dir, `round${tag}.json`), o.plan)
+  writeJsonAtomic(join(dir, 'request.json'), { kind: 'review', selection: { base: 'main', context: [] }, author: opposite(family), degradations: [] })
+  writeJsonAtomic(join(dir, 'resolved.json'), { family, via: 'process', model: 'm', effort: 'high', origin: { model: 'workers', effort: 'workers' } })
+  const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
+  makeFakeBin(bin, family)
+  warmFakeBin(bin, family)
+  const scratch = () => mkdtempSync(join(tmpdir(), 'sdd-ai-scratch-'))
+  const task = { cwd: dir, promptFile: join(dir, `prompt${tag}.md`), resultFile: join(dir, `result${tag}.md`), sessionId: 's1', scratch: scratch() }
+  const launch = family === 'claude' ? claudeReviewLaunch(task) : codexReviewLaunch(task)
+  const rtask = { cwd: dir, promptFile: join(dir, `prompt${tag}-refute.md`), resultFile: join(dir, `result${tag}-refute.md`), sessionId: 's2', scratch: scratch() }
+  const refuter = family === 'claude' ? claudeReviewLaunch({ ...rtask, systemPrompt: REFUTER_SYSTEM_PROMPT }) : codexReviewLaunch(rtask)
+  const argvName = `argv${tag}.json`
+  const argv: ArgvFile = {
+    family, kind: 'review', candidate: join(dir, `candidate${tag}.json`), launch: { ...launch, cmd: join(bin, family) },
+    deadline_sec: o.deadline_sec ?? 30, grace_ms: 200, resume_sec: 5, round: n, tag, material: join(dir, `material${tag}.md`),
+    refuter_launch: { ...refuter, cmd: join(bin, family) }, ...(o.plan ? { plan: join(dir, `round${tag}.json`) } : {}),
+  }
+  writeJsonAtomic(join(dir, argvName), argv)
+  writeJsonAtomic(join(dir, 'answers.json'), answers)
+  process.env.FAKE_MODE = 'scripted'
+  process.env.FAKE_ANSWERS = join(dir, 'answers.json')
+  process.env.FAKE_CALLS_FILE = join(dir, 'calls')
+  process.env.FAKE_PID_FILE = join(dir, 'pids')
+  return { dir, argvName }
+}
+
+const ledgerOf = (dir: string): Ledger => readRunJson(dir, 'ledger.json')
+const kinds = (dir: string) => metrics(dir).attempts.map((a: { kind: string; round: number; suffix: string }) => [a.round, a.kind, a.suffix])
+
+for (const family of ['claude', 'codex'] as const) {
+  test(`${family}: un grave inferencial de la ronda 1 va al refutador, y refuted lo deja refutado`, async () => {
+    const { dir, argvName } = prepareRound(family, [
+      firstRound([inferential, deterministic]),
+      refutation([{ id: 'F-1', result: 'refuted', evidence: 'a.txt:1', note: 'la guarda está en la línea 1' }]),
+    ])
+    const s = await supervise(dir, argvName)
+    assert.equal(s.state, 'done')
+    const l = ledgerOf(dir)
+    assert.deepEqual(l.entries.map((e) => [e.id, e.state]), [['F-1', 'refutado'], ['F-2', 'abierto']])
+    assert.deepEqual(l.entries[0].refutation, { result: 'refuted', evidence: 'a.txt:1', note: 'la guarda está en la línea 1' })
+    const refutePrompt = readFileSync(join(dir, 'prompt-refute.md'), 'utf8')
+    assert.match(refutePrompt, /refutador aislado/)
+    assert.ok(refutePrompt.includes('"F-1"') && !refutePrompt.includes('"F-2"'))
+    assert.deepEqual(kinds(dir), [[1, 'initial', ''], [1, 'refutation', '-refute']])
+    const round = readRunJson(dir, 'rounds.json').rounds[0]
+    assert.deepEqual([round.n, round.state, round.refutation.ids, round.refutation.outcome], [1, 'done', ['F-1'], 'admitted'])
+    assert.deepEqual(round.refutation.tool_events, [])
+    assert.equal(readRunJson(dir, 'verdict.json').quality, 'fail')
+  })
+}
+
+test('sin graves inferenciales no hay refutación', async () => {
+  const { dir, argvName } = prepareRound('claude', [firstRound([deterministic])])
+  await supervise(dir, argvName)
+  assert.equal(calls(dir).length, 1)
+  assert.equal(existsSync(join(dir, 'prompt-refute.md')), false)
+  assert.equal(readRunJson(dir, 'rounds.json').rounds[0].refutation, undefined)
+})
+
+test('un refutador que falla deja la tanda inconclusive, nunca refutada', async () => {
+  const { dir, argvName } = prepareRound('claude', [firstRound([inferential]), '__fail__'])
+  const s = await supervise(dir, argvName)
+  assert.equal(s.state, 'done')
+  const [e] = ledgerOf(dir).entries
+  assert.equal(e.state, 'abierto')
+  assert.equal(e.refutation?.result, 'inconclusive')
+  assert.match(e.refutation?.reason ?? '', /failed/)
+  assert.equal(readRunJson(dir, 'rounds.json').rounds[0].refutation.outcome, 'inconclusive')
+})
+
+test('un refutador que se agota deja la tanda inconclusive por timeout, sin reanudarse', async () => {
+  const { dir, argvName } = prepareRound('codex', [firstRound([inferential]), '__hang__'], { deadline_sec: 1 })
+  const s = await supervise(dir, argvName)
+  assert.equal(s.state, 'done')
+  assert.equal(calls(dir).length, 2)
+  assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'timeout' })
+})
+
+test('un refutador inadmisible dos veces deja la tanda inconclusive', async () => {
+  const { dir, argvName } = prepareRound('claude', [firstRound([inferential]), 'no sé', 'tampoco'])
+  await supervise(dir, argvName)
+  assert.deepEqual(kinds(dir), [[1, 'initial', ''], [1, 'refutation', '-refute'], [1, 'refutation', '-refute-fix']])
+  assert.ok(readFileSync(join(dir, 'prompt-refute-fix.md'), 'utf8').startsWith(readFileSync(join(dir, 'prompt-refute.md'), 'utf8')))
+  assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'inadmissible_twice' })
+})
+
+test('un refutador cancelado deja la tanda inconclusive por cancelled y la ronda en done', async () => {
+  const { dir, argvName } = prepareRound('claude', [firstRound([inferential]), '__hang__'])
+  const running = supervise(dir, argvName)
+  await waitFor(() => (existsSync(join(dir, 'calls')) && calls(dir).length === 2 ? true : undefined))
+  await sleep(200)
+  writeFileSync(join(dir, 'cancel.request'), 'ya')
+  const s = await running
+  assert.equal(s.state, 'done')
+  assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'cancelled' })
+})
+
+test('un prompt de refutación que no entra en el presupuesto deja la tanda inconclusive sin lanzar', async () => {
+  const { dir, argvName } = prepareRound('claude', [firstRound([inferential])], { materialPad: REVIEW_PROMPT_BUDGET })
+  await supervise(dir, argvName)
+  assert.equal(calls(dir).length, 1)
+  assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'prompt_too_large' })
+})
+
+/** Ledger después de una ronda 1 con dos graves deterministas: F-1 aceptado y F-2 rechazado. */
+function roundTwo(): { ledger: Ledger; plan: RoundPlan } {
+  const opened = openLedger([deterministic, { ...deterministic, axis: 'scope' }] as Parameters<typeof openLedger>[0])
+  const ledger = decide(decide(opened, 'accept', ['F-1']), 'reject', ['F-2'], 'es intencional')
+  const plan: RoundPlan = { n: 2, prev_hash: `sha256:${'0'.repeat(64)}`, identical: false, targets: targets(ledger), changed: { 'a.txt': [[2, 2]] } }
+  return { ledger, plan }
+}
+const answered = [{ id: 'F-1', answer: 'resolved' }, { id: 'F-2', answer: 'withdrawn' }]
+
+test('la ronda 2 escribe sus archivos con -r2, aplica las respuestas y abre las regresiones', async () => {
+  const { ledger, plan } = roundTwo()
+  const { dir, argvName } = prepareRound('claude', [nextRound(answered, [{ ...deterministic, severity: 'WARNING', claim: 'regresión' }])], { round: 2, ledger, plan })
+  const s = await supervise(dir, argvName)
+  assert.deepEqual([s.state, s.round, s.result_file], ['done', 2, 'result-r2.md'])
+  for (const f of ['stdout-r2.log', 'stderr-r2.log', 'result-r2.md']) assert.equal(existsSync(join(dir, f)), true, f)
+  for (const f of ['stdout.log', 'result.md']) assert.equal(existsSync(join(dir, f)), false, f)
+  const l = ledgerOf(dir)
+  assert.deepEqual(l.entries.map((e) => [e.id, e.state, e.round]), [['F-1', 'resuelto', 1], ['F-2', 'cerrado', 1], ['F-3', 'abierto', 2]])
+  assert.equal(l.completed, 2)
+  const r = readRunJson(dir, 'rounds.json').rounds
+  assert.deepEqual(r.map((x: { n: number; tag: string; state: string }) => [x.n, x.tag, x.state]), [[2, '-r2', 'done']])
+  assert.deepEqual(kinds(dir), [[2, 'initial', '']])
+})
+
+test('la corrección de la ronda 2 parte de prompt-r2.md', async () => {
+  const { ledger, plan } = roundTwo()
+  const { dir, argvName } = prepareRound('codex', ['sin JSON', nextRound(answered)], { round: 2, ledger, plan })
+  const s = await supervise(dir, argvName)
+  assert.equal(s.state, 'done')
+  assert.ok(readFileSync(join(dir, 'prompt-r2-fix.md'), 'utf8').startsWith(readFileSync(join(dir, 'prompt-r2.md'), 'utf8')))
+  assert.equal(existsSync(join(dir, 'result-r2-fix.md')), true)
+  assert.equal(existsSync(join(dir, 'prompt-fix.md')), false)
+  assert.equal(ledgerOf(dir).entries[0].state, 'resuelto')
+})
+
+test('una ronda 2 que agota el tope se reanuda con resume-r2.md', async () => {
+  const { ledger, plan } = roundTwo()
+  // La reanudación solo recibe el mensaje de cierre: la respuesta guionada lleva el hash y las rutas literales.
+  const literal = nextRound(answered).replace('$HASH', HASH).replace('$PATHS', '["a.txt"]')
+  const { dir, argvName } = prepareRound('claude', ['__hang__', literal], { round: 2, ledger, plan, deadline_sec: 1 })
+  const s = await supervise(dir, argvName)
+  assert.equal(s.state, 'done')
+  assert.equal(s.resume?.outcome, 'done')
+  assert.match(readFileSync(join(dir, 'resume-r2.md'), 'utf8'), /Se agotó el tiempo/)
+  assert.equal(existsSync(join(dir, 'argv-r2-resume.json')), true)
+  assert.deepEqual(kinds(dir), [[2, 'initial', ''], [2, 'resume', '-resume']])
+  assert.equal(ledgerOf(dir).entries[0].state, 'resuelto')
+})
+
+test('una ronda 2 unavailable no cambia el ledger y queda registrada', async () => {
+  const { ledger, plan } = roundTwo()
+  const { dir, argvName } = prepareRound('claude', [
+    '{"candidate_hash":"$HASH","inspection":{"status":"unavailable","paths":[],"reason":"no pude"},"responses":[],"findings":[]}',
+  ], { round: 2, ledger, plan })
+  const before = readFileSync(join(dir, 'ledger.json'), 'utf8')
+  const s = await supervise(dir, argvName)
+  assert.deepEqual([s.state, s.reason], ['unavailable', 'reviewer_unavailable'])
+  assert.equal(readFileSync(join(dir, 'ledger.json'), 'utf8'), before)
+  assert.deepEqual(readRunJson(dir, 'rounds.json').rounds.map((x: { n: number; state: string }) => [x.n, x.state]), [[2, 'unavailable']])
+})
+
+test('el recibo lista cada ronda con su candidato, e incluye el ledger y la nota', async () => {
+  const { ledger, plan } = roundTwo()
+  const { dir, argvName } = prepareRound('claude', [nextRound(answered)], { round: 2, ledger, plan })
+  writeJsonAtomic(join(dir, 'rounds.json'), { rounds: [{
+    n: 1, tag: '', candidate_hash: `sha256:${'0'.repeat(64)}`, base_sha: 'b'.repeat(40), head_sha: null, state: 'done',
+    started_at: 'x', ended_at: 'y', extra: false, model_effective: 'claude-falso', tool_events: [],
+  }] })
+  await supervise(dir, argvName)
+  const r = readRunJson(dir, 'receipt.json')
+  assert.deepEqual(r.rounds.map((x: { n: number; candidate_hash: string }) => [x.n, x.candidate_hash]), [[1, `sha256:${'0'.repeat(64)}`], [2, HASH]])
+  assert.equal(r.candidate_hash, HASH)
+  assert.deepEqual(r.ledger.entries.map((e: { state: string }) => e.state), ['resuelto', 'cerrado'])
+  assert.deepEqual(r.axes, { scope: 'ok', spec: 'ok', quality: 'ok' })
+  assert.deepEqual([r.reviewer.family, r.reviewer.model_requested, r.reviewer.model_effective], ['claude', 'm', 'claude-falso'])
+  assert.match(r.note, /no autoriza commit ni push/)
 })

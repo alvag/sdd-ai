@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  REVIEWER_SYSTEM_PROMPT, claudeLaunch, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId,
+  REFUTER_SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT, claudeLaunch, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId,
 } from '../src/workers/claude.ts'
 import { codexLaunch, codexResume, codexRetry, codexReviewLaunch } from '../src/workers/codex.ts'
 import type { WorkerTask } from '../src/types.ts'
@@ -95,6 +95,14 @@ test('el revisor Claude corre sin herramientas, sin personalizaciones y fuera de
     '--output-format', 'stream-json', '--verbose', '--session-id', 'S', '--model', 'opus', '--effort', 'high',
   ])
   assert.equal(l.args.includes('--no-session-persistence'), false)
+})
+
+test('el refutador Claude tiene el aislamiento del revisor y su propio prompt de sistema', () => {
+  const l = claudeReviewLaunch({ ...review, systemPrompt: REFUTER_SYSTEM_PROMPT })
+  assert.deepEqual([l.cmd, l.cwd, l.stdinFile], ['claude', '/tmp/vacio', '/r/p.md'])
+  assert.deepEqual(l.args, claudeReviewLaunch(review).args.map((a) => (a === REVIEWER_SYSTEM_PROMPT ? REFUTER_SYSTEM_PROMPT : a)))
+  assert.match(REFUTER_SYSTEM_PROMPT, /refutador aislado de hallazgos/)
+  assert.doesNotMatch(REFUTER_SYSTEM_PROMPT, /revisor de código/)
 })
 
 test('el revisor Codex corre sin shell ni web, fuera de un repo', () => {

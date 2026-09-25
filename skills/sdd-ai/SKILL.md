@@ -87,13 +87,72 @@ el reporte está completo.
 - **Si eres Codex**, pide escalamiento para `review start`, igual que para `run`.
 
 Después, `./bin/sdd-ai wait <id>`, igual que en la vía `process`. Al terminar, `wait` devuelve la
-misma vista que `./bin/sdd-ai review status <id>`: los ejes `SCOPE`, `SPEC` y `QUALITY`, los
-hallazgos, `out_of_scope` (lo grave que ya estaba antes del cambio) y `next`.
+misma vista que `./bin/sdd-ai review status <id>`: los ejes `SCOPE`, `SPEC` y `QUALITY`, el `ledger`
+con cada hallazgo (`F-1`, `F-2`…) y su estado, y `next`. Sigue siempre lo que dice `next`.
 
-- **`stale: true`**: el diff cambió desde la revisión y el veredicto ya no vale para lo que hay.
-  Propón la revisión nueva que trae `next`.
+### Decidir cada hallazgo
+
+Cada hallazgo `abierto` (los de `pending`) espera tu decisión:
+
+```
+./bin/sdd-ai review decide <id> accept <F-n>...
+./bin/sdd-ai review decide <id> reject <F-n>... --reason "<motivo>"
+```
+
+- `accept` si lo vas a corregir.
+- `reject` si no, con un motivo que el revisor pueda verificar en el código ("la línea 12 ya valida
+  el caso vacío"), no una opinión. El revisor va a responder ese motivo.
+- Una decisión se puede cambiar hasta que lances la ronda siguiente.
+- Lo grave que ya estaba antes del cambio queda `fuera-de-alcance`: no se decide y no hace fallar
+  ningún eje.
+
+### La ronda siguiente
+
+Corrige los aceptados y, con todo decidido, lanza:
+
+```
+./bin/sdd-ai review round <id> [--head <ref>]
+```
+
+La ronda revisa el candidato corregido con el mismo revisor, en una sesión nueva. No es una revisión
+completa: el revisor dice si cada aceptado quedó resuelto, responde cada rechazo y solo puede abrir
+hallazgos nuevos en lo que cambió desde la ronda anterior. `round` no lanza nada si queda un hallazgo
+sin decidir, si hay aceptados y no corregiste nada, o si no hay nada que verificar ni responder.
+
+- **`stale: true` después de corregir es lo esperado**: el diff cambió porque lo corregiste. Lanza la
+  ronda; no lances un `review start` nuevo.
+- Un aceptado que la ronda ve sin resolver vuelve a esperar: corrígelo otra vez (`accept`), o
+  recházalo con motivo si la evidencia del revisor no te convence.
+- Si el prompt de la ronda no entra en el presupuesto (`prompt_too_large`), la revisión no puede
+  seguir por rondas: propón un `review start` nuevo con un diff más chico o menos contexto.
+
+### Lo que decide el usuario, nunca tú
+
+- **`en-disputa`** (los de `disputes`): el revisor mantuvo un hallazgo que rechazaste. Tú fuiste parte
+  de esa discusión, así que no la decides: muéstrale al usuario tu motivo y la evidencia del revisor,
+  pregúntale, y registra lo que diga con `review decide` (`accept` para corregirlo, `reject` para
+  cerrarlo).
+- **El tope**: una revisión tiene hasta 3 rondas. Si se terminó la tercera y quedan hallazgos
+  vigentes, pregúntale al usuario si quiere una ronda más (`review round <id> --extra`, que concede
+  una sola) o dejar la revisión como está.
+
+### Refutación
+
+Un hallazgo grave que solo se sostiene razonando (`evidence: inferential`) va a un refutador aislado,
+que intenta desmentirlo con el mismo material:
+
+- **`refutado`** (los de `refuted`): sale del veredicto, pero queda visible en el ledger. Si no estás
+  de acuerdo con la refutación, díselo al usuario.
+- Un hallazgo **inconcluso** (los de `inconclusive`): el refutador no pudo decidir o no respondió.
+  Sigue contando y se decide como cualquier otro.
+
+### El resultado
+
 - **`unavailable`**: el revisor no pudo inspeccionar, o su respuesta no se pudo admitir ni después
-  de una corrección. Muestra `reason` y `detail` y pregunta si revisa de nuevo.
+  de una corrección. Muestra `reason` y `detail` y pregunta si la relanza: en la ronda 1 con
+  `review start`, en las siguientes con `review round`, como diga `next`.
+- **`stale: true` sin nada pendiente**: el diff cambió desde la última ronda y el veredicto ya no
+  vale para lo que hay. Propón la revisión nueva que trae `next`.
 - El recibo informa: no autoriza el commit ni el push. Un eje en `fail` se resuelve o se declara,
   como en cualquier revisión.
 
