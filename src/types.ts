@@ -29,13 +29,25 @@ export interface WorkerTask {
 export interface LaunchSpec { cmd: string; args: string[]; cwd: string; stdinFile: string }
 
 export type RunState = 'launching' | 'running' | 'done' | 'failed' | 'launch_failed'
-  | 'timeout' | 'cancelled' | 'delegated'
+  | 'timeout' | 'cancelled' | 'delegated' | 'unavailable'
 export const TERMINAL: ReadonlySet<RunState> = new Set<RunState>(
-  ['done', 'failed', 'launch_failed', 'timeout', 'cancelled', 'delegated'])
+  ['done', 'failed', 'launch_failed', 'timeout', 'cancelled', 'delegated', 'unavailable'])
+export interface ResumeInfo { session_id: string; started_at: string; outcome?: RunState }
+export interface Usage {
+  input_tokens?: number; output_tokens?: number
+  cache_read_input_tokens?: number; cache_creation_input_tokens?: number; reasoning_output_tokens?: number
+}
+export type AttemptKind = 'initial' | 'profile_retry' | 'resume' | 'correction'
+export interface AttemptMetrics {
+  kind: AttemptKind; suffix: string; started_at: string; ended_at: string; duration_ms: number
+  prompt_bytes: number; usage?: Usage; outcome: RunState; reason?: string; admission?: string
+  raw: { stdout: string; stderr: string; result: string }
+}
 export interface Status {
   state: RunState; reason?: string; detail?: string
   supervisor_pid?: number; worker_pid?: number; session_id?: string
-  started_at?: string; ended_at?: string; fallback?: Conductor; retry?: RetryInfo
+  started_at?: string; ended_at?: string; fallback?: Conductor; retry?: RetryInfo; resume?: ResumeInfo
+  result_file?: string
 }
 
 export class SddError extends Error {

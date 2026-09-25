@@ -19,6 +19,43 @@ function okCodex(): void {
   if (i >= 0) writeFileSync(args[i + 1], 'ok')
 }
 
+/** Emite una línea y deja el proceso vivo hasta que lo maten, como un worker que no terminó a tiempo. */
+function hang(line: string): void {
+  process.stdout.write(`${line}\n`)
+  setInterval(() => {}, 1000)
+}
+
+/**
+ * Un revisor falso: lee el prompt por stdin, toma el hash y las rutas del manifiesto, y responde en
+ * el canal de su familia (el `result` del stream en Claude, `--output-last-message` en Codex).
+ */
+function reviewer(kind: 'ok' | 'bad' | 'unavailable'): void {
+  const prompt = readFileSync(0, 'utf8')
+  const hash = /sha256:[0-9a-f]{64}/.exec(prompt)?.[0] ?? ''
+  const paths = [...prompt.matchAll(/^[AMDRT] (\S+)(?: \(antes [^)]+\))? — /gm)].map((m) => m[1])
+  const answer = kind === 'bad'
+    ? 'no pude armar el JSON'
+    : JSON.stringify(kind === 'ok'
+      ? { candidate_hash: hash, inspection: { status: 'completed', paths }, findings: [] }
+      : { candidate_hash: hash, inspection: { status: 'unavailable', paths: [], reason: 'no pude' }, findings: [] })
+  if (args[0] === 'exec') {
+    process.stdout.write('{"type":"thread.started","thread_id":"T1"}\n{"type":"item.completed","item":{"type":"agent_message","text":"."}}\n')
+    process.stdout.write('{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n')
+    const i = args.indexOf('--output-last-message')
+    if (i >= 0) writeFileSync(args[i + 1], answer)
+  } else {
+    process.stdout.write('{"type":"system","subtype":"init","session_id":"s","model":"claude-falso","tools":[]}\n')
+    process.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"."}]}}\n')
+    process.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: answer, usage: { input_tokens: 10, output_tokens: 5 } })}\n`)
+  }
+}
+
+/** Cuántas veces se invocó el CLI falso en esta corrida, contando la actual. */
+const callCount = () => (process.env.FAKE_CALLS_FILE ? readFileSync(process.env.FAKE_CALLS_FILE, 'utf8').trim().split('\n').length : 1)
+
+const claudeInit = () => fixture('claude-stream.jsonl').split('\n')[0]
+const codexThread = '{"type":"thread.started","thread_id":"T1"}'
+
 function fail(stdout: string, stderr = ''): void {
   process.stdout.write(fixture(stdout))
   if (stderr) process.stderr.write(fixture(stderr))
@@ -39,6 +76,37 @@ switch (process.env.FAKE_MODE) {
   case 'reject-effort-codex':
     if (args.some((a) => a.startsWith('model_reasoning_effort='))) fail('codex-esfuerzo-rechazado.jsonl')
     else okCodex()
+    break
+  case 'hang-unless-resume-claude':
+    if (args.includes('--resume')) okClaude()
+    else hang(claudeInit())
+    break
+  case 'hang-unless-resume-fail':
+    if (args.includes('--resume')) {
+      process.stderr.write('fake-cli: la reanudación falló\n')
+      process.exitCode = 1
+    } else {
+      hang(claudeInit())
+    }
+    break
+  case 'hang-unless-resume-codex':
+    if (args[0] === 'exec' && args[1] === 'resume') okCodex()
+    else hang(codexThread)
+    break
+  case 'hang-always-session':
+    hang(process.env.FAKE_FAMILY === 'codex' ? codexThread : claudeInit())
+    break
+  case 'review-ok':
+    reviewer('ok')
+    break
+  case 'review-unavailable':
+    reviewer('unavailable')
+    break
+  case 'review-bad-then-ok':
+    reviewer(callCount() === 1 ? 'bad' : 'ok')
+    break
+  case 'review-bad-always':
+    reviewer('bad')
     break
   case 'always-reject-model-codex':
     fail('codex-modelo-rechazado.jsonl')

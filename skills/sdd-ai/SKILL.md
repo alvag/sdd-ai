@@ -1,6 +1,6 @@
 ---
 name: sdd-ai
-description: Delega una tarea de solo lectura (explorar, buscar, resumir código) a un worker de Claude o Codex elegido por la config del repo. Usar cuando el usuario pide "delega esto a un worker", "usa sdd-ai" o "que otro agente explore esto".
+description: Delega una tarea de solo lectura (explorar, buscar, resumir código) a un worker de Claude o Codex elegido por la config del repo, o revisa un diff congelado con un revisor aislado. Usar cuando el usuario pide "delega esto a un worker", "usa sdd-ai", "que otro agente explore esto" o "revisa este diff".
 ---
 
 # sdd-ai: despachar un worker read-only
@@ -56,11 +56,48 @@ autosuficiente (qué hacer, dónde mirar, qué formato de respuesta).
 En Claude Code, con timeout de Bash de 600000 ms. Si sale con código 3, la corrida sigue viva:
 vuelve a llamar a `wait`. Con código 0, el resultado está en `result`.
 
-Si `wait` trae `warnings`, muéstraselas al usuario: el CLI rechazó el modelo o el esfuerzo pedido y
-el binario reintentó una sola vez sin ese campo. `retry` dice qué campo, qué se pidió, qué se usó y
-el diagnóstico del proveedor.
+Si `wait` trae `warnings`, muéstraselas al usuario. Hay dos casos:
 
-## 4. Si algo falla
+- `retry`: el CLI rechazó el modelo o el esfuerzo pedido y el binario reintentó una sola vez sin ese
+  campo. Dice qué campo, qué se pidió, qué se usó y el diagnóstico del proveedor.
+- `resume`: se agotó el tope y el binario reanudó la misma sesión una vez, pidiéndole que entregue
+  lo que tenga. Una respuesta reanudada puede ser más corta: díselo al usuario.
+
+## 4. Revisar un diff
+
+Para la revisión de un diff (la final antes de un commit, o la de un commit ya hecho) usa `review`
+en vez de un encargo a mano con `run --role code-review`. El binario congela el diff, arma el
+encargo, aísla al revisor y valida su respuesta por código: tú no escribes el encargo ni juzgas si
+el reporte está completo.
+
+```
+./bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>]... --conductor <claude|codex>
+```
+
+- `--base` es obligatoria: el commit contra el que se revisa (en un flujo SDD, el `base_commit` del
+  plan). Con `--head <ref>` se revisa el diff entre dos commits; sin él, el árbol de trabajo.
+- **Archivos nuevos:** solo entran los que están en el índice. Antes de revisar, marca los nuevos
+  que son parte del cambio con `git add -N <ruta>`. La respuesta trae `left_out`: los archivos
+  nuevos que quedaron afuera. Si alguno era parte del cambio, agrégalo y vuelve a correr `start`.
+- Pasa la spec, el plan y las tareas con `--context`: sin ellos, el revisor no puede juzgar el eje
+  SPEC.
+- El revisor es de la familia opuesta al autor del diff (`--author`, que por defecto es la tuya). Si
+  la respuesta trae `same_family` en `degradations`, avísale al usuario: revisó un agente fresco de
+  la misma familia, sin la diversidad de la otra.
+- **Si eres Codex**, pide escalamiento para `review start`, igual que para `run`.
+
+Después, `./bin/sdd-ai wait <id>`, igual que en la vía `process`. Al terminar, `wait` devuelve la
+misma vista que `./bin/sdd-ai review status <id>`: los ejes `SCOPE`, `SPEC` y `QUALITY`, los
+hallazgos, `out_of_scope` (lo grave que ya estaba antes del cambio) y `next`.
+
+- **`stale: true`**: el diff cambió desde la revisión y el veredicto ya no vale para lo que hay.
+  Propón la revisión nueva que trae `next`.
+- **`unavailable`**: el revisor no pudo inspeccionar, o su respuesta no se pudo admitir ni después
+  de una corrección. Muestra `reason` y `detail` y pregunta si revisa de nuevo.
+- El recibo informa: no autoriza el commit ni el push. Un eje en `fail` se resuelve o se declara,
+  como en cualquier revisión.
+
+## 5. Si algo falla
 
 - **`launch_failed`**: muestra `reason` y `detail` al usuario y **pregúntale** si quiere caer a tu
   familia, tu modelo y tu esfuerzo (`fallback`). Solo con un sí, corre el comando exacto que trae

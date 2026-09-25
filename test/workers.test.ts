@@ -1,7 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { claudeLaunch, claudeRetry } from '../src/workers/claude.ts'
-import { codexLaunch, codexRetry } from '../src/workers/codex.ts'
+import {
+  REVIEWER_SYSTEM_PROMPT, claudeLaunch, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId,
+} from '../src/workers/claude.ts'
+import { codexLaunch, codexResume, codexRetry, codexReviewLaunch } from '../src/workers/codex.ts'
 import type { WorkerTask } from '../src/types.ts'
 
 const t: WorkerTask = {
@@ -66,4 +68,56 @@ test('codexRetry quita -m o el par -c model_reasoning_effort', () => {
   assert.deepEqual(codexRetry(args, 'effort'), { requested: 'high', args: [...head, '-m', 'opus', '-'] })
   assert.equal(codexRetry(codexLaunch(bare).args, 'model'), null)
   assert.equal(codexRetry(codexLaunch(bare).args, 'effort'), null)
+})
+
+test('claudeResume cambia --session-id por --resume y conserva el resto', () => {
+  const args = claudeLaunch(t).args
+  assert.deepEqual(claudeResume(args), args.map((a) => (a === '--session-id' ? '--resume' : a)))
+  assert.equal(claudeResume(['-p', '--verbose']), null)
+})
+
+test('codexResume pasa a exec resume sin -C ni -s y conserva el aislamiento', () => {
+  assert.deepEqual(codexResume(codexLaunch(t).args, 'T', '/r/out-resume.md'), [
+    'exec', 'resume', '--ignore-user-config', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
+    '--json', '--output-last-message', '/r/out-resume.md', '-m', 'opus', '-c', 'model_reasoning_effort=high',
+    '-c', 'sandbox_mode="read-only"', 'T', '-',
+  ])
+  assert.equal(codexResume(['-p'], 'T', '/r/x.md'), null)
+})
+
+const review = { ...t, scratch: '/tmp/vacio' }
+
+test('el revisor Claude corre sin herramientas, sin personalizaciones y fuera del repo', () => {
+  const l = claudeReviewLaunch(review)
+  assert.deepEqual([l.cmd, l.cwd, l.stdinFile], ['claude', '/tmp/vacio', '/r/p.md'])
+  assert.deepEqual(l.args, [
+    '-p', '--safe-mode', '--tools', '', '--permission-prompts', 'none', '--system-prompt', REVIEWER_SYSTEM_PROMPT,
+    '--output-format', 'stream-json', '--verbose', '--session-id', 'S', '--model', 'opus', '--effort', 'high',
+  ])
+  assert.equal(l.args.includes('--no-session-persistence'), false)
+})
+
+test('el revisor Codex corre sin shell ni web, fuera de un repo', () => {
+  const l = codexReviewLaunch(review)
+  assert.deepEqual([l.cmd, l.cwd], ['codex', '/tmp/vacio'])
+  assert.deepEqual(l.args, [
+    'exec', '--ignore-user-config', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
+    '--disable', 'shell_tool', '-c', 'web_search="disabled"', '--skip-git-repo-check',
+    '-s', 'read-only', '-C', '/tmp/vacio', '--json', '--output-last-message', '/r/out.md',
+    '-m', 'opus', '-c', 'model_reasoning_effort=high', '-',
+  ])
+})
+
+test('reanudar al revisor conserva todo su aislamiento', () => {
+  const claude = claudeReviewLaunch(review).args
+  assert.deepEqual(claudeResume(claude)?.filter((a) => a !== '--resume'), claude.filter((a) => a !== '--session-id'))
+  const codex = codexResume(codexReviewLaunch(review).args, 'T', '/r/out-resume.md') ?? []
+  for (const flag of ['--ignore-user-config', 'shell_tool', 'web_search="disabled"', '--skip-git-repo-check', 'sandbox_mode="read-only"']) {
+    assert.ok(codex.includes(flag), flag)
+  }
+})
+
+test('withSessionId cambia solo el valor de la sesión', () => {
+  const args = claudeLaunch(t).args
+  assert.deepEqual(withSessionId(args, 'S2'), args.map((a) => (a === 'S' ? 'S2' : a)))
 })

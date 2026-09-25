@@ -8,11 +8,11 @@ import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { defaultWaitMax } from '../src/cli.ts'
 import { createRun, readStatus, setStatus } from '../src/runs.ts'
-import { makeFakeBin, makeRepo } from './helpers.ts'
+import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 
-interface Setup { repo: string; env: Record<string, string>; prompt: string }
+interface Setup { repo: string; env: Record<string, string>; prompt: string; bin: string }
 
 function setup(opts: { families?: string; bins?: Array<'claude' | 'codex'>; mode?: string; workers?: string } = {}): Setup {
   const repo = makeRepo()
@@ -34,7 +34,7 @@ function setup(opts: { families?: string; bins?: Array<'claude' | 'codex'>; mode
     CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')),
     FAKE_MODE: opts.mode ?? 'ok-codex',
   }
-  return { repo, env, prompt }
+  return { repo, env, prompt, bin }
 }
 
 function cli(s: Setup, args: string[], extraEnv: Record<string, string> = {}) {
@@ -140,6 +140,18 @@ test('wait informa el reintento', () => {
   assert.equal(w.out.state, 'done')
   assert.deepEqual([w.out.retry.field, w.out.retry.requested], ['model', 'no-existe'])
   assert.match(w.out.warnings.join(' '), /modelo no-existe/)
+})
+
+test('wait avisa la reanudación', () => {
+  const s = setup({ families: '[claude]', bins: ['claude'], mode: 'hang-unless-resume-claude' })
+  warmFakeBin(s.bin, 'claude')
+  const r = cli(s, ['run', '--prompt-file', s.prompt, '--deadline', '1'], AS_CODEX)
+  assert.equal(r.code, 0)
+  const w = cli(s, ['wait', r.out.id, '--max', '30'], AS_CODEX)
+  assert.equal(w.out.state, 'done')
+  assert.equal(w.out.resume.outcome, 'done')
+  assert.equal(w.out.result, 'ok')
+  assert.match(w.out.warnings.join(' '), /reanud/)
 })
 
 test('la caída desde Codex conserva el esfuerzo que declara el conductor', () => {

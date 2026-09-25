@@ -1,4 +1,4 @@
-import type { Family, RejectedField, RunState } from './types.ts'
+import type { Family, RejectedField, RunState, Usage } from './types.ts'
 
 export interface StreamFacts {
   /**
@@ -11,6 +11,10 @@ export interface StreamFacts {
   model?: string
   /** El proveedor rechazó el modelo o el esfuerzo pedido; `diagnostic` es su mensaje textual. */
   rejected?: { field: RejectedField; diagnostic: string }
+  /** Tokens que informa el CLI: el `result` de Claude, o la suma de los turnos de Codex. */
+  usage?: Usage
+  /** Herramientas que usó el worker, en orden: `tool_use:<nombre>` en Claude, el tipo de item en Codex. */
+  toolEvents: string[]
   result?: string
   isError?: boolean
   errors: string[]
@@ -27,7 +31,7 @@ export interface Ending {
 export interface Outcome { state: RunState; reason?: string; detail?: string }
 
 export function emptyFacts(): StreamFacts {
-  return { started: false, errors: [] }
+  return { started: false, errors: [], toolEvents: [] }
 }
 
 export function scanLine(family: Family, facts: StreamFacts, line: string): void {
@@ -50,11 +54,15 @@ export function scanLine(family: Family, facts: StreamFacts, line: string): void
         if (e.error === 'model_not_found') facts.rejected ??= { field: 'model', diagnostic: text }
       } else {
         facts.started = true
+        for (const c of Array.isArray(e.message?.content) ? e.message.content : []) {
+          if (c?.type === 'tool_use' && typeof c.name === 'string') facts.toolEvents.push(`tool_use:${c.name}`)
+        }
       }
     } else if (e.type === 'result') {
       if (typeof e.result === 'string') facts.result = e.result
       if (typeof e.is_error === 'boolean') facts.isError = e.is_error
       if (typeof e.session_id === 'string') facts.sessionId = e.session_id
+      if (typeof e.usage === 'object' && e.usage !== null) facts.usage = claudeUsage(e.usage)
     }
     return
   }
@@ -65,9 +73,41 @@ export function scanLine(family: Family, facts: StreamFacts, line: string): void
       if (e.type === 'item.completed' && typeof e.item.message === 'string') facts.errors.push(e.item.message)
     } else {
       facts.started = true
+      const kind = e.item?.type
+      if (e.type === 'item.completed' && typeof kind === 'string' && !NON_TOOL_ITEMS.has(kind)) facts.toolEvents.push(kind)
     }
+  } else if (e.type === 'turn.completed' && typeof e.usage === 'object' && e.usage !== null) {
+    facts.usage = addCodexUsage(facts.usage, e.usage)
   } else if (e.type === 'error' && typeof e.message === 'string') noteCodexError(facts, e.message)
   else if (e.type === 'turn.failed' && typeof e.error?.message === 'string') noteCodexError(facts, e.error.message)
+}
+
+const NON_TOOL_ITEMS = new Set(['agent_message', 'reasoning', 'error'])
+
+const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined)
+
+function claudeUsage(u: Record<string, unknown>): Usage {
+  const out: Usage = {}
+  for (const k of ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'] as const) {
+    const v = num(u[k])
+    if (v !== undefined) out[k] = v
+  }
+  return out
+}
+
+/** Codex informa el uso por turno y con otros nombres para la caché; se suman con los de Claude. */
+function addCodexUsage(acc: Usage | undefined, u: Record<string, unknown>): Usage {
+  const out: Usage = { ...acc }
+  const pairs: Array<[keyof Usage, string]> = [
+    ['input_tokens', 'input_tokens'], ['output_tokens', 'output_tokens'],
+    ['cache_read_input_tokens', 'cached_input_tokens'], ['cache_creation_input_tokens', 'cache_write_input_tokens'],
+    ['reasoning_output_tokens', 'reasoning_output_tokens'],
+  ]
+  for (const [to, from] of pairs) {
+    const v = num(u[from])
+    if (v !== undefined) out[to] = (out[to] ?? 0) + v
+  }
+  return out
 }
 
 function assistantText(e: Record<string, any>): string {

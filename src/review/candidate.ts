@@ -1,0 +1,206 @@
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { lstatSync, readFileSync, readlinkSync, realpathSync } from 'node:fs'
+import { isAbsolute, relative, resolve } from 'node:path'
+import { SddError } from '../types.ts'
+
+export interface Selection { base: string; head?: string; context: string[] }
+export interface CandidateFile {
+  path: string; status: 'A' | 'M' | 'D' | 'R' | 'T'; from?: string; mode: string
+  sha256: string | null; binary: boolean; lines: number; visible: Array<[number, number]>
+}
+export interface ContextFile { path: string; sha256: string; lines: number }
+export interface Candidate {
+  base_sha: string; head_sha: string | null; files: CandidateFile[]; context: ContextFile[]
+  left_out: string[]; diff: string; hash: string
+}
+
+// Fijan la forma del diff aunque la config Git del usuario diga otra cosa: prefijos, color,
+// diff externo y textconv cambian el texto y las rutas que el revisor tiene que citar.
+const DIFF_FLAGS = ['--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', '-M']
+
+function gitBytes(root: string, args: string[]): Buffer {
+  return execFileSync('git', ['-c', 'core.quotePath=false', ...args], { cwd: root, maxBuffer: 256 * 1024 * 1024 })
+}
+
+function git(root: string, args: string[]): string {
+  return gitBytes(root, args).toString('utf8')
+}
+
+const sha256 = (b: Buffer | string) => createHash('sha256').update(b).digest('hex')
+
+function resolveCommit(root: string, ref: string): string {
+  try {
+    return git(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).trim()
+  } catch {
+    throw new SddError('usage', `no se puede resolver la ref ${ref}`, { next: 'pasa un commit, rama o tag que exista' })
+  }
+}
+
+function countLines(text: string): number {
+  if (text === '') return 0
+  const n = text.split('\n').length
+  return text.endsWith('\n') ? n - 1 : n
+}
+
+interface Change { status: CandidateFile['status']; path: string; from?: string; mode: string }
+
+/**
+ * `--raw -z`: `:modo-viejo modo-nuevo sha-viejo sha-nuevo estado` y la ruta, separados por NUL; un
+ * renombre trae la ruta anterior y la nueva. El modo entra al hash: un `chmod` cambia el diff.
+ */
+function parseRaw(raw: string): Change[] {
+  const parts = raw.split('\0')
+  const out: Change[] = []
+  for (let i = 0; i < parts.length && parts[i] !== '';) {
+    const [, mode, , , state] = parts[i].slice(1).split(' ')
+    const code = state[0] as CandidateFile['status']
+    if (code === 'R') {
+      out.push({ status: 'R', from: parts[i + 1], path: parts[i + 2], mode })
+      i += 3
+    } else {
+      out.push({ status: code, path: parts[i + 1], mode })
+      i += 2
+    }
+  }
+  return out
+}
+
+/** `--numstat -z` marca un binario con `-\t-`; en un renombre la ruta nueva viene dos campos después. */
+function parseBinaries(raw: string): Set<string> {
+  const parts = raw.split('\0')
+  const out = new Set<string>()
+  for (let i = 0; i < parts.length && parts[i] !== '';) {
+    const [added, deleted, path] = parts[i].split('\t')
+    const binary = added === '-' && deleted === '-'
+    if (path === '') {
+      if (binary) out.add(parts[i + 2])
+      i += 3
+    } else {
+      if (binary) out.add(path)
+      i += 1
+    }
+  }
+  return out
+}
+
+/** Rango del lado nuevo de un encabezado `@@ -a,b +c,d @@`; nada si el hunk no deja líneas nuevas. */
+function newSide(header: string): [number, number] | undefined {
+  const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(header)
+  if (!m) return undefined
+  const start = Number(m[1])
+  const count = m[2] === undefined ? 1 : Number(m[2])
+  return count > 0 ? [start, start + count - 1] : undefined
+}
+
+/** Rangos del lado nuevo de cada hunk, por ruta: lo único que el revisor ve de un archivo modificado. */
+function parseVisible(diff: string): Map<string, Array<[number, number]>> {
+  const out = new Map<string, Array<[number, number]>>()
+  let current: Array<[number, number]> | undefined
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      current = undefined
+    } else if (line.startsWith('+++ b/')) {
+      current = []
+      out.set(line.slice('+++ b/'.length), current)
+    } else if (current && line.startsWith('@@')) {
+      const range = newSide(line)
+      if (range) current.push(range)
+    }
+  }
+  return out
+}
+
+/** Bytes de una ruta del candidato: del commit con head, del árbol sin él. Un symlink vale su enlace. */
+function contentOf(root: string, path: string, rev: string | null): Buffer {
+  if (rev) return gitBytes(root, ['show', `${rev}:${path}`])
+  const abs = resolve(root, path)
+  return lstatSync(abs).isSymbolicLink() ? Buffer.from(readlinkSync(abs)) : readFileSync(abs)
+}
+
+const outside = (rel: string) => rel === '' || rel.startsWith('..') || isAbsolute(rel)
+
+function readContextFile(root: string, p: string): { path: string; bytes: Buffer } {
+  const abs = isAbsolute(p) ? p : resolve(root, p)
+  const rel = relative(root, abs)
+  // Un symlink dentro del repo puede apuntar afuera: la ruta real también tiene que caer adentro.
+  if (outside(rel) || outside(relative(realpathSync(root), realpathSync(abs)))) {
+    throw new SddError('usage', `el contexto tiene que estar dentro del repo: ${p}`)
+  }
+  const bytes = readFileSync(abs)
+  if (bytes.includes(0)) throw new SddError('usage', `el contexto no puede ser binario: ${rel}`)
+  return { path: rel, bytes }
+}
+
+/**
+ * Congela el candidato: el diff contra la base (del árbol, o contra `head`), el contenido de cada ruta
+ * con su hash, los rangos que el revisor puede citar y el contexto. El hash sale del manifiesto y no
+ * del texto del diff, así que no depende de cómo lo imprima Git.
+ */
+export function freeze(root: string, sel: Selection): Candidate {
+  const baseSha = resolveCommit(root, sel.base)
+  const headSha = sel.head ? resolveCommit(root, sel.head) : null
+  const range = headSha ? [baseSha, headSha] : [baseSha]
+  const changes = parseRaw(git(root, ['diff', '--raw', '-z', '-M', ...range]))
+  const binaries = parseBinaries(git(root, ['diff', '--numstat', '-z', '-M', ...range]))
+  const diff = git(root, ['diff', ...DIFF_FLAGS, '--unified=3', ...range])
+  const visible = parseVisible(diff)
+
+  const files: CandidateFile[] = changes.map((ch) => {
+    const deleted = ch.status === 'D'
+    const bytes = contentOf(root, ch.path, deleted ? baseSha : headSha)
+    const binary = binaries.has(ch.path) || bytes.includes(0)
+    const lines = binary ? 0 : countLines(bytes.toString('utf8'))
+    let ranges: Array<[number, number]> = []
+    if (!binary && lines > 0) {
+      ranges = ch.status === 'A' || deleted ? [[1, lines]] : visible.get(ch.path) ?? []
+    }
+    const f: CandidateFile = { path: ch.path, status: ch.status, mode: ch.mode, sha256: sha256(bytes), binary, lines, visible: ranges }
+    if (ch.from) f.from = ch.from
+    return f
+  })
+
+  const context: ContextFile[] = sel.context.map((p) => {
+    const { path, bytes } = readContextFile(root, p)
+    return { path, sha256: sha256(bytes), lines: countLines(bytes.toString('utf8')) }
+  })
+
+  const leftOut = headSha
+    ? []
+    : git(root, ['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter((p) => p !== '')
+
+  const manifest = {
+    base_sha: baseSha,
+    head_sha: headSha,
+    files: files.map((f) => ({ path: f.path, status: f.status, from: f.from ?? null, mode: f.mode, sha256: f.sha256 })).sort((a, b) => a.path.localeCompare(b.path)),
+    context: context.map((c) => ({ path: c.path, sha256: c.sha256 })).sort((a, b) => a.path.localeCompare(b.path)),
+  }
+  return { base_sha: baseSha, head_sha: headSha, files, context, left_out: leftOut, diff, hash: `sha256:${sha256(JSON.stringify(manifest))}` }
+}
+
+/** Congela dos veces seguidas: si el árbol cambió en el medio, el candidato no representa nada estable. */
+export function freezeStable(root: string, sel: Selection, freezeFn: typeof freeze = freeze): Candidate {
+  const first = freezeFn(root, sel)
+  const second = freezeFn(root, sel)
+  if (first.hash !== second.hash) {
+    throw new SddError('candidate_unstable', 'el árbol cambió mientras se congelaba el candidato', {
+      next: 'vuelve a correr review start cuando nadie esté escribiendo en el repo',
+    })
+  }
+  return first
+}
+
+/** El texto de cada archivo de contexto, comprobado contra el hash con que se congeló. */
+export function readContext(root: string, c: Candidate): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const ctx of c.context) {
+    const { bytes } = readContextFile(root, ctx.path)
+    if (sha256(bytes) !== ctx.sha256) {
+      throw new SddError('candidate_unstable', `el contexto cambió después de congelarse: ${ctx.path}`, {
+        next: 'vuelve a correr review start',
+      })
+    }
+    out.set(ctx.path, bytes.toString('utf8'))
+  }
+  return out
+}

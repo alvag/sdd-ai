@@ -118,3 +118,35 @@ test('un error de la API de Claude no cuenta como arranque', () => {
 test('el init de Claude trae el modelo', () => {
   assert.equal(scan('claude', fixture('claude-stream.jsonl')).model, 'claude-haiku-4-5-20251001')
 })
+
+test('Claude: el result trae el uso de tokens', () => {
+  assert.deepEqual(scan('claude', fixture('claude-stream.jsonl')).usage, {
+    input_tokens: 9, output_tokens: 46, cache_read_input_tokens: 4563, cache_creation_input_tokens: 1820,
+  })
+})
+
+test('Codex: el uso de tokens es la suma de los turnos', () => {
+  const turn = fixture('codex-stream.jsonl').split('\n').find((l) => l.includes('"turn.completed"')) ?? ''
+  assert.deepEqual(scan('codex', `${turn}\n${turn}`).usage, {
+    input_tokens: 82242, output_tokens: 218, cache_read_input_tokens: 63232, cache_creation_input_tokens: 0, reasoning_output_tokens: 0,
+  })
+})
+
+test('las herramientas que usó el worker quedan registradas', () => {
+  const toolUse = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: {} }] } })
+  assert.deepEqual(scan('claude', toolUse).toolEvents, ['tool_use:Read'])
+  const items = [
+    { type: 'item.completed', item: { type: 'agent_message', text: 'hola' } },
+    { type: 'item.completed', item: { type: 'reasoning', text: '…' } },
+    { type: 'item.started', item: { type: 'web_search' } },
+    { type: 'item.completed', item: { type: 'web_search', query: 'x' } },
+    { type: 'item.completed', item: { type: 'command_execution', command: 'ls' } },
+  ].map((e) => JSON.stringify(e)).join('\n')
+  assert.deepEqual(scan('codex', items).toolEvents, ['web_search', 'command_execution'])
+})
+
+test('un revisor aislado de Claude no usa herramientas', () => {
+  const facts = scan('claude', fixture('claude-aislado.jsonl'))
+  assert.deepEqual(facts.toolEvents, [])
+  assert.equal(facts.usage?.input_tokens, 555)
+})
