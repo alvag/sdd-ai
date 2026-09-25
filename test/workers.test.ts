@@ -27,7 +27,7 @@ test('codex exec aislado, read-only y con resultado a archivo', () => {
   assert.equal(l.stdinFile, '/r/p.md')
   assert.deepEqual(l.args, [
     'exec', '--ignore-user-config', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
-    '-s', 'read-only', '-C', '/r', '--json', '--output-last-message', '/r/out.md',
+    '-c', 'web_search="disabled"', '-s', 'read-only', '-C', '/r', '--json', '--output-last-message', '/r/out.md',
     '-m', 'gpt-6-sol', '-c', 'model_reasoning_effort=high', '-',
   ])
 })
@@ -37,7 +37,8 @@ test('sin modelo ni esfuerzo no se emiten esas flags', () => {
   const c = claudeLaunch(bare).args
   const x = codexLaunch(bare).args
   for (const flag of ['--model', '--effort']) assert.equal(c.includes(flag), false)
-  for (const flag of ['-m', '-c']) assert.equal(x.includes(flag), false)
+  assert.equal(x.includes('-m'), false)
+  assert.equal(x.some((a) => a.startsWith('model_reasoning_effort=')), false)
 })
 
 test('el prompt viaja por stdin, nunca en el argv', () => {
@@ -62,7 +63,7 @@ test('codexRetry quita -m o el par -c model_reasoning_effort', () => {
   const args = codexLaunch(t).args
   const head = [
     'exec', '--ignore-user-config', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
-    '-s', 'read-only', '-C', '/r', '--json', '--output-last-message', '/r/out.md',
+    '-c', 'web_search="disabled"', '-s', 'read-only', '-C', '/r', '--json', '--output-last-message', '/r/out.md',
   ]
   assert.deepEqual(codexRetry(args, 'model'), { requested: 'opus', args: [...head, '-c', 'model_reasoning_effort=high', '-'] })
   assert.deepEqual(codexRetry(args, 'effort'), { requested: 'high', args: [...head, '-m', 'opus', '-'] })
@@ -79,10 +80,18 @@ test('claudeResume cambia --session-id por --resume y conserva el resto', () => 
 test('codexResume pasa a exec resume sin -C ni -s y conserva el aislamiento', () => {
   assert.deepEqual(codexResume(codexLaunch(t).args, 'T', '/r/out-resume.md'), [
     'exec', 'resume', '--ignore-user-config', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
-    '--json', '--output-last-message', '/r/out-resume.md', '-m', 'opus', '-c', 'model_reasoning_effort=high',
+    '-c', 'web_search="disabled"', '--json', '--output-last-message', '/r/out-resume.md', '-m', 'opus', '-c', 'model_reasoning_effort=high',
     '-c', 'sandbox_mode="read-only"', 'T', '-',
   ])
   assert.equal(codexResume(['-p'], 'T', '/r/x.md'), null)
+})
+
+test('el worker Codex corre sin búsqueda web, también al reanudar', () => {
+  const resumed = codexResume(codexLaunch(t).args, 'T', '/r/out-resume.md') ?? []
+  for (const args of [codexLaunch(t).args, codexLaunch(bare).args, resumed]) {
+    const i = args.indexOf('web_search="disabled"')
+    assert.ok(i > 0 && args[i - 1] === '-c', args.join(' '))
+  }
 })
 
 const review = { ...t, scratch: '/tmp/vacio' }

@@ -9,7 +9,7 @@ test('los roles de solo lectura son todos menos implement', () => {
 })
 
 test('pr es un rol retirado que ahora se llama code-review', () => {
-  assert.equal(RETIRED_ROLES.pr, 'code-review')
+  assert.equal(RETIRED_ROLES.get('pr'), 'code-review')
   assert.equal((ROLES as readonly string[]).includes('pr'), false)
 })
 

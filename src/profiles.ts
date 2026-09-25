@@ -45,7 +45,7 @@ export function parseWorkers(text: string, path: string): WorkersFile {
   if (doc.roles === undefined) return { roles }
   if (!isMap(doc.roles)) throw invalid(path, 'roles tiene que ser un mapa', 'roles: { explore: { claude: { model, effort } } }')
   for (const key of Object.keys(doc.roles)) {
-    const renamed = RETIRED_ROLES[key]
+    const renamed = RETIRED_ROLES.get(key)
     if (renamed) throw invalid(path, `el rol \`${key}\` ahora se llama \`${renamed}\``, `renombra la clave ${key}: a ${renamed}:`)
   }
   onlyKeys(doc.roles, ROLES, path, 'roles')

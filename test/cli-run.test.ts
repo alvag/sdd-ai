@@ -188,6 +188,17 @@ test('--role pr da el aviso de migración', () => {
   assert.deepEqual(runsIn(s.repo), [])
 })
 
+test('un rol con nombre de Object.prototype es desconocido', () => {
+  const s = setup({ families: '[codex]', bins: ['codex'] })
+  for (const role of ['constructor', 'toString', 'hasOwnProperty', '__proto__']) {
+    const r = cli(s, ['run', '--prompt-file', s.prompt, '--role', role])
+    assert.equal(r.code, 2, role)
+    assert.equal(r.out.code, 'usage', role)
+    assert.equal(r.out.message, `rol desconocido: ${role}`)
+  }
+  assert.deepEqual(runsIn(s.repo), [])
+})
+
 test('implement: error de uso sin corrida', () => {
   const s = setup({ families: '[codex]', bins: ['codex'] })
   const r = cli(s, ['run', '--prompt-file', s.prompt, '--role', 'implement'])

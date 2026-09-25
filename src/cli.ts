@@ -94,7 +94,7 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   if (env.SDD_AI_WORKER === '1') {
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   }
-  const renamed = RETIRED_ROLES[values.role]
+  const renamed = RETIRED_ROLES.get(values.role)
   if (renamed) throw new SddError('usage', `el rol \`${values.role}\` ahora se llama \`${renamed}\``, { next: `usa --role ${renamed}` })
   if (values.role === 'implement') {
     throw new SddError('usage', 'el rol implement necesita un worker que escriba, y sdd-ai todavía solo tiene workers de solo lectura', {

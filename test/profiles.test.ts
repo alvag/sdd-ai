@@ -32,6 +32,12 @@ test('el fixture de ai-workflows con pr renombrado valida', () => {
 
 test('esfuerzo fuera del enum', () => rejects(base('      model: opus\n      effort: turbo\n')))
 test('rol desconocido', () => rejects('schema_version: 1\nroles:\n  explorar:\n    claude:\n      model: opus\n'))
+test('un rol con nombre de Object.prototype es una clave no admitida', () => {
+  for (const key of ['constructor', 'toString', '__proto__']) {
+    assert.throws(() => parseWorkers(`schema_version: 1\nroles:\n  ${key}:\n    claude:\n      model: opus\n`, PATH), (e: unknown) =>
+      e instanceof SddError && e.code === 'workers_invalid' && e.message.includes(`clave no admitida "${key}" en roles`), key)
+  }
+})
 test('familia desconocida', () => rejects('schema_version: 1\nroles:\n  explore:\n    gemini:\n      model: g\n'))
 test('clave no admitida bajo una familia', () => rejects(base('      model: opus\n      timeout: 5\n')))
 test('clave no admitida en la raíz', () => rejects(`${base()}profiles:\n  x: 1\n`))

@@ -9,8 +9,12 @@ export type Role = typeof ROLES[number]
 /** Hasta que exista un worker que escriba, `implement` no se despacha. */
 export type ReadOnlyRole = Exclude<Role, 'implement'>
 export const READ_ONLY_ROLES: readonly ReadOnlyRole[] = ROLES.filter((r): r is ReadOnlyRole => r !== 'implement')
-/** Roles que cambiaron de nombre: el viejo da un error de migración, nunca funciona como alias. */
-export const RETIRED_ROLES: Readonly<Record<string, Role>> = { pr: 'code-review' }
+/**
+ * Roles que cambiaron de nombre: el viejo da un error de migración, nunca funciona como alias. Es un
+ * `Map` porque la clave la escribe el usuario, y un objeto resolvería `constructor` o `toString`
+ * desde su prototipo.
+ */
+export const RETIRED_ROLES: ReadonlyMap<string, Role> = new Map([['pr', 'code-review']])
 
 export type RejectedField = 'model' | 'effort'
 export interface RetryInfo { field: RejectedField; requested: string; effective: string; diagnostic: string }
