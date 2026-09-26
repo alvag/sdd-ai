@@ -3,14 +3,16 @@ import type { LaunchSpec, RejectedField, WorkerTask } from '../types.ts'
 const EFFORT_KEY = 'model_reasoning_effort='
 
 /**
- * `codex exec` sin la configuración del usuario ni sus hooks, apps o plugins, sin búsqueda web y en
- * sandbox de solo lectura. La búsqueda se apaga aparte porque viene encendida aunque se ignore la
- * config del usuario. El último mensaje del agente queda en `resultFile`; el prompt entra por stdin (`-`).
+ * `codex exec` sin la configuración del usuario ni sus hooks, apps o plugins y en sandbox de solo
+ * lectura. La búsqueda web se fija siempre: viene encendida aunque se ignore la config del usuario,
+ * así que sin web se apaga, y con web se pide en vivo para no depender del default de Codex. El último
+ * mensaje del agente queda en `resultFile`; el prompt entra por stdin (`-`).
  */
 export function codexLaunch(t: WorkerTask): LaunchSpec {
   const args = [
     'exec', '--ignore-user-config', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
-    '-c', 'web_search="disabled"', '-s', 'read-only', '-C', t.cwd, '--json', '--output-last-message', t.resultFile,
+    '-c', t.web ? 'web_search="live"' : 'web_search="disabled"',
+    '-s', 'read-only', '-C', t.cwd, '--json', '--output-last-message', t.resultFile,
   ]
   if (t.model) args.push('-m', t.model)
   if (t.effort) args.push('-c', `${EFFORT_KEY}${t.effort}`)

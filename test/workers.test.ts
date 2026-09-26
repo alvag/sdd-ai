@@ -86,11 +86,30 @@ test('codexResume pasa a exec resume sin -C ni -s y conserva el aislamiento', ()
   assert.equal(codexResume(['-p'], 'T', '/r/x.md'), null)
 })
 
-test('el worker Codex corre sin búsqueda web, también al reanudar', () => {
+const hasConfig = (args: string[], value: string) => args.some((a, i) => a === value && args[i - 1] === '-c')
+
+test('un worker sin web no la tiene por proceso en las dos familias, también al reanudar', () => {
   const resumed = codexResume(codexLaunch(t).args, 'T', '/r/out-resume.md') ?? []
   for (const args of [codexLaunch(t).args, codexLaunch(bare).args, resumed]) {
-    const i = args.indexOf('web_search="disabled"')
-    assert.ok(i > 0 && args[i - 1] === '-c', args.join(' '))
+    assert.ok(hasConfig(args, 'web_search="disabled"'), args.join(' '))
+  }
+  for (const args of [claudeLaunch(t).args, claudeLaunch(bare).args, claudeResume(claudeLaunch(t).args) ?? []]) {
+    assert.ok(args.includes('--tools=Read,Grep,Glob'), args.join(' '))
+    assert.equal(args.some((a) => a.startsWith('--allowedTools')), false, args.join(' '))
+  }
+})
+
+test('un worker con web la tiene por proceso en las dos familias, también al reanudar', () => {
+  const web: WorkerTask = { ...t, web: true }
+  const codex = codexLaunch(web).args
+  for (const args of [codex, codexResume(codex, 'T', '/r/out-resume.md') ?? []]) {
+    assert.ok(hasConfig(args, 'web_search="live"'), args.join(' '))
+    assert.equal(args.includes('web_search="disabled"'), false, args.join(' '))
+  }
+  const claude = claudeLaunch(web).args
+  for (const args of [claude, claudeResume(claude) ?? []]) {
+    assert.ok(args.includes('--tools=Read,Grep,Glob,WebFetch,WebSearch'), args.join(' '))
+    assert.ok(args.includes('--allowedTools=WebFetch,WebSearch'), args.join(' '))
   }
 })
 

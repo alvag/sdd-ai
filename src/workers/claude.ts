@@ -6,10 +6,16 @@ const FIELD_FLAGS: Record<RejectedField, string> = { model: '--model', effort: '
  * `claude -p` sin la configuración del usuario, con solo herramientas de lectura y sin prompts de
  * permiso que lo dejen colgado. `--tools` es variádico: se pasa con `=` para que no se trague los
  * argumentos siguientes. `stream-json` en modo print exige `--verbose`.
+ *
+ * Con web suma `WebFetch` y `WebSearch`, y además las preaprueba: sin prompts de permiso, una
+ * herramienta que pide permiso se niega y el worker sigue como si no la tuviera.
  */
 export function claudeLaunch(t: WorkerTask): LaunchSpec {
+  const tools = t.web
+    ? ['--tools=Read,Grep,Glob,WebFetch,WebSearch', '--allowedTools=WebFetch,WebSearch']
+    : ['--tools=Read,Grep,Glob']
   const args = [
-    '-p', '--safe-mode', '--tools=Read,Grep,Glob', '--permission-prompts', 'none',
+    '-p', '--safe-mode', ...tools, '--permission-prompts', 'none',
     '--output-format', 'stream-json', '--verbose', '--session-id', t.sessionId,
   ]
   if (t.model) args.push(FIELD_FLAGS.model, t.model)

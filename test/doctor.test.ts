@@ -32,6 +32,10 @@ test('los flags incluyen los del revisor y los de la reanudación', () => {
   assert.equal(resume.includes('-C') || resume.includes('-s'), false)
 })
 
+test('los flags incluyen los de los roles con web', () => {
+  assert.ok(emittedFlags('claude').includes('--allowedTools'))
+})
+
 test('un flag de reanudación que desaparece de su ayuda se reporta', () => {
   const resumeHelp = CODEX_RESUME_HELP.split('\n').filter((l) => !l.includes('--output-last-message')).join('\n')
   const report = doctor((cmd, args) => {

@@ -12,6 +12,12 @@ export type Role = typeof ROLES[number]
 export type ReadOnlyRole = Exclude<Role, 'implement'>
 export const READ_ONLY_ROLES: readonly ReadOnlyRole[] = ROLES.filter((r): r is ReadOnlyRole => r !== 'implement')
 /**
+ * Roles que pueden buscar en la web: explorar e investigar a veces necesitan documentación de afuera.
+ * Los demás responden solo con el encargo y el repositorio, porque lo que traen de la web no se puede
+ * reproducir y el conductor no sabe que vino de ahí.
+ */
+export const WEB_ROLES: ReadonlySet<ReadOnlyRole> = new Set<ReadOnlyRole>(['explore', 'investigate'])
+/**
  * Roles que cambiaron de nombre: el viejo da un error de migración, nunca funciona como alias. Es un
  * `Map` porque la clave la escribe el usuario, y un objeto resolvería `constructor` o `toString`
  * desde su prototipo.
@@ -31,6 +37,8 @@ export interface Resolution {
 export interface WorkerTask {
   cwd: string; promptFile: string; resultFile: string; sessionId: string
   model?: string; effort?: Effort
+  /** Puede buscar en la web; sin el campo, no. */
+  web?: boolean
 }
 export interface LaunchSpec { cmd: string; args: string[]; cwd: string; stdinFile: string }
 

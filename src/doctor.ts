@@ -15,6 +15,8 @@ export interface CliReport {
 const SAMPLE: WorkerTask = {
   cwd: '/r', promptFile: '/r/p', resultFile: '/r/o', sessionId: 's', model: 'm', effort: 'high',
 }
+// Un rol con web emite flags propias, como `--allowedTools` en Claude.
+const WEB_SAMPLE: WorkerTask = { ...SAMPLE, web: true }
 const REVIEW_SAMPLE = { ...SAMPLE, scratch: '/tmp/s' }
 const HELP_ARGS: Record<Family, string[]> = { claude: ['--help'], codex: ['exec', '--help'] }
 // `codex exec resume` tiene su propia ayuda: acepta menos flags que `exec`.
@@ -28,11 +30,12 @@ export function emittedFlags(family: Family, surface: 'exec' | 'resume' = 'exec'
   let argvs: string[][]
   if (family === 'claude') {
     const worker = claudeLaunch(SAMPLE).args
-    argvs = [worker, claudeReviewLaunch(REVIEW_SAMPLE).args, claudeResume(worker) ?? []]
+    argvs = [worker, claudeLaunch(WEB_SAMPLE).args, claudeReviewLaunch(REVIEW_SAMPLE).args, claudeResume(worker) ?? []]
   } else if (surface === 'resume') {
-    argvs = [codexResume(codexLaunch(SAMPLE).args, 't', '/r/o') ?? [], codexResume(codexReviewLaunch(REVIEW_SAMPLE).args, 't', '/r/o') ?? []]
+    argvs = [SAMPLE, WEB_SAMPLE].map((t) => codexResume(codexLaunch(t).args, 't', '/r/o') ?? [])
+    argvs.push(codexResume(codexReviewLaunch(REVIEW_SAMPLE).args, 't', '/r/o') ?? [])
   } else {
-    argvs = [codexLaunch(SAMPLE).args, codexReviewLaunch(REVIEW_SAMPLE).args]
+    argvs = [codexLaunch(SAMPLE).args, codexLaunch(WEB_SAMPLE).args, codexReviewLaunch(REVIEW_SAMPLE).args]
   }
   const flags = argvs.flat().filter((a) => a.startsWith('-') && a !== '-').map((a) => a.split('=')[0])
   return [...new Set(flags)]

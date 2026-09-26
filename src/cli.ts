@@ -26,7 +26,7 @@ import {
 } from './supervisor.ts'
 import {
   type Conductor, type Family, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
-  type Resolution, SddError, type Status, TERMINAL, type WorkerTask, isFamily, isReadOnlyRole, opposite, toNativeEffort,
+  type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isFamily, isReadOnlyRole, opposite, toNativeEffort,
 } from './types.ts'
 import { claudeLaunch } from './workers/claude.ts'
 import { codexLaunch } from './workers/codex.ts'
@@ -180,6 +180,7 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   const task: WorkerTask = { cwd: root, promptFile, resultFile: join(dir, 'result.md'), sessionId: randomUUID() }
   if (resolution.model) task.model = resolution.model
   if (resolution.effort) task.effort = resolution.effort
+  if (WEB_ROLES.has(role)) task.web = true
   const launch = resolution.family === 'claude' ? claudeLaunch(task) : codexLaunch(task)
   launchSupervisor(dir, { family: resolution.family, launch, deadline_sec: deadline }, env, { fallback: conductor })
   return { code: 0, out: { id, via: 'process', family: resolution.family } }

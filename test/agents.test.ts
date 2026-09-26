@@ -6,11 +6,12 @@ import { join } from 'node:path'
 import {
   type RoleProfiles, agentsState, parseAgentSource, renderClaudeAgent, renderCodexAgent, sourceHash, syncAgents,
 } from '../src/agents.ts'
-import { READ_ONLY_ROLES } from '../src/types.ts'
+import { READ_ONLY_ROLES, WEB_ROLES } from '../src/types.ts'
 
 const SOURCE = '---\ndescription: Worker read-only\n---\nLee tu encargo.\n'
 const src = parseAgentSource(SOURCE)
 const MARK = 'generado por sdd-ai desde agents/worker.md · no editar a mano · sdd-ai-hash:'
+const NO_WEB = 'No busques en la web ni consultes otras fuentes externas: trabaja solo con el encargo y el repositorio.'
 
 function profiles(over: Partial<RoleProfiles> = {}): RoleProfiles {
   const base = Object.fromEntries(READ_ONLY_ROLES.map((r) => [r, { claude: { model: 'opus' }, codex: { model: 'gpt-6-sol' } }]))
@@ -29,21 +30,23 @@ function makePkg(): string {
 test('el agente de Claude es read-only, sin CLAUDE.md, con el nombre de su rol y marcado como generado', () => {
   assert.equal(
     renderClaudeAgent(src, 'explore', { model: 'opus', effort: 'high' }, 'h1'),
-    '---\nname: sdd-ai-explore\ndescription: "Worker read-only Rol: explore."\ntools: Read, Grep, Glob\nmodel: opus\n'
+    '---\nname: sdd-ai-explore\ndescription: "Worker read-only Rol: explore."\ntools: Read, Grep, Glob, WebFetch, WebSearch\nmodel: opus\n'
       + 'effort: high\nomitClaudeMd: true\n---\n'
       + `<!-- ${MARK} h1 -->\n\nLee tu encargo.\n`,
   )
   assert.equal(renderClaudeAgent(src, 'explore', { model: 'opus' }, 'h1').includes('effort:'), false)
 })
 
-test('el agente de Codex lleva las instrucciones, el nombre de su rol y no declara sandbox_mode', () => {
+test('el agente de Codex lleva las instrucciones, el nombre de su rol y no declara sandbox_mode ni web_search', () => {
   const out = renderCodexAgent(src, 'code-review', { model: 'gpt-6-sol' }, 'h1')
   assert.equal(
     out,
     `# ${MARK} h1\nname = "sdd-ai-code-review"\n`
-      + 'description = "Worker read-only Rol: code-review."\nmodel = "gpt-6-sol"\ndeveloper_instructions = \'\'\'\nLee tu encargo.\n\'\'\'\n',
+      + 'description = "Worker read-only Rol: code-review."\nmodel = "gpt-6-sol"\ndeveloper_instructions = \'\'\'\nLee tu encargo.\n\n'
+      + `${NO_WEB}\n\'\'\'\n`,
   )
   assert.equal(out.includes('sandbox_mode'), false)
+  assert.equal(out.includes('web_search'), false)
 })
 
 test('un cuerpo con triple comilla simple no cabe en el TOML', () => {
@@ -52,6 +55,23 @@ test('un cuerpo con triple comilla simple no cabe en el TOML', () => {
 
 test('una fuente sin description no es válida', () => {
   assert.throws(() => parseAgentSource('---\nname: x\n---\ncuerpo\n'))
+})
+
+test('los agentes de Claude de explore e investigate tienen WebFetch y WebSearch, y los demás solo lectura', () => {
+  for (const role of READ_ONLY_ROLES) {
+    const tools = renderClaudeAgent(src, role, {}, 'h1').split('\n').find((l) => l.startsWith('tools:'))
+    const expected = ['explore', 'investigate'].includes(role) ? 'tools: Read, Grep, Glob, WebFetch, WebSearch' : 'tools: Read, Grep, Glob'
+    assert.equal(tools, expected, role)
+  }
+})
+
+test('los agentes de Codex sin web llevan la regla de no buscar en la web, y ninguno declara web_search', () => {
+  assert.deepEqual([...WEB_ROLES].sort(), ['explore', 'investigate'])
+  for (const role of READ_ONLY_ROLES) {
+    const out = renderCodexAgent(src, role, {}, 'h1')
+    assert.equal(out.includes(NO_WEB), !WEB_ROLES.has(role), role)
+    assert.equal(out.includes('web_search'), false, role)
+  }
 })
 
 test('el hash cambia si cambia el perfil de cualquier familia', () => {

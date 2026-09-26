@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { defaultWaitMax } from '../src/cli.ts'
 import { createRun, readStatus, setStatus } from '../src/runs.ts'
+import { TERMINAL } from '../src/types.ts'
 import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
@@ -65,6 +66,22 @@ test('run por proceso seguido de wait entrega el resultado', () => {
   assert.equal(w.code, 0, JSON.stringify(w.out))
   assert.equal(w.out.state, 'done')
   assert.equal(w.out.result, 'ok')
+})
+
+test('run da búsqueda web por proceso solo a explore e investigate', () => {
+  const launched = (s: Setup, role: string, extra: string[] = []): string[] => {
+    const r = cli(s, ['run', '--prompt-file', s.prompt, '--role', role, ...extra])
+    assert.deepEqual([r.code, r.out.via], [0, 'process'], r.stderr)
+    const w = cli(s, ['wait', r.out.id, '--max', '10'])
+    assert.ok(TERMINAL.has(w.out.state), `${role}: ${w.out.state}`)
+    return JSON.parse(readFileSync(join(s.repo, '.sdd-ai', 'runs', r.out.id, 'argv.json'), 'utf8')).launch.args
+  }
+  const codex = setup({ families: '[codex]', bins: ['codex'] })
+  for (const role of ['explore', 'investigate']) assert.ok(launched(codex, role).includes('web_search="live"'), role)
+  assert.ok(launched(codex, 'design-review').includes('web_search="disabled"'))
+  const claude = setup({ families: '[claude]', bins: ['claude'] })
+  assert.ok(launched(claude, 'explore', ['--conductor', 'codex']).includes('--allowedTools=WebFetch,WebSearch'))
+  assert.equal(launched(claude, 'design-review', ['--conductor', 'codex']).some((a) => a.startsWith('--allowedTools')), false)
 })
 
 test('vía nativa: sin agentes sincronizados es agents_stale; tras sync, delegated', () => {

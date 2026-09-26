@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { parse } from 'yaml'
-import { type Family, type Profile, READ_ONLY_ROLES, type ReadOnlyRole, SddError } from './types.ts'
+import { type Family, type Profile, READ_ONLY_ROLES, type ReadOnlyRole, SddError, WEB_ROLES } from './types.ts'
 
 export interface AgentSource { description: string; body: string; raw: string }
 export type RoleProfiles = Record<ReadOnlyRole, Record<Family, Profile>>
@@ -52,7 +52,8 @@ function describe(src: AgentSource, role: ReadOnlyRole): string {
 }
 
 export function renderClaudeAgent(src: AgentSource, role: ReadOnlyRole, p: Profile, hash: string): string {
-  const lines = ['---', `name: ${yamlScalar(agentName(role))}`, `description: ${yamlScalar(describe(src, role))}`, 'tools: Read, Grep, Glob']
+  const tools = WEB_ROLES.has(role) ? 'Read, Grep, Glob, WebFetch, WebSearch' : 'Read, Grep, Glob'
+  const lines = ['---', `name: ${yamlScalar(agentName(role))}`, `description: ${yamlScalar(describe(src, role))}`, `tools: ${tools}`]
   if (p.model) lines.push(`model: ${yamlScalar(p.model)}`)
   if (p.effort) lines.push(`effort: ${p.effort}`)
   // Acerca el nativo al worker por proceso, que corre con --safe-mode.
@@ -60,9 +61,13 @@ export function renderClaudeAgent(src: AgentSource, role: ReadOnlyRole, p: Profi
   return lines.join('\n') + src.body
 }
 
+const NO_WEB_RULE = 'No busques en la web ni consultes otras fuentes externas: trabaja solo con el encargo y el repositorio.'
+
 /**
- * Sin `sandbox_mode`: Codex lo acepta en el archivo del rol pero no lo aplica al subagente, que
- * hereda el sandbox del conductor. Declararlo daría una garantía que no existe.
+ * Sin `sandbox_mode` ni `web_search`: Codex los acepta en el archivo del rol pero no los aplica al
+ * subagente, que hereda el sandbox y la búsqueda web del conductor. Declararlos daría una garantía que
+ * no existe. Por eso, en los roles sin web, la búsqueda se apaga con una regla al final de las
+ * instrucciones; en Claude no hace falta, porque la lista `tools:` ya la deja afuera.
  */
 export function renderCodexAgent(src: AgentSource, role: ReadOnlyRole, p: Profile, hash: string): string {
   if (src.body.includes("'''")) {
@@ -71,7 +76,8 @@ export function renderCodexAgent(src: AgentSource, role: ReadOnlyRole, p: Profil
   const lines = [`# ${MARK} ${hash}`, `name = ${JSON.stringify(agentName(role))}`, `description = ${JSON.stringify(describe(src, role))}`]
   if (p.model) lines.push(`model = ${JSON.stringify(p.model)}`)
   if (p.effort) lines.push(`model_reasoning_effort = ${JSON.stringify(p.effort)}`)
-  lines.push(`developer_instructions = '''\n${src.body}'''`, '')
+  const body = WEB_ROLES.has(role) ? src.body : `${src.body}\n${NO_WEB_RULE}\n`
+  lines.push(`developer_instructions = '''\n${body}'''`, '')
   return lines.join('\n')
 }
 

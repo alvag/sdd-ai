@@ -25,6 +25,8 @@ autosuficiente (qué hacer, dónde mirar, qué formato de respuesta).
 - Agrega `--role <rol>` cuando la tarea tiene un rol claro: `code-review` para revisar código,
   `refute` para refutar, `investigate` para una causa raíz, `design-review`, `debate` o
   `counter-plan`. Sin el flag, el rol es `explore`.
+  `explore` e `investigate` pueden buscar en la web; los demás roles trabajan solo con el encargo y
+  el repositorio.
 - Agrega `--families claude` o `--families codex` solo si el usuario dijo "solo Claude" o
   "solo Codex" para esta tarea.
 - **Si eres Codex** y la respuesta va a salir por la vía `process`, ejecuta `run` pidiendo
@@ -38,6 +40,10 @@ autosuficiente (qué hacer, dónde mirar, qué formato de respuesta).
 - Claude Code: herramienta `Agent` con `subagent_type` igual al valor de `agent` (hay un agente
   por rol, como `sdd-ai-explore` o `sdd-ai-code-review`).
 - Codex: `spawn_agent` con `agent_type` igual al valor de `agent`, sin heredar el historial.
+  El subagente hereda la búsqueda web de tu sesión, porque Codex no aplica `web_search` desde el
+  archivo del agente. Por eso `explore` e `investigate` buscan solo si la tienes encendida, y en los
+  demás roles la búsqueda se apaga solo por instrucción. Si hace falta garantizarlo, conviene la vía
+  `process`.
 - En los dos, el mensaje es: `Tu encargo está en <prompt_file>. Léelo completo y cúmplelo.`
 - Si la respuesta trae `model` o `effort`, pásalos a la herramienta: en Codex, `model` y
   `reasoning_effort` de `spawn_agent`; en Claude Code, `model` del `Agent` con el alias que
