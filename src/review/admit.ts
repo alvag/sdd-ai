@@ -5,8 +5,20 @@ export type Axis = 'scope' | 'spec' | 'quality'
 export type Severity = 'BLOCKER' | 'CRITICAL' | 'WARNING' | 'SUGGESTION'
 export type Causality = 'introduced' | 'worsened' | 'pre-existing'
 export type Evidence = 'deterministic' | 'inferential'
-export interface Finding { axis: Axis; severity: Severity; location: string; claim: string; causality?: Causality; evidence?: Evidence }
-export interface AdmittedReview { candidate_hash: string; inspection: { status: 'completed'; paths: string[] }; findings: Finding[] }
+export interface Finding {
+  axis: Axis; severity: Severity; location: string; claim: string; causality?: Causality; evidence?: Evidence
+  /** En un artefacto, el archivo que tiene el defecto cuando no es el artefacto mismo. */
+  of?: string
+  /** En la ronda N de un artefacto, la línea de la corrección que causó la regresión: `+N` o `-N`. */
+  cause?: string
+}
+/** Una afirmación de un artefacto que el revisor no pudo comprobar con el material. */
+export interface Unverifiable { location: string; claim: string }
+export interface AdmittedReview {
+  candidate_hash: string; inspection: { status: 'completed'; paths: string[] }; findings: Finding[]
+  /** Solo en un artefacto; siempre presente ahí, también vacía. */
+  unverifiable?: Unverifiable[]
+}
 export type Admission<T = AdmittedReview> =
   | { kind: 'admitted'; review: T }
   | { kind: 'unavailable'; reason: string }
@@ -15,6 +27,7 @@ export interface RoundReview {
   candidate_hash: string
   responses: Array<{ id: string; answer: Answer; evidence?: string; note?: string }>
   findings: Finding[]
+  unverifiable?: Unverifiable[]
 }
 export interface RefutationReview {
   candidate_hash: string
@@ -150,9 +163,10 @@ function optionalNote(v: unknown, where: string): { note?: string } {
   return { note: v }
 }
 
-function checkFinding(raw: unknown, i: number, c: Candidate): Finding {
+function checkFinding(raw: unknown, i: number, c: Candidate, round = false): Finding {
   const where = `findings[${i}]`
   if (!isMap(raw)) throw new Rejection(`${where} tiene que ser un objeto`)
+  if (c.subject) return checkArtifactFinding(raw, where, c, round)
   onlyKeys(raw, ['axis', 'severity', 'location', 'claim', 'causality', 'evidence'], where)
   const axis = oneOf(raw.axis, AXES, `${where}.axis`) as Axis
   const severity = oneOf(raw.severity, SEVERITIES, `${where}.severity`) as Severity
@@ -169,6 +183,58 @@ function checkFinding(raw: unknown, i: number, c: Candidate): Finding {
   }
   checkLocation(f.location, c)
   return f
+}
+
+/**
+ * Un hallazgo de un artefacto: declara de qué archivo es el defecto (`of`), y en la ronda N su causa. La
+ * causalidad no aplica: si llega se valida, pero no hace falta.
+ */
+function checkArtifactFinding(raw: Record<string, unknown>, where: string, c: Candidate, round: boolean): Finding {
+  onlyKeys(raw, ['of', 'axis', 'severity', 'location', 'claim', 'causality', 'evidence', ...(round ? ['cause'] : [])], where)
+  const artifact = c.files[0].path
+  if (typeof raw.of !== 'string' || (raw.of !== artifact && !c.context.some((x) => x.path === raw.of))) {
+    throw new Rejection(`${where}.of tiene que ser la ruta del artefacto (${artifact}) o de un insumo o contexto`)
+  }
+  const axis = oneOf(raw.axis, AXES, `${where}.axis`) as Axis
+  const severity = oneOf(raw.severity, SEVERITIES, `${where}.severity`) as Severity
+  if (typeof raw.location !== 'string' || raw.location.trim() === '') throw new Rejection(`${where}.location tiene que ser una cita ruta:línea`)
+  if (typeof raw.claim !== 'string' || raw.claim.trim() === '') throw new Rejection(`${where}.claim no puede estar vacío`)
+  const f: Finding = { axis, severity, location: raw.location, claim: raw.claim }
+  if (raw.causality !== undefined) f.causality = oneOf(raw.causality, CAUSALITIES, `${where}.causality`) as Causality
+  if (raw.evidence !== undefined) f.evidence = oneOf(raw.evidence, EVIDENCES, `${where}.evidence`) as Evidence
+  if (GRAVE.has(severity) && f.evidence === undefined) {
+    throw new Rejection(`${where} es ${severity} y no declara evidence (deterministic | inferential)`)
+  }
+  checkLocation(f.location, c)
+  // Un defecto de otro archivo se cita en ese archivo; uno del artefacto puede citar su evidencia en cualquiera.
+  if (raw.of !== artifact) {
+    if (parseLocation(f.location).path !== raw.of) throw new Rejection(`${where} es un defecto de ${raw.of} y su cita no cae en ese archivo`)
+    f.of = raw.of
+  }
+  if (round) {
+    // Los insumos y el contexto no cambian entre rondas: la corrección no puede causar un defecto en ellos.
+    if (raw.of !== artifact) throw new Rejection(`${where} es un defecto de ${raw.of}: un hallazgo nuevo de la ronda solo se admite como regresión del artefacto (${artifact})`)
+    if (typeof raw.cause !== 'string') throw new Rejection(`${where} es un hallazgo nuevo de la ronda y le falta cause (+N | -N)`)
+    f.cause = raw.cause
+  }
+  return f
+}
+
+/** Las afirmaciones del artefacto que el revisor no pudo comprobar: una lista, también vacía, en líneas del artefacto. */
+function checkUnverifiable(v: unknown, c: Candidate): Unverifiable[] {
+  if (!Array.isArray(v)) throw new Rejection('falta unverifiable: una lista de afirmaciones no verificables, [] si no hay ninguna')
+  const artifact = c.files[0].path
+  return v.map((u, i) => {
+    const where = `unverifiable[${i}]`
+    if (!isMap(u)) throw new Rejection(`${where} tiene que ser un objeto`)
+    onlyKeys(u, ['location', 'claim'], where)
+    if (typeof u.location !== 'string' || parseLocation(u.location).path !== artifact || !parseLocation(u.location).lines) {
+      throw new Rejection(`${where}.location tiene que ser una línea del artefacto (${artifact}:línea)`)
+    }
+    checkLocation(u.location, c)
+    if (typeof u.claim !== 'string' || u.claim.trim() === '') throw new Rejection(`${where}.claim no puede estar vacío`)
+    return { location: u.location, claim: u.claim }
+  })
 }
 
 function checkHash(raw: Record<string, unknown>, c: Candidate): void {
@@ -202,13 +268,15 @@ function checkInspection(raw: Record<string, unknown>, c: Candidate): { paths: s
 }
 
 function check(raw: Record<string, unknown>, c: Candidate): Admission {
-  onlyKeys(raw, ['candidate_hash', 'inspection', 'findings'], 'la respuesta')
+  onlyKeys(raw, ['candidate_hash', 'inspection', 'findings', ...(c.subject ? ['unverifiable'] : [])], 'la respuesta')
   checkHash(raw, c)
   const insp = checkInspection(raw, c)
   if ('reason' in insp) return { kind: 'unavailable', reason: insp.reason }
   if (!Array.isArray(raw.findings)) throw new Rejection('findings tiene que ser una lista')
   const findings = raw.findings.map((f, i) => checkFinding(f, i, c))
-  return { kind: 'admitted', review: { candidate_hash: c.hash, inspection: { status: 'completed', paths: insp.paths }, findings } }
+  const review: AdmittedReview = { candidate_hash: c.hash, inspection: { status: 'completed', paths: insp.paths }, findings }
+  if (c.subject) review.unverifiable = checkUnverifiable(raw.unverifiable, c)
+  return { kind: 'admitted', review }
 }
 
 /** Una respuesta solo se admite si trae exactamente un objeto con `candidate_hash` y ese objeto pasa `check`. */
@@ -277,21 +345,41 @@ function checkRegression(f: Finding, plan: RoundPlan): void {
   }
 }
 
+/**
+ * En un artefacto, un hallazgo nuevo es una regresión si su causa cae en lo que cambió: `+N` en una línea
+ * agregada o cambiada del artefacto actual, o `-N` en una borrada de la versión anterior. Su ubicación
+ * puede estar en cualquier línea: una sección que no cambió puede quedar incoherente por la corrección.
+ */
+function checkCause(f: Finding, plan: RoundPlan, c: Candidate): void {
+  if (plan.identical) throw new Rejection(`el artefacto no cambió respecto de la ronda anterior y no admite hallazgos nuevos: ${f.location}`)
+  const m = /^([+-])(\d+)$/.exec(f.cause ?? '')
+  if (!m) throw new Rejection(`la causa ${JSON.stringify(f.cause)} no es +N ni -N`)
+  const n = Number(m[2])
+  const added = plan.changed[c.files[0].path]
+  const ranges = m[1] === '+' ? (added === undefined || added === 'binary' ? [] : added) : plan.removed ?? []
+  if (!ranges.some(([a, b]) => n >= a && n <= b)) {
+    throw new Rejection(`la causa ${f.cause} no es una línea ${m[1] === '+' ? 'agregada o cambiada' : 'borrada'} por la corrección`)
+  }
+}
+
 /** Admite la ronda N: respuestas por ID y, como hallazgos nuevos, solo regresiones de la corrección. */
 export function admitRound(text: string, c: Candidate, plan: RoundPlan): Admission<RoundReview> {
   return admitWith(text, (raw) => {
-    onlyKeys(raw, ['candidate_hash', 'inspection', 'responses', 'findings'], 'la respuesta')
+    onlyKeys(raw, ['candidate_hash', 'inspection', 'responses', 'findings', ...(c.subject ? ['unverifiable'] : [])], 'la respuesta')
     checkHash(raw, c)
     const insp = checkInspection(raw, c)
     if ('reason' in insp) return { kind: 'unavailable', reason: insp.reason }
     const responses = checkResponses(raw.responses, c, plan)
     if (!Array.isArray(raw.findings)) throw new Rejection('findings tiene que ser una lista')
     const findings = raw.findings.map((f, i) => {
-      const finding = checkFinding(f, i, c)
-      checkRegression(finding, plan)
+      const finding = checkFinding(f, i, c, true)
+      if (c.subject) checkCause(finding, plan, c)
+      else checkRegression(finding, plan)
       return finding
     })
-    return { kind: 'admitted', review: { candidate_hash: c.hash, responses, findings } }
+    const review: RoundReview = { candidate_hash: c.hash, responses, findings }
+    if (c.subject) review.unverifiable = checkUnverifiable(raw.unverifiable, c)
+    return { kind: 'admitted', review }
   })
 }
 

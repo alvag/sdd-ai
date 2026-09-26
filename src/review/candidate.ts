@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { SddError } from '../types.ts'
+import type { ArtifactKind, ArtifactRole } from './artifact.ts'
 import type { ChangedRanges } from './ledger.ts'
 
 export interface Selection { base: string; head?: string; context: string[] }
@@ -12,10 +13,19 @@ export interface CandidateFile {
   /** El modo en la base. Queda fuera del hash; un candidato congelado antes de guardarlo no lo trae. */
   old_mode?: string
 }
-export interface ContextFile { path: string; sha256: string; lines: number }
+/** Un archivo de contexto. En un artefacto, los insumos de arriba llevan su rol; los de `--context`, no. */
+export interface ContextFile { path: string; sha256: string; lines: number; role?: ArtifactRole }
+/** Un diff congelado o, con `subject`, un artefacto: sin diff ni SHAs, con el artefacto como único archivo. */
 export interface Candidate {
-  base_sha: string; head_sha: string | null; files: CandidateFile[]; context: ContextFile[]
+  subject?: { kind: ArtifactKind }
+  base_sha: string | null; head_sha: string | null; files: CandidateFile[]; context: ContextFile[]
   left_out: string[]; diff: string; hash: string
+}
+
+/** La base de un diff. Solo se llama en ramas de diff: un artefacto no tiene base. */
+export function baseOf(c: Candidate): string {
+  if (c.base_sha === null) throw new Error('un artefacto no tiene base')
+  return c.base_sha
 }
 
 // Fijan la forma del diff aunque la config Git del usuario diga otra cosa: prefijos, color,
@@ -30,7 +40,7 @@ function git(root: string, args: string[]): string {
   return gitBytes(root, args).toString('utf8')
 }
 
-const sha256 = (b: Buffer | string) => createHash('sha256').update(b).digest('hex')
+export const sha256 = (b: Buffer | string) => createHash('sha256').update(b).digest('hex')
 
 function resolveCommit(root: string, ref: string): string {
   try {
@@ -40,7 +50,7 @@ function resolveCommit(root: string, ref: string): string {
   }
 }
 
-function countLines(text: string): number {
+export function countLines(text: string): number {
   if (text === '') return 0
   const n = text.split('\n').length
   return text.endsWith('\n') ? n - 1 : n
@@ -124,15 +134,15 @@ function contentOf(root: string, path: string, rev: string | null): Buffer {
 
 const outside = (rel: string) => rel === '' || rel.startsWith('..') || isAbsolute(rel)
 
-function readContextFile(root: string, p: string): { path: string; bytes: Buffer } {
+export function readContextFile(root: string, p: string, what = 'el contexto'): { path: string; bytes: Buffer } {
   const abs = isAbsolute(p) ? p : resolve(root, p)
   const rel = relative(root, abs)
   // Un symlink dentro del repo puede apuntar afuera: la ruta real también tiene que caer adentro.
   if (outside(rel) || outside(relative(realpathSync(root), realpathSync(abs)))) {
-    throw new SddError('usage', `el contexto tiene que estar dentro del repo: ${p}`)
+    throw new SddError('usage', `${what} tiene que estar dentro del repo: ${p}`)
   }
   const bytes = readFileSync(abs)
-  if (bytes.includes(0)) throw new SddError('usage', `el contexto no puede ser binario: ${rel}`)
+  if (bytes.includes(0)) throw new SddError('usage', `${what} no puede ser binario: ${rel}`)
   return { path: rel, bytes }
 }
 
@@ -183,16 +193,20 @@ export function freeze(root: string, sel: Selection): Candidate {
   return { base_sha: baseSha, head_sha: headSha, files, context, left_out: leftOut, diff, hash: `sha256:${sha256(JSON.stringify(manifest))}` }
 }
 
-/** Congela dos veces seguidas: si el árbol cambió en el medio, el candidato no representa nada estable. */
-export function freezeStable(root: string, sel: Selection, freezeFn: typeof freeze = freeze): Candidate {
-  const first = freezeFn(root, sel)
-  const second = freezeFn(root, sel)
-  if (first.hash !== second.hash) {
+/** Congela dos veces seguidas: si el árbol cambió en el medio, el resultado no representa nada estable. */
+export function freezeStableWith<S, R>(root: string, sel: S, fn: (root: string, sel: S) => R, hashOf: (r: R) => string): R {
+  const first = fn(root, sel)
+  const second = fn(root, sel)
+  if (hashOf(first) !== hashOf(second)) {
     throw new SddError('candidate_unstable', 'el árbol cambió mientras se congelaba el candidato', {
       next: 'vuelve a correr review start cuando nadie esté escribiendo en el repo',
     })
   }
   return first
+}
+
+export function freezeStable(root: string, sel: Selection, freezeFn: typeof freeze = freeze): Candidate {
+  return freezeStableWith(root, sel, freezeFn, (c) => c.hash)
 }
 
 /**
@@ -201,21 +215,24 @@ export function freezeStable(root: string, sel: Selection, freezeFn: typeof free
  * del refutador con ellos, aunque el árbol ya haya cambiado. Devuelve los blobs que escribió, para
  * poder quitarlos si la ronda no llega a lanzarse.
  */
-export function snapshot(root: string, c: Candidate, dir: string): string[] {
+export function snapshot(root: string, c: Candidate, dir: string, retained?: Map<string, Buffer>): string[] {
   const blobs = join(dir, 'blobs')
   mkdirSync(blobs, { recursive: true })
   const unstable = (what: string, path: string) => new SddError('candidate_unstable', `${what} cambió después de congelarse: ${path}`, {
     next: 'vuelve a lanzar la ronda cuando nadie esté escribiendo en el repo',
   })
+  // Un artefacto se guarda con los bytes que se validaron al congelarlo: así el blob es el contenido del
+  // hash aunque el árbol haya cambiado después. Sin ellos, se lee como el contexto, siguiendo symlinks.
+  const artifactBytes = (path: string) => retained?.get(path) ?? readContextFile(root, path).bytes
   const pending = c.files.map((f) => {
-    const bytes = contentOf(root, f.path, f.status === 'D' ? c.base_sha : c.head_sha)
-    if (sha256(bytes) !== f.sha256) throw unstable('el archivo', f.path)
-    return { file: join(blobs, f.sha256), bytes }
+    const b = c.subject ? artifactBytes(f.path) : contentOf(root, f.path, f.status === 'D' ? c.base_sha : c.head_sha)
+    if (sha256(b) !== f.sha256) throw unstable('el archivo', f.path)
+    return { file: join(blobs, f.sha256), bytes: b }
   })
   for (const ctx of c.context) {
-    const { bytes } = readContextFile(root, ctx.path)
-    if (sha256(bytes) !== ctx.sha256) throw unstable('el contexto', ctx.path)
-    pending.push({ file: join(blobs, ctx.sha256), bytes })
+    const b = c.subject ? artifactBytes(ctx.path) : readContextFile(root, ctx.path).bytes
+    if (sha256(b) !== ctx.sha256) throw unstable('el contexto', ctx.path)
+    pending.push({ file: join(blobs, ctx.sha256), bytes: b })
   }
   const written: string[] = []
   for (const { file, bytes } of pending) {

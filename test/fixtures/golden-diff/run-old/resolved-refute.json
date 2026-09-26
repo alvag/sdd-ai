@@ -1,0 +1,10 @@
+{
+  "family": "claude",
+  "via": "process",
+  "origin": {
+    "model": "workers",
+    "effort": "workers"
+  },
+  "model": "sonnet",
+  "effort": "medium"
+}

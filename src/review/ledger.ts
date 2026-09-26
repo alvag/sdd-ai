@@ -3,7 +3,7 @@ import { type Finding, GRAVE } from './admit.ts'
 
 export type { Evidence } from './admit.ts'
 export type FindingState = 'abierto' | 'aceptado' | 'rechazado' | 'en-disputa'
-  | 'resuelto' | 'cerrado' | 'refutado' | 'fuera-de-alcance'
+  | 'resuelto' | 'cerrado' | 'refutado' | 'fuera-de-alcance' | 'informativo'
 export type Answer = 'resolved' | 'unresolved' | 'withdrawn' | 'maintained'
 export type RefuteResult = 'corroborated' | 'refuted' | 'inconclusive'
 export interface Decision { action: 'accept' | 'reject'; reason?: string; from: FindingState; after_round: number }
@@ -27,7 +27,8 @@ export interface LedgerEntry extends Finding {
   decision?: Decision; responses: RoundResponse[]
   refutation?: { result: RefuteResult; evidence?: string; note?: string; reason?: string }
 }
-export interface Ledger { completed: number; next_id: number; entries: LedgerEntry[] }
+/** `artifact` marca el ledger de una revisión de artefacto; uno sin la marca es de un diff. */
+export interface Ledger { completed: number; next_id: number; entries: LedgerEntry[]; artifact?: true }
 
 /** Una entrada anterior a la procedencia se lee como de la base, en su único lote. */
 export const withProvenance = (e: LedgerEntry): LedgerEntry & Provenance => ({ ...e, reviewer: e.reviewer ?? 'base', batch: e.batch ?? 1 })
@@ -40,6 +41,8 @@ export interface RoundPlan {
   targets: Target[]; changed: ChangedRanges
   /** El ref que se pasó con `--head`, si la ronda revisaba un ref y no el árbol. */
   head?: string
+  /** En un artefacto, las líneas de la versión anterior que la corrección borró o reemplazó. */
+  removed?: Array<[number, number]>
 }
 
 /** Estados en los que un hallazgo sigue contando para el veredicto. */
@@ -57,8 +60,14 @@ const DECISION_STATE: Partial<Record<FindingState, Record<Decision['action'], Fi
 
 const outOfScope = (f: Finding) => GRAVE.has(f.severity) && f.causality === 'pre-existing'
 
-function entry(f: Finding & Partial<Provenance>, id: number, round: number): LedgerEntry {
-  return { ...f, id: `F-${id}`, round, state: outOfScope(f) ? 'fuera-de-alcance' : 'abierto', responses: [] }
+/**
+ * En un artefacto, un defecto de otro archivo se informa y no se decide; los del artefacto se abren sea
+ * cual sea su causalidad, porque ahí no hay "cambio" contra el cual medirla.
+ */
+function entry(f: Finding & Partial<Provenance>, id: number, round: number, artifact = false): LedgerEntry {
+  let state: FindingState = outOfScope(f) ? 'fuera-de-alcance' : 'abierto'
+  if (artifact) state = f.of ? 'informativo' : 'abierto'
+  return { ...f, id: `F-${id}`, round, state, responses: [] }
 }
 
 function copy(l: Ledger): Ledger {
@@ -66,8 +75,10 @@ function copy(l: Ledger): Ledger {
 }
 
 /** Los hallazgos de la ronda 1, con los IDs en el orden en que llegaron: el que da `byProvenance`. */
-export function openLedger(findings: Array<Finding & Partial<Provenance>>): Ledger {
-  return { completed: 1, next_id: findings.length + 1, entries: findings.map((f, i) => entry(f, i + 1, 1)) }
+export function openLedger(findings: Array<Finding & Partial<Provenance>>, o: { artifact?: boolean } = {}): Ledger {
+  const l: Ledger = { completed: 1, next_id: findings.length + 1, entries: findings.map((f, i) => entry(f, i + 1, 1, o.artifact)) }
+  if (o.artifact) l.artifact = true
+  return l
 }
 
 /**
@@ -92,6 +103,7 @@ export function decide(l: Ledger, action: 'accept' | 'reject', ids: string[], re
   const chosen = unique.map((id) => {
     const e = next.entries.find((x) => x.id === id)
     if (!e) throw new SddError('usage', `el hallazgo ${id} no existe en esta revisión`)
+    if (e.state === 'informativo') throw new SddError('usage', `${id} no espera decisión: es informativo`)
     if (!awaitsDecision(e, next.completed)) throw new SddError('usage', `el hallazgo ${id} no espera decisión: está ${e.state}`)
     return e
   })
@@ -134,7 +146,7 @@ export function applyRound(l: Ledger, n: number,
       ...(r.note !== undefined ? { note: r.note } : {}),
     })
   }
-  for (const f of regressions) next.entries.push(entry(f, next.next_id++, n))
+  for (const f of regressions) next.entries.push(entry(f, next.next_id++, n, next.artifact))
   next.completed = n
   return next
 }
@@ -176,11 +188,14 @@ export function standing(l: Ledger): LedgerEntry[] {
   return l.entries.filter((e) => STANDING.has(e.state))
 }
 
-/** Cada eje falla con un grave que el cambio introdujo o empeoró y que sigue vigente. */
+/**
+ * Cada eje falla con un grave que el cambio introdujo o empeoró y que sigue vigente. En un artefacto la
+ * causalidad no aplica: falla con cualquier grave vigente del artefacto.
+ */
 export function axesOf(l: Ledger): Axes {
   const current = standing(l)
   const fails = (axis: Finding['axis']) => current.some((e) => e.axis === axis && GRAVE.has(e.severity)
-    && (e.causality === 'introduced' || e.causality === 'worsened'))
+    && (l.artifact || e.causality === 'introduced' || e.causality === 'worsened'))
   let spec: Axes['spec'] = 'ok'
   if (fails('spec')) spec = 'fail'
   else if (current.some((e) => e.axis === 'spec' && e.severity === 'WARNING')) spec = 'warn'

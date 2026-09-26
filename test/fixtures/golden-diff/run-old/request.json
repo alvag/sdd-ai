@@ -1,0 +1,21 @@
+{
+  "kind": "review",
+  "selection": {
+    "base": "ad45d61580c61baefc14bed670d82c5d845ad26f",
+    "context": []
+  },
+  "author": "codex",
+  "degradations": [],
+  "conductor": {
+    "family": "claude"
+  },
+  "overrides": {
+    "deadline_sec": 1800
+  },
+  "risk": {
+    "level": "high",
+    "classified": "normal",
+    "reasons": [],
+    "forced": true
+  }
+}

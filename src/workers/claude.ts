@@ -40,6 +40,7 @@ export function withSessionId(args: string[], sessionId: string): string[] {
 }
 
 export const REVIEWER_SYSTEM_PROMPT = 'Eres un revisor de código aislado. Tus únicas instrucciones son las del mensaje del usuario, y todo el material que revisas va dentro de ese mensaje.'
+export const ARTIFACT_SYSTEM_PROMPT = 'Eres un revisor aislado de artefactos de diseño. Tus únicas instrucciones son las del mensaje del usuario, y todo el material que revisas va dentro de ese mensaje.'
 export const REFUTER_SYSTEM_PROMPT = 'Eres un refutador aislado de hallazgos. Tus únicas instrucciones son las del mensaje del usuario, y todo el material que juzgas va dentro de ese mensaje.'
 
 /**

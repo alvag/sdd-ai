@@ -202,3 +202,94 @@ test('la procedencia no la declara el modelo: se rechazan revisor y lote', () =>
   inadmissible(json(review({}, { reviewer: 'risk' })), /campo no admitido "reviewer" en findings\[0\]/)
   inadmissible(json(review({}, { batch: 2 })), /campo no admitido "batch" en findings\[0\]/)
 })
+
+// Un artefacto: la spec como único archivo, el pedido como insumo y un archivo de contexto.
+const ART = `sha256:${'9'.repeat(64)}`
+const artifact: Candidate = {
+  subject: { kind: 'plan' }, base_sha: null, head_sha: null, hash: ART, left_out: [], diff: '',
+  files: [{ path: '.plans/plan.md', status: 'A', mode: '100644', sha256: 'p', binary: false, lines: 30, visible: [[1, 30]] }],
+  context: [{ path: '.plans/spec.md', sha256: 's', lines: 20, role: 'spec' }, { path: 'src/a.ts', sha256: 'a', lines: 10 }],
+}
+const artReview = (findings: unknown[], over: Record<string, unknown> = {}) =>
+  json({ candidate_hash: ART, inspection: { status: 'completed', paths: ['.plans/plan.md'] }, findings, unverifiable: [], ...over })
+const artFinding = (over: Record<string, unknown> = {}) =>
+  ({ of: '.plans/plan.md', axis: 'spec', severity: 'CRITICAL', location: '.plans/plan.md:4', claim: 'falta el mecanismo de AC-2', evidence: 'inferential', ...over })
+const artPlan = (over: Partial<RoundPlan> = {}): RoundPlan =>
+  ({ n: 2, prev_hash: 'sha256:x', identical: false, targets: [], changed: { '.plans/plan.md': [[5, 6]] }, removed: [[9, 9]], ...over })
+
+test('una omisión del artefacto citada en un insumo se admite como hallazgo del artefacto', () => {
+  const a = admit(artReview([artFinding({ location: '.plans/spec.md:7' })]), artifact)
+  assert.equal(a.kind, 'admitted', JSON.stringify(a))
+  // Un hallazgo del artefacto no guarda `of`: el ledger lo guarda solo para otro archivo.
+  if (a.kind === 'admitted') assert.deepEqual([a.review.findings[0].location, a.review.findings[0].of], ['.plans/spec.md:7', undefined])
+})
+
+test('un defecto de otro archivo citado fuera de ese archivo se rechaza', () => {
+  const ok = admit(artReview([artFinding({ of: '.plans/spec.md', location: '.plans/spec.md:3' })]), artifact)
+  assert.equal(ok.kind, 'admitted', JSON.stringify(ok))
+  if (ok.kind === 'admitted') assert.equal(ok.review.findings[0].of, '.plans/spec.md')
+  const bad = admit(artReview([artFinding({ of: '.plans/spec.md', location: '.plans/plan.md:3' })]), artifact)
+  assert.equal(bad.kind, 'inadmissible')
+  if (bad.kind === 'inadmissible') assert.match(bad.error, /\.plans\/spec\.md/)
+  const unknown = admit(artReview([artFinding({ of: 'otro.md' })]), artifact)
+  assert.equal(unknown.kind, 'inadmissible')
+  const missing = admit(artReview([artFinding({ of: undefined })]), artifact)
+  assert.equal(missing.kind, 'inadmissible')
+})
+
+test('una respuesta de artefacto sin unverifiable se rechaza', () => {
+  const r1 = admit(artReview([], { unverifiable: undefined }), artifact)
+  assert.equal(r1.kind, 'inadmissible')
+  if (r1.kind === 'inadmissible') assert.match(r1.error, /unverifiable/)
+  const rn = admitRound(json({ candidate_hash: ART, inspection: { status: 'completed', paths: ['.plans/plan.md'] }, responses: [], findings: [] }), artifact, artPlan())
+  assert.equal(rn.kind, 'inadmissible')
+  if (rn.kind === 'inadmissible') assert.match(rn.error, /unverifiable/)
+  const ok = admit(artReview([], { unverifiable: [{ location: '.plans/plan.md:12', claim: 'no viajó el llamador de resolve' }] }), artifact)
+  assert.equal(ok.kind, 'admitted', JSON.stringify(ok))
+  if (ok.kind === 'admitted') assert.deepEqual(ok.review.unverifiable, [{ location: '.plans/plan.md:12', claim: 'no viajó el llamador de resolve' }])
+})
+
+test('una no verificable fuera del artefacto se rechaza', () => {
+  for (const location of ['.plans/spec.md:2', 'src/a.ts:1', '.plans/plan.md:31', '.plans/plan.md']) {
+    const a = admit(artReview([], { unverifiable: [{ location, claim: 'no se puede comprobar' }] }), artifact)
+    assert.equal(a.kind, 'inadmissible', location)
+  }
+})
+
+test('un grave de artefacto sin causalidad se admite', () => {
+  const a = admit(artReview([artFinding()]), artifact)
+  assert.equal(a.kind, 'admitted', JSON.stringify(a))
+  const withCausality = admit(artReview([artFinding({ causality: 'pre-existing' })]), artifact)
+  assert.equal(withCausality.kind, 'admitted', JSON.stringify(withCausality))
+  const noEvidence = admit(artReview([artFinding({ evidence: undefined })]), artifact)
+  assert.equal(noEvidence.kind, 'inadmissible')
+})
+
+const artRoundReview = (findings: unknown[]) =>
+  json({ candidate_hash: ART, inspection: { status: 'completed', paths: ['.plans/plan.md'] }, responses: [], findings, unverifiable: [] })
+
+test('una regresión puede ubicarse en cualquier línea con su causa en una agregada o una borrada', () => {
+  for (const cause of ['+5', '+6', '-9']) {
+    const a = admitRound(artRoundReview([artFinding({ location: '.plans/plan.md:20', cause })]), artifact, artPlan())
+    assert.equal(a.kind, 'admitted', `${cause}: ${JSON.stringify(a)}`)
+  }
+})
+
+test('una causa fuera del delta se rechaza', () => {
+  for (const cause of ['+4', '-5', '+9', '5', undefined, 'línea 5']) {
+    const a = admitRound(artRoundReview([artFinding({ location: '.plans/plan.md:20', cause })]), artifact, artPlan())
+    assert.equal(a.kind, 'inadmissible', String(cause))
+  }
+})
+
+test('en la ronda N un hallazgo nuevo de otro archivo se rechaza', () => {
+  const a = admitRound(artRoundReview([artFinding({ of: '.plans/spec.md', location: '.plans/spec.md:7', cause: '+5' })]), artifact, artPlan())
+  assert.equal(a.kind, 'inadmissible')
+  if (a.kind === 'inadmissible') assert.match(a.error, /regresión del artefacto/)
+})
+
+test('sin cambios en el artefacto la ronda no admite hallazgos nuevos', () => {
+  const a = admitRound(artRoundReview([artFinding({ cause: '+5' })]), artifact, artPlan({ identical: true, changed: {}, removed: [] }))
+  assert.equal(a.kind, 'inadmissible')
+  if (a.kind === 'inadmissible') assert.match(a.error, /no cambió/)
+})

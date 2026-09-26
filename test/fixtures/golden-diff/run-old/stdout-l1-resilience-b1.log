@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"s","model":"claude-falso","tools":[]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"."}]}}
+{"type":"result","is_error":false,"result":"{\"candidate_hash\":\"sha256:e48ea63ba45a302b0c17905eb22caf23a10c300a1a51e4ce831fc6883669ea31\",\"inspection\":{\"status\":\"completed\",\"paths\":[\"a.txt\"]},\"findings\":[{\"axis\":\"scope\",\"severity\":\"WARNING\",\"location\":\"a.txt:5\",\"claim\":\"lo dice resilience\"}]}","usage":{"input_tokens":10,"output_tokens":5}}

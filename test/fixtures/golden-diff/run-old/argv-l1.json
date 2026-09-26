@@ -1,0 +1,87 @@
+{
+  "family": "claude",
+  "deadline_sec": 1800,
+  "kind": "review",
+  "candidate": "/private/var/folders/69/m995sghn00bgb_wc53rp8h8r0000gn/T/sdd-ai-repo-rScOFd/.sdd-ai/runs/20260926-0925-3705/candidate.json",
+  "round": 1,
+  "tag": "",
+  "launch_n": 1,
+  "reviewer_resolution": {
+    "family": "claude",
+    "via": "process",
+    "origin": {
+      "model": "workers",
+      "effort": "workers"
+    },
+    "model": "opus",
+    "effort": "high"
+  },
+  "refuter_resolution": {
+    "family": "claude",
+    "via": "process",
+    "origin": {
+      "model": "workers",
+      "effort": "workers"
+    },
+    "model": "sonnet",
+    "effort": "medium"
+  },
+  "jobs": [
+    {
+      "key": "base-b1",
+      "reviewer": "base",
+      "batch": 1,
+      "paths": [
+        "a.txt"
+      ],
+      "prompt": "/private/var/folders/69/m995sghn00bgb_wc53rp8h8r0000gn/T/sdd-ai-repo-rScOFd/.sdd-ai/runs/20260926-0925-3705/prompt-l1-base-b1.md"
+    },
+    {
+      "key": "risk-b1",
+      "reviewer": "risk",
+      "batch": 1,
+      "paths": [
+        "a.txt"
+      ],
+      "prompt": "/private/var/folders/69/m995sghn00bgb_wc53rp8h8r0000gn/T/sdd-ai-repo-rScOFd/.sdd-ai/runs/20260926-0925-3705/prompt-l1-risk-b1.md"
+    },
+    {
+      "key": "resilience-b1",
+      "reviewer": "resilience",
+      "batch": 1,
+      "paths": [
+        "a.txt"
+      ],
+      "prompt": "/private/var/folders/69/m995sghn00bgb_wc53rp8h8r0000gn/T/sdd-ai-repo-rScOFd/.sdd-ai/runs/20260926-0925-3705/prompt-l1-resilience-b1.md"
+    },
+    {
+      "key": "reliability-b1",
+      "reviewer": "reliability",
+      "batch": 1,
+      "paths": [
+        "a.txt"
+      ],
+      "prompt": "/private/var/folders/69/m995sghn00bgb_wc53rp8h8r0000gn/T/sdd-ai-repo-rScOFd/.sdd-ai/runs/20260926-0925-3705/prompt-l1-reliability-b1.md"
+    },
+    {
+      "key": "readability-b1",
+      "reviewer": "readability",
+      "batch": 1,
+      "paths": [
+        "a.txt"
+      ],
+      "prompt": "/private/var/folders/69/m995sghn00bgb_wc53rp8h8r0000gn/T/sdd-ai-repo-rScOFd/.sdd-ai/runs/20260926-0925-3705/prompt-l1-readability-b1.md"
+    }
+  ],
+  "batches": [
+    [
+      "a.txt"
+    ]
+  ],
+  "risk": {
+    "level": "high",
+    "classified": "normal",
+    "reasons": [],
+    "forced": true
+  }
+}

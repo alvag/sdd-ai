@@ -219,3 +219,36 @@ test('los IDs siguen el orden fijo base, lentes y lote', () => {
   const next = applyRound(l, 2, [], byProvenance([at('base', 2), at('base', 1)]))
   assert.deepEqual(next.entries.slice(6).map((e) => [e.id, e.batch]), [['F-7', 1], ['F-8', 2]])
 })
+
+const ofSpec = (over: Partial<Finding> = {}): Finding =>
+  ({ axis: 'spec', severity: 'CRITICAL', location: '.plans/spec.md:3', claim: 'la spec se contradice', evidence: 'inferential', of: '.plans/spec.md', ...over })
+
+test('un defecto de otro archivo queda informativo: fuera del veredicto, de decide y de round', () => {
+  const l = openLedger([ofSpec()], { artifact: true })
+  assert.equal(l.artifact, true)
+  assert.equal(stateOf(l, 'F-1'), 'informativo')
+  assert.deepEqual(axesOf(l), { scope: 'ok', spec: 'ok', quality: 'ok' })
+  assert.deepEqual([undecided(l), targets(l)], [[], []])
+  usage(() => decide(l, 'accept', ['F-1']), /F-1 no espera decisión: es informativo/)
+})
+
+test('un grave pre-existing del artefacto hace fallar su eje', () => {
+  const l = openLedger([grave('quality', 'pre-existing')], { artifact: true })
+  assert.equal(stateOf(l, 'F-1'), 'abierto')
+  assert.equal(axesOf(l).quality, 'fail')
+  // Sin artefacto, sigue fuera de alcance como en un diff.
+  assert.equal(stateOf(openLedger([grave('quality', 'pre-existing')]), 'F-1'), 'fuera-de-alcance')
+})
+
+test('una omisión del artefacto citada en un insumo cuenta para el veredicto', () => {
+  const l = openLedger([f('spec', 'CRITICAL', { location: '.plans/spec.md:7', evidence: 'inferential' })], { artifact: true })
+  assert.equal(stateOf(l, 'F-1'), 'abierto')
+  assert.equal(axesOf(l).spec, 'fail')
+})
+
+test('en un artefacto, una regresión de la ronda N se abre aunque traiga causalidad pre-existing', () => {
+  const l = decide(openLedger([f('quality', 'CRITICAL', { evidence: 'inferential' })], { artifact: true }), 'accept', ['F-1'])
+  const next = applyRound(l, 2, [{ id: 'F-1', answer: 'resolved' }], [grave('scope', 'pre-existing')])
+  assert.equal(next.artifact, true)
+  assert.deepEqual(next.entries.map((e) => [e.id, e.state]), [['F-1', 'resuelto'], ['F-2', 'abierto']])
+})

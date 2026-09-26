@@ -1,0 +1,11 @@
+{
+  "round": 1,
+  "launch": 1,
+  "state": "unavailable",
+  "worker_pid": 66570,
+  "supervisor_pid": 66561,
+  "started_at": "2026-09-26T14:25:20.749Z",
+  "reason": "jobs_incomplete",
+  "detail": "base-b1: done, risk-b1: launch_failed/unknown, resilience-b1: done, reliability-b1: done, readability-b1: done",
+  "ended_at": "2026-09-26T14:25:21.031Z"
+}

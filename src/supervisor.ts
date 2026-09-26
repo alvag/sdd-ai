@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 import { createInterface } from 'node:readline'
 import { type Outcome, type StreamFacts, classify, emptyFacts, scanLine } from './outcome.ts'
-import { type Admission, type AdmittedReview, type RoundReview, admit, admitRefutation, admitRound, parseLocation } from './review/admit.ts'
+import { type Admission, type AdmittedReview, type RoundReview, type Unverifiable, admit, admitRefutation, admitRound, parseLocation } from './review/admit.ts'
 import { sliceCandidate } from './review/batch.ts'
 import { type Candidate, readContextBlobs } from './review/candidate.ts'
 import {
@@ -20,7 +20,7 @@ import { readJson, setStatus, writeJsonAtomic } from './runs.ts'
 import type {
   AttemptKind, AttemptMetrics, Family, LaunchSpec, RejectedField, Resolution, ResumeInfo, RetryInfo, RunState, Status, WorkerTask,
 } from './types.ts'
-import { REFUTER_SYSTEM_PROMPT, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId } from './workers/claude.ts'
+import { ARTIFACT_SYSTEM_PROMPT, REFUTER_SYSTEM_PROMPT, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId } from './workers/claude.ts'
 import { codexResume, codexRetry, codexReviewLaunch, withResultFile } from './workers/codex.ts'
 
 /** Un revisor sobre un lote. `prompt` es la ruta de su prompt, ya medido y escrito por la CLI. */
@@ -78,12 +78,14 @@ export interface RefutationRecord {
 
 /** Una entrada de `rounds.json` por ronda lanzada, haya terminado o no. */
 export interface RoundRecord {
-  n: number; tag: string; candidate_hash: string; base_sha: string; head_sha: string | null
+  n: number; tag: string; candidate_hash: string; base_sha: string | null; head_sha: string | null
   state: RunState; reason?: string; detail?: string; started_at: string; ended_at: string
   extra: boolean; model_effective: string | null
   tool_events: string[]; retry?: RetryInfo; resume?: ResumeInfo
   refutation?: RefutationRecord
   launch?: number; risk?: RiskRecord; batches?: string[][]; jobs?: JobRecord[]
+  /** En un artefacto, lo que el revisor de esta ronda no pudo comprobar. */
+  unverifiable?: Unverifiable[]
 }
 
 const DEFAULT_RESUME_SEC = 300
@@ -352,6 +354,9 @@ const roundDegradations = (r: RoundRecord) => {
  * quién, con qué degradaciones y qué quedó. Son proyecciones; nadie los lee para decidir. Informa;
  * no autoriza.
  */
+/** Lo que dice el recibo de un artefacto: el veredicto no aprueba nada, el gate es de la persona. */
+export const ARTIFACT_NOTE = 'el veredicto informa; el gate del artefacto lo decide la persona'
+
 export function writeReceipt(dir: string): void {
   const ledger = readJson<Ledger>(join(dir, 'ledger.json'))
   const rounds = optionalJson<{ rounds: RoundRecord[] }>(join(dir, 'rounds.json'))?.rounds ?? []
@@ -363,9 +368,13 @@ export function writeReceipt(dir: string): void {
   const lastDone = rounds.filter((r) => r.state === 'done' || (r.state === 'cancelled' && r.refutation)).at(-1)
   const degradations = [...(request?.degradations ?? [])]
   for (const d of rounds.flatMap(roundDegradations)) if (!degradations.includes(d)) degradations.push(d)
+  const artifact = ledger.artifact === true
+  const informative = ledger.entries.filter((e) => e.state === 'informativo')
+    .map((e) => ({ id: e.id, of: e.of, severity: e.severity, claim: e.claim, location: e.location }))
   writeJsonAtomic(join(dir, 'verdict.json'), {
     ...axes, findings: standing(ledger).map(withProvenance),
     out_of_scope: ledger.entries.filter((e) => e.state === 'fuera-de-alcance').map(withProvenance),
+    ...(artifact ? { informative } : {}),
   })
   writeJsonAtomic(join(dir, 'receipt.json'), {
     candidate_hash: lastDone?.candidate_hash ?? null, base_sha: lastDone?.base_sha ?? null, head_sha: lastDone?.head_sha ?? null,
@@ -375,7 +384,8 @@ export function writeReceipt(dir: string): void {
       degradations: roundDegradations(r), tool_events: r.tool_events, ...(r.refutation ? { refutation: r.refutation } : {}),
       ...declaredBatches(r.batches), ...(r.jobs ? { jobs: r.jobs.map(jobSummary) } : {}),
     })),
-    selection: request?.selection ?? null, author: request?.author ?? null, risk: readRisk(request ?? {}),
+    selection: request?.selection ?? null, author: request?.author ?? null,
+    risk: artifact ? { level: 'no_aplica' } : readRisk(request ?? {}),
     reviewer: {
       family: resolved.family, model_requested: resolved.model ?? null,
       model_effective: lastDone?.model_effective ?? null, effort: resolved.effort ?? null,
@@ -383,7 +393,9 @@ export function writeReceipt(dir: string): void {
     degradations, tool_events: rounds.flatMap((r) => r.tool_events),
     axes, ledger: { ...ledger, entries: ledger.entries.map(withProvenance) },
     written_at: new Date().toISOString(),
-    note: 'informa; no autoriza commit ni push',
+    ...(artifact
+      ? { informative, unverifiable: lastDone?.unverifiable ?? [], note: ARTIFACT_NOTE }
+      : { note: 'informa; no autoriza commit ni push' }),
   })
 }
 
@@ -658,13 +670,14 @@ async function runJob(ctx: RunContext, job: ReviewJob, candidate: Candidate, pla
   const jctx: RunContext = { ...ctx, prefix, job: { reviewer: job.reviewer, batch: job.batch, launch: launchN } }
   const base = { key: job.key, reviewer: job.reviewer, batch: job.batch, launch: launchN, prompt_sha256: sha256(readFileSync(job.prompt)) }
   return withScratch(async (scratch) => {
-    const launch = reviewLaunch(resolution, job.prompt, join(dir, `result${prefix}.md`), scratch)
+    const launch = reviewLaunch(resolution, job.prompt, join(dir, `result${prefix}.md`), scratch, candidate.subject ? ARTIFACT_SYSTEM_PROMPT : undefined)
     const r = await runAttempts(jctx, launch, Date.now() + argv.deadline_sec * 1000, resumeSec, 'review')
     const extras = { ...(r.retry ? { retry: r.retry } : {}), ...(r.resume ? { resume: r.resume } : {}) }
     if (r.outcome.state !== 'done') {
       return { ...base, ...outcomeFields(r.outcome), model_effective: r.last.facts.model ?? null, tool_events: r.toolEvents, ...extras }
     }
-    const view = sliceCandidate(candidate, job.paths)
+    // Un artefacto es un solo trabajo con todo el material: no hay lotes que recortar.
+    const view = candidate.subject ? candidate : sliceCandidate(candidate, job.paths)
     const fix: Fix = { name: `${prefix}-fix`, suffix: '-fix', kind: 'correction' }
     const phase: Phase<AdmittedReview | RoundReview> = plan
       ? await admitPhase(jctx, r.current, r.last, resumeSec, (t) => admitRound(t, view, narrow(plan, job)), fix)
@@ -691,11 +704,12 @@ type Admitted = JobRecord & { admitted: string }
  * Abre o avanza el ledger una sola vez, con las respuestas de todos los trabajos. La procedencia la
  * anota el código y los hallazgos entran en el orden fijo: base, lentes y lote.
  */
-function advance(ctx: RunContext, records: Admitted[], plan: RoundPlan | undefined): Ledger {
+function advance(ctx: RunContext, records: Admitted[], plan: RoundPlan | undefined, candidate: Candidate): Ledger {
   const withProvenance = <T extends { findings: AdmittedReview['findings'] }>(r: Admitted, review: T) =>
     review.findings.map((f) => ({ ...f, reviewer: r.reviewer, batch: r.batch }))
   if (!plan) {
-    return openLedger(byProvenance(records.flatMap((r) => withProvenance(r, readJson<AdmittedReview>(join(ctx.dir, r.admitted))))))
+    return openLedger(byProvenance(records.flatMap((r) => withProvenance(r, readJson<AdmittedReview>(join(ctx.dir, r.admitted))))),
+      { artifact: candidate.subject !== undefined })
   }
   const reviews = records.map((r) => ({ r, review: readJson<RoundReview>(join(ctx.dir, r.admitted)) }))
   return applyRound(readJson<Ledger>(join(ctx.dir, 'ledger.json')), ctx.round, reviews.flatMap((x) => x.review.responses),
@@ -742,9 +756,10 @@ async function superviseReview(ctx: RunContext, resumeSec: number): Promise<Stat
     outcome = { state: 'cancelled' }
   } else if (admitted.length === ordered.length) {
     // El ledger se escribe antes de refutar: un cancel en la refutación deja la ronda con sus respuestas.
-    const ledger = advance(ctx, admitted, plan)
+    const ledger = advance(ctx, admitted, plan, candidate)
     writeJsonAtomic(join(dir, 'ledger.json'), ledger)
-    const batch = refutationBatch(ledger, ctx.round)
+    // Un artefacto no se refuta: casi todo hallazgo sobre un documento es inferencial.
+    const batch = candidate.subject ? [] : refutationBatch(ledger, ctx.round)
     const r = batch.length > 0 ? await refute(ctx, candidate, ledger, batch, resumeSec, launchN) : undefined
     refutation = r?.record
     outcome = { state: r?.cancelled ? 'cancelled' : 'done' }
@@ -752,12 +767,15 @@ async function superviseReview(ctx: RunContext, resumeSec: number): Promise<Stat
     outcome = { state: 'unavailable', reason: 'jobs_incomplete', detail: ordered.map(jobState).join(', ') }
   }
 
+  const unverifiable = candidate.subject && outcome.state === 'done' && admitted.length > 0
+    ? readJson<AdmittedReview | RoundReview>(join(dir, admitted[0].admitted)).unverifiable ?? []
+    : undefined
   appendRound(dir, {
     n: ctx.round, tag: ctx.tag, candidate_hash: candidate.hash, base_sha: candidate.base_sha, head_sha: candidate.head_sha,
     ...outcomeFields(outcome), started_at: startedAt, ended_at: new Date().toISOString(), extra: argv.extra ?? false,
     model_effective: ordered[0]?.model_effective ?? null, tool_events: ordered.flatMap((r) => r.tool_events),
     launch: launchN, ...(argv.risk ? { risk: argv.risk } : {}), ...(argv.batches ? { batches: argv.batches } : {}),
-    jobs: ordered, ...(refutation ? { refutation } : {}),
+    jobs: ordered, ...(refutation ? { refutation } : {}), ...(unverifiable ? { unverifiable } : {}),
   })
   if (existsSync(join(dir, 'ledger.json'))) writeReceipt(dir)
   const patch: Partial<Status> = { ...outcome, ended_at: new Date().toISOString(), round: ctx.round, job: undefined }

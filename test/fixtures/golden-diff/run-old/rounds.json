@@ -1,0 +1,89 @@
+{
+  "rounds": [
+    {
+      "n": 1,
+      "tag": "",
+      "candidate_hash": "sha256:e48ea63ba45a302b0c17905eb22caf23a10c300a1a51e4ce831fc6883669ea31",
+      "base_sha": "ad45d61580c61baefc14bed670d82c5d845ad26f",
+      "head_sha": null,
+      "state": "unavailable",
+      "reason": "jobs_incomplete",
+      "detail": "base-b1: done, risk-b1: launch_failed/unknown, resilience-b1: done, reliability-b1: done, readability-b1: done",
+      "started_at": "2026-09-26T14:25:20.746Z",
+      "ended_at": "2026-09-26T14:25:21.030Z",
+      "extra": false,
+      "model_effective": "claude-falso",
+      "tool_events": [],
+      "launch": 1,
+      "risk": {
+        "level": "high",
+        "classified": "normal",
+        "reasons": [],
+        "forced": true
+      },
+      "batches": [
+        [
+          "a.txt"
+        ]
+      ],
+      "jobs": [
+        {
+          "key": "base-b1",
+          "reviewer": "base",
+          "batch": 1,
+          "launch": 1,
+          "prompt_sha256": "6a709ec7fe52b4f669b0fed7bf480602f451d3db908d3d23edf33d7a60002462",
+          "state": "done",
+          "admitted": "admitted-l1-base-b1.json",
+          "model_effective": "claude-falso",
+          "tool_events": []
+        },
+        {
+          "key": "risk-b1",
+          "reviewer": "risk",
+          "batch": 1,
+          "launch": 1,
+          "prompt_sha256": "4f7984b53b2280f8eba36d705cd3a7ad5d6280411cf749d54b4cf3ceb4e9543c",
+          "state": "launch_failed",
+          "reason": "unknown",
+          "detail": "fake-cli: falla guionada",
+          "model_effective": null,
+          "tool_events": []
+        },
+        {
+          "key": "resilience-b1",
+          "reviewer": "resilience",
+          "batch": 1,
+          "launch": 1,
+          "prompt_sha256": "07f6c5bee414d6ec5e09db524638d81761520ed7714eda78c67ee4d8c75fccad",
+          "state": "done",
+          "admitted": "admitted-l1-resilience-b1.json",
+          "model_effective": "claude-falso",
+          "tool_events": []
+        },
+        {
+          "key": "reliability-b1",
+          "reviewer": "reliability",
+          "batch": 1,
+          "launch": 1,
+          "prompt_sha256": "e2eaf0fd0c6d0c0ac73777ad7f856353177941e2f473a853b9f47589d651ad29",
+          "state": "done",
+          "admitted": "admitted-l1-reliability-b1.json",
+          "model_effective": "claude-falso",
+          "tool_events": []
+        },
+        {
+          "key": "readability-b1",
+          "reviewer": "readability",
+          "batch": 1,
+          "launch": 1,
+          "prompt_sha256": "d2757940c5e649b9f8584fb2068e89d843fc5b0c22b3d4cbc81673ed6e013192",
+          "state": "done",
+          "admitted": "admitted-l1-readability-b1.json",
+          "model_effective": "claude-falso",
+          "tool_events": []
+        }
+      ]
+    }
+  ]
+}

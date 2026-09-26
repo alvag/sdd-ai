@@ -11,7 +11,9 @@ import { type Candidate, freeze, snapshot } from '../src/review/candidate.ts'
 import { type Ledger, type Reviewer, type RoundPlan, decide, openLedger, targets } from '../src/review/ledger.ts'
 import { CORRECTION_RESERVE, REVIEW_PROMPT_BUDGET, renderMaterial, renderReviewPrompt, renderRoundPrompt } from '../src/review/prompt.ts'
 import { type ArgvFile, cleanEnv, removeScratch, supervise, writeReceipt } from '../src/supervisor.ts'
-import { REFUTER_SYSTEM_PROMPT } from '../src/workers/claude.ts'
+import { ARTIFACT_SYSTEM_PROMPT, REFUTER_SYSTEM_PROMPT } from '../src/workers/claude.ts'
+import { renderArtifactMaterial, renderArtifactPrompt } from '../src/review/artifact-prompt.ts'
+import { freezeArtifact } from '../src/review/artifact.ts'
 import { type Family, type Resolution, opposite } from '../src/types.ts'
 import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
@@ -976,4 +978,81 @@ test('un cancel durante la corrección del refutador deja la ronda cancelled', a
   const s = await running
   assert.equal(s.state, 'cancelled')
   assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'cancelled' })
+})
+
+/** Una ronda 1 de artefacto preparada como la deja la CLI: un solo trabajo, sin resolución de refutador. */
+function prepareArtifactRound(family: Family, answers: string[]): { dir: string; argvName: string } {
+  const repo = makeRepo()
+  mkdirSync(join(repo, '.plans'))
+  writeFileSync(join(repo, '.plans', 'spec.md'), '# Spec\n\n- AC-1: algo observable.\n')
+  writeFileSync(join(repo, '.plans', 'plan.md'), '# Plan\n\nAC-1 se cumple con resolve.\n')
+  const sel = { artifact: '.plans/plan.md', kind: 'plan' as const, inputs: [{ role: 'spec' as const, path: '.plans/spec.md' }], context: [] }
+  const { candidate: c, bytes } = freezeArtifact(repo, sel)
+  const dir = createRun(repo, 'a')
+  writeJsonAtomic(join(dir, 'candidate.json'), c)
+  snapshot(repo, c, dir, bytes)
+  const prompt = join(dir, 'prompt-l1-base-b1.md')
+  writeFileSync(prompt, renderArtifactPrompt(c, renderArtifactMaterial(c, bytes)))
+  writeJsonAtomic(join(dir, 'request.json'), { kind: 'review', selection: sel, author: opposite(family), degradations: [] })
+  const reviewer = resolution(family, { model: 'm', effort: 'high', origin: { model: 'workers', effort: 'workers' } })
+  writeJsonAtomic(join(dir, 'resolved.json'), reviewer)
+  isolate(family)
+  const argv: ArgvFile = {
+    family, kind: 'review', candidate: join(dir, 'candidate.json'), deadline_sec: 30, grace_ms: 200, resume_sec: 5,
+    round: 1, tag: '', launch_n: 1, reviewer_resolution: reviewer,
+    jobs: [{ key: 'base-b1', reviewer: 'base', batch: 1, paths: ['.plans/plan.md'], prompt }],
+  }
+  writeJsonAtomic(join(dir, 'argv-l1.json'), argv)
+  writeJsonAtomic(join(dir, 'answers.json'), answers)
+  process.env.FAKE_MODE = 'scripted'
+  process.env.FAKE_ANSWERS = join(dir, 'answers.json')
+  process.env.FAKE_CALLS_FILE = join(dir, 'calls')
+  process.env.FAKE_PID_FILE = join(dir, 'pids')
+  return { dir, argvName: 'argv-l1.json' }
+}
+
+const artifactRound = (findings: unknown[], unverifiable: unknown[] = []) =>
+  `{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":$PATHS},"findings":${JSON.stringify(findings)},"unverifiable":${JSON.stringify(unverifiable)}}`
+const planGrave = { of: '.plans/plan.md', axis: 'spec', severity: 'CRITICAL', location: '.plans/plan.md:3', claim: 'AC-1 no tiene mecanismo', evidence: 'inferential' }
+
+test('un artefacto corre un solo trabajo contra el candidato entero, con su system prompt', async () => {
+  const { dir, argvName } = prepareArtifactRound('claude', [artifactRound([])])
+  const s = await supervise(dir, argvName)
+  assert.equal(s.state, 'done')
+  assert.equal(calls(dir).length, 1)
+  assert.equal(calls(dir)[0][calls(dir)[0].indexOf('--system-prompt') + 1], ARTIFACT_SYSTEM_PROMPT)
+})
+
+test('una revisión de artefacto nunca lanza el refutador', async () => {
+  // Con causality introduced, un diff mandaría este hallazgo al refutador.
+  const { dir, argvName } = prepareArtifactRound('claude', [artifactRound([{ ...planGrave, causality: 'introduced' }]), '__fail__'])
+  const s = await supervise(dir, argvName)
+  assert.equal(s.state, 'done')
+  assert.equal(calls(dir).length, 1)
+  const l = ledgerOf(dir)
+  assert.deepEqual([l.artifact, l.entries.map((e) => [e.id, e.state])], [true, [['F-1', 'abierto']]])
+  assert.equal(readRunJson(dir, 'rounds.json').rounds[0].refutation, undefined)
+  assert.deepEqual(scratches(tmpdir()).filter((n) => n.includes('refute')), [])
+})
+
+test('las no verificables no cuentan para el veredicto', async () => {
+  const { dir, argvName } = prepareArtifactRound('codex', [artifactRound([], [{ location: '.plans/plan.md:3', claim: 'no viajó resolve' }])])
+  await supervise(dir, argvName)
+  const verdict = readRunJson(dir, 'verdict.json')
+  assert.deepEqual([verdict.scope, verdict.spec, verdict.quality], ['ok', 'ok', 'ok'])
+  assert.deepEqual(readRunJson(dir, 'rounds.json').rounds[0].unverifiable, [{ location: '.plans/plan.md:3', claim: 'no viajó resolve' }])
+  assert.deepEqual(readRunJson(dir, 'receipt.json').unverifiable, [{ location: '.plans/plan.md:3', claim: 'no viajó resolve' }])
+})
+
+test('el recibo de un artefacto dice que el gate lo decide la persona y no menciona commit ni push', async () => {
+  const informative = { ...planGrave, of: '.plans/spec.md', location: '.plans/spec.md:3', claim: 'la spec se contradice' }
+  const { dir, argvName } = prepareArtifactRound('claude', [artifactRound([planGrave, informative])])
+  await supervise(dir, argvName)
+  const receipt = readRunJson(dir, 'receipt.json')
+  assert.equal(receipt.note, 'el veredicto informa; el gate del artefacto lo decide la persona')
+  assert.doesNotMatch(JSON.stringify({ note: receipt.note }), /commit|push/)
+  assert.deepEqual(receipt.risk, { level: 'no_aplica' })
+  assert.deepEqual(receipt.informative, [{ id: 'F-2', of: '.plans/spec.md', severity: 'CRITICAL', claim: 'la spec se contradice', location: '.plans/spec.md:3' }])
+  assert.deepEqual(readRunJson(dir, 'verdict.json').informative, receipt.informative)
+  assert.equal(readRunJson(dir, 'verdict.json').spec, 'fail')
 })

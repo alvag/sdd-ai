@@ -11,18 +11,22 @@ import { doctor } from './doctor.ts'
 import { repoRoot } from './git.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { nativeProfile, resolve } from './resolve.ts'
+import { renderArtifactMaterial, renderArtifactPrompt, renderArtifactRoundPrompt } from './review/artifact-prompt.ts'
 import {
-  type Candidate, type Selection, changedRanges, freeze, freezeStable, readContext, snapshot,
+  type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, validateArtifactArgs,
+} from './review/artifact.ts'
+import {
+  type Candidate, type Selection, baseOf, changedRanges, freeze, freezeStable, freezeStableWith, readContext, snapshot,
 } from './review/candidate.ts'
 import { type PlannedJob, planJobs, planRoundJobs, sliceCandidate } from './review/batch.ts'
 import {
   type Ledger, REVIEWERS, type Reviewer, type RoundPlan, axesOf, decide, targets, undecided, withProvenance,
 } from './review/ledger.ts'
-import { renderMaterial, renderReviewPrompt } from './review/prompt.ts'
+import { fits, renderMaterial, renderReviewPrompt } from './review/prompt.ts'
 import { type Risk, type RiskRecord, classify, classifyDelta, readRisk } from './review/risk.ts'
 import { createRun, isAlive, newRunId, readJson, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
 import {
-  type ArgvFile, type JobRecord, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, supervise, writeReceipt,
+  ARTIFACT_NOTE, type ArgvFile, type JobRecord, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, supervise, writeReceipt,
 } from './supervisor.ts'
 import {
   type Conductor, type Family, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
@@ -197,7 +201,8 @@ function launchSupervisor(dir: string, argv: ArgvFile, env: Env, status: Partial
 }
 
 interface ReviewRequest {
-  kind: 'review'; selection: Selection; author: Family; degradations: string[]
+  /** Un diff, o un artefacto con sus insumos: una corrida anterior a los artefactos siempre es un diff. */
+  kind: 'review'; selection: Selection | ArtifactSelection; author: Family; degradations: string[]
   overrides?: { families?: string; model?: string; effort?: string; deadline_sec?: number }
   /** El nivel congelado al empezar; una corrida anterior a la clasificación no lo trae. */
   risk?: RiskRecord
@@ -222,9 +227,16 @@ function writeJobs(dir: string, prefix: string, jobs: PlannedJob[]): ReviewJob[]
   })
 }
 
+/** La selección de un diff. Solo se llama en ramas de diff: un artefacto tiene la suya. */
+function diffSelection(req: ReviewRequest): Selection {
+  if (isArtifact(req.selection)) throw new Error('la revisión es de un artefacto, no de un diff')
+  return req.selection
+}
+
 /** Un delta con riesgo alto: la ronda no corre y se propone reiniciar con lentes, con el mismo head. */
 function riskHigh(req: ReviewRequest, delta: Risk, head: string | undefined): SddError {
-  const selection: Selection = { base: req.selection.base, context: req.selection.context }
+  const sel = diffSelection(req)
+  const selection: Selection = { base: sel.base, context: sel.context }
   if (head) selection.head = head
   const restart = restartCommand({ ...req, selection, risk: { ...readRisk(req), forced: true } })
   return new SddError('risk_high', 'la corrección introduce riesgo alto', {
@@ -254,12 +266,25 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
       'conductor-effort': { type: 'string' },
       deadline: { type: 'string', default: '1800' },
       risk: { type: 'string' },
+      artifact: { type: 'string' },
+      kind: { type: 'string' },
+      request: { type: 'string' },
+      spec: { type: 'string' },
+      plan: { type: 'string' },
     },
   })
   if (env.SDD_AI_WORKER === '1') {
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   }
-  if (!values.base) throw new SddError('usage', 'falta --base', { next: './bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>] [--risk high]' })
+  const abs = (p: string) => (isAbsolute(p) ? p : resolvePath(cwd, p))
+  let artifact: ArtifactSelection | undefined
+  if (values.artifact !== undefined) {
+    const { kind, inputs } = validateArtifactArgs(values)
+    artifact = { artifact: abs(values.artifact), kind, inputs: inputs.map((i) => ({ role: i.role, path: abs(i.path) })), context: values.context.map(abs) }
+  } else if (values.kind !== undefined || values.request !== undefined || values.spec !== undefined || values.plan !== undefined) {
+    throw new SddError('usage', '--kind, --request, --spec y --plan solo se usan con --artifact')
+  }
+  if (!artifact && !values.base) throw new SddError('usage', 'falta --base', { next: './bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>] [--risk high]' })
   if (values.risk !== undefined && values.risk !== 'high') {
     throw new SddError('usage', '--risk solo acepta high: el nivel se sube, nunca se baja')
   }
@@ -280,13 +305,20 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   const workers = loadWorkers(root)
   const codexRoot = loadCodexRoot(env)
   // El autor ocupa el lugar del conductor: la familia opuesta a él es la que revisa.
-  const resolution = resolve({ conductor: { family: author }, families, workers, role: 'code-review', flags, codexRoot })
+  const role = artifact ? 'design-review' : 'code-review'
+  const resolution = resolve({ conductor: { family: author }, families, workers, role, flags, codexRoot })
   const family = resolution.family
   const degradations = family === author ? ['same_family'] : []
+  if (artifact) {
+    return startArtifact({
+      root, env, sel: artifact, family, resolution, author, degradations, conductor, deadline,
+      overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline },
+    })
+  }
   // El refutador es de la familia del revisor, con el perfil de su propio rol.
   const refuter = resolve({ conductor: { family: opposite(family) }, families: [family], workers, role: 'refute', flags: {}, codexRoot })
 
-  const selection: Selection = { base: values.base, context: values.context.map((p) => (isAbsolute(p) ? p : resolvePath(cwd, p))) }
+  const selection: Selection = { base: values.base ?? '', context: values.context.map(abs) }
   if (values.head) selection.head = values.head
   const candidate = freezeStable(root, selection)
   const classified = classify(candidate)
@@ -334,6 +366,14 @@ function shellArg(s: string): string {
 }
 
 function restartCommand(req: ReviewRequest): string {
+  if (isArtifact(req.selection)) {
+    const sel = req.selection
+    const parts = ['./bin/sdd-ai review start', `--artifact ${shellArg(sel.artifact)}`, `--kind ${sel.kind}`]
+    for (const i of sel.inputs) parts.push(`--${i.role} ${shellArg(i.path)}`)
+    for (const c of sel.context) parts.push(`--context ${shellArg(c)}`)
+    parts.push(`--author ${req.author}`)
+    return parts.join(' ')
+  }
   const parts = ['./bin/sdd-ai review start', `--base ${shellArg(req.selection.base)}`]
   if (req.selection.head) parts.push(`--head ${shellArg(req.selection.head)}`)
   for (const c of req.selection.context) parts.push(`--context ${shellArg(c)}`)
@@ -356,24 +396,45 @@ function resolvesTo(root: string, ref: string | undefined, sha: string | null): 
  * se movió; sin `--head`, reconstruye con la misma base y el mismo contexto sobre el árbol. Si la
  * reconstrucción falla, cuenta como `stale`.
  */
-function freshness(root: string, req: ReviewRequest, c: Candidate, head: string | undefined): { stale: boolean; ref_moved?: boolean } {
+interface Freshness { stale: boolean; ref_moved?: boolean; stale_reason?: 'inputs' | 'artifact' }
+
+function freshness(root: string, req: ReviewRequest, c: Candidate, head: string | undefined): Freshness {
+  if (isArtifact(req.selection)) return artifactFreshness(root, req.selection, c)
+  const sel = req.selection
   try {
     if (c.head_sha) {
-      const again = freeze(root, { base: c.base_sha, head: c.head_sha, context: req.selection.context })
-      const moved = !resolvesTo(root, head, c.head_sha) || !resolvesTo(root, req.selection.base, c.base_sha)
+      const again = freeze(root, { base: baseOf(c), head: c.head_sha, context: sel.context })
+      const moved = !resolvesTo(root, head, c.head_sha) || !resolvesTo(root, sel.base, c.base_sha)
       return { stale: again.hash !== c.hash, ref_moved: moved }
     }
-    return { stale: freeze(root, { base: req.selection.base, context: req.selection.context }).hash !== c.hash }
+    return { stale: freeze(root, { base: sel.base, context: sel.context }).hash !== c.hash }
   } catch {
     return { stale: true }
   }
 }
 
+/**
+ * Vigencia de un artefacto, sin Git: primero los insumos y el contexto, porque un cambio ahí invalida la
+ * revisión entera; después el artefacto, que cambia a propósito entre rondas.
+ */
+function artifactFreshness(root: string, sel: ArtifactSelection, c: Candidate): Freshness {
+  if (!inputsUnchanged(root, c)) return { stale: true, stale_reason: 'inputs' }
+  try {
+    return freezeArtifact(root, sel).candidate.hash === c.hash ? { stale: false } : { stale: true, stale_reason: 'artifact' }
+  } catch (e) {
+    if (e instanceof SddError) return { stale: true, stale_reason: 'artifact' }
+    throw e
+  }
+}
+
+const inputsChanged = (id: string, req: ReviewRequest) =>
+  `cambió un insumo o el contexto desde la revisión y la corrida ya no se puede seguir; revisa de nuevo: ${restartCommand(req)} (${id} queda como historial)`
+
 const tagOf = (n: number) => (n === 1 ? '' : `-r${n}`)
 
 /** El ref que revisó la ronda `n`: el de `review start` en la 1, el de su `round-r<n>.json` después. */
 function headOf(dir: string, req: ReviewRequest, n: number): string | undefined {
-  if (n === 1) return req.selection.head
+  if (n === 1) return isArtifact(req.selection) ? undefined : req.selection.head
   const file = join(dir, `round${tagOf(n)}.json`)
   return existsSync(file) ? readJson<RoundPlan>(file).head : undefined
 }
@@ -391,8 +452,10 @@ function relaunchNext(id: string, dir: string, req: ReviewRequest, s: Status, ro
  * El paso siguiente, por prioridad: esperar, relanzar una ronda que no terminó, decidir, preguntar
  * por las disputas, el checkpoint del tope, corregir y lanzar, y por último la vigencia.
  */
-function roundNext(id: string, dir: string, req: ReviewRequest, s: Status, round: number, ledger: Ledger, stale: boolean): string {
+function roundNext(id: string, dir: string, req: ReviewRequest, s: Status, round: number, ledger: Ledger, fresh: Freshness): string {
   if (!TERMINAL.has(s.state)) return `./bin/sdd-ai wait ${id}`
+  // Con un insumo cambiado, decidir o relanzar sería trabajo perdido: review round lo va a rechazar.
+  if (fresh.stale_reason === 'inputs') return inputsChanged(id, req)
   // Una ronda que avanzó el ledger ya terminó aunque la hayan cancelado en la refutación.
   if (s.state !== 'done' && ledger.completed !== round) return relaunchNext(id, dir, req, s, round, ledger.completed)
   const disputes = ledger.entries.filter((e) => e.state === 'en-disputa').map((e) => e.id)
@@ -410,7 +473,11 @@ function roundNext(id: string, dir: string, req: ReviewRequest, s: Status, round
   const verify = goals.filter((t) => t.kind === 'verify').map((t) => t.id)
   if (verify.length > 0) return `corrige los aceptados (${verify.join(', ')}) y lanza ./bin/sdd-ai review round ${id}`
   if (goals.length > 0) return `lanza ./bin/sdd-ai review round ${id} para que el revisor responda los rechazos`
-  if (stale) return `el diff cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
+  if (isArtifact(req.selection)) {
+    if (fresh.stale) return `el artefacto cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
+    return `la revisión está vigente; ${ARTIFACT_NOTE}`
+  }
+  if (fresh.stale) return `el diff cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
   return 'la revisión está vigente; el recibo informa y no autoriza commit ni push'
 }
 
@@ -440,10 +507,21 @@ function roundShape(dir: string, s: Status, round: number): Record<string, unkno
   return { reviewers: reviewersOf(jobs), ...declaredBatches(last?.batches), ...(jobs.length > 0 ? { jobs: jobs.map(jobSummary) } : {}) }
 }
 
-/** El nivel congelado, con sus motivos y si se subió a mano. */
-function riskView(req: ReviewRequest): { level: string; reasons: unknown[]; forced: boolean } {
+/** El nivel congelado, con sus motivos y si se subió a mano. Un artefacto no se clasifica. */
+function riskView(req: ReviewRequest): Record<string, unknown> {
+  if (isArtifact(req.selection)) return { level: 'no_aplica' }
   const r = readRisk(req)
   return { level: r.level, reasons: r.reasons, forced: r.forced }
+}
+
+/** Lo propio de un artefacto: los hallazgos de otros archivos, lo que no se pudo comprobar y de quién es el gate. */
+function artifactView(ledger: Ledger, rounds: RoundRecord[]): Record<string, unknown> {
+  return {
+    informative: ledger.entries.filter((e) => e.state === 'informativo')
+      .map((e) => ({ id: e.id, of: e.of, severity: e.severity, claim: e.claim, location: e.location })),
+    unverifiable: rounds.filter((r) => r.state === 'done').at(-1)?.unverifiable ?? [],
+    note: ARTIFACT_NOTE,
+  }
 }
 
 /** Lo que el conductor necesita de una revisión: estado, revisor, ledger, ejes, vigencia y el paso siguiente. */
@@ -463,11 +541,13 @@ function reviewView(root: string, id: string, dir: string, s: Status): Result {
   const ledgerFile = join(dir, 'ledger.json')
   if (!existsSync(ledgerFile)) {
     const c = readJson<Candidate>(join(dir, 'candidate.json'))
+    const fresh = freshness(root, req, c, headOf(dir, req, 1))
     const out: Record<string, unknown> = {
       id, state: s.state, round, candidate_hash: c.hash, reviewer, degradations: req.degradations, risk: riskView(req),
-      ...roundShape(dir, s, round), ...freshness(root, req, c, req.selection.head), ...common,
+      ...roundShape(dir, s, round), ...fresh, ...common,
     }
     if (!TERMINAL.has(s.state)) out.next = `./bin/sdd-ai wait ${id}`
+    else if (fresh.stale_reason === 'inputs') out.next = inputsChanged(id, req)
     else out.next = relaunchNext(id, dir, req, s, round, 0)
     return { code, out }
   }
@@ -489,8 +569,9 @@ function reviewView(root: string, id: string, dir: string, s: Status): Result {
     inconclusive: ledger.entries.flatMap((e) => (e.state !== 'refutado' && e.refutation?.result === 'inconclusive'
       ? [{ id: e.id, reason: e.refutation.reason ?? 'refuter_inconclusive' }] : [])),
     tool_events: rounds.filter((r) => r.state === 'done').at(-1)?.tool_events ?? receipt.tool_events,
+    ...(ledger.artifact ? artifactView(ledger, rounds) : {}),
     ...common,
-    next: roundNext(id, dir, req, s, round, ledger, fresh.stale),
+    next: roundNext(id, dir, req, s, round, ledger, fresh),
   }
   return { code, out }
 }
@@ -528,6 +609,197 @@ function planFirstRound(c: Candidate, contextTexts: Map<string, string>, risk: R
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex')
 
 /**
+ * Un artefacto que no entra en el presupuesto, con el tamaño de cada archivo. Si entra con sus insumos
+ * obligatorios, lo que sobra es `--context`; si no, review no puede revisar esa combinación.
+ */
+/**
+ * En la ronda N el contexto no se puede cambiar sin un `review start` nuevo, que empieza en la ronda 1 y sin
+ * CAMBIOS; por eso el `next` se elige midiendo el prompt de esa ronda 1 y no el de la ronda que no entró.
+ */
+function artifactTooLarge(c: Candidate, bytes: Map<string, Buffer>, inRound = false): SddError {
+  const sizes = [c.files[0], ...c.context].map((x) => `${x.path}: ${bytes.get(x.path)?.length ?? 0} bytes`).join(', ')
+  const firstRoundFits = (x: Candidate) => fits(renderArtifactPrompt(x, renderArtifactMaterial(x, bytes)))
+  const required = { ...c, context: c.context.filter((x) => x.role) }
+  let next = 'review no puede revisar esta combinación de artefacto e insumos: no entra en el presupuesto ni sin --context'
+  if (inRound && firstRoundFits(c)) next = 'la corrección no entra en una ronda: corre un review start nuevo sobre el artefacto corregido'
+  else if (firstRoundFits(required)) {
+    next = `${inRound ? 'corre un review start nuevo sin archivos de --context' : 'quita archivos de --context'}: el artefacto con sus insumos obligatorios sí entra`
+  }
+  const message = inRound ? 'la ronda con el artefacto corregido no entra en el presupuesto' : 'el artefacto con sus insumos y su contexto no entra en el presupuesto'
+  return new SddError('prompt_too_large', message, { detail: sizes, next })
+}
+
+/** La ronda 1 de un artefacto: un solo trabajo, sin lotes ni lentes, medido antes de crear nada. */
+function planArtifactRound1(c: Candidate, bytes: Map<string, Buffer>): PlannedJob[] {
+  const text = renderArtifactPrompt(c, renderArtifactMaterial(c, bytes))
+  if (!fits(text)) throw artifactTooLarge(c, bytes)
+  return [{ key: 'base-b1', reviewer: 'base', batch: 1, paths: [c.files[0].path], text }]
+}
+
+/**
+ * `review start` de un artefacto: lo congela con sus insumos, mide el prompt y lanza al revisor con el
+ * perfil de `design-review`. No clasifica riesgo ni resuelve refutador: un artefacto no los usa.
+ */
+function startArtifact(o: {
+  root: string; env: Env; sel: ArtifactSelection; family: Family; resolution: Resolution; author: Family
+  degradations: string[]; conductor: Conductor; deadline: number; overrides: ReviewRequest['overrides']
+}): Result {
+  const { candidate, bytes } = freezeStableWith(o.root, o.sel, freezeArtifact, (r) => r.candidate.hash)
+  const jobs = planArtifactRound1(candidate, bytes)
+  if (!inPath(o.family, o.env)) {
+    throw new SddError('cli_missing', `${o.family} no está en PATH`, { next: `revisa con --families ${opposite(o.family)} y acepta la degradación` })
+  }
+  const id = newRunId()
+  const dir = createRun(o.root, id)
+  const planned = writeJobs(dir, '-l1', jobs)
+  writeJsonAtomic(join(dir, 'candidate.json'), candidate)
+  const request: ReviewRequest & Record<string, unknown> = {
+    kind: 'review', selection: o.sel, author: o.author, degradations: o.degradations, conductor: o.conductor, overrides: o.overrides,
+  }
+  writeJsonAtomic(join(dir, 'request.json'), request)
+  writeJsonAtomic(join(dir, 'resolved.json'), o.resolution)
+  writeFileSync(join(dir, 'material.md'), renderArtifactMaterial(candidate, bytes))
+  snapshot(o.root, candidate, dir, bytes)
+  launchSupervisor(dir, {
+    family: o.family, deadline_sec: o.deadline, kind: 'review', candidate: join(dir, 'candidate.json'), round: 1, tag: '', launch_n: 1,
+    reviewer_resolution: o.resolution, jobs: planned,
+  }, o.env, { round: 1, launch: 1 }, 'argv-l1.json')
+  return {
+    code: 0,
+    out: {
+      id, via: 'process', family: o.family, degradations: o.degradations, candidate_hash: candidate.hash,
+      artifact: candidate.files[0].path, kind: o.sel.kind,
+      inputs: candidate.context.filter((x) => x.role).map((x) => ({ role: x.role, path: x.path })),
+      context: candidate.context.filter((x) => !x.role).map((x) => x.path),
+      risk: { level: 'no_aplica' }, reviewers: ['base'], next: `./bin/sdd-ai wait ${id}`,
+    },
+  }
+}
+
+/**
+ * La ronda siguiente de un artefacto, o el relanzamiento de una que no terminó. El orden importa: primero
+ * los insumos, porque si cambiaron la corrida ya no se puede seguir y decidir antes sería trabajo
+ * perdido; después las decisiones pendientes; después el artefacto, que cambia a propósito.
+ */
+async function reviewRoundArtifact(o: {
+  root: string; dir: string; id: string; req: ReviewRequest; sel: ArtifactSelection; head?: string; extra: boolean; env: Env
+}): Promise<Result> {
+  const { root, dir, id, req, sel } = o
+  if (o.head !== undefined) {
+    throw new SddError('usage', 'una ronda de artefacto no acepta --head: el artefacto se revisa desde el árbol')
+  }
+  const ledgerFile = join(dir, 'ledger.json')
+  const ledger = existsSync(ledgerFile) ? readJson<Ledger>(ledgerFile) : undefined
+  const completed = ledger?.completed ?? 0
+  if (o.extra && completed < ROUND_CAP) {
+    throw new SddError('usage', `--extra solo concede una ronda más allá del tope de ${ROUND_CAP}; esta revisión completó ${completed}`, {
+      next: `./bin/sdd-ai review round ${id}`,
+    })
+  }
+  const first = readJson<Candidate>(join(dir, 'candidate.json'))
+  const prev = ledger ? readJson<Candidate>(join(dir, `candidate${tagOf(completed)}.json`)) : first
+  const changedInputs = () => new SddError('usage', 'cambió un insumo o el contexto desde la ronda anterior', { next: inputsChanged(id, req) })
+  if (!inputsUnchanged(root, prev)) throw changedInputs()
+  const goals = ledger ? targets(ledger) : []
+  if (ledger) {
+    const pending = undecided(ledger)
+    if (pending.length > 0) {
+      throw new SddError('usage', `hay hallazgos sin decidir: ${pending.join(', ')}`, {
+        next: `./bin/sdd-ai review decide ${id} accept|reject ${pending.join(' ')} [--reason <motivo>]`,
+      })
+    }
+    if (goals.length === 0) {
+      throw new SddError('usage', 'no hay nada que verificar ni responder', { next: `./bin/sdd-ai review status ${id}` })
+    }
+    if (completed >= ROUND_CAP && !o.extra) {
+      throw new SddError('round_cap', `la revisión ya hizo ${ROUND_CAP} rondas y quedan hallazgos vigentes`, {
+        next: `pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está`,
+      })
+    }
+  }
+
+  const n = completed + 1
+  const tag = tagOf(n)
+  const { candidate, bytes } = freezeStableWith(root, sel, freezeArtifact, (r) => r.candidate.hash)
+  // Un insumo que cambió entre la validación y el congelado también invalida la corrida.
+  const same = (a: Candidate['context'], b: Candidate['context']) =>
+    a.length === b.length && a.every((x, i) => x.path === b[i].path && x.role === b[i].role && x.sha256 === b[i].sha256)
+  if (!same(candidate.context, prev.context)) throw changedInputs()
+  const identical = candidate.hash === prev.hash
+  if (ledger && identical && goals.some((t) => t.kind === 'verify')) {
+    throw new SddError('usage', 'el artefacto es idéntico al de la ronda anterior y hay aceptados que verificar', {
+      next: 'corrige los aceptados antes de lanzar la ronda siguiente',
+    })
+  }
+  const written = snapshot(root, candidate, dir, bytes)
+  const resolved = readJson<Resolution>(join(dir, 'resolved.json'))
+  const path = candidate.files[0].path
+  let plan: RoundPlan | undefined
+  let jobsPlanned: PlannedJob[]
+  try {
+    if (ledger) {
+      const before = readFileSync(join(dir, 'blobs', prev.files[0].sha256 ?? '')).toString('utf8')
+      const after = bytes.get(path)?.toString('utf8') ?? ''
+      const delta = identical ? { added: [], removed: [] } : artifactDelta(before, after)
+      plan = { n, prev_hash: prev.hash, identical, targets: goals, changed: delta.added.length > 0 ? { [path]: delta.added } : {}, removed: delta.removed }
+      const material = renderArtifactMaterial(candidate, bytes)
+      const text = renderArtifactRoundPrompt(candidate, material, plan, ledger.entries, ROUND_CAP, before, after)
+      if (!fits(text)) {
+        // Sin los pendientes: si así entra, lo que no entra son ellos, y la corrida queda como estaba.
+        if (fits(renderArtifactRoundPrompt(candidate, material, { ...plan, targets: [] }, ledger.entries, ROUND_CAP, before, after))) {
+          throw new SddError('prompt_too_large', 'los hallazgos pendientes no entran en el presupuesto', {
+            detail: `${Buffer.byteLength(text)} bytes con los pendientes`,
+            next: 'review no puede verificar esos pendientes en un solo prompt: pregunta al usuario cómo seguir',
+          })
+        }
+        throw artifactTooLarge(candidate, bytes, true)
+      }
+      jobsPlanned = [{ key: 'base-b1', reviewer: 'base', batch: 1, paths: [path], text, targets: goals }]
+    } else {
+      jobsPlanned = planArtifactRound1(candidate, bytes)
+    }
+    if (!inPath(resolved.family, o.env)) {
+      throw new SddError('cli_missing', `${resolved.family} no está en PATH`, { next: 'instala o expone el CLI del revisor de la ronda 1' })
+    }
+  } catch (e) {
+    for (const f of written) rmSync(f, { force: true })
+    throw e
+  }
+
+  // Lo admitido en un lanzamiento anterior de esta ronda se conserva si su encargo es el mismo.
+  const rounds = existsSync(join(dir, 'rounds.json')) ? readJson<{ rounds: RoundRecord[] }>(join(dir, 'rounds.json')).rounds : []
+  const last = rounds.filter((r) => r.n === n).at(-1)
+  const kept: JobRecord[] = []
+  const toRun = jobsPlanned.filter((j) => {
+    const same = last?.jobs?.find((x) => x.key === j.key && x.admitted !== undefined && x.prompt_sha256 === sha256(j.text))
+    if (same) kept.push(same)
+    return same === undefined
+  })
+
+  const k = nextLaunch(dir, tag)
+  writeJsonAtomic(join(dir, `candidate${tag}.json`), candidate)
+  writeFileSync(join(dir, `material${tag}.md`), renderArtifactMaterial(candidate, bytes))
+  const jobs = writeJobs(dir, `${tag}-l${k}`, toRun)
+  if (plan) writeJsonAtomic(join(dir, `round${tag}.json`), plan)
+  writeJsonAtomic(join(dir, 'status.json'), { state: 'launching', round: n, launch: k })
+  rmSync(join(dir, 'cancel.request'), { force: true })
+  launchSupervisor(dir, {
+    family: resolved.family, deadline_sec: req.overrides?.deadline_sec ?? 1800, kind: 'review',
+    candidate: join(dir, `candidate${tag}.json`), round: n, tag, ...(plan ? { plan: join(dir, `round${tag}.json`) } : {}), launch_n: k,
+    reviewer_resolution: resolved, jobs, kept, extra: o.extra,
+  }, o.env, { round: n, launch: k }, `argv${tag}-l${k}.json`)
+  return {
+    code: 0,
+    out: {
+      id, round: n, launch: k, family: resolved.family, candidate_hash: candidate.hash, identical,
+      ...(plan ? { targets: goals, changed: plan.changed[path] ?? [], removed: plan.removed ?? [] } : { reviewers: ['base'] }),
+      ...(kept.length > 0 ? { kept: kept.map((j) => j.key) } : {}),
+      next: `./bin/sdd-ai wait ${id}`,
+    },
+  }
+}
+
+/**
  * La ronda siguiente, o el relanzamiento de una que no terminó, también la 1: congela el candidato con
  * la base y el contexto de la ronda 1 y lanza lo que falta con el mismo revisor, en sesiones nuevas.
  * Todo lo que puede impedirla se comprueba y se mide antes de escribir un archivo de la ronda.
@@ -547,6 +819,7 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
     throw new SddError('usage', 'la ronda anterior sigue en curso', { next: `./bin/sdd-ai wait ${id}` })
   }
   const req = readJson<ReviewRequest>(join(dir, 'request.json'))
+  if (isArtifact(req.selection)) return reviewRoundArtifact({ root, dir, id, req, sel: req.selection, head: values.head, extra: values.extra, env })
   const ledgerFile = join(dir, 'ledger.json')
   // Sin ledger, la ronda 1 no terminó: se relanza.
   const ledger = existsSync(ledgerFile) ? readJson<Ledger>(ledgerFile) : undefined
@@ -580,10 +853,10 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
   const prev = ledger ? readJson<Candidate>(join(dir, `candidate${tagOf(completed)}.json`)) : first
   let selection: Selection
   if (ledger) {
-    selection = { base: first.base_sha, context: req.selection.context }
+    selection = { base: baseOf(first), context: req.selection.context }
     if (values.head) selection.head = values.head
   } else {
-    selection = values.head ? { ...req.selection, head: values.head } : req.selection
+    selection = values.head ? { ...diffSelection(req), head: values.head } : diffSelection(req)
   }
   const candidate = freezeStable(root, selection)
   const identical = candidate.hash === prev.hash
