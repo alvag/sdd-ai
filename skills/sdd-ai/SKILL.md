@@ -71,7 +71,7 @@ encargo, aísla al revisor y valida su respuesta por código: tú no escribes el
 el reporte está completo.
 
 ```
-./bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>]... --conductor <claude|codex>
+./bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>]... [--risk high] --conductor <claude|codex>
 ```
 
 - `--base` es obligatoria: el commit contra el que se revisa (en un flujo SDD, el `base_commit` del
@@ -86,9 +86,35 @@ el reporte está completo.
   la misma familia, sin la diversidad de la otra.
 - **Si eres Codex**, pide escalamiento para `review start`, igual que para `run`.
 
-Después, `./bin/sdd-ai wait <id>`, igual que en la vía `process`. Al terminar, `wait` devuelve la
-misma vista que `./bin/sdd-ai review status <id>`: los ejes `SCOPE`, `SPEC` y `QUALITY`, el `ledger`
-con cada hallazgo (`F-1`, `F-2`…) y su estado, y `next`. Sigue siempre lo que dice `next`.
+### Nivel de riesgo y revisores
+
+`review start` clasifica el candidato en `normal` o `high` y lo congela en la corrida. La respuesta
+trae `risk`: el nivel, los motivos (cada uno con la señal y la ruta que la disparó) y `forced`, que
+dice si el nivel se subió a mano. Es `high` si el candidato tiene una ruta con un segmento `auth`,
+`security`, `update`, `webhook` o `payments`, un script de shell agregado o cambiado, un archivo
+que pasa a ejecutable, o una línea agregada que lanza procesos (`exec(`, `spawn`, `child_process`,
+un shebang…). El tamaño del diff no cuenta.
+
+- **`--risk high`** sube el nivel a mano. Úsalo cuando el cambio toca algo sensible que las señales
+  no ven, como una regla de permisos en un archivo con otro nombre. Solo sube: no hay forma de bajar
+  un `high`.
+- **Qué revisores corren** (`reviewers`): en `normal`, la revisión base (SCOPE → SPEC → QUALITY); en
+  `high`, la base y cuatro lentes aisladas, en este orden: riesgo, resiliencia, fiabilidad y
+  legibilidad. Todos son de la misma familia y corren **en serie**, y `--deadline` vale para cada uno.
+  Un cambio `high` repartido en dos lotes son diez trabajos seguidos: avísale al usuario del tiempo.
+- **Procedencia**: cada hallazgo del `ledger` trae `reviewer` (`base` o la lente) y `batch` (el lote).
+  El binario no fusiona hallazgos repetidos entre revisores: si dos dicen lo mismo, rechaza el
+  duplicado con `review decide <id> reject <F-n> --reason "duplicado de F-m"`.
+- **Lotes**: si un prompt no entra en 200 KiB, el material se reparte en lotes de archivos completos,
+  agrupados por directorio, y cada revisor corre una vez por lote. La respuesta trae `batches` con
+  los archivos de cada lote y `batches_note`: **las relaciones entre archivos de lotes distintos no
+  se revisaron juntas**. Díselo al usuario.
+
+Después, `./bin/sdd-ai wait <id>`, igual que en la vía `process`. Si el tope de `wait` vence con la
+ronda en curso, la salida trae `progress`: qué revisor y qué lote corren, y cuántos trabajos van de
+cuántos. Al terminar, `wait` devuelve la misma vista que `./bin/sdd-ai review status <id>`: el
+nivel, los revisores y los lotes, los ejes `SCOPE`, `SPEC` y `QUALITY`, el `ledger` con cada
+hallazgo (`F-1`, `F-2`…), su estado y su procedencia, y `next`. Sigue siempre lo que dice `next`.
 
 ### Decidir cada hallazgo
 
@@ -123,8 +149,27 @@ sin decidir, si hay aceptados y no corregiste nada, o si no hay nada que verific
   ronda; no lances un `review start` nuevo.
 - Un aceptado que la ronda ve sin resolver vuelve a esperar: corrígelo otra vez (`accept`), o
   recházalo con motivo si la evidencia del revisor no te convence.
-- Si el prompt de la ronda no entra en el presupuesto (`prompt_too_large`), la revisión no puede
-  seguir por rondas: propón un `review start` nuevo con un diff más chico o menos contexto.
+- La ronda siguiente no corre lentes: es una pasada de la base, en lotes si el material no entra,
+  con cada pendiente en el lote de su archivo.
+- **`risk_high`**: la corrección trajo riesgo alto (`detail` nombra la señal y la ruta), así que la
+  ronda no corre: nada nuevo de riesgo alto queda aprobado sin las lentes. Pregúntale al usuario si
+  reinicia la revisión con lentes; si dice que sí, corre el `review start … --risk high` que trae
+  `next`.
+- **Relanzar una ronda que no terminó**, también la 1: `review round <id>`, como diga `next`. Corre
+  solo los trabajos que faltan; lo ya admitido se conserva mientras su encargo sea el mismo. Si el
+  candidato cambió, corre todos, y antes se frena con `risk_high` si el cambio trajo riesgo alto.
+
+### Si algo no entra en el presupuesto
+
+`start` y `round` miden cada prompt antes de lanzar. Si alguno no entra, sale `prompt_too_large`, no
+se lanza nada y la corrida queda como estaba. El mensaje dice qué no entra:
+
+- **Un archivo** (`el archivo <ruta> no entra solo en el presupuesto`): `review` no puede revisarlo.
+  Pregúntale al usuario si lo saca del cambio o lo revisa por fuera de `review`. No partas el cambio
+  por tu cuenta.
+- **El contexto** (`el contexto solo no entra`): pregúntale qué contexto quitar.
+- **Un bloque de pendientes** (`el bloque de pendientes … no entra`): los hallazgos pendientes de ese
+  lote no caben en un prompt. Pregúntale al usuario cómo seguir.
 
 ### Lo que decide el usuario, nunca tú
 
@@ -143,14 +188,20 @@ que intenta desmentirlo con el mismo material:
 
 - **`refutado`** (los de `refuted`): sale del veredicto, pero queda visible en el ledger. Si no estás
   de acuerdo con la refutación, díselo al usuario.
-- Un hallazgo **inconcluso** (los de `inconclusive`): el refutador no pudo decidir o no respondió.
+- Un hallazgo **inconcluso** (los de `inconclusive`, cada uno con su `reason`): el refutador no pudo
+  decidir, no respondió, no entraba en un prompt (`prompt_too_large`) o se canceló (`cancelled`).
   Sigue contando y se decide como cualquier otro.
+- Si el material no entra entero, la tanda se reparte por hallazgos en sub-tandas; el registro de la
+  refutación en el recibo lo dice con `trimmed`.
+- Un `cancel` durante la refutación deja la ronda `cancelled` con su ledger escrito: se sigue con
+  `decide` y `round`, sin relanzar la refutación.
 
 ### El resultado
 
-- **`unavailable`**: el revisor no pudo inspeccionar, o su respuesta no se pudo admitir ni después
-  de una corrección. Muestra `reason` y `detail` y pregunta si la relanza: en la ronda 1 con
-  `review start`, en las siguientes con `review round`, como diga `next`.
+- **`unavailable`** con `reason: jobs_incomplete`: algún trabajo de la ronda no quedó admitido (el
+  revisor no pudo inspeccionar, se agotó el tope, falló el CLI o su respuesta no se admitió ni después
+  de una corrección). `jobs` trae el estado de cada trabajo y `detail` lo resume. Muéstraselo al
+  usuario y pregunta si relanza la ronda con `review round <id>`, como diga `next`.
 - **`stale: true` sin nada pendiente**: el diff cambió desde la última ronda y el veredicto ya no
   vale para lo que hay. Propón la revisión nueva que trae `next`.
 - El recibo informa: no autoriza el commit ni el push. Un eje en `fail` se resuelve o se declara,
@@ -170,7 +221,12 @@ que intenta desmentirlo con el mismo material:
   `./bin/sdd-ai agents sync` (en Codex, con escalamiento: escribe en `.codex/`) y reabrir la sesión.
 - **`config_missing`**: muestra el bloque que trae `next` y pregunta si lo creas. No escribas la
   config sin permiso.
-- Para cortar una corrida: `./bin/sdd-ai cancel <id>`.
+- Para cortar una corrida: `./bin/sdd-ai cancel <id>`. En una revisión detiene el trabajo en curso y
+  no lanza los que faltan.
+- **Límites declarados de `review`**: si el supervisor muere en medio de una ronda, no deja su
+  registro y el relanzamiento corre todos los trabajos, no solo los que faltaban. Las sesiones del
+  revisor Claude dejan un directorio de proyecto en `~/.claude/projects/`: el binario solo borra su
+  temporal del sistema.
 
 Después de cada `./bin/sdd-ai agents sync` hay que reabrir la sesión para que el CLI cargue los
 agentes y esta skill.

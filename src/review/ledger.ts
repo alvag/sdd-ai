@@ -8,12 +8,29 @@ export type Answer = 'resolved' | 'unresolved' | 'withdrawn' | 'maintained'
 export type RefuteResult = 'corroborated' | 'refuted' | 'inconclusive'
 export interface Decision { action: 'accept' | 'reject'; reason?: string; from: FindingState; after_round: number }
 export interface RoundResponse { round: number; answer: Answer; evidence?: string; note?: string }
+/** Quién revisó: la revisión base o una de las cuatro lentes del nivel alto. */
+export type Reviewer = 'base' | 'risk' | 'resilience' | 'reliability' | 'readability'
+export const LENSES: readonly Exclude<Reviewer, 'base'>[] = ['risk', 'resilience', 'reliability', 'readability']
+export const REVIEWERS: readonly Reviewer[] = ['base', ...LENSES]
+/** De qué revisor y de qué lote salió un hallazgo. La anota el código; el modelo no la declara. */
+export interface Provenance { reviewer: Reviewer; batch: number }
+
+/** El orden fijo de los hallazgos de una ronda: la base, las lentes en orden y, dentro de cada revisor, por lote. */
+export function byProvenance<T extends Provenance>(items: T[]): T[] {
+  return [...items].sort((a, b) => REVIEWERS.indexOf(a.reviewer) - REVIEWERS.indexOf(b.reviewer) || a.batch - b.batch)
+}
+
 export interface LedgerEntry extends Finding {
   id: string; round: number; state: FindingState
+  /** Una entrada anterior a la procedencia no la trae: se lee como `base`. */
+  reviewer?: Reviewer; batch?: number
   decision?: Decision; responses: RoundResponse[]
   refutation?: { result: RefuteResult; evidence?: string; note?: string; reason?: string }
 }
 export interface Ledger { completed: number; next_id: number; entries: LedgerEntry[] }
+
+/** Una entrada anterior a la procedencia se lee como de la base, en su único lote. */
+export const withProvenance = (e: LedgerEntry): LedgerEntry & Provenance => ({ ...e, reviewer: e.reviewer ?? 'base', batch: e.batch ?? 1 })
 export interface Target { id: string; kind: 'verify' | 'respond' }
 export interface Axes { scope: 'ok' | 'fail'; spec: 'ok' | 'warn' | 'fail'; quality: 'ok' | 'fail' }
 export type ChangedRanges = Record<string, Array<[number, number]> | 'binary'>
@@ -40,7 +57,7 @@ const DECISION_STATE: Partial<Record<FindingState, Record<Decision['action'], Fi
 
 const outOfScope = (f: Finding) => GRAVE.has(f.severity) && f.causality === 'pre-existing'
 
-function entry(f: Finding, id: number, round: number): LedgerEntry {
+function entry(f: Finding & Partial<Provenance>, id: number, round: number): LedgerEntry {
   return { ...f, id: `F-${id}`, round, state: outOfScope(f) ? 'fuera-de-alcance' : 'abierto', responses: [] }
 }
 
@@ -48,8 +65,8 @@ function copy(l: Ledger): Ledger {
   return structuredClone(l)
 }
 
-/** Los hallazgos de la ronda 1, con los IDs en el orden en que llegaron. */
-export function openLedger(findings: Finding[]): Ledger {
+/** Los hallazgos de la ronda 1, con los IDs en el orden en que llegaron: el que da `byProvenance`. */
+export function openLedger(findings: Array<Finding & Partial<Provenance>>): Ledger {
   return { completed: 1, next_id: findings.length + 1, entries: findings.map((f, i) => entry(f, i + 1, 1)) }
 }
 
@@ -105,7 +122,7 @@ export function undecided(l: Ledger): string[] {
 
 export function applyRound(l: Ledger, n: number,
   responses: Array<{ id: string; answer: Answer; evidence?: string; note?: string }>,
-  regressions: Finding[]): Ledger {
+  regressions: Array<Finding & Partial<Provenance>>): Ledger {
   const next = copy(l)
   for (const r of responses) {
     const e = next.entries.find((x) => x.id === r.id)

@@ -1,24 +1,45 @@
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
-import { closeSync, existsSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs'
-import { basename, join, relative } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import {
+  closeSync, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, writeSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, relative } from 'node:path'
 import { createInterface } from 'node:readline'
 import { type Outcome, type StreamFacts, classify, emptyFacts, scanLine } from './outcome.ts'
-import { type Admission, admit, admitRefutation, admitRound } from './review/admit.ts'
-import type { Candidate } from './review/candidate.ts'
+import { type Admission, type AdmittedReview, type RoundReview, admit, admitRefutation, admitRound, parseLocation } from './review/admit.ts'
+import { sliceCandidate } from './review/batch.ts'
+import { type Candidate, readContextBlobs } from './review/candidate.ts'
 import {
-  type Ledger, type LedgerEntry, type RoundPlan, applyRefutation, applyRound, axesOf, openLedger, refutationBatch, standing,
+  type Ledger, type LedgerEntry, type Reviewer, type RoundPlan, type Target, applyRefutation, applyRound, axesOf, byProvenance,
+  openLedger, refutationBatch, standing, withProvenance,
 } from './review/ledger.ts'
-import { REVIEW_PROMPT_BUDGET, closingMessage, renderCorrectionPrompt, renderRefutePrompt } from './review/prompt.ts'
+import { REVIEW_PROMPT_BUDGET, closingMessage, fits, renderCorrectionPrompt, renderMaterial, renderRefutePrompt } from './review/prompt.ts'
+import { type RiskRecord, readRisk } from './review/risk.ts'
 import { readJson, setStatus, writeJsonAtomic } from './runs.ts'
 import type {
-  AttemptKind, AttemptMetrics, Family, LaunchSpec, RejectedField, Resolution, ResumeInfo, RetryInfo, RunState, Status,
+  AttemptKind, AttemptMetrics, Family, LaunchSpec, RejectedField, Resolution, ResumeInfo, RetryInfo, RunState, Status, WorkerTask,
 } from './types.ts'
-import { claudeResume, claudeRetry, withSessionId } from './workers/claude.ts'
-import { codexResume, codexRetry, withResultFile } from './workers/codex.ts'
+import { REFUTER_SYSTEM_PROMPT, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId } from './workers/claude.ts'
+import { codexResume, codexRetry, codexReviewLaunch, withResultFile } from './workers/codex.ts'
+
+/** Un revisor sobre un lote. `prompt` es la ruta de su prompt, ya medido y escrito por la CLI. */
+export interface ReviewJob { key: string; reviewer: Reviewer; batch: number; paths: string[]; prompt: string; targets?: Target[] }
+
+/**
+ * Cómo terminó un trabajo en un lanzamiento. `prompt_sha256` es la identidad de su encargo: el
+ * candidato, el revisor, el lote, los pendientes, las decisiones y sus motivos.
+ */
+export interface JobRecord {
+  key: string; reviewer: Reviewer; batch: number; launch: number; state: RunState; reason?: string; detail?: string
+  admitted?: string; prompt_sha256: string; model_effective: string | null; tool_events: string[]
+  retry?: RetryInfo; resume?: ResumeInfo
+}
 
 export interface ArgvFile {
-  family: Family; launch: LaunchSpec; deadline_sec: number; grace_ms?: number
+  family: Family; deadline_sec: number; grace_ms?: number
+  /** El worker de `run`. Una revisión arma el de cada trabajo, con su propio temporal. */
+  launch?: LaunchSpec
   /** Tope de la reanudación que sigue a un `timeout`; el de la corrida ya venció a esa altura. */
   resume_sec?: number
   kind?: 'run' | 'review'
@@ -29,12 +50,30 @@ export interface ArgvFile {
   tag?: string
   /** `round<tag>.json` de una ronda n≥2: qué verifica, qué responde y dónde admite regresiones. */
   plan?: string
-  /** `material<tag>.md`: el material congelado de la ronda, que el refutador recibe tal cual. */
-  material?: string
-  /** El refutador, listo para lanzar; su stdinFile es `prompt<tag>-refute.md`. */
-  refuter_launch?: LaunchSpec
   /** La ronda la concedió `--extra`, más allá del tope. */
   extra?: boolean
+  /** Número de este lanzamiento de la ronda: separa sus archivos de los de un relanzamiento. */
+  launch_n?: number
+  reviewer_resolution?: Resolution
+  refuter_resolution?: Resolution
+  /** Los trabajos a correr, en serie y en este orden. */
+  jobs?: ReviewJob[]
+  /** Los trabajos ya admitidos en un lanzamiento anterior de la misma ronda, que no se repiten. */
+  kept?: JobRecord[]
+  batches?: string[][]
+  risk?: RiskRecord
+}
+
+/** Cómo terminó una sub-tanda de refutación: sus hallazgos, los archivos de su material y su resultado. */
+export interface SubBatchRecord { ids: string[]; paths: string[]; outcome: 'admitted' | 'inconclusive'; reason?: string }
+
+/**
+ * La refutación de una ronda. `trimmed` dice si el material no entró entero y la tanda se partió por
+ * hallazgos; `partial` es que algunas sub-tandas se admitieron y otras no.
+ */
+export interface RefutationRecord {
+  ids: string[]; outcome: 'admitted' | 'inconclusive' | 'partial'; reason?: string; tool_events: string[]
+  trimmed: boolean; batches: SubBatchRecord[]
 }
 
 /** Una entrada de `rounds.json` por ronda lanzada, haya terminado o no. */
@@ -43,7 +82,8 @@ export interface RoundRecord {
   state: RunState; reason?: string; detail?: string; started_at: string; ended_at: string
   extra: boolean; model_effective: string | null
   tool_events: string[]; retry?: RetryInfo; resume?: ResumeInfo
-  refutation?: { ids: string[]; outcome: 'admitted' | 'inconclusive'; reason?: string; tool_events: string[] }
+  refutation?: RefutationRecord
+  launch?: number; risk?: RiskRecord; batches?: string[][]; jobs?: JobRecord[]
 }
 
 const DEFAULT_RESUME_SEC = 300
@@ -75,8 +115,47 @@ function killGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
-/** `tag` separa los archivos de cada ronda; `round` va a cada intento de `metrics.json`. */
-interface RunContext { dir: string; family: Family; grace: number; cancelFile: string; tag: string; round: number }
+const SCRATCH_PREFIX = 'sdd-ai-review-'
+
+/**
+ * Borra un temporal de un trabajo, y solo eso: un directorio que está directamente bajo el temporal
+ * del sistema y cuyo nombre empieza con el prefijo de sdd-ai. Devuelve si borró.
+ */
+export function removeScratch(dir: string): boolean {
+  let real: string
+  try {
+    real = realpathSync(dir)
+  } catch {
+    return false
+  }
+  if (dirname(real) !== realpathSync(tmpdir()) || !basename(real).startsWith(SCRATCH_PREFIX)) return false
+  rmSync(real, { recursive: true, force: true })
+  return true
+}
+
+/**
+ * Corre `fn` con un directorio vacío propio y lo borra al terminar, sea cual sea el final. Vive el
+ * trabajo entero porque la reanudación de Codex usa el cwd del proceso.
+ */
+export async function withScratch<T>(fn: (scratch: string) => Promise<T>): Promise<T> {
+  const scratch = mkdtempSync(join(tmpdir(), SCRATCH_PREFIX))
+  try {
+    return await fn(scratch)
+  } finally {
+    removeScratch(scratch)
+  }
+}
+
+/**
+ * `tag` separa las rondas y `prefix` los archivos de E/S de cada trabajo (`<tag>-l<k>-<clave>`; '' en
+ * `run`). `job` es la procedencia que va a `metrics.json`. `once` se comparte entre los trabajos.
+ */
+interface RunContext {
+  dir: string; family: Family; grace: number; cancelFile: string; tag: string; round: number; prefix: string
+  argv: ArgvFile
+  job?: { reviewer: Reviewer | 'refute'; batch: number; launch: number }
+  once: { started: boolean }
+}
 interface Attempt {
   outcome: Outcome; facts: StreamFacts; resultFile: string
   startedAt: Date; endedAt: Date; stdoutFile: string; stderrFile: string
@@ -90,12 +169,12 @@ function resultFileOf(family: Family, launch: LaunchSpec, dir: string, name: str
 }
 
 /**
- * Un lanzamiento del worker. Cada intento escribe sus propios logs (`<tag><suffix>`) para que la
- * salida de uno no se mezcle con la clasificación de otro, ni con la de una ronda anterior.
+ * Un lanzamiento del worker. Cada intento escribe sus propios logs (`<prefijo><suffix>`) para que la
+ * salida de uno no se mezcle con la clasificación de otro, ni con la de otro trabajo o lanzamiento.
  */
 async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, until: number): Promise<Attempt> {
   const { dir, family, grace, cancelFile } = ctx
-  const name = `${ctx.tag}${suffix}`
+  const name = `${ctx.prefix}${suffix}`
   const facts = emptyFacts()
   const startedAt = new Date()
   const stdoutFile = join(dir, `stdout${name}.log`)
@@ -124,7 +203,10 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
   if (child.pid !== undefined) {
     const pid = child.pid
     const running: Partial<Status> = { state: 'running', worker_pid: pid, supervisor_pid: process.pid }
-    if (suffix === '') running.started_at = new Date().toISOString()
+    if (!ctx.once.started) {
+      running.started_at = new Date().toISOString()
+      ctx.once.started = true
+    }
     setStatus(dir, running)
     createInterface({ input: child.stdout! }).on('line', (line) => {
       writeSync(stdoutFd, `${line}\n`)
@@ -161,8 +243,11 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
   }
   let resultText = ''
   if (family === 'claude') {
-    resultText = facts.result ?? ''
-    writeFileSync(resultFile, resultText)
+    // Sin resultado en el stream no hay archivo: un archivo vacío se leería como una respuesta.
+    if (facts.result !== undefined) {
+      resultText = facts.result
+      writeFileSync(resultFile, resultText)
+    }
   } else if (existsSync(resultFile)) {
     resultText = readFileSync(resultFile, 'utf8')
   }
@@ -187,16 +272,23 @@ function withTotals(m: MetricsFile): MetricsFile {
   return m
 }
 
-/** Suma el intento a `metrics.json`: ronda, duración, bytes del prompt, tokens y dónde quedó su salida cruda. */
+/**
+ * Suma el intento a `metrics.json`: ronda, procedencia, duración, bytes del prompt, tokens y dónde quedó
+ * su salida cruda. Un resultado que el worker no escribió queda como `null`.
+ */
 function recordAttempt(ctx: RunContext, kind: AttemptKind, suffix: string, launch: LaunchSpec, a: Attempt): void {
   const { dir } = ctx
   const file = join(dir, 'metrics.json')
   const m: MetricsFile = existsSync(file) ? readJson<MetricsFile>(file) : { attempts: [], totals: { duration_ms: 0, attempts: 0, inadmissible: 0 } }
   const entry: AttemptMetrics = {
-    round: ctx.round, kind, suffix, started_at: a.startedAt.toISOString(), ended_at: a.endedAt.toISOString(),
+    round: ctx.round, ...(ctx.job ?? {}),
+    kind, suffix, started_at: a.startedAt.toISOString(), ended_at: a.endedAt.toISOString(),
     duration_ms: a.endedAt.getTime() - a.startedAt.getTime(), prompt_bytes: statSync(launch.stdinFile).size,
     outcome: a.outcome.state,
-    raw: { stdout: relative(dir, a.stdoutFile), stderr: relative(dir, a.stderrFile), result: relative(dir, a.resultFile) },
+    raw: {
+      stdout: relative(dir, a.stdoutFile), stderr: relative(dir, a.stderrFile),
+      result: existsSync(a.resultFile) ? relative(dir, a.resultFile) : null,
+    },
   }
   if (a.facts.usage) entry.usage = a.facts.usage
   if (a.outcome.reason) entry.reason = a.outcome.reason
@@ -234,7 +326,26 @@ function optionalJson<T>(file: string): T | undefined {
   return existsSync(file) ? readJson<T>(file) : undefined
 }
 
-const roundDegradations = (r: RoundRecord) => [...(r.retry ? ['profile_retry'] : []), ...(r.resume ? ['resume'] : [])]
+/** El límite de repartir en lotes: lo que la vista y el recibo advierten cuando una ronda corrió en más de uno. */
+export const BATCHES_NOTE = 'las relaciones entre archivos de lotes distintos no se revisaron juntas'
+
+/** Los lotes de una ronda, numerados, con su advertencia; nada si corrió en uno solo. */
+export function declaredBatches(batches: string[][] | undefined): { batches?: Array<{ n: number; paths: string[] }>; batches_note?: string } {
+  if (!batches || batches.length < 2) return {}
+  return { batches: batches.map((paths, i) => ({ n: i + 1, paths })), batches_note: BATCHES_NOTE }
+}
+
+/** Lo que el conductor necesita de cada trabajo: quién, qué lote, en qué lanzamiento y cómo terminó. */
+export const jobSummary = (j: JobRecord) => ({
+  key: j.key, reviewer: j.reviewer, batch: j.batch, launch: j.launch, state: j.state, ...(j.reason ? { reason: j.reason } : {}),
+})
+
+const roundDegradations = (r: RoundRecord) => {
+  const jobs = r.jobs ?? []
+  const retry = r.retry !== undefined || jobs.some((j) => j.retry !== undefined)
+  const resume = r.resume !== undefined || jobs.some((j) => j.resume !== undefined)
+  return [...(retry ? ['profile_retry'] : []), ...(resume ? ['resume'] : [])]
+}
 
 /**
  * Reescribe el veredicto y el recibo desde el ledger y `rounds.json`: qué se revisó en cada ronda,
@@ -244,14 +355,17 @@ const roundDegradations = (r: RoundRecord) => [...(r.retry ? ['profile_retry'] :
 export function writeReceipt(dir: string): void {
   const ledger = readJson<Ledger>(join(dir, 'ledger.json'))
   const rounds = optionalJson<{ rounds: RoundRecord[] }>(join(dir, 'rounds.json'))?.rounds ?? []
-  const request = optionalJson<{ selection?: unknown; author?: string; degradations?: string[] }>(join(dir, 'request.json'))
+  const request = optionalJson<{ selection?: unknown; author?: string; degradations?: string[]; risk?: RiskRecord }>(join(dir, 'request.json'))
   const resolved = readJson<Resolution>(join(dir, 'resolved.json'))
   const axes = axesOf(ledger)
-  const lastDone = rounds.filter((r) => r.state === 'done').at(-1)
+  // La última ronda que avanzó el ledger: una terminada, o una cancelada en la refutación, que corre
+  // después de escribirlo.
+  const lastDone = rounds.filter((r) => r.state === 'done' || (r.state === 'cancelled' && r.refutation)).at(-1)
   const degradations = [...(request?.degradations ?? [])]
   for (const d of rounds.flatMap(roundDegradations)) if (!degradations.includes(d)) degradations.push(d)
   writeJsonAtomic(join(dir, 'verdict.json'), {
-    ...axes, findings: standing(ledger), out_of_scope: ledger.entries.filter((e) => e.state === 'fuera-de-alcance'),
+    ...axes, findings: standing(ledger).map(withProvenance),
+    out_of_scope: ledger.entries.filter((e) => e.state === 'fuera-de-alcance').map(withProvenance),
   })
   writeJsonAtomic(join(dir, 'receipt.json'), {
     candidate_hash: lastDone?.candidate_hash ?? null, base_sha: lastDone?.base_sha ?? null, head_sha: lastDone?.head_sha ?? null,
@@ -259,14 +373,15 @@ export function writeReceipt(dir: string): void {
       n: r.n, candidate_hash: r.candidate_hash, base_sha: r.base_sha, head_sha: r.head_sha, state: r.state,
       ...(r.reason ? { reason: r.reason } : {}), extra: r.extra, model_effective: r.model_effective,
       degradations: roundDegradations(r), tool_events: r.tool_events, ...(r.refutation ? { refutation: r.refutation } : {}),
+      ...declaredBatches(r.batches), ...(r.jobs ? { jobs: r.jobs.map(jobSummary) } : {}),
     })),
-    selection: request?.selection ?? null, author: request?.author ?? null,
+    selection: request?.selection ?? null, author: request?.author ?? null, risk: readRisk(request ?? {}),
     reviewer: {
       family: resolved.family, model_requested: resolved.model ?? null,
       model_effective: lastDone?.model_effective ?? null, effort: resolved.effort ?? null,
     },
     degradations, tool_events: rounds.flatMap((r) => r.tool_events),
-    axes, ledger,
+    axes, ledger: { ...ledger, entries: ledger.entries.map(withProvenance) },
     written_at: new Date().toISOString(),
     note: 'informa; no autoriza commit ni push',
   })
@@ -281,7 +396,7 @@ function appendRound(dir: string, record: RoundRecord): void {
 function retryArgs(ctx: RunContext, args: string[], field: RejectedField): { args: string[]; requested: string } | null {
   if (ctx.family === 'claude') return claudeRetry(args, field, randomUUID())
   const next = codexRetry(args, field)
-  return next && { ...next, args: withResultFile(next.args, join(ctx.dir, `result${ctx.tag}-2.md`)) }
+  return next && { ...next, args: withResultFile(next.args, join(ctx.dir, `result${ctx.prefix}-2.md`)) }
 }
 
 /** En Claude la sesión la fija el argv; en Codex solo se conoce cuando el stream abre el hilo. */
@@ -292,9 +407,9 @@ function sessionOf(family: Family, args: string[], facts: StreamFacts): string |
 }
 
 function resumeLaunch(ctx: RunContext, launch: LaunchSpec, sessionId: string): LaunchSpec | null {
-  const { dir, family, tag } = ctx
-  const args = family === 'claude' ? claudeResume(launch.args) : codexResume(launch.args, sessionId, join(dir, `result${tag}-resume.md`))
-  return args ? { ...launch, args, stdinFile: join(dir, `resume${tag}.md`) } : null
+  const { dir, family, prefix } = ctx
+  const args = family === 'claude' ? claudeResume(launch.args) : codexResume(launch.args, sessionId, join(dir, `result${prefix}-resume.md`))
+  return args ? { ...launch, args, stdinFile: join(dir, `resume${prefix}.md`) } : null
 }
 
 /** Lo que usó el reintento en lugar del valor rechazado: el modelo si el CLI lo informa, si no el default. */
@@ -320,6 +435,7 @@ async function admitPhase<T>(ctx: RunContext, launch: LaunchSpec, last: Attempt,
   if (adm.kind === 'unavailable') return { last, outcome: { state: 'unavailable', reason: 'reviewer_unavailable', detail: adm.reason }, toolEvents: [] }
 
   const text = renderCorrectionPrompt(readFileSync(launch.stdinFile, 'utf8'), adm.error)
+  // Un prompt medido con la reserva nunca llega acá; queda como defensa.
   if (Buffer.byteLength(text) > REVIEW_PROMPT_BUDGET) {
     return { last, outcome: { state: 'unavailable', reason: 'correction_over_budget', detail: adm.error }, toolEvents: [] }
   }
@@ -328,6 +444,8 @@ async function admitPhase<T>(ctx: RunContext, launch: LaunchSpec, last: Attempt,
   const fixed = await attempt(ctx, fixLaunch, fix.suffix, Date.now() + fixSec * 1000)
   recordAttempt(ctx, fix.kind, fix.suffix, fixLaunch, fixed)
   const toolEvents = fixed.facts.toolEvents
+  // Un cancel durante la corrección es un cancel, no una corrección fallida: la ronda termina cancelada.
+  if (fixed.outcome.state === 'cancelled') return { last: fixed, outcome: fixed.outcome, toolEvents }
   if (fixed.outcome.state !== 'done') {
     return { last: fixed, outcome: { state: 'unavailable', reason: 'correction_failed', detail: stateAndReason(fixed.outcome) }, toolEvents }
   }
@@ -337,106 +455,161 @@ async function admitPhase<T>(ctx: RunContext, launch: LaunchSpec, last: Attempt,
   return { last: fixed, outcome: { state: 'unavailable', reason: 'inadmissible_twice', detail: second.error }, toolEvents }
 }
 
-type Refutation = { outcome: Parameters<typeof applyRefutation>[1]; record: NonNullable<RoundRecord['refutation']> }
-
-/**
- * Una sola tanda por ronda: el refutador recibe los graves inferenciales con el mismo material que vio
- * el revisor, sin reanudación. Si no llega a una respuesta admitida, toda la tanda queda inconclusa.
- */
-async function refute(ctx: RunContext, argv: ArgvFile, candidate: Candidate, batch: LedgerEntry[], fixSec: number): Promise<Refutation> {
-  const ids = batch.map((e) => e.id)
-  const failed = (reason: string, toolEvents: string[] = []): Refutation =>
-    ({ outcome: { failed: reason, ids }, record: { ids, outcome: 'inconclusive', reason, tool_events: toolEvents } })
-  if (!argv.refuter_launch || !argv.material) return failed('no_refuter')
-  const prompt = renderRefutePrompt(candidate, readFileSync(argv.material, 'utf8'), batch)
-  if (Buffer.byteLength(prompt) > REVIEW_PROMPT_BUDGET) return failed('prompt_too_large')
-  if (existsSync(ctx.cancelFile)) return failed('cancelled')
-  const launch = argv.refuter_launch
-  writeFileSync(launch.stdinFile, prompt)
-  const first = await attempt(ctx, launch, '-refute', Date.now() + argv.deadline_sec * 1000)
-  recordAttempt(ctx, 'refutation', '-refute', launch, first)
-  if (first.outcome.state !== 'done') return failed(stateAndReason(first.outcome), first.facts.toolEvents)
-  const phase = await admitPhase(ctx, launch, first, fixSec, (t) => admitRefutation(t, candidate, ids),
-    { name: `${ctx.tag}-refute-fix`, suffix: '-refute-fix', kind: 'refutation' })
-  const toolEvents = [...first.facts.toolEvents, ...phase.toolEvents]
-  if (!phase.review) return failed(phase.outcome.reason ?? phase.outcome.state, toolEvents)
-  return { outcome: { results: phase.review.results }, record: { ids, outcome: 'admitted', tool_events: toolEvents } }
+/** El revisor o el refutador de una ronda, en su temporal y con una sesión nueva. */
+function reviewLaunch(r: Resolution, promptFile: string, resultFile: string, scratch: string, systemPrompt?: string): LaunchSpec {
+  const task: WorkerTask & { scratch: string } = { cwd: scratch, promptFile, resultFile, sessionId: randomUUID(), scratch }
+  if (r.model) task.model = r.model
+  if (r.effort) task.effort = r.effort
+  return r.family === 'claude' ? claudeReviewLaunch({ ...task, ...(systemPrompt ? { systemPrompt } : {}) }) : codexReviewLaunch(task)
 }
 
+/** Los hallazgos que se juzgan juntos y los archivos que su material necesita. */
+interface SubBatch { entries: LedgerEntry[]; paths: string[] }
+
 /**
- * Admite la ronda y actualiza el ledger: la 1 lo abre, la n aplica las respuestas y las regresiones.
- * Después, si hay graves inferenciales nuevos, corre la tanda de refutación.
+ * Parte la tanda si el material entero no entra: se recorre por ID y se empaqueta de forma voraz. Cada
+ * hallazgo aporta el archivo de su cita, o ninguno si cita el contexto, y entra en la sub-tanda si el
+ * prompt con la unión de archivos entra. Uno que no entra ni solo no se lanza.
  */
-async function reviewRound(ctx: RunContext, argv: ArgvFile, candidate: Candidate, launch: LaunchSpec, last: Attempt, fixSec: number):
-  Promise<{ phase: Phase<unknown>; ledger?: Ledger; refutation?: RoundRecord['refutation'] }> {
-  const fix: Fix = { name: `${ctx.tag}-fix`, suffix: '-fix', kind: 'correction' }
-  let phase: Phase<unknown>
-  let ledger: Ledger | undefined
-  if (ctx.round === 1) {
-    const p = await admitPhase(ctx, launch, last, fixSec, (t) => admit(t, candidate), fix)
-    if (p.review) ledger = openLedger(p.review.findings)
-    phase = p
-  } else {
-    if (!argv.plan) throw new Error(`la ronda ${ctx.round} no trae su plan`)
-    const plan = readJson<RoundPlan>(argv.plan)
-    const p = await admitPhase(ctx, launch, last, fixSec, (t) => admitRound(t, candidate, plan), fix)
-    if (p.review) {
-      ledger = applyRound(readJson<Ledger>(join(ctx.dir, 'ledger.json')), ctx.round, p.review.responses, p.review.findings)
+function packRefutation(c: Candidate, contextTexts: Map<string, string>, batch: LedgerEntry[]):
+  { subs: SubBatch[]; tooLarge: LedgerEntry[]; trimmed: boolean } {
+  const all = c.files.map((f) => f.path)
+  const fitsWith = (paths: string[], entries: LedgerEntry[]) =>
+    fits(renderRefutePrompt(c, renderMaterial(c, contextTexts, sliceCandidate(c, paths)), entries))
+  if (fitsWith(all, batch)) return { subs: [{ entries: batch, paths: all }], tooLarge: [], trimmed: false }
+  const fileOf = (e: LedgerEntry) => {
+    const cited = parseLocation(e.location).path
+    return all.includes(cited) ? [cited] : []
+  }
+  const subs: SubBatch[] = []
+  const tooLarge: LedgerEntry[] = []
+  let current: SubBatch = { entries: [], paths: [] }
+  for (const e of batch) {
+    const paths = [...new Set([...current.paths, ...fileOf(e)])]
+    if (fitsWith(paths, [...current.entries, e])) {
+      current = { entries: [...current.entries, e], paths }
+    } else if (!fitsWith(fileOf(e), [e])) {
+      tooLarge.push(e)
+    } else {
+      if (current.entries.length > 0) subs.push(current)
+      current = { entries: [e], paths: fileOf(e) }
     }
-    phase = p
   }
-  if (!ledger) return { phase }
-  const batch = refutationBatch(ledger, ctx.round)
-  if (batch.length === 0) return { phase, ledger }
-  const r = await refute(ctx, argv, candidate, batch, fixSec)
-  return { phase, ledger: applyRefutation(ledger, r.outcome), refutation: r.record }
+  if (current.entries.length > 0) subs.push(current)
+  return { subs, tooLarge, trimmed: true }
+}
+
+interface SubResult { outcome: Parameters<typeof applyRefutation>[1]; record: SubBatchRecord; toolEvents: string[] }
+
+/**
+ * Una sub-tanda en su temporal: un solo intento, sin reanudación ni reintento de perfil, admitido
+ * contra los archivos y el contexto de su material. Si no llega a una respuesta admitida, sus
+ * hallazgos quedan inconclusos con el motivo.
+ */
+async function refuteSub(ctx: RunContext, resolution: Resolution, c: Candidate, contextTexts: Map<string, string>, sub: SubBatch,
+  j: number, launchN: number, fixSec: number): Promise<SubResult> {
+  const { dir, argv } = ctx
+  const ids = sub.entries.map((e) => e.id)
+  const failed = (reason: string, toolEvents: string[] = []): SubResult =>
+    ({ outcome: { failed: reason, ids }, record: { ids, paths: sub.paths, outcome: 'inconclusive', reason }, toolEvents })
+  const view = sliceCandidate(c, sub.paths)
+  const prefix = `${ctx.tag}-l${launchN}-refute-s${j}`
+  const rctx: RunContext = { ...ctx, family: resolution.family, prefix, job: { reviewer: 'refute', batch: j, launch: launchN } }
+  const promptFile = join(dir, `prompt${prefix}.md`)
+  writeFileSync(promptFile, renderRefutePrompt(c, renderMaterial(c, contextTexts, view), sub.entries))
+  return withScratch(async (scratch) => {
+    const launch = reviewLaunch(resolution, promptFile, join(dir, `result${prefix}.md`), scratch, REFUTER_SYSTEM_PROMPT)
+    const first = await attempt(rctx, launch, '', Date.now() + argv.deadline_sec * 1000)
+    recordAttempt(rctx, 'refutation', '', launch, first)
+    if (first.outcome.state !== 'done') return failed(stateAndReason(first.outcome), first.facts.toolEvents)
+    const phase = await admitPhase(rctx, launch, first, fixSec, (t) => admitRefutation(t, view, ids),
+      { name: `${prefix}-fix`, suffix: '-fix', kind: 'refutation' })
+    const toolEvents = [...first.facts.toolEvents, ...phase.toolEvents]
+    if (!phase.review) return failed(phase.outcome.reason ?? phase.outcome.state, toolEvents)
+    return { outcome: { results: phase.review.results }, record: { ids, paths: sub.paths, outcome: 'admitted' }, toolEvents }
+  })
 }
 
 /**
- * Lanza al worker de una corrida preparada, aplica el tope y escribe el estado final. Si el CLI
- * rechaza el modelo o el esfuerzo pedido, relanza una sola vez sin ese campo y lo deja registrado.
- * Si se agota el tope, reanuda una sola vez la misma sesión para que entregue lo que tenga. En una
- * revisión, cada ronda lee su propio argv (`argv<tag>.json`).
+ * La refutación de los graves inferenciales de la ronda, en sub-tandas medidas antes de lanzar. Cada
+ * resultado se aplica al ledger en orden, apenas llega. Un cancel detiene la sub-tanda en curso y no
+ * lanza las demás: lo que no tiene resultado queda inconcluso por `cancelled`.
  */
-export async function supervise(dir: string, argvName = 'argv.json'): Promise<Status> {
-  const argv = readJson<ArgvFile>(join(dir, argvName))
-  const cancelFile = join(dir, 'cancel.request')
-  const ctx: RunContext = {
-    dir, family: argv.family, grace: argv.grace_ms ?? 10_000, cancelFile, tag: argv.tag ?? '', round: argv.round ?? 1,
+async function refute(ctx: RunContext, c: Candidate, ledger: Ledger, batch: LedgerEntry[], fixSec: number, launchN: number):
+  Promise<{ ledger: Ledger; record: RefutationRecord; cancelled: boolean }> {
+  const { dir, argv, cancelFile } = ctx
+  const ids = batch.map((e) => e.id)
+  const records: SubBatchRecord[] = []
+  const toolEvents: string[] = []
+  let l = ledger
+  let cancelled = false
+  const settle = (outcome: Parameters<typeof applyRefutation>[1]) => {
+    l = applyRefutation(l, outcome)
+    writeJsonAtomic(join(dir, 'ledger.json'), l)
   }
-  const review = argv.kind === 'review' && argv.candidate ? readJson<Candidate>(argv.candidate) : undefined
-  const roundStarted = new Date().toISOString()
-  const closeRound = (patch: Partial<RoundRecord> & { state: RunState }) => {
-    if (!review) return
-    appendRound(dir, {
-      n: ctx.round, tag: ctx.tag, candidate_hash: review.hash, base_sha: review.base_sha, head_sha: review.head_sha,
-      started_at: roundStarted, ended_at: new Date().toISOString(), extra: argv.extra ?? false, model_effective: null,
-      tool_events: [], ...patch,
-    })
+  const resolution = argv.refuter_resolution
+  if (!resolution) {
+    settle({ failed: 'no_refuter', ids })
+    const batches: SubBatchRecord[] = [{ ids, paths: [], outcome: 'inconclusive', reason: 'no_refuter' }]
+    return { ledger: l, record: { ids, outcome: 'inconclusive', reason: 'no_refuter', tool_events: [], trimmed: false, batches }, cancelled }
   }
-  const roundPatch: Partial<Status> = review ? { round: ctx.round } : {}
-  // Un cancel que llegó antes de que hubiera worker: no se lanza nada.
-  if (existsSync(cancelFile)) {
-    closeRound({ state: 'cancelled' })
-    return setStatus(dir, { state: 'cancelled', ended_at: new Date().toISOString(), ...roundPatch })
+  const contextTexts = readContextBlobs(dir, c)
+  const { subs, tooLarge, trimmed } = packRefutation(c, contextTexts, batch)
+  for (const e of tooLarge) {
+    settle({ failed: 'prompt_too_large', ids: [e.id] })
+    records.push({ ids: [e.id], paths: [parseLocation(e.location).path], outcome: 'inconclusive', reason: 'prompt_too_large' })
   }
-  const until = Date.now() + argv.deadline_sec * 1000
-  const resumeSec = argv.resume_sec ?? DEFAULT_RESUME_SEC
+  for (const [i, sub] of subs.entries()) {
+    const subIds = sub.entries.map((e) => e.id)
+    if (cancelled || existsSync(cancelFile)) {
+      cancelled = true
+      settle({ failed: 'cancelled', ids: subIds })
+      records.push({ ids: subIds, paths: sub.paths, outcome: 'inconclusive', reason: 'cancelled' })
+      continue
+    }
+    setStatus(dir, { job: { phase: 'refutation', key: `refute-s${i + 1}`, index: i + 1, total: subs.length } })
+    const r = await refuteSub(ctx, resolution, c, contextTexts, sub, i + 1, launchN, fixSec)
+    settle(r.outcome)
+    records.push(r.record)
+    toolEvents.push(...r.toolEvents)
+    if (r.record.reason === 'cancelled') cancelled = true
+  }
+  const admitted = records.filter((r) => r.outcome === 'admitted').length
+  const outcome = admitted === records.length ? 'admitted' : admitted === 0 ? 'inconclusive' : 'partial'
+  const reasons = [...new Set(records.map((r) => r.reason).filter((r) => r !== undefined))]
+  const record: RefutationRecord = {
+    ids, outcome, ...(outcome === 'inconclusive' && reasons.length === 1 ? { reason: reasons[0] } : {}),
+    tool_events: toolEvents, trimmed, batches: records,
+  }
+  return { ledger: l, record, cancelled }
+}
 
-  let last = await attempt(ctx, argv.launch, '', until)
-  recordAttempt(ctx, 'initial', '', argv.launch, last)
+interface Attempts {
+  last: Attempt; outcome: Outcome; facts: StreamFacts; current: LaunchSpec; toolEvents: string[]
+  retry?: RetryInfo; resume?: ResumeInfo
+}
+
+/**
+ * El intento de un worker con sus dos recuperaciones: si el CLI rechaza el modelo o el esfuerzo
+ * pedido, relanza una sola vez sin ese campo; si se agota el tope, reanuda una sola vez la misma
+ * sesión para que entregue lo que tenga.
+ */
+async function runAttempts(ctx: RunContext, launch: LaunchSpec, until: number, resumeSec: number, kind: 'run' | 'review'): Promise<Attempts> {
+  const { dir, cancelFile, argv } = ctx
+  let last = await attempt(ctx, launch, '', until)
+  recordAttempt(ctx, 'initial', '', launch, last)
   const toolEvents = [...last.facts.toolEvents]
   let { outcome, facts } = last
-  let current = argv.launch
+  let current = launch
   let retry: RetryInfo | undefined
   const rejected = outcome.state === 'launch_failed' ? facts.rejected : undefined
-  const next = rejected ? retryArgs(ctx, argv.launch.args, rejected.field) : null
+  const next = rejected ? retryArgs(ctx, launch.args, rejected.field) : null
   if (rejected && next) {
     if (existsSync(cancelFile)) {
       outcome = { state: 'cancelled' }
     } else {
-      current = { ...argv.launch, args: next.args }
-      writeJsonAtomic(join(dir, `argv${ctx.tag}-2.json`), { ...argv, launch: current })
+      current = { ...launch, args: next.args }
+      writeJsonAtomic(join(dir, `argv${ctx.prefix}-2.json`), { ...argv, launch: current })
       last = await attempt(ctx, current, '-2', until)
       recordAttempt(ctx, 'profile_retry', '-2', current, last)
       toolEvents.push(...last.facts.toolEvents)
@@ -444,53 +617,179 @@ export async function supervise(dir: string, argvName = 'argv.json'): Promise<St
       facts = last.facts
       retry = {
         field: rejected.field, requested: next.requested,
-        effective: effectiveValue(argv.family, rejected.field, facts), diagnostic: rejected.diagnostic,
+        effective: effectiveValue(ctx.family, rejected.field, facts), diagnostic: rejected.diagnostic,
       }
     }
   }
 
   let resume: ResumeInfo | undefined
   if (outcome.state === 'timeout' && !existsSync(cancelFile)) {
-    const sessionId = sessionOf(argv.family, current.args, facts)
-    const launch = sessionId ? resumeLaunch(ctx, current, sessionId) : null
-    if (sessionId && launch) {
-      writeFileSync(launch.stdinFile, closingMessage(argv.kind ?? 'run'))
+    const sessionId = sessionOf(ctx.family, current.args, facts)
+    const resumed = sessionId ? resumeLaunch(ctx, current, sessionId) : null
+    if (sessionId && resumed) {
+      writeFileSync(resumed.stdinFile, closingMessage(kind))
       resume = { session_id: sessionId, started_at: new Date().toISOString() }
       setStatus(dir, { resume })
-      writeJsonAtomic(join(dir, `argv${ctx.tag}-resume.json`), { ...argv, launch })
-      last = await attempt(ctx, launch, '-resume', Date.now() + resumeSec * 1000)
-      recordAttempt(ctx, 'resume', '-resume', launch, last)
+      writeJsonAtomic(join(dir, `argv${ctx.prefix}-resume.json`), { ...argv, launch: resumed })
+      last = await attempt(ctx, resumed, '-resume', Date.now() + resumeSec * 1000)
+      recordAttempt(ctx, 'resume', '-resume', resumed, last)
       toolEvents.push(...last.facts.toolEvents)
       facts = { ...last.facts, sessionId: last.facts.sessionId ?? sessionId }
       resume = { ...resume, outcome: last.outcome.state }
-      // Una reanudación que no entrega deja la corrida en el timeout original, con su sesión.
+      // Una reanudación que no entrega deja el intento en el timeout original, con su sesión.
       if (last.outcome.state === 'done' || last.outcome.state === 'cancelled') outcome = last.outcome
     }
   }
+  return { last, outcome, facts, current, toolEvents, ...(retry ? { retry } : {}), ...(resume ? { resume } : {}) }
+}
 
-  if (review) {
-    let refutation: RoundRecord['refutation']
-    if (outcome.state === 'done') {
-      const reviewed = await reviewRound(ctx, argv, review, current, last, resumeSec)
-      last = reviewed.phase.last
-      outcome = reviewed.phase.outcome
-      toolEvents.push(...reviewed.phase.toolEvents)
-      refutation = reviewed.refutation
-      if (reviewed.ledger) writeJsonAtomic(join(dir, 'ledger.json'), reviewed.ledger)
+const sha256 = (b: Buffer) => createHash('sha256').update(b).digest('hex')
+
+/**
+ * Un trabajo de revisión en su temporal: lanza con su propio tope, y si el revisor entrega, lo admite
+ * contra la vista de su lote. La respuesta admitida queda en `admitted<prefijo>.json`.
+ */
+async function runJob(ctx: RunContext, job: ReviewJob, candidate: Candidate, plan: RoundPlan | undefined,
+  launchN: number, resumeSec: number): Promise<JobRecord> {
+  const { argv, dir } = ctx
+  const resolution = argv.reviewer_resolution
+  if (!resolution) throw new Error('la ronda no trae la resolución del revisor')
+  const prefix = `${ctx.tag}-l${launchN}-${job.key}`
+  const jctx: RunContext = { ...ctx, prefix, job: { reviewer: job.reviewer, batch: job.batch, launch: launchN } }
+  const base = { key: job.key, reviewer: job.reviewer, batch: job.batch, launch: launchN, prompt_sha256: sha256(readFileSync(job.prompt)) }
+  return withScratch(async (scratch) => {
+    const launch = reviewLaunch(resolution, job.prompt, join(dir, `result${prefix}.md`), scratch)
+    const r = await runAttempts(jctx, launch, Date.now() + argv.deadline_sec * 1000, resumeSec, 'review')
+    const extras = { ...(r.retry ? { retry: r.retry } : {}), ...(r.resume ? { resume: r.resume } : {}) }
+    if (r.outcome.state !== 'done') {
+      return { ...base, ...outcomeFields(r.outcome), model_effective: r.last.facts.model ?? null, tool_events: r.toolEvents, ...extras }
     }
-    closeRound({
-      state: outcome.state, ...(outcome.reason ? { reason: outcome.reason } : {}), ...(outcome.detail ? { detail: outcome.detail } : {}),
-      model_effective: last.facts.model ?? null, tool_events: toolEvents,
-      ...(retry ? { retry } : {}), ...(resume ? { resume } : {}), ...(refutation ? { refutation } : {}),
-    })
-    if (existsSync(join(dir, 'ledger.json'))) writeReceipt(dir)
+    const view = sliceCandidate(candidate, job.paths)
+    const fix: Fix = { name: `${prefix}-fix`, suffix: '-fix', kind: 'correction' }
+    const phase: Phase<AdmittedReview | RoundReview> = plan
+      ? await admitPhase(jctx, r.current, r.last, resumeSec, (t) => admitRound(t, view, narrow(plan, job)), fix)
+      : await admitPhase(jctx, r.current, r.last, resumeSec, (t) => admit(t, view), fix)
+    const common = { model_effective: phase.last.facts.model ?? null, tool_events: [...r.toolEvents, ...phase.toolEvents], ...extras }
+    if (!phase.review) return { ...base, ...outcomeFields(phase.outcome), ...common }
+    const admitted = `admitted${prefix}.json`
+    writeJsonAtomic(join(dir, admitted), phase.review)
+    return { ...base, state: 'done', admitted, ...common }
+  })
+}
+
+const outcomeFields = (o: Outcome) => ({ state: o.state, ...(o.reason ? { reason: o.reason } : {}), ...(o.detail ? { detail: o.detail } : {}) })
+
+/** El plan de la ronda acotado a un trabajo: sus pendientes y los cambios de sus rutas. */
+function narrow(plan: RoundPlan, job: ReviewJob): RoundPlan {
+  const changed = Object.fromEntries(Object.entries(plan.changed).filter(([p]) => job.paths.includes(p)))
+  return { ...plan, targets: job.targets ?? plan.targets, changed }
+}
+
+type Admitted = JobRecord & { admitted: string }
+
+/**
+ * Abre o avanza el ledger una sola vez, con las respuestas de todos los trabajos. La procedencia la
+ * anota el código y los hallazgos entran en el orden fijo: base, lentes y lote.
+ */
+function advance(ctx: RunContext, records: Admitted[], plan: RoundPlan | undefined): Ledger {
+  const withProvenance = <T extends { findings: AdmittedReview['findings'] }>(r: Admitted, review: T) =>
+    review.findings.map((f) => ({ ...f, reviewer: r.reviewer, batch: r.batch }))
+  if (!plan) {
+    return openLedger(byProvenance(records.flatMap((r) => withProvenance(r, readJson<AdmittedReview>(join(ctx.dir, r.admitted))))))
+  }
+  const reviews = records.map((r) => ({ r, review: readJson<RoundReview>(join(ctx.dir, r.admitted)) }))
+  return applyRound(readJson<Ledger>(join(ctx.dir, 'ledger.json')), ctx.round, reviews.flatMap((x) => x.review.responses),
+    byProvenance(reviews.flatMap((x) => withProvenance(x.r, x.review))))
+}
+
+const jobState = (r: JobRecord) => `${r.key}: ${r.state}${r.reason ? `/${r.reason}` : ''}`
+
+/**
+ * Una ronda de revisión: recorre sus trabajos en serie, cada uno con su tope y su temporal. Un trabajo
+ * que no queda admitido no detiene a los demás; un cancel sí. Con todos admitidos se abre o avanza el
+ * ledger y se refuta; si falta alguno, la ronda termina `unavailable` con el estado de cada uno.
+ */
+async function superviseReview(ctx: RunContext, resumeSec: number): Promise<Status> {
+  const { dir, argv, cancelFile } = ctx
+  if (!argv.candidate) throw new Error('la ronda no trae su candidato')
+  const candidate = readJson<Candidate>(argv.candidate)
+  if (ctx.round > 1 && !argv.plan) throw new Error(`la ronda ${ctx.round} no trae su plan`)
+  const plan = argv.plan ? readJson<RoundPlan>(argv.plan) : undefined
+  const launchN = argv.launch_n ?? 1
+  const startedAt = new Date().toISOString()
+  const jobs = argv.jobs ?? []
+  const records: JobRecord[] = [...(argv.kept ?? [])]
+  let cancelled = false
+  for (const [i, job] of jobs.entries()) {
+    if (existsSync(cancelFile)) {
+      cancelled = true
+      break
+    }
+    setStatus(dir, { job: { phase: 'review', key: job.key, reviewer: job.reviewer, batch: job.batch, index: i + 1, total: jobs.length } })
+    const record = await runJob(ctx, job, candidate, plan, launchN, resumeSec)
+    records.push(record)
+    if (record.state === 'cancelled') {
+      cancelled = true
+      break
+    }
   }
 
-  const patch: Partial<Status> = { ...outcome, ended_at: new Date().toISOString(), ...roundPatch }
-  // Cada intento conserva su propia respuesta; `wait` lee la del último.
-  if (last.resultFile !== join(dir, 'result.md')) patch.result_file = basename(last.resultFile)
-  if (facts.sessionId) patch.session_id = facts.sessionId
+  const ordered = byProvenance(records)
+  let outcome: Outcome
+  let refutation: RefutationRecord | undefined
+  const admitted = ordered.filter((r): r is Admitted => r.admitted !== undefined)
+  if (cancelled) {
+    outcome = { state: 'cancelled' }
+  } else if (admitted.length === ordered.length) {
+    // El ledger se escribe antes de refutar: un cancel en la refutación deja la ronda con sus respuestas.
+    const ledger = advance(ctx, admitted, plan)
+    writeJsonAtomic(join(dir, 'ledger.json'), ledger)
+    const batch = refutationBatch(ledger, ctx.round)
+    const r = batch.length > 0 ? await refute(ctx, candidate, ledger, batch, resumeSec, launchN) : undefined
+    refutation = r?.record
+    outcome = { state: r?.cancelled ? 'cancelled' : 'done' }
+  } else {
+    outcome = { state: 'unavailable', reason: 'jobs_incomplete', detail: ordered.map(jobState).join(', ') }
+  }
+
+  appendRound(dir, {
+    n: ctx.round, tag: ctx.tag, candidate_hash: candidate.hash, base_sha: candidate.base_sha, head_sha: candidate.head_sha,
+    ...outcomeFields(outcome), started_at: startedAt, ended_at: new Date().toISOString(), extra: argv.extra ?? false,
+    model_effective: ordered[0]?.model_effective ?? null, tool_events: ordered.flatMap((r) => r.tool_events),
+    launch: launchN, ...(argv.risk ? { risk: argv.risk } : {}), ...(argv.batches ? { batches: argv.batches } : {}),
+    jobs: ordered, ...(refutation ? { refutation } : {}),
+  })
+  if (existsSync(join(dir, 'ledger.json'))) writeReceipt(dir)
+  const patch: Partial<Status> = { ...outcome, ended_at: new Date().toISOString(), round: ctx.round, job: undefined }
+  const retry = records.findLast((r) => r.retry)?.retry
+  const resume = records.findLast((r) => r.resume)?.resume
   if (retry) patch.retry = retry
   if (resume) patch.resume = resume
+  return setStatus(dir, patch)
+}
+
+/**
+ * Lanza al worker de una corrida preparada, aplica el tope y escribe el estado final. En una revisión,
+ * cada lanzamiento de una ronda lee su propio argv (`argv<tag>-l<k>.json`) y recorre sus trabajos.
+ */
+export async function supervise(dir: string, argvName = 'argv.json'): Promise<Status> {
+  const argv = readJson<ArgvFile>(join(dir, argvName))
+  const cancelFile = join(dir, 'cancel.request')
+  const ctx: RunContext = {
+    dir, family: argv.family, grace: argv.grace_ms ?? 10_000, cancelFile, tag: argv.tag ?? '', round: argv.round ?? 1,
+    prefix: '', argv, once: { started: false },
+  }
+  const resumeSec = argv.resume_sec ?? DEFAULT_RESUME_SEC
+  if (argv.kind === 'review') return superviseReview(ctx, resumeSec)
+  // Un cancel que llegó antes de que hubiera worker: no se lanza nada.
+  if (existsSync(cancelFile)) return setStatus(dir, { state: 'cancelled', ended_at: new Date().toISOString() })
+  if (!argv.launch) throw new Error('la corrida no trae su lanzamiento')
+  const r = await runAttempts(ctx, argv.launch, Date.now() + argv.deadline_sec * 1000, resumeSec, 'run')
+  const patch: Partial<Status> = { ...r.outcome, ended_at: new Date().toISOString() }
+  // Cada intento conserva su propia respuesta; `wait` lee la del último.
+  if (r.last.resultFile !== join(dir, 'result.md')) patch.result_file = basename(r.last.resultFile)
+  if (r.facts.sessionId) patch.session_id = r.facts.sessionId
+  if (r.retry) patch.retry = r.retry
+  if (r.resume) patch.resume = r.resume
   return setStatus(dir, patch)
 }

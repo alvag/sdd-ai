@@ -1,18 +1,18 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { createRun, readStatus, writeJsonAtomic } from '../src/runs.ts'
-import type { Candidate } from '../src/review/candidate.ts'
-import { type Ledger, type RoundPlan, decide, openLedger, targets } from '../src/review/ledger.ts'
-import { REVIEW_PROMPT_BUDGET, renderMaterial, renderReviewPrompt, renderRoundPrompt } from '../src/review/prompt.ts'
-import { type ArgvFile, cleanEnv, supervise } from '../src/supervisor.ts'
-import { REFUTER_SYSTEM_PROMPT, claudeReviewLaunch } from '../src/workers/claude.ts'
-import { codexReviewLaunch } from '../src/workers/codex.ts'
-import { type Family, opposite } from '../src/types.ts'
+import { sliceCandidate } from '../src/review/batch.ts'
+import { type Candidate, freeze, snapshot } from '../src/review/candidate.ts'
+import { type Ledger, type Reviewer, type RoundPlan, decide, openLedger, targets } from '../src/review/ledger.ts'
+import { CORRECTION_RESERVE, REVIEW_PROMPT_BUDGET, renderMaterial, renderReviewPrompt, renderRoundPrompt } from '../src/review/prompt.ts'
+import { type ArgvFile, cleanEnv, removeScratch, supervise, writeReceipt } from '../src/supervisor.ts'
+import { REFUTER_SYSTEM_PROMPT } from '../src/workers/claude.ts'
+import { type Family, type Resolution, opposite } from '../src/types.ts'
 import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
 const FAKE = join(import.meta.dirname, 'fake-cli.ts')
@@ -37,7 +37,8 @@ function prepare(family: Family, mode: string, over: Partial<ArgvFile> = {}): st
 function prepareWith(family: Family, mode: string, extra: string[]): string {
   const dir = prepare(family, mode)
   const argv = JSON.parse(readFileSync(join(dir, 'argv.json'), 'utf8')) as ArgvFile
-  writeJsonAtomic(join(dir, 'argv.json'), { ...argv, launch: { ...argv.launch, args: [...argv.launch.args, ...extra] } })
+  const launch = argv.launch ?? { cmd: '', args: [], cwd: dir, stdinFile: '' }
+  writeJsonAtomic(join(dir, 'argv.json'), { ...argv, launch: { ...launch, args: [...launch.args, ...extra] } })
   return dir
 }
 
@@ -225,7 +226,7 @@ test('un timeout con sesión reanuda una vez y termina en done', async () => {
   assert.deepEqual([s.resume?.session_id, s.resume?.outcome], ['s1', 'done'])
   assert.equal(s.result_file, 'result-resume.md')
   assert.equal(readFileSync(join(dir, 'result-resume.md'), 'utf8'), 'ok')
-  assert.equal(readFileSync(join(dir, 'result.md'), 'utf8'), '')
+  assert.equal(existsSync(join(dir, 'result.md')), false, 'el intento que se colgó no dejó respuesta')
 })
 
 test('Codex reanuda con exec resume, sin -C ni -s', async () => {
@@ -307,8 +308,27 @@ test('metrics.json distingue el reintento de perfil y la reanudación', async ()
 })
 
 const HASH = `sha256:${'a'.repeat(64)}`
+const BASE_PATH = process.env.PATH ?? ''
+const BASE_TMP = tmpdir()
 
-/** Corrida de revisión con un candidato fijo de una ruta y el lanzador real de la familia, apuntado al CLI falso. */
+/**
+ * El CLI falso por su nombre al principio del PATH, como lo lanza el supervisor, y un temporal del
+ * sistema propio para ver qué quedó en él.
+ */
+function isolate(family: Family): string {
+  const bin = mkdtempSync(join(BASE_TMP, 'sdd-ai-bin-'))
+  makeFakeBin(bin, family)
+  warmFakeBin(bin, family)
+  process.env.PATH = `${bin}:${BASE_PATH}`
+  const tmp = mkdtempSync(join(BASE_TMP, 'sdd-ai-tmp-'))
+  process.env.TMPDIR = tmp
+  return tmp
+}
+const scratches = (tmp: string) => readdirSync(tmp).filter((n) => n.startsWith('sdd-ai-review-'))
+const resolution = (family: Family, more: Partial<Resolution> = {}): Resolution =>
+  ({ family, via: 'process', origin: { model: 'heredado', effort: 'heredado' }, ...more })
+
+/** Corrida de revisión con un candidato fijo de una ruta y un solo trabajo de la base. */
 function prepareReview(family: Family, mode: string, pad = 0): string {
   const dir = createRun(makeRepo(), 'r')
   const c: Candidate = {
@@ -316,20 +336,15 @@ function prepareReview(family: Family, mode: string, pad = 0): string {
     files: [{ path: 'a.txt', status: 'M', mode: '100644', sha256: 'x', binary: false, lines: 3, visible: [[1, 3]] }],
   }
   writeJsonAtomic(join(dir, 'candidate.json'), c)
-  writeFileSync(join(dir, 'prompt.md'), renderReviewPrompt(c, new Map()) + 'x'.repeat(pad))
-  const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
-  makeFakeBin(bin, family)
-  const task = {
-    cwd: dir, promptFile: join(dir, 'prompt.md'), resultFile: join(dir, 'result.md'), sessionId: 's1',
-    scratch: mkdtempSync(join(tmpdir(), 'sdd-ai-scratch-')),
-  }
-  const launch = family === 'claude' ? claudeReviewLaunch(task) : codexReviewLaunch(task)
+  const prompt = join(dir, 'prompt-l1-base-b1.md')
+  writeFileSync(prompt, renderReviewPrompt(c, new Map()) + 'x'.repeat(pad))
+  isolate(family)
   const argv: ArgvFile = {
-    family, kind: 'review', candidate: join(dir, 'candidate.json'), launch: { ...launch, cmd: join(bin, family) },
-    deadline_sec: 30, resume_sec: 5,
+    family, kind: 'review', candidate: join(dir, 'candidate.json'), deadline_sec: 30, resume_sec: 5, round: 1, tag: '', launch_n: 1,
+    reviewer_resolution: resolution(family), jobs: [{ key: 'base-b1', reviewer: 'base', batch: 1, paths: ['a.txt'], prompt }],
   }
   writeJsonAtomic(join(dir, 'argv.json'), argv)
-  writeJsonAtomic(join(dir, 'resolved.json'), { family, via: 'process', origin: { model: 'heredado', effort: 'heredado' } })
+  writeJsonAtomic(join(dir, 'resolved.json'), resolution(family))
   process.env.FAKE_MODE = mode
   process.env.FAKE_CALLS_FILE = join(dir, 'calls')
   process.env.FAKE_PID_FILE = join(dir, 'pids')
@@ -337,6 +352,7 @@ function prepareReview(family: Family, mode: string, pad = 0): string {
 }
 
 const readRunJson = (dir: string, name: string) => JSON.parse(readFileSync(join(dir, name), 'utf8'))
+const session = (args: string[]) => args[args.indexOf('--session-id') + 1]
 
 test('una revisión admitida deja veredicto y recibo, y el recibo no autoriza nada', async () => {
   const dir = prepareReview('claude', 'review-ok')
@@ -350,12 +366,15 @@ test('una revisión admitida deja veredicto y recibo, y el recibo no autoriza na
   assert.deepEqual(r.tool_events, [])
   assert.match(r.note, /no autoriza commit ni push/)
   assert.equal(metrics(dir).attempts[0].admission, 'ok')
+  assert.equal(s.result_file, undefined, 'una revisión no apunta a un resultado')
 })
 
-test('un revisor que declara que no pudo inspeccionar termina en unavailable sin reintento', async () => {
+test('un revisor que declara que no pudo inspeccionar deja la ronda unavailable sin reintento', async () => {
   const dir = prepareReview('codex', 'review-unavailable')
   const s = await supervise(dir)
-  assert.deepEqual([s.state, s.reason, s.detail], ['unavailable', 'reviewer_unavailable', 'no pude'])
+  assert.deepEqual([s.state, s.reason, s.detail], ['unavailable', 'jobs_incomplete', 'base-b1: unavailable/reviewer_unavailable'])
+  const [job] = readRunJson(dir, 'rounds.json').rounds[0].jobs
+  assert.deepEqual([job.key, job.state, job.reason, job.detail], ['base-b1', 'unavailable', 'reviewer_unavailable', 'no pude'])
   assert.equal(calls(dir).length, 1)
 })
 
@@ -365,17 +384,15 @@ test('una respuesta inadmisible se corrige una vez, en una sesión nueva de Clau
   const [first, second] = calls(dir)
   assert.equal(s.state, 'done')
   assert.equal(calls(dir).length, 2)
-  assert.equal(first[first.indexOf('--session-id') + 1], 's1')
-  assert.notEqual(second[second.indexOf('--session-id') + 1], 's1')
-  assert.match(readFileSync(join(dir, 'prompt-fix.md'), 'utf8'), /CORRECCIÓN[\s\S]*exactamente un objeto JSON/)
+  assert.notEqual(session(second), session(first))
+  assert.match(readFileSync(join(dir, 'prompt-l1-base-b1-fix.md'), 'utf8'), /CORRECCIÓN[\s\S]*exactamente un objeto JSON/)
   const m = metrics(dir)
   assert.deepEqual(m.attempts.map((a: { kind: string }) => a.kind), ['initial', 'correction'])
   assert.match(m.attempts[0].admission, /^inadmissible: /)
   assert.equal(m.attempts[1].admission, 'ok')
   assert.equal(m.totals.inadmissible, 1)
-  assert.deepEqual(m.attempts.map((a: { raw: { result: string } }) => a.raw.result), ['result.md', 'result-fix.md'])
-  assert.equal(s.result_file, 'result-fix.md')
-  assert.notEqual(readFileSync(join(dir, 'result.md'), 'utf8'), readFileSync(join(dir, 'result-fix.md'), 'utf8'))
+  assert.deepEqual(m.attempts.map((a: { raw: { result: string } }) => a.raw.result), ['result-l1-base-b1.md', 'result-l1-base-b1-fix.md'])
+  assert.notEqual(readFileSync(join(dir, 'result-l1-base-b1.md'), 'utf8'), readFileSync(join(dir, 'result-l1-base-b1-fix.md'), 'utf8'))
 })
 
 test('la corrección de Codex es un exec nuevo, no una reanudación', async () => {
@@ -383,23 +400,39 @@ test('la corrección de Codex es un exec nuevo, no una reanudación', async () =
   const s = await supervise(dir)
   assert.equal(s.state, 'done')
   assert.deepEqual(calls(dir)[1].slice(0, 2), ['exec', '--ignore-user-config'])
-  assert.equal(existsSync(join(dir, 'result-fix.md')), true)
+  assert.equal(existsSync(join(dir, 'result-l1-base-b1-fix.md')), true)
 })
 
-test('dos respuestas inadmisibles terminan en unavailable', async () => {
+test('dos respuestas inadmisibles dejan la ronda unavailable', async () => {
   const dir = prepareReview('claude', 'review-bad-always')
   const s = await supervise(dir)
-  assert.deepEqual([s.state, s.reason], ['unavailable', 'inadmissible_twice'])
+  assert.deepEqual([s.state, s.reason, s.detail], ['unavailable', 'jobs_incomplete', 'base-b1: unavailable/inadmissible_twice'])
   assert.equal(calls(dir).length, 2)
 })
 
 test('si el prompt corregido no entra en el presupuesto, no se relanza', async () => {
   const probe = prepareReview('claude', 'review-bad-always')
-  const size = readFileSync(join(probe, 'prompt.md')).length
+  const size = readFileSync(join(probe, 'prompt-l1-base-b1.md')).length
   const dir = prepareReview('claude', 'review-bad-always', REVIEW_PROMPT_BUDGET - size - 50)
   const s = await supervise(dir)
-  assert.deepEqual([s.state, s.reason], ['unavailable', 'correction_over_budget'])
+  assert.deepEqual([s.state, s.detail], ['unavailable', 'base-b1: unavailable/correction_over_budget'])
   assert.equal(calls(dir).length, 1)
+})
+
+test('con la reserva, un trabajo medido nunca termina en correction_over_budget', async () => {
+  const probe = prepareReview('claude', 'scripted')
+  const size = readFileSync(join(probe, 'prompt-l1-base-b1.md')).length
+  const dir = prepareReview('claude', 'scripted', REVIEW_PROMPT_BUDGET - CORRECTION_RESERVE - size)
+  assert.equal(readFileSync(join(dir, 'prompt-l1-base-b1.md')).length, REVIEW_PROMPT_BUDGET - CORRECTION_RESERVE)
+  writeJsonAtomic(join(dir, 'answers.json'), [
+    `{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":["a.txt","${'x'.repeat(10000)}"]},"findings":[]}`,
+    `{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":$PATHS},"findings":[]}`,
+  ])
+  process.env.FAKE_ANSWERS = join(dir, 'answers.json')
+  const s = await supervise(dir)
+  assert.equal(s.state, 'done')
+  assert.equal(calls(dir).length, 2)
+  assert.match(readFileSync(join(dir, 'prompt-l1-base-b1-fix.md'), 'utf8'), /motivo recortado/)
 })
 
 test('cleanEnv quita las señales de sesión del conductor y marca al worker', () => {
@@ -414,6 +447,11 @@ const ROUND_CANDIDATE: Candidate = {
   base_sha: 'b'.repeat(40), head_sha: null, hash: HASH, left_out: [], context: [], diff: 'diff --git a/a.txt b/a.txt\n',
   files: [{ path: 'a.txt', status: 'M', mode: '100644', sha256: 'x', binary: false, lines: 3, visible: [[1, 3]] }],
 }
+/** Dos archivos para repartir en dos lotes. */
+const TWO: Candidate = {
+  ...ROUND_CANDIDATE, diff: 'diff --git a/a.txt b/a.txt\ndiff --git a/b.txt b/b.txt\n',
+  files: [...ROUND_CANDIDATE.files, { path: 'b.txt', status: 'M', mode: '100644', sha256: 'y', binary: false, lines: 3, visible: [[1, 3]] }],
+}
 const inferential = { axis: 'quality', severity: 'CRITICAL', location: 'a.txt:2', claim: 'puede fallar con una lista vacía', causality: 'introduced', evidence: 'inferential' }
 const deterministic = { ...inferential, claim: 'la línea 2 no valida', evidence: 'deterministic' }
 const firstRound = (findings: unknown[]) =>
@@ -422,37 +460,48 @@ const nextRound = (responses: unknown[], findings: unknown[] = []) =>
   `{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":$PATHS},"responses":${JSON.stringify(responses)},"findings":${JSON.stringify(findings)}}`
 const refutation = (results: unknown[]) => `{"candidate_hash":"$HASH","results":${JSON.stringify(results)}}`
 
-interface RoundSetup { round?: number; ledger?: Ledger; plan?: RoundPlan; deadline_sec?: number; materialPad?: number }
+interface JobSpec { key: string; reviewer: Reviewer; batch: number; paths: string[] }
+interface RoundSetup {
+  round?: number; ledger?: Ledger; plan?: RoundPlan; deadline_sec?: number; resume_sec?: number
+  candidate?: Candidate; jobs?: JobSpec[]; launch?: number
+  /** El repo de un candidato congelado de verdad: sus blobs quedan en la corrida, como los deja la CLI. */
+  repo?: string
+}
 
-/** Una ronda preparada como la deja la CLI: candidato, material, prompt, revisor y refutador apuntados al CLI falso guionado. */
-function prepareRound(family: Family, answers: string[], o: RoundSetup = {}): { dir: string; argvName: string } {
+/**
+ * Una ronda preparada como la deja la CLI: candidato, material, un prompt por trabajo, y revisor y
+ * refutador resueltos a la familia del CLI falso guionado.
+ */
+function prepareRound(family: Family, answers: string[], o: RoundSetup = {}): { dir: string; argvName: string; tmp: string } {
   const dir = createRun(makeRepo(), 'r')
   const n = o.round ?? 1
   const tag = n === 1 ? '' : `-r${n}`
-  writeJsonAtomic(join(dir, `candidate${tag}.json`), ROUND_CANDIDATE)
-  const material = renderMaterial(ROUND_CANDIDATE, new Map()) + 'x'.repeat(o.materialPad ?? 0)
-  writeFileSync(join(dir, `material${tag}.md`), material)
-  const prompt = o.plan && o.ledger
-    ? renderRoundPrompt(ROUND_CANDIDATE, material, o.plan, o.ledger.entries, 3)
-    : renderReviewPrompt(ROUND_CANDIDATE, new Map())
-  writeFileSync(join(dir, `prompt${tag}.md`), prompt)
+  const k = o.launch ?? 1
+  const c = o.candidate ?? ROUND_CANDIDATE
+  writeJsonAtomic(join(dir, `candidate${tag}.json`), c)
+  if (o.repo) snapshot(o.repo, c, dir)
+  const material = renderMaterial(c, new Map())
+  const specs = o.jobs ?? [{ key: 'base-b1', reviewer: 'base', batch: 1, paths: c.files.map((f) => f.path) }]
+  const jobs = specs.map((j) => {
+    const view = j.paths.length === c.files.length ? undefined : sliceCandidate(c, j.paths)
+    const text = o.plan && o.ledger
+      ? renderRoundPrompt(c, view ? renderMaterial(c, new Map(), view) : material, o.plan, o.ledger.entries, 3, view ? j.paths : undefined)
+      : renderReviewPrompt(c, new Map(), { reviewer: j.reviewer, ...(view ? { view } : {}) })
+    const prompt = join(dir, `prompt${tag}-l${k}-${j.key}.md`)
+    writeFileSync(prompt, text)
+    return { ...j, prompt }
+  })
   if (o.ledger) writeJsonAtomic(join(dir, 'ledger.json'), o.ledger)
   if (o.plan) writeJsonAtomic(join(dir, `round${tag}.json`), o.plan)
   writeJsonAtomic(join(dir, 'request.json'), { kind: 'review', selection: { base: 'main', context: [] }, author: opposite(family), degradations: [] })
-  writeJsonAtomic(join(dir, 'resolved.json'), { family, via: 'process', model: 'm', effort: 'high', origin: { model: 'workers', effort: 'workers' } })
-  const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
-  makeFakeBin(bin, family)
-  warmFakeBin(bin, family)
-  const scratch = () => mkdtempSync(join(tmpdir(), 'sdd-ai-scratch-'))
-  const task = { cwd: dir, promptFile: join(dir, `prompt${tag}.md`), resultFile: join(dir, `result${tag}.md`), sessionId: 's1', scratch: scratch() }
-  const launch = family === 'claude' ? claudeReviewLaunch(task) : codexReviewLaunch(task)
-  const rtask = { cwd: dir, promptFile: join(dir, `prompt${tag}-refute.md`), resultFile: join(dir, `result${tag}-refute.md`), sessionId: 's2', scratch: scratch() }
-  const refuter = family === 'claude' ? claudeReviewLaunch({ ...rtask, systemPrompt: REFUTER_SYSTEM_PROMPT }) : codexReviewLaunch(rtask)
-  const argvName = `argv${tag}.json`
+  const reviewer = resolution(family, { model: 'm', effort: 'high', origin: { model: 'workers', effort: 'workers' } })
+  writeJsonAtomic(join(dir, 'resolved.json'), reviewer)
+  const tmp = isolate(family)
+  const argvName = `argv${tag}-l${k}.json`
   const argv: ArgvFile = {
-    family, kind: 'review', candidate: join(dir, `candidate${tag}.json`), launch: { ...launch, cmd: join(bin, family) },
-    deadline_sec: o.deadline_sec ?? 30, grace_ms: 200, resume_sec: 5, round: n, tag, material: join(dir, `material${tag}.md`),
-    refuter_launch: { ...refuter, cmd: join(bin, family) }, ...(o.plan ? { plan: join(dir, `round${tag}.json`) } : {}),
+    family, kind: 'review', candidate: join(dir, `candidate${tag}.json`), deadline_sec: o.deadline_sec ?? 30, grace_ms: 200,
+    resume_sec: o.resume_sec ?? 5, round: n, tag, launch_n: k,
+    reviewer_resolution: reviewer, refuter_resolution: resolution(family), jobs, ...(o.plan ? { plan: join(dir, `round${tag}.json`) } : {}),
   }
   writeJsonAtomic(join(dir, argvName), argv)
   writeJsonAtomic(join(dir, 'answers.json'), answers)
@@ -460,11 +509,13 @@ function prepareRound(family: Family, answers: string[], o: RoundSetup = {}): { 
   process.env.FAKE_ANSWERS = join(dir, 'answers.json')
   process.env.FAKE_CALLS_FILE = join(dir, 'calls')
   process.env.FAKE_PID_FILE = join(dir, 'pids')
-  return { dir, argvName }
+  return { dir, argvName, tmp }
 }
 
 const ledgerOf = (dir: string): Ledger => readRunJson(dir, 'ledger.json')
 const kinds = (dir: string) => metrics(dir).attempts.map((a: { kind: string; round: number; suffix: string }) => [a.round, a.kind, a.suffix])
+const cwds = (dir: string) => readFileSync(join(dir, 'calls.cwd'), 'utf8').trim().split('\n')
+const twoLots: JobSpec[] = [{ key: 'base-b1', reviewer: 'base', batch: 1, paths: ['a.txt'] }, { key: 'base-b2', reviewer: 'base', batch: 2, paths: ['b.txt'] }]
 
 for (const family of ['claude', 'codex'] as const) {
   test(`${family}: un grave inferencial de la ronda 1 va al refutador, y refuted lo deja refutado`, async () => {
@@ -477,10 +528,11 @@ for (const family of ['claude', 'codex'] as const) {
     const l = ledgerOf(dir)
     assert.deepEqual(l.entries.map((e) => [e.id, e.state]), [['F-1', 'refutado'], ['F-2', 'abierto']])
     assert.deepEqual(l.entries[0].refutation, { result: 'refuted', evidence: 'a.txt:1', note: 'la guarda está en la línea 1' })
-    const refutePrompt = readFileSync(join(dir, 'prompt-refute.md'), 'utf8')
+    const refutePrompt = readFileSync(join(dir, 'prompt-l1-refute-s1.md'), 'utf8')
     assert.match(refutePrompt, /refutador aislado/)
     assert.ok(refutePrompt.includes('"F-1"') && !refutePrompt.includes('"F-2"'))
-    assert.deepEqual(kinds(dir), [[1, 'initial', ''], [1, 'refutation', '-refute']])
+    assert.deepEqual(kinds(dir), [[1, 'initial', ''], [1, 'refutation', '']])
+    if (family === 'claude') assert.equal(calls(dir)[1][calls(dir)[1].indexOf('--system-prompt') + 1], REFUTER_SYSTEM_PROMPT)
     const round = readRunJson(dir, 'rounds.json').rounds[0]
     assert.deepEqual([round.n, round.state, round.refutation.ids, round.refutation.outcome], [1, 'done', ['F-1'], 'admitted'])
     assert.deepEqual(round.refutation.tool_events, [])
@@ -492,7 +544,7 @@ test('sin graves inferenciales no hay refutación', async () => {
   const { dir, argvName } = prepareRound('claude', [firstRound([deterministic])])
   await supervise(dir, argvName)
   assert.equal(calls(dir).length, 1)
-  assert.equal(existsSync(join(dir, 'prompt-refute.md')), false)
+  assert.equal(existsSync(join(dir, 'prompt-l1-refute-s1.md')), false)
   assert.equal(readRunJson(dir, 'rounds.json').rounds[0].refutation, undefined)
 })
 
@@ -518,27 +570,27 @@ test('un refutador que se agota deja la tanda inconclusive por timeout, sin rean
 test('un refutador inadmisible dos veces deja la tanda inconclusive', async () => {
   const { dir, argvName } = prepareRound('claude', [firstRound([inferential]), 'no sé', 'tampoco'])
   await supervise(dir, argvName)
-  assert.deepEqual(kinds(dir), [[1, 'initial', ''], [1, 'refutation', '-refute'], [1, 'refutation', '-refute-fix']])
-  assert.ok(readFileSync(join(dir, 'prompt-refute-fix.md'), 'utf8').startsWith(readFileSync(join(dir, 'prompt-refute.md'), 'utf8')))
+  assert.deepEqual(kinds(dir), [[1, 'initial', ''], [1, 'refutation', ''], [1, 'refutation', '-fix']])
+  assert.ok(readFileSync(join(dir, 'prompt-l1-refute-s1-fix.md'), 'utf8').startsWith(readFileSync(join(dir, 'prompt-l1-refute-s1.md'), 'utf8')))
   assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'inadmissible_twice' })
 })
 
-test('un refutador cancelado deja la tanda inconclusive por cancelled y la ronda en done', async () => {
-  const { dir, argvName } = prepareRound('claude', [firstRound([inferential]), '__hang__'])
+test('cancel en la refutación deja la ronda cancelled con su ledger', async () => {
+  const { dir, argvName } = prepareRound('claude', [firstRound([inferential, { ...inferential, location: 'a.txt:3' }]), '__hang__'])
   const running = supervise(dir, argvName)
   await waitFor(() => (existsSync(join(dir, 'calls')) && calls(dir).length === 2 ? true : undefined))
   await sleep(200)
   writeFileSync(join(dir, 'cancel.request'), 'ya')
   const s = await running
-  assert.equal(s.state, 'done')
-  assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'cancelled' })
-})
-
-test('un prompt de refutación que no entra en el presupuesto deja la tanda inconclusive sin lanzar', async () => {
-  const { dir, argvName } = prepareRound('claude', [firstRound([inferential])], { materialPad: REVIEW_PROMPT_BUDGET })
-  await supervise(dir, argvName)
-  assert.equal(calls(dir).length, 1)
-  assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'prompt_too_large' })
+  assert.equal(s.state, 'cancelled')
+  const l = ledgerOf(dir)
+  assert.equal(l.completed, 1)
+  assert.deepEqual(l.entries.map((e) => [e.id, e.refutation]), [
+    ['F-1', { result: 'inconclusive', reason: 'cancelled' }], ['F-2', { result: 'inconclusive', reason: 'cancelled' }],
+  ])
+  assert.equal(readRunJson(dir, 'receipt.json').candidate_hash, HASH)
+  const round = readRunJson(dir, 'rounds.json').rounds[0]
+  assert.deepEqual([round.state, round.refutation.outcome, round.refutation.reason], ['cancelled', 'inconclusive', 'cancelled'])
 })
 
 /** Ledger después de una ronda 1 con dos graves deterministas: F-1 aceptado y F-2 rechazado. */
@@ -550,33 +602,36 @@ function roundTwo(): { ledger: Ledger; plan: RoundPlan } {
 }
 const answered = [{ id: 'F-1', answer: 'resolved' }, { id: 'F-2', answer: 'withdrawn' }]
 
-test('la ronda 2 escribe sus archivos con -r2, aplica las respuestas y abre las regresiones', async () => {
+test('la ronda 2 escribe sus archivos con -r2 y su lanzamiento, aplica las respuestas y abre las regresiones', async () => {
   const { ledger, plan } = roundTwo()
   const { dir, argvName } = prepareRound('claude', [nextRound(answered, [{ ...deterministic, severity: 'WARNING', claim: 'regresión' }])], { round: 2, ledger, plan })
   const s = await supervise(dir, argvName)
-  assert.deepEqual([s.state, s.round, s.result_file], ['done', 2, 'result-r2.md'])
-  for (const f of ['stdout-r2.log', 'stderr-r2.log', 'result-r2.md']) assert.equal(existsSync(join(dir, f)), true, f)
-  for (const f of ['stdout.log', 'result.md']) assert.equal(existsSync(join(dir, f)), false, f)
+  assert.deepEqual([s.state, s.round], ['done', 2])
+  for (const f of ['stdout-r2-l1-base-b1.log', 'stderr-r2-l1-base-b1.log', 'result-r2-l1-base-b1.md', 'admitted-r2-l1-base-b1.json']) {
+    assert.equal(existsSync(join(dir, f)), true, f)
+  }
+  for (const f of ['stdout.log', 'result.md', 'result-r2.md']) assert.equal(existsSync(join(dir, f)), false, f)
   const l = ledgerOf(dir)
   assert.deepEqual(l.entries.map((e) => [e.id, e.state, e.round]), [['F-1', 'resuelto', 1], ['F-2', 'cerrado', 1], ['F-3', 'abierto', 2]])
+  assert.deepEqual([l.entries[2].reviewer, l.entries[2].batch], ['base', 1])
   assert.equal(l.completed, 2)
   const r = readRunJson(dir, 'rounds.json').rounds
-  assert.deepEqual(r.map((x: { n: number; tag: string; state: string }) => [x.n, x.tag, x.state]), [[2, '-r2', 'done']])
+  assert.deepEqual(r.map((x: { n: number; tag: string; state: string; launch: number }) => [x.n, x.tag, x.state, x.launch]), [[2, '-r2', 'done', 1]])
   assert.deepEqual(kinds(dir), [[2, 'initial', '']])
 })
 
-test('la corrección de la ronda 2 parte de prompt-r2.md', async () => {
+test('la corrección de la ronda 2 parte del prompt de su trabajo', async () => {
   const { ledger, plan } = roundTwo()
   const { dir, argvName } = prepareRound('codex', ['sin JSON', nextRound(answered)], { round: 2, ledger, plan })
   const s = await supervise(dir, argvName)
   assert.equal(s.state, 'done')
-  assert.ok(readFileSync(join(dir, 'prompt-r2-fix.md'), 'utf8').startsWith(readFileSync(join(dir, 'prompt-r2.md'), 'utf8')))
-  assert.equal(existsSync(join(dir, 'result-r2-fix.md')), true)
+  assert.ok(readFileSync(join(dir, 'prompt-r2-l1-base-b1-fix.md'), 'utf8').startsWith(readFileSync(join(dir, 'prompt-r2-l1-base-b1.md'), 'utf8')))
+  assert.equal(existsSync(join(dir, 'result-r2-l1-base-b1-fix.md')), true)
   assert.equal(existsSync(join(dir, 'prompt-fix.md')), false)
   assert.equal(ledgerOf(dir).entries[0].state, 'resuelto')
 })
 
-test('una ronda 2 que agota el tope se reanuda con resume-r2.md', async () => {
+test('una ronda 2 que agota el tope se reanuda con el resume de su trabajo', async () => {
   const { ledger, plan } = roundTwo()
   // La reanudación solo recibe el mensaje de cierre: la respuesta guionada lleva el hash y las rutas literales.
   const literal = nextRound(answered).replace('$HASH', HASH).replace('$PATHS', '["a.txt"]')
@@ -584,8 +639,8 @@ test('una ronda 2 que agota el tope se reanuda con resume-r2.md', async () => {
   const s = await supervise(dir, argvName)
   assert.equal(s.state, 'done')
   assert.equal(s.resume?.outcome, 'done')
-  assert.match(readFileSync(join(dir, 'resume-r2.md'), 'utf8'), /Se agotó el tiempo/)
-  assert.equal(existsSync(join(dir, 'argv-r2-resume.json')), true)
+  assert.match(readFileSync(join(dir, 'resume-r2-l1-base-b1.md'), 'utf8'), /Se agotó el tiempo/)
+  assert.equal(existsSync(join(dir, 'argv-r2-l1-base-b1-resume.json')), true)
   assert.deepEqual(kinds(dir), [[2, 'initial', ''], [2, 'resume', '-resume']])
   assert.equal(ledgerOf(dir).entries[0].state, 'resuelto')
 })
@@ -597,7 +652,7 @@ test('una ronda 2 unavailable no cambia el ledger y queda registrada', async () 
   ], { round: 2, ledger, plan })
   const before = readFileSync(join(dir, 'ledger.json'), 'utf8')
   const s = await supervise(dir, argvName)
-  assert.deepEqual([s.state, s.reason], ['unavailable', 'reviewer_unavailable'])
+  assert.deepEqual([s.state, s.reason], ['unavailable', 'jobs_incomplete'])
   assert.equal(readFileSync(join(dir, 'ledger.json'), 'utf8'), before)
   assert.deepEqual(readRunJson(dir, 'rounds.json').rounds.map((x: { n: number; state: string }) => [x.n, x.state]), [[2, 'unavailable']])
 })
@@ -617,4 +672,308 @@ test('el recibo lista cada ronda con su candidato, e incluye el ledger y la nota
   assert.deepEqual(r.axes, { scope: 'ok', spec: 'ok', quality: 'ok' })
   assert.deepEqual([r.reviewer.family, r.reviewer.model_requested, r.reviewer.model_effective], ['claude', 'm', 'claude-falso'])
   assert.match(r.note, /no autoriza commit ni push/)
+})
+
+test('los trabajos corren en serie, cada uno con su propio plazo', async () => {
+  const { dir, argvName } = prepareRound('claude', ['__hang__', '__hang__', firstRound([])],
+    { candidate: TWO, jobs: twoLots, deadline_sec: 1, resume_sec: 1 })
+  const s = await supervise(dir, argvName)
+  const attempts = metrics(dir).attempts as Array<{ batch: number; kind: string; started_at: string; ended_at: string }>
+  const firstEnd = Math.max(...attempts.filter((a) => a.batch === 1).map((a) => Date.parse(a.ended_at)))
+  const secondStart = attempts.find((a) => a.batch === 2)?.started_at ?? ''
+  assert.ok(Date.parse(secondStart) >= firstEnd, 'el segundo empezó después de que terminó el primero')
+  assert.ok(Date.parse(secondStart) - Date.parse(attempts[0].started_at) > 1000, 'el primero consumió más que un plazo')
+  const jobs = readRunJson(dir, 'rounds.json').rounds[0].jobs
+  assert.deepEqual(jobs.map((j: { key: string; state: string }) => [j.key, j.state]), [['base-b1', 'timeout'], ['base-b2', 'done']])
+  assert.ok(jobs[1].admitted)
+  assert.deepEqual([s.state, s.reason, s.detail], ['unavailable', 'jobs_incomplete', 'base-b1: timeout, base-b2: done'])
+})
+
+test('cancel detiene el trabajo en curso y no lanza los demás', async () => {
+  const { dir, argvName } = prepareRound('claude', ['__hang__', firstRound([])], { candidate: TWO, jobs: twoLots })
+  const running = supervise(dir, argvName)
+  await waitFor(() => (existsSync(join(dir, 'calls')) ? true : undefined))
+  await sleep(200)
+  writeFileSync(join(dir, 'cancel.request'), 'ya')
+  const s = await running
+  assert.equal(s.state, 'cancelled')
+  assert.equal(calls(dir).length, 1)
+  const round = readRunJson(dir, 'rounds.json').rounds[0]
+  assert.deepEqual([round.state, round.jobs.map((j: { key: string; state: string }) => [j.key, j.state])], ['cancelled', [['base-b1', 'cancelled']]])
+})
+
+test('un trabajo no admitido deja la ronda unavailable y los demás corren', async () => {
+  const { dir, argvName } = prepareRound('claude', ['__fail__', firstRound([{ ...deterministic, location: 'b.txt:2' }])], { candidate: TWO, jobs: twoLots })
+  const s = await supervise(dir, argvName)
+  assert.equal(calls(dir).length, 2)
+  assert.deepEqual([s.state, s.reason, s.detail], ['unavailable', 'jobs_incomplete', 'base-b1: launch_failed/unknown, base-b2: done'])
+  const jobs = readRunJson(dir, 'rounds.json').rounds[0].jobs
+  assert.deepEqual(jobs.map((j: { key: string; state: string; launch: number }) => [j.key, j.state, j.launch]), [['base-b1', 'launch_failed', 1], ['base-b2', 'done', 1]])
+  assert.equal(existsSync(join(dir, 'ledger.json')), false)
+})
+
+test('cada respuesta se admite contra su lote: exactamente sus rutas', async () => {
+  const wrong = '{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":["a.txt","b.txt"]},"findings":[]}'
+  const { dir, argvName } = prepareRound('claude', [firstRound([]), wrong, wrong], { candidate: TWO, jobs: twoLots })
+  const s = await supervise(dir, argvName)
+  assert.deepEqual([s.state, s.detail], ['unavailable', 'base-b1: done, base-b2: unavailable/inadmissible_twice'])
+  const prompts = ['prompt-l1-base-b1.md', 'prompt-l1-base-b2.md'].map((f) => readFileSync(join(dir, f), 'utf8'))
+  assert.ok(prompts[0].includes('\nLOTE: a.txt\n') && prompts[1].includes('\nLOTE: b.txt\n'))
+  assert.match(metrics(dir).attempts[1].admission, /inspection\.paths trae rutas que no son del candidato: a\.txt/)
+})
+
+test('contra su lote, una cita a un archivo de otro lote se rechaza', async () => {
+  const other = firstRound([{ ...deterministic, location: 'b.txt:2' }])
+  const { dir, argvName } = prepareRound('claude', [other, other, firstRound([])], { candidate: TWO, jobs: twoLots })
+  const s = await supervise(dir, argvName)
+  assert.deepEqual([s.state, s.detail], ['unavailable', 'base-b1: unavailable/inadmissible_twice, base-b2: done'])
+  assert.match(metrics(dir).attempts[0].admission, /b\.txt:2 apunta a una ruta que no está en el candidato/)
+})
+
+test('el ledger se abre solo cuando todos los trabajos fueron admitidos', async () => {
+  const jobs: JobSpec[] = [
+    { key: 'base-b1', reviewer: 'base', batch: 1, paths: ['a.txt'] }, { key: 'base-b2', reviewer: 'base', batch: 2, paths: ['b.txt'] },
+    { key: 'risk-b1', reviewer: 'risk', batch: 1, paths: ['a.txt'] }, { key: 'risk-b2', reviewer: 'risk', batch: 2, paths: ['b.txt'] },
+  ]
+  const at = (claim: string, location: string) => ({ ...deterministic, severity: 'WARNING', claim, location })
+  const { dir, argvName } = prepareRound('claude', [
+    firstRound([at('base 1', 'a.txt:1')]), firstRound([at('base 2', 'b.txt:1')]),
+    firstRound([at('riesgo 1', 'a.txt:2')]), firstRound([at('riesgo 2', 'b.txt:2')]),
+  ], { candidate: TWO, jobs })
+  const s = await supervise(dir, argvName)
+  assert.equal(s.state, 'done')
+  assert.deepEqual(ledgerOf(dir).entries.map((e) => [e.id, e.claim, e.reviewer, e.batch]), [
+    ['F-1', 'base 1', 'base', 1], ['F-2', 'base 2', 'base', 2], ['F-3', 'riesgo 1', 'risk', 1], ['F-4', 'riesgo 2', 'risk', 2],
+  ])
+  assert.equal(readRunJson(dir, 'rounds.json').rounds[0].jobs.length, 4)
+})
+
+test('un relanzamiento no pisa logs, prompt, resultado ni argv', async () => {
+  const { dir, argvName } = prepareRound('claude', ['__fail__', firstRound([])])
+  await supervise(dir, argvName)
+  const names = ['stdout-l1-base-b1.log', 'stderr-l1-base-b1.log', 'prompt-l1-base-b1.md', 'argv-l1.json']
+  const before = names.map((f) => readFileSync(join(dir, f), 'utf8'))
+  const argv = readRunJson(dir, argvName) as ArgvFile
+  const prompt = join(dir, 'prompt-l2-base-b1.md')
+  writeFileSync(prompt, `${readFileSync(join(dir, 'prompt-l1-base-b1.md'), 'utf8')}\n`)
+  writeJsonAtomic(join(dir, 'argv-l2.json'), { ...argv, launch_n: 2, jobs: (argv.jobs ?? []).map((j) => ({ ...j, prompt })) })
+  const s = await supervise(dir, 'argv-l2.json')
+  assert.equal(s.state, 'done')
+  assert.deepEqual(names.map((f) => readFileSync(join(dir, f), 'utf8')), before)
+  for (const f of ['stdout-l2-base-b1.log', 'result-l2-base-b1.md', 'admitted-l2-base-b1.json']) assert.equal(existsSync(join(dir, f)), true, f)
+  assert.deepEqual(readRunJson(dir, 'rounds.json').rounds.map((r: { launch: number; state: string }) => [r.launch, r.state]), [[1, 'unavailable'], [2, 'done']])
+})
+
+test('metrics registra revisor, lote y lanzamiento, y un resultado ausente queda ausente', async () => {
+  const { dir, argvName } = prepareRound('claude', ['__fail__'], { launch: 3 })
+  await supervise(dir, argvName)
+  const [a] = metrics(dir).attempts
+  assert.deepEqual([a.reviewer, a.batch, a.launch, a.round], ['base', 1, 3, 1])
+  assert.equal(a.raw.result, null)
+  assert.equal(existsSync(join(dir, 'result-l3-base-b1.md')), false)
+  assert.deepEqual([a.raw.stdout, a.raw.stderr], ['stdout-l3-base-b1.log', 'stderr-l3-base-b1.log'])
+})
+
+test('un lanzamiento nunca lee el resultado de otro', async () => {
+  const { dir, argvName } = prepareRound('codex', [firstRound([]), '__fail__'])
+  assert.equal((await supervise(dir, argvName)).state, 'done')
+  const argv = readRunJson(dir, argvName) as ArgvFile
+  writeJsonAtomic(join(dir, 'argv-l2.json'), { ...argv, launch_n: 2 })
+  const s = await supervise(dir, 'argv-l2.json')
+  assert.notEqual(s.state, 'done')
+  assert.equal(existsSync(join(dir, 'result-l2-base-b1.md')), false)
+  assert.equal(calls(dir)[1][calls(dir)[1].indexOf('--output-last-message') + 1], join(dir, 'result-l2-base-b1.md'))
+})
+
+test('cada trabajo borra su temporal al terminar, sea cual sea el final', async () => {
+  const jobs: JobSpec[] = [...twoLots, { key: 'risk-b1', reviewer: 'risk', batch: 1, paths: ['a.txt'] }]
+  const { dir, argvName, tmp } = prepareRound('claude', [firstRound([]), '__fail__', '__hang__', '__hang__'],
+    { candidate: TWO, jobs, deadline_sec: 1, resume_sec: 1 })
+  const s = await supervise(dir, argvName)
+  assert.equal(s.state, 'unavailable')
+  assert.equal(calls(dir).length, 4)
+  assert.deepEqual(scratches(tmp), [])
+  const real = realpathSync(tmp)
+  for (const cwd of cwds(dir)) assert.ok(cwd.startsWith(`${real}/sdd-ai-review-`), cwd)
+  assert.equal(new Set(cwds(dir)).size, 3, 'la reanudación usa el temporal de su trabajo')
+})
+
+test('el refutador no crea temporal si no corre', async () => {
+  const { dir, argvName, tmp } = prepareRound('claude', [firstRound([deterministic])])
+  await supervise(dir, argvName)
+  assert.equal(cwds(dir).length, 1)
+  assert.deepEqual(scratches(tmp), [])
+})
+
+test('el borrado solo alcanza temporales de sdd-ai', () => {
+  const tmp = isolate('claude')
+  const other = mkdtempSync(join(tmp, 'otro-'))
+  const outside = mkdtempSync(join(makeRepo(), 'sdd-ai-review-'))
+  const target = mkdtempSync(join(BASE_TMP, 'sdd-ai-destino-'))
+  const link = join(tmp, 'sdd-ai-review-x')
+  symlinkSync(target, link)
+  const own = mkdtempSync(join(tmp, 'sdd-ai-review-'))
+  mkdirSync(join(own, 'adentro'))
+  assert.deepEqual([removeScratch(other), removeScratch(outside), removeScratch(link)], [false, false, false])
+  assert.deepEqual([existsSync(other), existsSync(outside), existsSync(target)], [true, true, true])
+  assert.equal(removeScratch(own), true)
+  assert.equal(existsSync(own), false)
+})
+
+const git = (repo: string, ...args: string[]) =>
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: repo, encoding: 'utf8' }).trim()
+/** Un archivo de unos 120 KB: dos no entran juntos en un prompt. */
+const bulky = (tag: string) => Array.from({ length: 1200 }, (_, i) => `${tag} ${String(i + 1).padStart(4, '0')} ${'x'.repeat(90)}`).join('\n').concat('\n')
+
+/** Un candidato congelado de verdad, con dos archivos grandes en dos directorios y, si se pide, un contexto. */
+function bulkyCandidate(context?: string): { repo: string; c: Candidate } {
+  const repo = makeRepo()
+  writeFileSync(join(repo, 'a.txt'), 'a\n')
+  git(repo, 'add', '-A')
+  git(repo, 'commit', '-qm', 'base')
+  const base = git(repo, 'rev-parse', 'HEAD')
+  mkdirSync(join(repo, 'x'))
+  mkdirSync(join(repo, 'y'))
+  writeFileSync(join(repo, 'x', 'uno.txt'), bulky('uno'))
+  writeFileSync(join(repo, 'y', 'dos.txt'), bulky('dos'))
+  git(repo, 'add', '-N', 'x/uno.txt', 'y/dos.txt')
+  if (context) writeFileSync(join(repo, 'spec.md'), context)
+  return { repo, c: freeze(repo, { base, context: context ? ['spec.md'] : [] }) }
+}
+const bulkyLots: JobSpec[] = [
+  { key: 'base-b1', reviewer: 'base', batch: 1, paths: ['x/uno.txt'] }, { key: 'base-b2', reviewer: 'base', batch: 2, paths: ['y/dos.txt'] },
+]
+const onUno = { ...inferential, location: 'x/uno.txt:5' }
+const onDos = { ...inferential, location: 'y/dos.txt:5' }
+
+test('el refutador recibe el material entero si entra', async () => {
+  const repo = makeRepo()
+  writeFileSync(join(repo, 'a.txt'), 'uno\ndos\ntres\n')
+  git(repo, 'add', '-A')
+  git(repo, 'commit', '-qm', 'base')
+  const base = git(repo, 'rev-parse', 'HEAD')
+  writeFileSync(join(repo, 'a.txt'), 'uno\nDOS\ntres\n')
+  writeFileSync(join(repo, 'spec.md'), '# spec congelada\n')
+  const c = freeze(repo, { base, context: ['spec.md'] })
+  const { dir, argvName } = prepareRound('claude', [
+    firstRound([inferential]), refutation([{ id: 'F-1', result: 'corroborated', evidence: 'a.txt:2' }]),
+  ], { candidate: c, repo })
+  writeFileSync(join(repo, 'spec.md'), '# spec cambiada después\n')
+  assert.equal((await supervise(dir, argvName)).state, 'done')
+  const prompt = readFileSync(join(dir, 'prompt-l1-refute-s1.md'), 'utf8')
+  assert.ok(prompt.endsWith(`${renderMaterial(c, new Map([['spec.md', '# spec congelada\n']]))}\n`), 'el material entero, con el contexto de los blobs')
+  const r = readRunJson(dir, 'rounds.json').rounds[0].refutation
+  assert.deepEqual([r.outcome, r.trimmed, r.batches], ['admitted', false, [{ ids: ['F-1'], paths: ['a.txt'], outcome: 'admitted' }]])
+})
+
+test('el refutador parte la tanda por hallazgos cuando no entra', async () => {
+  const { repo, c } = bulkyCandidate()
+  const { dir, argvName } = prepareRound('claude', [
+    firstRound([onUno]), firstRound([onDos]),
+    refutation([{ id: 'F-1', result: 'corroborated', evidence: 'x/uno.txt:5' }]), refutation([{ id: 'F-2', result: 'refuted', evidence: 'y/dos.txt:5' }]),
+  ], { candidate: c, repo, jobs: bulkyLots })
+  assert.equal((await supervise(dir, argvName)).state, 'done')
+  const r = readRunJson(dir, 'rounds.json').rounds[0].refutation
+  assert.deepEqual([r.outcome, r.trimmed, r.batches], ['admitted', true, [
+    { ids: ['F-1'], paths: ['x/uno.txt'], outcome: 'admitted' }, { ids: ['F-2'], paths: ['y/dos.txt'], outcome: 'admitted' },
+  ]])
+  assert.deepEqual(ledgerOf(dir).entries.map((e) => [e.id, e.state, e.refutation?.result]), [['F-1', 'abierto', 'corroborated'], ['F-2', 'refutado', 'refuted']])
+  const first = readFileSync(join(dir, 'prompt-l1-refute-s1.md'), 'utf8')
+  assert.ok(first.includes('│diff --git a/x/uno.txt b/x/uno.txt') && !first.includes('│diff --git a/y/dos.txt b/y/dos.txt'))
+})
+
+test('en el refutador, un hallazgo que no entra solo queda inconclusive sin lanzarse', async () => {
+  const { repo, c } = bulkyCandidate()
+  const { dir, argvName } = prepareRound('claude', [
+    firstRound([{ ...onUno, claim: 'x'.repeat(100_000) }]), firstRound([onDos]),
+    refutation([{ id: 'F-2', result: 'corroborated', evidence: 'y/dos.txt:5' }]),
+  ], { candidate: c, repo, jobs: bulkyLots })
+  assert.equal((await supervise(dir, argvName)).state, 'done')
+  assert.equal(calls(dir).length, 3)
+  assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'prompt_too_large' })
+  const r = readRunJson(dir, 'rounds.json').rounds[0].refutation
+  assert.deepEqual([r.outcome, r.batches], ['partial', [
+    { ids: ['F-1'], paths: ['x/uno.txt'], outcome: 'inconclusive', reason: 'prompt_too_large' },
+    { ids: ['F-2'], paths: ['y/dos.txt'], outcome: 'admitted' },
+  ]])
+  assert.ok(readFileSync(join(dir, 'prompt-l1-refute-s1.md'), 'utf8').includes('"F-2"'))
+})
+
+test('una sub-tanda que falla no vuelve unavailable la ronda', async () => {
+  const { repo, c } = bulkyCandidate()
+  const { dir, argvName } = prepareRound('claude', [
+    firstRound([onUno]), firstRound([onDos]), '__fail__', refutation([{ id: 'F-2', result: 'refuted', evidence: 'y/dos.txt:5' }]),
+  ], { candidate: c, repo, jobs: bulkyLots })
+  assert.equal((await supervise(dir, argvName)).state, 'done')
+  const [f1, f2] = ledgerOf(dir).entries
+  assert.deepEqual([f1.state, f1.refutation?.result, f2.state], ['abierto', 'inconclusive', 'refutado'])
+  assert.match(f1.refutation?.reason ?? '', /launch_failed/)
+  assert.equal(readRunJson(dir, 'rounds.json').rounds[0].refutation.outcome, 'partial')
+})
+
+test('el progreso muestra la sub-tanda de refutación en curso', async () => {
+  const { dir, argvName } = prepareRound('claude', [firstRound([inferential]), '__hang__'])
+  const running = supervise(dir, argvName)
+  const job = await waitFor(() => {
+    const j = existsSync(join(dir, 'status.json')) ? readStatus(dir).job : undefined
+    return j?.phase === 'refutation' ? j : undefined
+  })
+  assert.deepEqual(job, { phase: 'refutation', key: 'refute-s1', index: 1, total: 1 })
+  writeFileSync(join(dir, 'cancel.request'), 'ya')
+  assert.equal((await running).state, 'cancelled')
+  assert.equal(readStatus(dir).job, undefined)
+})
+
+test('metrics registra cada sub-tanda con su lanzamiento', async () => {
+  const { dir, argvName } = prepareRound('claude', [
+    firstRound([inferential]), refutation([{ id: 'F-1', result: 'corroborated', evidence: 'a.txt:2' }]),
+  ], { launch: 2 })
+  await supervise(dir, argvName)
+  const [review, refuted] = metrics(dir).attempts
+  assert.deepEqual([review.reviewer, review.batch, review.launch], ['base', 1, 2])
+  assert.deepEqual([refuted.reviewer, refuted.batch, refuted.launch, refuted.kind], ['refute', 1, 2, 'refutation'])
+  assert.deepEqual([refuted.raw.stdout, refuted.raw.result], ['stdout-l2-refute-s1.log', 'result-l2-refute-s1.md'])
+})
+
+test('el recibo toma la última ronda que avanzó el ledger', async () => {
+  const { ledger, plan } = roundTwo()
+  const { dir, argvName } = prepareRound('claude', [nextRound(answered)], { round: 2, ledger, plan })
+  const earlier = `sha256:${'0'.repeat(64)}`
+  const refuted = { ids: ['F-1'], outcome: 'admitted', tool_events: [], trimmed: false, batches: [] }
+  const round1 = {
+    n: 1, tag: '', candidate_hash: earlier, base_sha: 'b'.repeat(40), head_sha: null, state: 'done',
+    started_at: 'x', ended_at: 'y', extra: false, model_effective: 'claude-falso', tool_events: [], refutation: refuted,
+  }
+  writeJsonAtomic(join(dir, 'rounds.json'), { rounds: [round1] })
+  await supervise(dir, argvName)
+  const r = readRunJson(dir, 'receipt.json')
+  assert.equal(r.rounds[1].refutation, undefined)
+  assert.equal(r.candidate_hash, HASH, 'una ronda terminada sin refutación también avanzó el ledger')
+  const later = `sha256:${'9'.repeat(64)}`
+  writeJsonAtomic(join(dir, 'rounds.json'), { rounds: [...readRunJson(dir, 'rounds.json').rounds,
+    { ...round1, n: 3, candidate_hash: later, state: 'cancelled' }, { ...round1, n: 4, candidate_hash: earlier, state: 'cancelled', refutation: undefined }] })
+  writeReceipt(dir)
+  assert.equal(readRunJson(dir, 'receipt.json').candidate_hash, later, 'una ronda cancelada en la refutación avanzó el ledger')
+})
+
+test('un cancel durante la corrección deja la ronda cancelled', async () => {
+  const { dir, argvName } = prepareRound('claude', ['sin JSON', '__hang__'])
+  const running = supervise(dir, argvName)
+  await waitFor(() => (existsSync(join(dir, 'calls')) && calls(dir).length === 2 ? true : undefined))
+  await sleep(200)
+  writeFileSync(join(dir, 'cancel.request'), 'ya')
+  const s = await running
+  assert.equal(s.state, 'cancelled')
+  assert.deepEqual(readRunJson(dir, 'rounds.json').rounds[0].jobs.map((j: { key: string; state: string }) => [j.key, j.state]), [['base-b1', 'cancelled']])
+})
+
+test('un cancel durante la corrección del refutador deja la ronda cancelled', async () => {
+  const { dir, argvName } = prepareRound('claude', [firstRound([inferential]), 'no sé', '__hang__'])
+  const running = supervise(dir, argvName)
+  await waitFor(() => (existsSync(join(dir, 'calls')) && calls(dir).length === 3 ? true : undefined))
+  await sleep(200)
+  writeFileSync(join(dir, 'cancel.request'), 'ya')
+  const s = await running
+  assert.equal(s.state, 'cancelled')
+  assert.deepEqual(ledgerOf(dir).entries[0].refutation, { result: 'inconclusive', reason: 'cancelled' })
 })

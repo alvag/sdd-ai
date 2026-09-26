@@ -9,6 +9,8 @@ export interface Selection { base: string; head?: string; context: string[] }
 export interface CandidateFile {
   path: string; status: 'A' | 'M' | 'D' | 'R' | 'T'; from?: string; mode: string
   sha256: string | null; binary: boolean; lines: number; visible: Array<[number, number]>
+  /** El modo en la base. Queda fuera del hash; un candidato congelado antes de guardarlo no lo trae. */
+  old_mode?: string
 }
 export interface ContextFile { path: string; sha256: string; lines: number }
 export interface Candidate {
@@ -44,23 +46,24 @@ function countLines(text: string): number {
   return text.endsWith('\n') ? n - 1 : n
 }
 
-interface Change { status: CandidateFile['status']; path: string; from?: string; mode: string }
+interface Change { status: CandidateFile['status']; path: string; from?: string; mode: string; old_mode: string }
 
 /**
  * `--raw -z`: `:modo-viejo modo-nuevo sha-viejo sha-nuevo estado` y la ruta, separados por NUL; un
- * renombre trae la ruta anterior y la nueva. El modo entra al hash: un `chmod` cambia el diff.
+ * renombre trae la ruta anterior y la nueva. El modo nuevo entra al hash: un `chmod` cambia el diff.
+ * El viejo solo lo usa el clasificador de riesgo.
  */
 function parseRaw(raw: string): Change[] {
   const parts = raw.split('\0')
   const out: Change[] = []
   for (let i = 0; i < parts.length && parts[i] !== '';) {
-    const [, mode, , , state] = parts[i].slice(1).split(' ')
+    const [oldMode, mode, , , state] = parts[i].slice(1).split(' ')
     const code = state[0] as CandidateFile['status']
     if (code === 'R') {
-      out.push({ status: 'R', from: parts[i + 1], path: parts[i + 2], mode })
+      out.push({ status: 'R', from: parts[i + 1], path: parts[i + 2], mode, old_mode: oldMode })
       i += 3
     } else {
-      out.push({ status: code, path: parts[i + 1], mode })
+      out.push({ status: code, path: parts[i + 1], mode, old_mode: oldMode })
       i += 2
     }
   }
@@ -158,6 +161,7 @@ export function freeze(root: string, sel: Selection): Candidate {
     }
     const f: CandidateFile = { path: ch.path, status: ch.status, mode: ch.mode, sha256: sha256(bytes), binary, lines, visible: ranges }
     if (ch.from) f.from = ch.from
+    f.old_mode = ch.old_mode
     return f
   })
 
@@ -193,21 +197,26 @@ export function freezeStable(root: string, sel: Selection, freezeFn: typeof free
 
 /**
  * Guarda en `<dir>/blobs/<sha256>` los bytes de cada archivo del candidato (de un borrado, los de la
- * base), para que la ronda siguiente pueda compararlos aunque el árbol ya haya cambiado. Devuelve los
- * blobs que escribió, para poder quitarlos si la ronda no llega a lanzarse.
+ * base) y de cada archivo de contexto: la ronda siguiente los compara, y el supervisor arma el material
+ * del refutador con ellos, aunque el árbol ya haya cambiado. Devuelve los blobs que escribió, para
+ * poder quitarlos si la ronda no llega a lanzarse.
  */
 export function snapshot(root: string, c: Candidate, dir: string): string[] {
   const blobs = join(dir, 'blobs')
   mkdirSync(blobs, { recursive: true })
+  const unstable = (what: string, path: string) => new SddError('candidate_unstable', `${what} cambió después de congelarse: ${path}`, {
+    next: 'vuelve a lanzar la ronda cuando nadie esté escribiendo en el repo',
+  })
   const pending = c.files.map((f) => {
     const bytes = contentOf(root, f.path, f.status === 'D' ? c.base_sha : c.head_sha)
-    if (sha256(bytes) !== f.sha256) {
-      throw new SddError('candidate_unstable', `el archivo cambió después de congelarse: ${f.path}`, {
-        next: 'vuelve a lanzar la ronda cuando nadie esté escribiendo en el repo',
-      })
-    }
+    if (sha256(bytes) !== f.sha256) throw unstable('el archivo', f.path)
     return { file: join(blobs, f.sha256), bytes }
   })
+  for (const ctx of c.context) {
+    const { bytes } = readContextFile(root, ctx.path)
+    if (sha256(bytes) !== ctx.sha256) throw unstable('el contexto', ctx.path)
+    pending.push({ file: join(blobs, ctx.sha256), bytes })
+  }
   const written: string[] = []
   for (const { file, bytes } of pending) {
     if (existsSync(file) || written.includes(file)) continue
@@ -254,6 +263,11 @@ export function changedRanges(prev: Candidate, next: Candidate, dir: string): Ch
     }
   }
   return out
+}
+
+/** El texto de cada archivo de contexto desde los blobs de la corrida, sin volver al repo. */
+export function readContextBlobs(dir: string, c: Candidate): Map<string, string> {
+  return new Map(c.context.map((ctx) => [ctx.path, readFileSync(join(dir, 'blobs', ctx.sha256), 'utf8')]))
 }
 
 /** El texto de cada archivo de contexto, comprobado contra el hash con que se congeló. */

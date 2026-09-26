@@ -1,3 +1,5 @@
+import type { Reviewer } from './review/ledger.ts'
+
 export type Family = 'claude' | 'codex'
 export type Via = 'native' | 'process'
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -44,10 +46,17 @@ export interface Usage {
 export type AttemptKind = 'initial' | 'profile_retry' | 'resume' | 'correction' | 'refutation'
 export interface AttemptMetrics {
   round: number
+  /** En una revisión, de qué trabajo es el intento; en una sub-tanda de refutación, `batch` es su número. */
+  reviewer?: Reviewer | 'refute'; batch?: number; launch?: number
   kind: AttemptKind; suffix: string; started_at: string; ended_at: string; duration_ms: number
   prompt_bytes: number; usage?: Usage; outcome: RunState; reason?: string; admission?: string
-  raw: { stdout: string; stderr: string; result: string }
+  /** `result` es null si el worker no escribió su respuesta. */
+  raw: { stdout: string; stderr: string; result: string | null }
 }
+/** El trabajo en curso de una ronda: un revisor sobre un lote, o una sub-tanda de refutación. */
+export type JobProgress =
+  | { phase: 'review'; key: string; reviewer: Reviewer; batch: number; index: number; total: number }
+  | { phase: 'refutation'; key: string; index: number; total: number }
 export interface Status {
   state: RunState; reason?: string; detail?: string
   supervisor_pid?: number; worker_pid?: number; session_id?: string
@@ -55,6 +64,9 @@ export interface Status {
   result_file?: string
   /** En una revisión, la ronda a la que corresponde este estado. */
   round?: number
+  /** En una revisión, el lanzamiento activo de la ronda y el trabajo que corre. */
+  launch?: number
+  job?: JobProgress
 }
 
 export class SddError extends Error {

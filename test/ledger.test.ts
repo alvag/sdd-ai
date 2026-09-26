@@ -2,7 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Finding } from '../src/review/admit.ts'
 import {
-  type Ledger, applyRefutation, applyRound, axesOf, decide, openLedger, refutationBatch, targets, undecided,
+  LENSES, type Ledger, REVIEWERS, type Reviewer, applyRefutation, applyRound, axesOf, byProvenance, decide, openLedger,
+  refutationBatch, targets, undecided,
 } from '../src/review/ledger.ts'
 import { SddError } from '../src/types.ts'
 
@@ -204,4 +205,17 @@ test('SPEC con solo advertencias vigentes queda en warn; una sugerencia no', () 
   let l = decide(openLedger([f('spec', 'WARNING')]), 'accept', ['F-1'])
   l = applyRound(l, 2, [{ id: 'F-1', answer: 'resolved' }], [])
   assert.equal(axesOf(l).spec, 'ok')
+})
+
+test('los IDs siguen el orden fijo base, lentes y lote', () => {
+  const at = (reviewer: Reviewer, batch: number) => ({ ...f('quality', 'WARNING'), claim: `${reviewer}-${batch}`, reviewer, batch })
+  const shuffled = [at('risk', 2), at('base', 2), at('readability', 1), at('base', 1), at('risk', 1), at('resilience', 1)]
+  const l = openLedger(byProvenance(shuffled))
+  assert.deepEqual(l.entries.map((e) => [e.id, e.claim, e.reviewer, e.batch]), [
+    ['F-1', 'base-1', 'base', 1], ['F-2', 'base-2', 'base', 2], ['F-3', 'risk-1', 'risk', 1],
+    ['F-4', 'risk-2', 'risk', 2], ['F-5', 'resilience-1', 'resilience', 1], ['F-6', 'readability-1', 'readability', 1],
+  ])
+  assert.deepEqual(REVIEWERS, ['base', ...LENSES])
+  const next = applyRound(l, 2, [], byProvenance([at('base', 2), at('base', 1)]))
+  assert.deepEqual(next.entries.slice(6).map((e) => [e.id, e.batch]), [['F-7', 1], ['F-8', 2]])
 })

@@ -5,7 +5,8 @@ import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { type Candidate, changedRanges, freeze, freezeStable, readContext, snapshot } from '../src/review/candidate.ts'
+import { type Candidate, changedRanges, freeze, freezeStable, readContext, readContextBlobs, snapshot } from '../src/review/candidate.ts'
+import { renderMaterial } from '../src/review/prompt.ts'
 import { SddError } from '../src/types.ts'
 import { makeRepo } from './helpers.ts'
 
@@ -256,4 +257,40 @@ test('changedRanges: un cambio que solo toca el modo no deja líneas citables', 
   const next = round(repo, base, dir)
   assert.notEqual(prev.hash, next.hash)
   assert.deepEqual(changedRanges(prev, next, dir), {})
+})
+
+test('numerar no cambia el hash del candidato', () => {
+  const { repo, base } = repoWithBase()
+  writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 10\n', 'línea diez\n'))
+  const c = freeze(repo, { base, context: [] })
+  const { diff, hash } = c
+  assert.match(renderMaterial(c, new Map()), /10│\+línea diez/)
+  assert.deepEqual([c.diff, c.hash], [diff, hash])
+  assert.equal(freeze(repo, { base, context: [] }).hash, hash)
+})
+
+test('el modo anterior queda fuera del hash', () => {
+  const { repo, base } = repoWithBase()
+  chmodSync(join(repo, 'a.txt'), 0o755)
+  const c = freeze(repo, { base, context: [] })
+  assert.deepEqual([file(c, 'a.txt')?.old_mode, file(c, 'a.txt')?.mode], ['100644', '100755'])
+  const manifest = {
+    base_sha: c.base_sha, head_sha: c.head_sha,
+    files: c.files.map((f) => ({ path: f.path, status: f.status, from: f.from ?? null, mode: f.mode, sha256: f.sha256 })),
+    context: [],
+  }
+  assert.equal(c.hash, `sha256:${sha(JSON.stringify(manifest))}`)
+})
+
+test('snapshot guarda también los bytes del contexto', () => {
+  const { repo, base } = repoWithBase()
+  writeFileSync(join(repo, 'a.txt'), lines(21))
+  writeFileSync(join(repo, 'ctx.md'), '# contexto\n')
+  const c = freeze(repo, { base, context: ['ctx.md'] })
+  const dir = runDir()
+  const written = snapshot(repo, c, dir)
+  assert.ok(written.includes(join(dir, 'blobs', sha('# contexto\n'))))
+  writeFileSync(join(repo, 'ctx.md'), '# otro\n')
+  assert.deepEqual([...readContextBlobs(dir, c)], [['ctx.md', '# contexto\n']])
+  assert.throws(() => snapshot(repo, c, runDir()), (e: unknown) => e instanceof SddError && e.code === 'candidate_unstable' && /contexto/.test(e.message))
 })

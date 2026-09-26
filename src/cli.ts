@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
-import { accessSync, constants, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { createHash, randomUUID } from 'node:crypto'
+import { accessSync, constants, existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
@@ -15,16 +14,22 @@ import { nativeProfile, resolve } from './resolve.ts'
 import {
   type Candidate, type Selection, changedRanges, freeze, freezeStable, readContext, snapshot,
 } from './review/candidate.ts'
-import { type Ledger, type RoundPlan, axesOf, decide, targets, undecided } from './review/ledger.ts'
-import { checkBudget, renderMaterial, renderReviewPrompt, renderRoundPrompt } from './review/prompt.ts'
-import { createRun, isAlive, newRunId, readJson, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
-import { type ArgvFile, type RoundRecord, supervise, writeReceipt } from './supervisor.ts'
+import { type PlannedJob, planJobs, planRoundJobs, sliceCandidate } from './review/batch.ts'
 import {
-  type Conductor, type Family, type LaunchSpec, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
+  type Ledger, REVIEWERS, type Reviewer, type RoundPlan, axesOf, decide, targets, undecided, withProvenance,
+} from './review/ledger.ts'
+import { renderMaterial, renderReviewPrompt } from './review/prompt.ts'
+import { type Risk, type RiskRecord, classify, classifyDelta, readRisk } from './review/risk.ts'
+import { createRun, isAlive, newRunId, readJson, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
+import {
+  type ArgvFile, type JobRecord, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, supervise, writeReceipt,
+} from './supervisor.ts'
+import {
+  type Conductor, type Family, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
   type Resolution, SddError, type Status, TERMINAL, type WorkerTask, isFamily, isReadOnlyRole, opposite, toNativeEffort,
 } from './types.ts'
-import { REFUTER_SYSTEM_PROMPT, claudeLaunch, claudeReviewLaunch } from './workers/claude.ts'
-import { codexLaunch, codexReviewLaunch } from './workers/codex.ts'
+import { claudeLaunch } from './workers/claude.ts'
+import { codexLaunch } from './workers/codex.ts'
 
 type Env = Record<string, string | undefined>
 interface Result { code: number; out: unknown }
@@ -176,14 +181,14 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   if (resolution.model) task.model = resolution.model
   if (resolution.effort) task.effort = resolution.effort
   const launch = resolution.family === 'claude' ? claudeLaunch(task) : codexLaunch(task)
-  launchSupervisor(dir, { family: resolution.family, launch, deadline_sec: deadline }, env, conductor)
+  launchSupervisor(dir, { family: resolution.family, launch, deadline_sec: deadline }, env, { fallback: conductor })
   return { code: 0, out: { id, via: 'process', family: resolution.family } }
 }
 
 /** Deja la corrida en `launching` y lanza al supervisor desprendido, que sobrevive al shell del conductor. */
-function launchSupervisor(dir: string, argv: ArgvFile, env: Env, fallback?: Conductor, argvName = 'argv.json'): void {
+function launchSupervisor(dir: string, argv: ArgvFile, env: Env, status: Partial<Status>, argvName = 'argv.json'): void {
   writeJsonAtomic(join(dir, argvName), argv)
-  setStatus(dir, fallback ? { state: 'launching', fallback } : { state: 'launching' })
+  setStatus(dir, { ...status, state: 'launching' })
   const supervisor = spawn(process.execPath, [BIN_PATH, '__supervise', dir, argvName], { detached: true, stdio: 'ignore', env: definedEnv(env) })
   supervisor.unref()
   // En un archivo propio y no en status.json: el supervisor ya puede estar escribiendo ese estado.
@@ -193,25 +198,38 @@ function launchSupervisor(dir: string, argv: ArgvFile, env: Env, fallback?: Cond
 interface ReviewRequest {
   kind: 'review'; selection: Selection; author: Family; degradations: string[]
   overrides?: { families?: string; model?: string; effort?: string; deadline_sec?: number }
+  /** El nivel congelado al empezar; una corrida anterior a la clasificación no lo trae. */
+  risk?: RiskRecord
 }
 
-/** Revisor y refutador de una ronda, cada uno con su sesión y su directorio vacío. */
-function reviewLaunches(root: string, dir: string, tag: string, reviewer: Resolution, refuter: Resolution): { launch: LaunchSpec; refuter_launch: LaunchSpec } {
-  const task = (name: string, p: Resolution): WorkerTask & { scratch: string } => {
-    const t: WorkerTask & { scratch: string } = {
-      cwd: root, promptFile: join(dir, `prompt${name}.md`), resultFile: join(dir, `result${name}.md`), sessionId: randomUUID(),
-      scratch: mkdtempSync(join(tmpdir(), 'sdd-ai-review-')),
-    }
-    if (p.model) t.model = p.model
-    if (p.effort) t.effort = p.effort
-    return t
-  }
-  const r = task(tag, reviewer)
-  const f = task(`${tag}-refute`, refuter)
-  return {
-    launch: reviewer.family === 'claude' ? claudeReviewLaunch(r) : codexReviewLaunch(r),
-    refuter_launch: refuter.family === 'claude' ? claudeReviewLaunch({ ...f, systemPrompt: REFUTER_SYSTEM_PROMPT }) : codexReviewLaunch(f),
-  }
+/**
+ * El número del lanzamiento siguiente de una ronda: uno más que el mayor que ya dejó su argv. Se cuenta
+ * del directorio porque un supervisor que murió no deja registro.
+ */
+function nextLaunch(dir: string, tag: string): number {
+  const pattern = new RegExp(`^argv${tag}-l(\\d+)`)
+  const used = readdirSync(dir).map((f) => pattern.exec(f)?.[1]).filter((k) => k !== undefined).map(Number)
+  return Math.max(0, ...used) + 1
+}
+
+/** Escribe el prompt de cada trabajo planificado con el prefijo de su lanzamiento. */
+function writeJobs(dir: string, prefix: string, jobs: PlannedJob[]): ReviewJob[] {
+  return jobs.map(({ text, ...j }) => {
+    const prompt = join(dir, `prompt${prefix}-${j.key}.md`)
+    writeFileSync(prompt, text)
+    return { ...j, prompt }
+  })
+}
+
+/** Un delta con riesgo alto: la ronda no corre y se propone reiniciar con lentes, con el mismo head. */
+function riskHigh(req: ReviewRequest, delta: Risk, head: string | undefined): SddError {
+  const selection: Selection = { base: req.selection.base, context: req.selection.context }
+  if (head) selection.head = head
+  const restart = restartCommand({ ...req, selection, risk: { ...readRisk(req), forced: true } })
+  return new SddError('risk_high', 'la corrección introduce riesgo alto', {
+    detail: delta.reasons.map((r) => `${r.signal} en ${r.path}: ${r.detail}`).join(', '),
+    next: `pregunta al usuario si reinicia la revisión con lentes: ${restart}`,
+  })
 }
 
 /**
@@ -234,12 +252,16 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
       'conductor-model': { type: 'string' },
       'conductor-effort': { type: 'string' },
       deadline: { type: 'string', default: '1800' },
+      risk: { type: 'string' },
     },
   })
   if (env.SDD_AI_WORKER === '1') {
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   }
-  if (!values.base) throw new SddError('usage', 'falta --base', { next: './bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>]' })
+  if (!values.base) throw new SddError('usage', 'falta --base', { next: './bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>] [--risk high]' })
+  if (values.risk !== undefined && values.risk !== 'high') {
+    throw new SddError('usage', '--risk solo acepta high: el nivel se sube, nunca se baja')
+  }
   const deadline = Number(values.deadline)
   if (!Number.isFinite(deadline) || deadline <= 0) throw new SddError('usage', `--deadline inválido: ${values.deadline}`)
 
@@ -266,20 +288,23 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   const selection: Selection = { base: values.base, context: values.context.map((p) => (isAbsolute(p) ? p : resolvePath(cwd, p))) }
   if (values.head) selection.head = values.head
   const candidate = freezeStable(root, selection)
+  const classified = classify(candidate)
+  const forced = values.risk === 'high'
+  const risk: RiskRecord = { level: forced ? 'high' : classified.level, classified: classified.level, reasons: classified.reasons, forced }
   const contextTexts = readContext(root, candidate)
-  const prompt = renderReviewPrompt(candidate, contextTexts)
-  checkBudget(prompt)
+  // Todo se mide antes de crear la corrida: si algún prompt no entra, no queda nada escrito.
+  const { reviewers, batches, jobs } = planFirstRound(candidate, contextTexts, risk)
   if (!inPath(family, env)) {
     throw new SddError('cli_missing', `${family} no está en PATH`, { next: `revisa con --families ${opposite(family)} y acepta la degradación` })
   }
 
   const id = newRunId()
   const dir = createRun(root, id)
-  writeFileSync(join(dir, 'prompt.md'), prompt)
+  const planned = writeJobs(dir, '-l1', jobs)
   writeJsonAtomic(join(dir, 'candidate.json'), candidate)
   const request: ReviewRequest & Record<string, unknown> = {
     kind: 'review', selection, author, degradations, conductor,
-    overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline },
+    overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline }, risk,
   }
   writeJsonAtomic(join(dir, 'request.json'), request)
   writeJsonAtomic(join(dir, 'resolved.json'), resolution)
@@ -287,15 +312,16 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   writeFileSync(join(dir, 'material.md'), renderMaterial(candidate, contextTexts))
   snapshot(root, candidate, dir)
 
-  const { launch, refuter_launch } = reviewLaunches(root, dir, '', resolution, refuter)
   launchSupervisor(dir, {
-    family, launch, deadline_sec: deadline, kind: 'review', candidate: join(dir, 'candidate.json'),
-    round: 1, tag: '', material: join(dir, 'material.md'), refuter_launch,
-  }, env)
+    family, deadline_sec: deadline, kind: 'review', candidate: join(dir, 'candidate.json'), round: 1, tag: '', launch_n: 1,
+    reviewer_resolution: resolution, refuter_resolution: refuter, jobs: planned, batches, risk,
+  }, env, { round: 1, launch: 1 }, 'argv-l1.json')
   return {
     code: 0,
     out: {
       id, via: 'process', family, degradations, candidate_hash: candidate.hash,
+      risk: { level: risk.level, reasons: risk.reasons, forced: risk.forced }, reviewers,
+      ...(batches.length > 1 ? { batches: batches.map((paths, i) => ({ n: i + 1, paths })) } : {}),
       files: candidate.files.map((f) => f.path), left_out: candidate.left_out, next: `./bin/sdd-ai wait ${id}`,
     },
   }
@@ -311,6 +337,7 @@ function restartCommand(req: ReviewRequest): string {
   if (req.selection.head) parts.push(`--head ${shellArg(req.selection.head)}`)
   for (const c of req.selection.context) parts.push(`--context ${shellArg(c)}`)
   parts.push(`--author ${req.author}`)
+  if (req.risk?.forced) parts.push('--risk high')
   return parts.join(' ')
 }
 
@@ -350,19 +377,23 @@ function headOf(dir: string, req: ReviewRequest, n: number): string | undefined 
   return existsSync(file) ? readJson<RoundPlan>(file).head : undefined
 }
 
+/** Relanzar una ronda que no terminó: corre solo los trabajos que faltan, con el mismo ref que revisaba. */
+function relaunchNext(id: string, dir: string, req: ReviewRequest, s: Status, round: number, completed: number): string {
+  const head = headOf(dir, req, round)
+  const parts = [`./bin/sdd-ai review round ${id}`]
+  if (head) parts.push(`--head ${shellArg(head)}`)
+  if (completed >= ROUND_CAP) parts.push('--extra')
+  return `la ronda ${round} terminó en ${s.state}; pregunta al usuario si la relanza: ${parts.join(' ')}`
+}
+
 /**
  * El paso siguiente, por prioridad: esperar, relanzar una ronda que no terminó, decidir, preguntar
  * por las disputas, el checkpoint del tope, corregir y lanzar, y por último la vigencia.
  */
 function roundNext(id: string, dir: string, req: ReviewRequest, s: Status, round: number, ledger: Ledger, stale: boolean): string {
   if (!TERMINAL.has(s.state)) return `./bin/sdd-ai wait ${id}`
-  if (s.state !== 'done') {
-    const head = headOf(dir, req, round)
-    const parts = [`./bin/sdd-ai review round ${id}`]
-    if (head) parts.push(`--head ${shellArg(head)}`)
-    if (ledger.completed >= ROUND_CAP) parts.push('--extra')
-    return `la ronda ${round} terminó en ${s.state}; pregunta al usuario si la relanza: ${parts.join(' ')}`
-  }
+  // Una ronda que avanzó el ledger ya terminó aunque la hayan cancelado en la refutación.
+  if (s.state !== 'done' && ledger.completed !== round) return relaunchNext(id, dir, req, s, round, ledger.completed)
   const disputes = ledger.entries.filter((e) => e.state === 'en-disputa').map((e) => e.id)
   const pending = undecided(ledger).filter((x) => !disputes.includes(x))
   if (pending.length > 0) {
@@ -384,6 +415,36 @@ function roundNext(id: string, dir: string, req: ReviewRequest, s: Status, round
 
 interface Receipt { tool_events: string[]; degradations: string[]; reviewer: { model_effective: string | null } }
 
+const reviewersOf = (jobs: Array<{ reviewer: Reviewer }>): Reviewer[] =>
+  (jobs.length === 0 ? ['base'] : REVIEWERS.filter((r) => jobs.some((j) => j.reviewer === r)))
+
+/**
+ * Los revisores, los lotes y los trabajos de la ronda. Mientras corre salen del argv del lanzamiento
+ * activo, porque su registro todavía no existe, junto con el trabajo en curso; terminada, del último
+ * registro de `rounds.json`, con el estado de cada trabajo. Una corrida anterior no trae ninguno: base
+ * y un solo lote.
+ */
+function roundShape(dir: string, s: Status, round: number): Record<string, unknown> {
+  if (!TERMINAL.has(s.state)) {
+    const file = join(dir, `argv${tagOf(round)}-l${s.launch ?? 1}.json`)
+    const argv = existsSync(file) ? readJson<ArgvFile>(file) : undefined
+    return {
+      reviewers: reviewersOf([...(argv?.kept ?? []), ...(argv?.jobs ?? [])]), ...declaredBatches(argv?.batches),
+      ...(s.job ? { progress: s.job } : {}),
+    }
+  }
+  const rounds = existsSync(join(dir, 'rounds.json')) ? readJson<{ rounds: RoundRecord[] }>(join(dir, 'rounds.json')).rounds : []
+  const last = rounds.at(-1)
+  const jobs = last?.jobs ?? []
+  return { reviewers: reviewersOf(jobs), ...declaredBatches(last?.batches), ...(jobs.length > 0 ? { jobs: jobs.map(jobSummary) } : {}) }
+}
+
+/** El nivel congelado, con sus motivos y si se subió a mano. */
+function riskView(req: ReviewRequest): { level: string; reasons: unknown[]; forced: boolean } {
+  const r = readRisk(req)
+  return { level: r.level, reasons: r.reasons, forced: r.forced }
+}
+
 /** Lo que el conductor necesita de una revisión: estado, revisor, ledger, ejes, vigencia y el paso siguiente. */
 function reviewView(root: string, id: string, dir: string, s: Status): Result {
   const req = readJson<ReviewRequest>(join(dir, 'request.json'))
@@ -402,12 +463,11 @@ function reviewView(root: string, id: string, dir: string, s: Status): Result {
   if (!existsSync(ledgerFile)) {
     const c = readJson<Candidate>(join(dir, 'candidate.json'))
     const out: Record<string, unknown> = {
-      id, state: s.state, round, candidate_hash: c.hash, reviewer, degradations: req.degradations,
-      ...freshness(root, req, c, req.selection.head), ...common,
+      id, state: s.state, round, candidate_hash: c.hash, reviewer, degradations: req.degradations, risk: riskView(req),
+      ...roundShape(dir, s, round), ...freshness(root, req, c, req.selection.head), ...common,
     }
     if (!TERMINAL.has(s.state)) out.next = `./bin/sdd-ai wait ${id}`
-    else if (out.stale === true) out.next = `el diff cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
-    else out.next = `pregunta al usuario si revisa de nuevo: ${restartCommand(req)}`
+    else out.next = relaunchNext(id, dir, req, s, round, 0)
     return { code, out }
   }
 
@@ -420,11 +480,13 @@ function reviewView(root: string, id: string, dir: string, s: Status): Result {
   const out: Record<string, unknown> = {
     id, state: s.state, round, completed: ledger.completed, candidate_hash: c.hash,
     reviewer: { ...reviewer, model_effective: receipt.reviewer.model_effective },
-    degradations: receipt.degradations, ...fresh,
-    axes: axesOf(ledger), ledger: ledger.entries,
+    degradations: receipt.degradations, risk: riskView(req), ...roundShape(dir, s, round), ...fresh,
+    axes: axesOf(ledger),
+    ledger: ledger.entries.map(withProvenance),
     pending: undecided(ledger).filter((x) => !disputes.includes(x)), disputes,
     refuted: ledger.entries.filter((e) => e.state === 'refutado').map((e) => e.id),
-    inconclusive: ledger.entries.filter((e) => e.state !== 'refutado' && e.refutation?.result === 'inconclusive').map((e) => e.id),
+    inconclusive: ledger.entries.flatMap((e) => (e.state !== 'refutado' && e.refutation?.result === 'inconclusive'
+      ? [{ id: e.id, reason: e.refutation.reason ?? 'refuter_inconclusive' }] : [])),
     tool_events: rounds.filter((r) => r.state === 'done').at(-1)?.tool_events ?? receipt.tool_events,
     ...common,
     next: roundNext(id, dir, req, s, round, ledger, fresh.stale),
@@ -452,10 +514,22 @@ function reviewDecide(args: string[], cwd: string): Result {
   return reviewView(root, id, dir, readStatus(dir))
 }
 
+/** Los trabajos de una ronda 1: la base, y con el nivel alto también las lentes, repartidos en lotes si hace falta. */
+function planFirstRound(c: Candidate, contextTexts: Map<string, string>, risk: RiskRecord):
+  { reviewers: readonly Reviewer[]; batches: string[][]; jobs: PlannedJob[] } {
+  const reviewers: readonly Reviewer[] = risk.level === 'high' ? REVIEWERS : ['base']
+  const planned = planJobs(c, reviewers, (r, paths) => renderReviewPrompt(c, contextTexts, {
+    reviewer: r, ...(paths.length === c.files.length ? {} : { view: sliceCandidate(c, paths) }),
+  }))
+  return { reviewers, ...planned }
+}
+
+const sha256 = (text: string) => createHash('sha256').update(text).digest('hex')
+
 /**
- * La ronda siguiente: congela el candidato corregido con la base y el contexto de la ronda 1 y lanza
- * la pasada dirigida con el mismo revisor, en una sesión nueva. Todo lo que puede impedirla se
- * comprueba antes de escribir un archivo de la ronda.
+ * La ronda siguiente, o el relanzamiento de una que no terminó, también la 1: congela el candidato con
+ * la base y el contexto de la ronda 1 y lanza lo que falta con el mismo revisor, en sesiones nuevas.
+ * Todo lo que puede impedirla se comprueba y se mide antes de escribir un archivo de la ronda.
  */
 async function reviewRound(args: string[], env: Env, cwd: string): Promise<Result> {
   const { values, positionals } = parseArgs({
@@ -473,40 +547,46 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
   }
   const req = readJson<ReviewRequest>(join(dir, 'request.json'))
   const ledgerFile = join(dir, 'ledger.json')
-  if (!existsSync(ledgerFile)) {
-    throw new SddError('usage', 'la revisión no tiene una ronda 1 completada', { next: `pregunta al usuario si revisa de nuevo: ${restartCommand(req)}` })
-  }
-  const ledger = readJson<Ledger>(ledgerFile)
-  if (values.extra && ledger.completed < ROUND_CAP) {
-    throw new SddError('usage', `--extra solo concede una ronda más allá del tope de ${ROUND_CAP}; esta revisión completó ${ledger.completed}`, {
+  // Sin ledger, la ronda 1 no terminó: se relanza.
+  const ledger = existsSync(ledgerFile) ? readJson<Ledger>(ledgerFile) : undefined
+  const completed = ledger?.completed ?? 0
+  if (values.extra && completed < ROUND_CAP) {
+    throw new SddError('usage', `--extra solo concede una ronda más allá del tope de ${ROUND_CAP}; esta revisión completó ${completed}`, {
       next: `./bin/sdd-ai review round ${id}`,
     })
   }
-  const pending = undecided(ledger)
-  if (pending.length > 0) {
-    throw new SddError('usage', `hay hallazgos sin decidir: ${pending.join(', ')}`, {
-      next: `./bin/sdd-ai review decide ${id} accept|reject ${pending.join(' ')} [--reason <motivo>]`,
-    })
-  }
-  const goals = targets(ledger)
-  if (goals.length === 0) {
-    throw new SddError('usage', 'no hay nada que verificar ni responder', { next: `./bin/sdd-ai review status ${id}` })
-  }
-  if (ledger.completed >= ROUND_CAP && !values.extra) {
-    throw new SddError('round_cap', `la revisión ya hizo ${ROUND_CAP} rondas y quedan hallazgos vigentes`, {
-      next: `pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está`,
-    })
+  const goals = ledger ? targets(ledger) : []
+  if (ledger) {
+    const pending = undecided(ledger)
+    if (pending.length > 0) {
+      throw new SddError('usage', `hay hallazgos sin decidir: ${pending.join(', ')}`, {
+        next: `./bin/sdd-ai review decide ${id} accept|reject ${pending.join(' ')} [--reason <motivo>]`,
+      })
+    }
+    if (goals.length === 0) {
+      throw new SddError('usage', 'no hay nada que verificar ni responder', { next: `./bin/sdd-ai review status ${id}` })
+    }
+    if (completed >= ROUND_CAP && !values.extra) {
+      throw new SddError('round_cap', `la revisión ya hizo ${ROUND_CAP} rondas y quedan hallazgos vigentes`, {
+        next: `pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está`,
+      })
+    }
   }
 
-  const n = ledger.completed + 1
-  const tag = `-r${n}`
-  const prev = readJson<Candidate>(join(dir, `candidate${ledger.completed === 1 ? '' : `-r${ledger.completed}`}.json`))
+  const n = completed + 1
+  const tag = tagOf(n)
   const first = readJson<Candidate>(join(dir, 'candidate.json'))
-  const selection: Selection = { base: first.base_sha, context: req.selection.context }
-  if (values.head) selection.head = values.head
+  const prev = ledger ? readJson<Candidate>(join(dir, `candidate${tagOf(completed)}.json`)) : first
+  let selection: Selection
+  if (ledger) {
+    selection = { base: first.base_sha, context: req.selection.context }
+    if (values.head) selection.head = values.head
+  } else {
+    selection = values.head ? { ...req.selection, head: values.head } : req.selection
+  }
   const candidate = freezeStable(root, selection)
   const identical = candidate.hash === prev.hash
-  if (identical && goals.some((t) => t.kind === 'verify')) {
+  if (ledger && identical && goals.some((t) => t.kind === 'verify')) {
     throw new SddError('usage', 'el candidato es idéntico al de la ronda anterior y hay aceptados que verificar', {
       next: 'corrige los aceptados antes de lanzar la ronda siguiente',
     })
@@ -514,16 +594,25 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
   // Los blobs son lo único que se escribe antes de las últimas comprobaciones: la comparación con la
   // ronda anterior los necesita. Si la ronda no se lanza, se quitan.
   const written = snapshot(root, candidate, dir)
-  let plan: RoundPlan
-  let material: string
-  let prompt: string
   const resolved = readJson<Resolution>(join(dir, 'resolved.json'))
+  let plan: RoundPlan | undefined
+  let material: string
+  let planned: { reviewers?: readonly Reviewer[]; batches: string[][]; jobs: PlannedJob[] }
   try {
-    plan = { n, prev_hash: prev.hash, identical, targets: goals, changed: identical ? {} : changedRanges(prev, candidate, dir) }
-    if (values.head) plan.head = values.head
-    material = renderMaterial(candidate, readContext(root, candidate))
-    prompt = renderRoundPrompt(candidate, material, plan, ledger.entries, ROUND_CAP)
-    checkBudget(prompt)
+    const changed = identical ? {} : changedRanges(prev, candidate, dir)
+    if (!identical) {
+      const delta = classifyDelta(prev, candidate, changed)
+      if (delta.level === 'high') throw riskHigh(req, delta, selection.head)
+    }
+    const contextTexts = readContext(root, candidate)
+    material = renderMaterial(candidate, contextTexts)
+    if (ledger) {
+      plan = { n, prev_hash: prev.hash, identical, targets: goals, changed }
+      if (values.head) plan.head = values.head
+      planned = planRoundJobs(candidate, contextTexts, plan, ledger.entries, ROUND_CAP)
+    } else {
+      planned = planFirstRound(candidate, contextTexts, readRisk(req))
+    }
     if (!inPath(resolved.family, env)) {
       throw new SddError('cli_missing', `${resolved.family} no está en PATH`, { next: 'instala o expone el CLI del revisor de la ronda 1' })
     }
@@ -532,24 +621,39 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
     throw e
   }
 
+  // Lo admitido en un lanzamiento anterior de esta ronda se conserva si su encargo es el mismo: el
+  // digest del prompt cubre el candidato, el revisor, el lote, los pendientes y los motivos.
+  const rounds = existsSync(join(dir, 'rounds.json')) ? readJson<{ rounds: RoundRecord[] }>(join(dir, 'rounds.json')).rounds : []
+  const last = rounds.filter((r) => r.n === n).at(-1)
+  const kept: JobRecord[] = []
+  const toRun = planned.jobs.filter((j) => {
+    const same = last?.jobs?.find((x) => x.key === j.key && x.admitted !== undefined && x.prompt_sha256 === sha256(j.text))
+    if (same) kept.push(same)
+    return same === undefined
+  })
+
+  const k = nextLaunch(dir, tag)
   writeJsonAtomic(join(dir, `candidate${tag}.json`), candidate)
   writeFileSync(join(dir, `material${tag}.md`), material)
-  writeFileSync(join(dir, `prompt${tag}.md`), prompt)
-  writeJsonAtomic(join(dir, `round${tag}.json`), plan)
-  const { launch, refuter_launch } = reviewLaunches(root, dir, tag, resolved, readJson<Resolution>(join(dir, 'resolved-refute.json')))
+  const jobs = writeJobs(dir, `${tag}-l${k}`, toRun)
+  if (plan) writeJsonAtomic(join(dir, `round${tag}.json`), plan)
   // La ronda arranca con un estado limpio: nada de la anterior (motivo, reanudación, cancelación) la alcanza.
-  writeJsonAtomic(join(dir, 'status.json'), { state: 'launching', round: n })
+  writeJsonAtomic(join(dir, 'status.json'), { state: 'launching', round: n, launch: k })
   rmSync(join(dir, 'cancel.request'), { force: true })
   launchSupervisor(dir, {
-    family: resolved.family, launch, deadline_sec: req.overrides?.deadline_sec ?? 1800, kind: 'review',
-    candidate: join(dir, `candidate${tag}.json`), round: n, tag, plan: join(dir, `round${tag}.json`),
-    material: join(dir, `material${tag}.md`), refuter_launch, extra: values.extra,
-  }, env, undefined, `argv${tag}.json`)
+    family: resolved.family, deadline_sec: req.overrides?.deadline_sec ?? 1800, kind: 'review',
+    candidate: join(dir, `candidate${tag}.json`), round: n, tag, ...(plan ? { plan: join(dir, `round${tag}.json`) } : {}), launch_n: k,
+    reviewer_resolution: resolved, refuter_resolution: readJson<Resolution>(join(dir, 'resolved-refute.json')), jobs, kept,
+    batches: planned.batches, risk: readRisk(req), extra: values.extra,
+  }, env, { round: n, launch: k }, `argv${tag}-l${k}.json`)
   return {
     code: 0,
     out: {
-      id, round: n, family: resolved.family, candidate_hash: candidate.hash, identical, targets: goals,
-      changed: Object.keys(plan.changed), left_out: candidate.left_out, next: `./bin/sdd-ai wait ${id}`,
+      id, round: n, launch: k, family: resolved.family, candidate_hash: candidate.hash, identical,
+      ...(plan ? { targets: goals, changed: Object.keys(plan.changed) } : { reviewers: planned.reviewers }),
+      ...(planned.batches.length > 1 ? { batches: planned.batches.map((paths, i) => ({ n: i + 1, paths })) } : {}),
+      ...(kept.length > 0 ? { kept: kept.map((j) => j.key) } : {}),
+      left_out: candidate.left_out, next: `./bin/sdd-ai wait ${id}`,
     },
   }
 }
@@ -641,7 +745,14 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
       s = setStatus(dir, { state: 'failed', reason: 'supervisor_lost', detail: `el supervisor ${supervisorPid} terminó sin escribir un estado final` })
       return report(root, id, dir, s)
     }
-    if (Date.now() >= until) return { code: 3, out: { id, state: s.state, next: `./bin/sdd-ai wait ${id}` } }
+    if (Date.now() >= until) {
+      const out: Record<string, unknown> = { id, state: s.state }
+      // Una revisión en curso dice su nivel, qué ronda, qué revisores y lotes, y qué trabajo va de cuántos.
+      const request = join(dir, 'request.json')
+      const req = existsSync(request) ? readJson<ReviewRequest>(request) : undefined
+      if (req?.kind === 'review') Object.assign(out, { risk: riskView(req), round: s.round ?? 1, ...roundShape(dir, s, s.round ?? 1) })
+      return { code: 3, out: { ...out, next: `./bin/sdd-ai wait ${id}` } }
+    }
     await sleep(250)
   }
 }

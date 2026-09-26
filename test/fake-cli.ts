@@ -6,8 +6,11 @@ import { join } from 'node:path'
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')
 const args = process.argv.slice(2)
-// Cada invocación queda anotada para que los tests cuenten los intentos y vean sus argumentos.
-if (process.env.FAKE_CALLS_FILE) appendFileSync(process.env.FAKE_CALLS_FILE, `${JSON.stringify(args)}\n`)
+// Cada invocación queda anotada para que los tests cuenten los intentos y vean sus argumentos y su cwd.
+if (process.env.FAKE_CALLS_FILE) {
+  appendFileSync(process.env.FAKE_CALLS_FILE, `${JSON.stringify(args)}\n`)
+  appendFileSync(`${process.env.FAKE_CALLS_FILE}.cwd`, `${process.cwd()}\n`)
+}
 
 function okClaude(): void {
   process.stdout.write(fixture('claude-stream.jsonl'))
@@ -26,13 +29,23 @@ function hang(line: string): void {
 }
 
 /**
- * Un revisor falso: lee el prompt por stdin, toma el hash y las rutas del manifiesto, y responde en
- * el canal de su familia (el `result` del stream en Claude, `--output-last-message` en Codex).
+ * Las rutas que el prompt pide en `inspection.paths`: las de su sección LOTE si la trae, aunque sean
+ * cero; si no, las del manifiesto.
+ */
+function pathsOf(prompt: string): string[] {
+  const lot = /(?:^|\n)## LOTE\n([\s\S]*?)(?:\n\n|$)/.exec(prompt)
+  if (lot) return [...lot[1].matchAll(/^LOTE: (.+)$/gm)].map((m) => m[1])
+  return [...prompt.matchAll(/^[AMDRT] (\S+)(?: \(antes [^)]+\))? — /gm)].map((m) => m[1])
+}
+
+/**
+ * Un revisor falso: lee el prompt por stdin, toma el hash y las rutas que pide, y responde en el canal
+ * de su familia (el `result` del stream en Claude, `--output-last-message` en Codex).
  */
 function reviewer(kind: 'ok' | 'bad' | 'unavailable'): void {
   const prompt = readFileSync(0, 'utf8')
   const hash = /sha256:[0-9a-f]{64}/.exec(prompt)?.[0] ?? ''
-  const paths = [...prompt.matchAll(/^[AMDRT] (\S+)(?: \(antes [^)]+\))? — /gm)].map((m) => m[1])
+  const paths = pathsOf(prompt)
   const answer = kind === 'bad'
     ? 'no pude armar el JSON'
     : JSON.stringify(kind === 'ok'
@@ -58,7 +71,7 @@ const callCount = () => (process.env.FAKE_CALLS_FILE ? readFileSync(process.env.
 
 /**
  * Guion de respuestas: la invocación k usa `answers[k-1]` de FAKE_ANSWERS. Un texto es la respuesta,
- * con `$HASH` (el hash del prompt) y `$PATHS` (las rutas del manifiesto) reemplazados; `__hang__` abre
+ * con `$HASH` (el hash del prompt) y `$PATHS` (las rutas que pide el prompt) reemplazados; `__hang__` abre
  * la sesión y se cuelga; `__fail__` sale con 1 sin stream.
  */
 function scripted(): void {
@@ -69,7 +82,7 @@ function scripted(): void {
   // Una reanudación solo recibe el mensaje de cierre: como la sesión real, recuerda el candidato anterior.
   const memory = `${process.env.FAKE_CALLS_FILE ?? '/dev/null'}.memoria`
   let hash = /sha256:[0-9a-f]{64}/.exec(prompt)?.[0]
-  let paths = [...prompt.matchAll(/^[AMDRT] (\S+)(?: \(antes [^)]+\))? — /gm)].map((m) => m[1])
+  let paths = pathsOf(prompt)
   if (hash) {
     if (process.env.FAKE_CALLS_FILE) writeFileSync(memory, JSON.stringify({ hash, paths }))
   } else if (process.env.FAKE_CALLS_FILE && existsSync(memory)) {

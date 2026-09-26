@@ -197,3 +197,8 @@ test('una evidencia con texto después de la cita se rechaza diciendo dónde va 
   assert.equal(r.kind, 'inadmissible')
   if (r.kind === 'inadmissible') assert.match(r.error, /la explicación va en note/)
 })
+
+test('la procedencia no la declara el modelo: se rechazan revisor y lote', () => {
+  inadmissible(json(review({}, { reviewer: 'risk' })), /campo no admitido "reviewer" en findings\[0\]/)
+  inadmissible(json(review({}, { batch: 2 })), /campo no admitido "batch" en findings\[0\]/)
+})

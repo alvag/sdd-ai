@@ -100,7 +100,7 @@ function oneOf(v: unknown, allowed: readonly string[], field: string): string {
 }
 
 /** `ruta`, `ruta:línea` o `ruta:inicio-fin`. */
-function parseLocation(location: string): { path: string; lines?: [number, number] } {
+export function parseLocation(location: string): { path: string; lines?: [number, number] } {
   const m = /^(.+):(\d+)(?:-(\d+))?$/.exec(location)
   if (!m) return { path: location }
   const start = Number(m[2])
