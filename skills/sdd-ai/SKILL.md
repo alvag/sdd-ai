@@ -1,9 +1,9 @@
 ---
 name: sdd-ai
-description: Delega una tarea de solo lectura (explorar, buscar, resumir código) a un worker de Claude o Codex elegido por la config del repo, o revisa un diff congelado con un revisor aislado. Usar cuando el usuario pide "delega esto a un worker", "usa sdd-ai", "que otro agente explore esto" o "revisa este diff".
+description: Delega una tarea de solo lectura (explorar, buscar, resumir código) o una escritura acotada a un worker de Claude o Codex elegido por la config del repo, o revisa un diff congelado con un revisor aislado. Usar cuando el usuario pide "delega esto a un worker", "usa sdd-ai", "que otro agente explore esto" o "revisa este diff".
 ---
 
-# sdd-ai: despachar un worker read-only
+# sdd-ai: despachar un worker
 
 El binario decide qué familia hace el trabajo y por qué vía. Tú escribes el encargo, sigues lo que
 responde y le preguntas al usuario ante cualquier fallo. Todo comando imprime un JSON.
@@ -24,7 +24,8 @@ el encargo tiene que ser autosuficiente (qué hacer, dónde mirar, qué formato 
   expone al shell, así que sin el flag una caída a tu familia no puede conservarlo.
 - Agrega `--role <rol>` cuando la tarea tiene un rol claro: `code-review` para revisar código,
   `refute` para refutar, `investigate` para una causa raíz, `design-review`, `debate` o
-  `counter-plan`. Sin el flag, el rol es `explore`.
+  `counter-plan`, e `implement` para delegar una escritura (sección 6). Sin el flag, el rol es
+  `explore`.
   `explore` e `investigate` pueden buscar en la web; los demás roles trabajan solo con el encargo y
   el repositorio.
 - Agrega `--families claude` o `--families codex` solo si el usuario dijo "solo Claude" o
@@ -269,7 +270,70 @@ de `design-review`. No hay nivel de riesgo, lentes, lotes ni refutador.
 - **El gate es del usuario.** El veredicto informa y no aprueba nada: presenta el artefacto con el
   resultado de la revisión y espera su aprobación.
 
-## 6. Si algo falla
+## 6. Delegar una escritura
+
+`./bin/sdd-ai run --role implement --prompt-file <encargo>` lanza un writer por proceso: un worker de
+la otra familia que escribe en tu árbol de trabajo, sin commitear. Cuándo usarlo lo dice el bootstrap
+con sus umbrales; esta sección dice cómo.
+
+- **Antes de lanzarlo.** Si el usuario no te dio permiso para cambiar el proyecto, pregúntale, como
+  harías antes de escribir inline. No delegues un cambio en `.git`, `.sdd-ai/`, `.claude/`, `.codex/`,
+  `.agents/` o en archivos que Git ignora: eso va inline o se propone SDD. El árbol tiene que estar
+  limpio y en un commit: con cambios sin commitear, `run` los nombra y el `next` te dice que le
+  preguntes al usuario si los conserva o los revierte; si los conserva, sigues inline hasta que él
+  deje el árbol limpio. sdd-ai nunca hace stash, commit ni revert.
+- **El encargo** trae el objetivo, los archivos que se tocan y cómo se comprueba que quedó bien. No
+  hace falta ninguna estructura: el binario lo envuelve en un contrato fijo que le prohíbe commitear,
+  tocar esas rutas, correr pruebas o comandos, y le pide declarar lo que se desvió y cerrar con
+  `STATUS: done`.
+- **Mientras corre, no edites el árbol.** Espera con `./bin/sdd-ai wait <id>`. Hay un writer por
+  repositorio: otro `run --role implement`, desde cualquier sesión o worktree, se rechaza nombrando
+  el que está abierto.
+- **Lo que trae `wait`**: la base, cada archivo con su estado, sus líneas y sus modos (los nuevos
+  incluidos), la ruta a `diff.patch`, el reporte del writer, si cerró con la marca, las rutas señaladas
+  (`flagged`: cambios en el directorio de Git, `.sdd-ai/`, `.claude/`, `.codex/` o `.agents/`), la
+  corrida alterada (`run_altered`: archivos de `.sdd-ai/runs/<id>/` que el writer tocó) y si `HEAD` se
+  movió. El cambio sale del árbol real contra la base, no del reporte.
+- **Antes de aceptar el cambio, en este orden:**
+  1. Mira primero `flagged`, `run_altered` y `failed`. Si hay algo, díselo al usuario antes de seguir.
+  2. Lee el diff completo.
+  3. Lanza el `review start` que trae `next` antes de correr nada que pueda cambiar el árbol. Revisa
+     el mismo contenido que la cosecha, archivos nuevos incluidos, y se niega si el árbol ya no es el de
+     la cosecha.
+  4. Corre los checks focalizados y después los completos.
+  5. Espera el resultado de la revisión y resuelve sus hallazgos (sección 4).
+  6. Comprueba que el árbol sigue siendo el de la cosecha, o el que revisaste después. Si un check o
+     tu corrección lo cambió, esa revisión ya no vale para lo que hay: díselo al usuario y, si siguen,
+     revisa el árbol actual con `review start --base <base> --author <familia del writer> --untracked`,
+     que suma los archivos nuevos. Si también editaste tú, di que la autoría quedó mezclada.
+- **No aceptes con un check en rojo**, salvo que el usuario decida explícitamente sobre cada fallo.
+- **La revisión tiene que ser de otra familia que el writer.** Si no puede, por ejemplo después de una
+  caída de familia, díselo al usuario y sigue lo que decida: nunca revises con la misma familia sin su
+  sí. La caída de familia de un writer también se pregunta antes de correrla.
+- **Un diff parcial o que no quedó bien**, o un `wait` que termina en fallo, plazo vencido o
+  cancelación: el `next` te dice que le preguntes al usuario si conserva el cambio o lo revierte.
+  Después puedes corregir a mano lo chico, relanzar con un encargo mejor (`--retry` relanza el encargo
+  original) o proponer SDD. Si no quedó ningún cambio, no hay nada que conservar: ofrece relanzar.
+- **`control_unavailable`**: el binario no pudo escribir su almacén de control, que vive en el
+  directorio de Git. Pasa cuando lo corres dentro del sandbox de Codex: vuelve a correr el mismo
+  comando pidiendo salir del sandbox. Esa escalada la aprueba el usuario o el auto-review; si no se
+  aprueba, escribe inline.
+- **Cese incierto** (`cessation_uncertain`): el supervisor del writer desapareció y no se puede
+  confirmar que el writer dejó de escribir. **Detente y pregúntale al usuario sin tocar el árbol.**
+  Con su sí, `./bin/sdd-ai cancel <id>` detiene el grupo del writer si puede acreditar que es el suyo,
+  y congela la cosecha. Si no lo acredita, no envía ninguna señal y el `next` trae
+  `cancel <id> --writer-gone`: córrelo solo después de que el usuario confirme que el writer ya no
+  corre, porque congela y libera la reserva sin señalar a nadie.
+- **Límites de esta fase:**
+  - el writer solo sale por proceso: no hay writer nativo;
+  - no hay ciclo de corrección automático;
+  - el worker Codex por proceso sigue leyendo el `AGENTS.md` del repo y el global del usuario;
+  - el writer Codex conserva su shell para leer, y puede escribir en `$TMPDIR` y `/tmp`;
+  - la cosecha no ve archivos ignorados fuera de las rutas señaladas;
+  - una sesión abierta antes de este cambio recibe el bootstrap nuevo recién al limpiar, compactar o
+    retomar.
+
+## 7. Si algo falla
 
 - **`launch_failed`**: muestra `reason` y `detail` al usuario y **pregúntale** si quiere caer a tu
   familia, tu modelo y tu esfuerzo (`fallback`). Solo con un sí, corre el comando exacto que trae
@@ -278,8 +342,8 @@ de `design-review`. No hay nivel de riesgo, lentes, lotes ni refutador.
 - **`session_unknown`**: una corrida nativa necesita el id de tu sesión (`CLAUDE_CODE_SESSION_ID` en
   Claude Code, `CODEX_SESSION_ID` en Codex), porque sin él ningún hook la dejaría lanzar. Díselo al
   usuario.
-- **Rol `implement`**: da un error de uso porque todavía no hay un worker que escriba. Díselo al
-  usuario y no lo cambies por otro rol sin preguntarle.
+- **Rol `implement`**: los errores del writer (`control_unavailable`, `writer_open`, `no_head`,
+  `tree_dirty`) y el cese incierto están en la sección 6.
 - **Rol `pr`**: ahora se llama `code-review`. El error de migración vale para `--role pr` y para una
   clave `pr:` en `.sdd-ai/workers.yml`; no edites la config sin permiso.
 - **`agents_stale`**: los agentes generados están desactualizados. Propón
@@ -300,7 +364,7 @@ de `design-review`. No hay nivel de riesgo, lentes, lotes ni refutador.
 Después de cada `./bin/sdd-ai agents sync` hay que reabrir la sesión para que el CLI cargue los
 agentes y esta skill.
 
-## 7. Los hooks
+## 8. Los hooks
 
 `.claude/settings.json` y `.codex/hooks.json` instalan hooks que hacen cumplir esta skill. Todos
 llaman al lanzador `bin/sdd-ai-hook`, que corre `./bin/sdd-ai hook <claude|codex>`, y callan en un
@@ -340,8 +404,8 @@ números salen de una constante del binario: esta skill no los repite y los nomb
 bootstrap".
 
 - **El bootstrap** llega por `SessionStart` al abrir, limpiar, compactar o retomar, antes de la lista
-  de corridas. Dice cuándo la exploración se delega y con qué comando, que la escritura delegada llega
-  con la fase 4b, que el tamaño y el riesgo solo proponen SDD, y cómo se cierra. Al retomar sale solo
+  de corridas. Dice cuándo la exploración y la escritura se delegan y con qué comando, qué no se delega,
+  que el tamaño y el riesgo solo proponen SDD, y cómo se cierra. Al retomar sale solo
   si la sesión no lo tenía, porque la conversación retomada conserva el de su arranque. Los subagentes
   nativos no lo reciben, porque no disparan `SessionStart`, y los workers por proceso tampoco, porque
   corren con los hooks apagados.

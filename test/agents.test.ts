@@ -1,12 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type RoleProfiles, agentsState, parseAgentSource, renderClaudeAgent, renderCodexAgent, sourceHash, syncAgents,
 } from '../src/agents.ts'
 import { READ_ONLY_ROLES, WEB_ROLES } from '../src/types.ts'
+import { makeRepo } from './helpers.ts'
 
 const SOURCE = '---\ndescription: Worker read-only\n---\nLee tu encargo.\n'
 const src = parseAgentSource(SOURCE)
@@ -98,6 +100,18 @@ test('sync genera un agente por rol de solo lectura y familia', () => {
   // Cada agente lleva el perfil de su rol.
   assert.match(readFileSync(join(root, '.claude/agents/sdd-ai-refute.md'), 'utf8'), /\nmodel: sonnet\neffort: high\n/)
   assert.match(readFileSync(join(root, '.claude/agents/sdd-ai-explore.md'), 'utf8'), /\nmodel: opus\nomitClaudeMd/)
+})
+
+test('agents sync no genera sdd-ai-implement', () => {
+  const repo = makeRepo()
+  const r = spawnSync(join(import.meta.dirname, '..', 'bin', 'sdd-ai'), ['agents', 'sync'], {
+    cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')) },
+  })
+  assert.equal(r.status, 0, r.stderr)
+  const claude = readdirSync(join(repo, '.claude', 'agents'))
+  const codex = readdirSync(join(repo, '.codex', 'agents'))
+  assert.deepEqual(claude.sort(), READ_ONLY_ROLES.map((role) => `sdd-ai-${role}.md`).sort())
+  assert.deepEqual(codex.sort(), READ_ONLY_ROLES.map((role) => `sdd-ai-${role}.toml`).sort())
 })
 
 test('sync borra lo generado que sobra y no toca un archivo sin marca', () => {

@@ -1,4 +1,4 @@
-import { READ_ONLY_ROLES } from './types.ts'
+import { DISPATCHABLE_ROLES } from './types.ts'
 
 /** Los umbrales de la ruta directa. El bootstrap y el recordatorio los leen de acá, y de ningún otro lado. */
 export interface RouteThresholds {
@@ -21,8 +21,13 @@ export const ROUTE: RouteThresholds = {
 
 export type Crossed = 'calls' | 'reads' | 'edits'
 
-/** El writer se nombra como delegable recién cuando `run` acepte `implement`. */
-const WRITER_DISPATCHABLE = (READ_ONLY_ROLES as readonly string[]).includes('implement')
+/** El writer se nombra como delegable solo si `run` acepta `implement`: los textos siguen al binario. */
+const WRITER_DISPATCHABLE = (DISPATCHABLE_ROLES as readonly string[]).includes('implement')
+
+const WRITER_COMMAND = '`./bin/sdd-ai run --role implement --prompt-file <encargo>`'
+
+/** Lo que el contrato del writer le prohíbe tocar: un cambio ahí no se delega. */
+const WRITER_FORBIDDEN = '`.git`, `.sdd-ai/`, `.claude/`, `.codex/`, `.agents/` o en archivos que Git ignora'
 
 /** Cómo se delega la exploración: el bootstrap y el recordatorio lo dicen con las mismas palabras. */
 function delegateExplore(): string {
@@ -33,7 +38,9 @@ function delegateExplore(): string {
 function writerLine(t: RouteThresholds, writerDispatchable: boolean): string {
   const files = `Con ${t.writerMinFiles} o más archivos no triviales para escribir`
   return writerDispatchable
-    ? `- ${files}, la escritura se delega con \`./bin/sdd-ai run --role implement --prompt-file <encargo>\`.`
+    ? `- ${files}, la escritura se delega con ${WRITER_COMMAND}, con el encargo en un temporal como en la exploración. ` +
+      'Lanzar el writer sin permiso previo necesita la misma pregunta que escribir inline. ' +
+      `Un cambio en ${WRITER_FORBIDDEN} no se delega: va inline o se propone SDD.`
     : `- ${files}, la escritura delegada llega con la fase 4b de sdd-ai: hoy se escribe inline o se le propone SDD al usuario.`
 }
 
@@ -57,7 +64,8 @@ export function renderBootstrap(t: RouteThresholds = ROUTE, writerDispatchable =
     '- Si el encargo no se puede escribir, porque el usuario prohíbe toda escritura o porque el entorno no deja escribir fuera ' +
       'del repositorio, la exploración va inline, y es una excepción admitida.',
     writerLine(t, writerDispatchable),
-    `- La escritura de un cambio de menos de ${t.minDelegateLines} líneas (agregadas más quitadas) no se delega; la exploración ` +
+    `- La escritura de un cambio de menos de ${t.minDelegateLines} líneas (agregadas más quitadas) no se delega` +
+      `${writerDispatchable ? ` aunque toque ${t.writerMinFiles} o más archivos` : ''}; la exploración ` +
       `sí, por la regla de los ${t.exploreMinFiles} archivos. Un cambio mecánico, como renombrar o formatear, no cuenta para ` +
       'elegir la ruta; el recordatorio de sesión larga cuenta igual todas las ediciones.',
     '- Primero se validan las premisas y se corren checks focalizados; después, los completos.',
@@ -76,13 +84,14 @@ const CROSSED_LABEL: Record<Crossed, (n: number) => string> = {
  * El recordatorio de sesión larga: nombra cada umbral cruzado, con su conteo, y qué hacer con cada
  * uno. Se entiende sin el bootstrap, que puede haber quedado lejos en la conversación.
  */
-export function renderReminder(crossed: Crossed[], counts: Record<Crossed, number>, t: RouteThresholds = ROUTE): string {
+export function renderReminder(crossed: Crossed[], counts: Record<Crossed, number>, t: RouteThresholds = ROUTE,
+  writerDispatchable = WRITER_DISPATCHABLE): string {
   const explore = `revisar cuántos archivos quedan por entender y, si son ${t.exploreMinFiles} o más, delegar la exploración: ${delegateExplore()}`
-  const todo: Record<Crossed, string> = {
-    calls: explore,
-    reads: explore,
-    edits: 'la escritura delegada llega con la fase 4b de sdd-ai; si el cambio creció, se le propone SDD al usuario',
-  }
+  const edits = writerDispatchable
+    ? `si lo que queda por escribir toca ${t.writerMinFiles} o más archivos no triviales y ${t.minDelegateLines} líneas o más, ` +
+      `delegar la escritura con permiso del usuario: ${WRITER_COMMAND}; si el cambio creció, se le propone SDD`
+    : 'la escritura delegada llega con la fase 4b de sdd-ai; si el cambio creció, se le propone SDD al usuario'
+  const todo: Record<Crossed, string> = { calls: explore, reads: explore, edits }
   return [
     'Recordatorio de sdd-ai: esta sesión trabaja inline sin delegar desde su último `run` o `review`, y cruzó estos umbrales:',
     ...crossed.map((c) => `- ${CROSSED_LABEL[c](counts[c])} (umbral: ${t.backstop[c]}): ${todo[c]}.`),

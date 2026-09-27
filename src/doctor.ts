@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import type { Family, WorkerTask } from './types.ts'
-import { claudeLaunch, claudeResume, claudeReviewLaunch } from './workers/claude.ts'
-import { codexLaunch, codexResume, codexReviewLaunch } from './workers/codex.ts'
+import { claudeLaunch, claudeResume, claudeReviewLaunch, claudeWriterLaunch } from './workers/claude.ts'
+import { codexLaunch, codexResume, codexReviewLaunch, codexWriterLaunch } from './workers/codex.ts'
 
 type Exec = (cmd: string, args: string[]) => { status: number | null; stdout: string }
 
@@ -23,19 +23,21 @@ const HELP_ARGS: Record<Family, string[]> = { claude: ['--help'], codex: ['exec'
 const CODEX_RESUME_HELP_ARGS = ['exec', 'resume', '--help']
 
 /**
- * Flags que emiten los adapters —worker, revisor y reanudación—, sacados de su propia salida para no
+ * Flags que emiten los adapters —worker, writer, revisor y reanudación—, sacados de su propia salida para no
  * mantener una lista aparte. En Codex, la reanudación se contrasta contra la ayuda de `exec resume`.
  */
 export function emittedFlags(family: Family, surface: 'exec' | 'resume' = 'exec'): string[] {
   let argvs: string[][]
   if (family === 'claude') {
     const worker = claudeLaunch(SAMPLE).args
-    argvs = [worker, claudeLaunch(WEB_SAMPLE).args, claudeReviewLaunch(REVIEW_SAMPLE).args, claudeResume(worker) ?? []]
+    const writer = claudeWriterLaunch(SAMPLE).args
+    argvs = [worker, claudeLaunch(WEB_SAMPLE).args, claudeReviewLaunch(REVIEW_SAMPLE).args, writer, claudeResume(worker) ?? [], claudeResume(writer) ?? []]
   } else if (surface === 'resume') {
     argvs = [SAMPLE, WEB_SAMPLE].map((t) => codexResume(codexLaunch(t).args, 't', '/r/o') ?? [])
     argvs.push(codexResume(codexReviewLaunch(REVIEW_SAMPLE).args, 't', '/r/o') ?? [])
+    argvs.push(codexResume(codexWriterLaunch(SAMPLE).args, 't', '/r/o') ?? [])
   } else {
-    argvs = [codexLaunch(SAMPLE).args, codexLaunch(WEB_SAMPLE).args, codexReviewLaunch(REVIEW_SAMPLE).args]
+    argvs = [codexLaunch(SAMPLE).args, codexLaunch(WEB_SAMPLE).args, codexReviewLaunch(REVIEW_SAMPLE).args, codexWriterLaunch(SAMPLE).args]
   }
   const flags = argvs.flat().filter((a) => a.startsWith('-') && a !== '-').map((a) => a.split('=')[0])
   return [...new Set(flags)]

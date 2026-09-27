@@ -24,6 +24,23 @@ export function claudeLaunch(t: WorkerTask): LaunchSpec {
 }
 
 /**
+ * El writer: sin las personalizaciones del usuario, con lectura y edición de archivos y sin nada que
+ * ejecute comandos ni busque en la web. `--restricted` confina las herramientas de archivos al
+ * directorio de trabajo y deja la escritura en rutas sensibles, como `.git`, a una aprobación que
+ * `--permission-prompts none` niega. La edición se preaprueba solo dentro del repo.
+ */
+export function claudeWriterLaunch(t: WorkerTask): LaunchSpec {
+  const args = [
+    '-p', '--safe-mode', '--permission-mode', 'default', '--permission-prompts', 'none', '--restricted', '--strict-mcp-config',
+    '--tools=Read,Grep,Glob,Edit,Write', '--allowedTools=Read,Grep,Glob,Edit(./**),Write',
+    '--output-format', 'stream-json', '--verbose', '--session-id', t.sessionId,
+  ]
+  if (t.model) args.push(FIELD_FLAGS.model, t.model)
+  if (t.effort) args.push(FIELD_FLAGS.effort, t.effort)
+  return { cmd: 'claude', args, cwd: t.cwd, stdinFile: t.promptFile }
+}
+
+/**
  * Argv del reintento: sin el flag rechazado y con otra sesión, porque Claude no acepta un
  * `--session-id` que ya usó un intento anterior. `null` si el flag no estaba.
  */

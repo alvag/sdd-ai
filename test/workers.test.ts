@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  REFUTER_SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT, claudeLaunch, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId,
+  REFUTER_SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT, claudeLaunch, claudeResume, claudeRetry, claudeReviewLaunch, claudeWriterLaunch, withSessionId,
 } from '../src/workers/claude.ts'
-import { codexLaunch, codexResume, codexRetry, codexReviewLaunch } from '../src/workers/codex.ts'
+import { codexLaunch, codexResume, codexRetry, codexReviewLaunch, codexWriterLaunch } from '../src/workers/codex.ts'
 import type { WorkerTask } from '../src/types.ts'
 
 const t: WorkerTask = {
@@ -156,4 +156,41 @@ test('reanudar al revisor conserva todo su aislamiento', () => {
 test('withSessionId cambia solo el valor de la sesión', () => {
   const args = claudeLaunch(t).args
   assert.deepEqual(withSessionId(args, 'S2'), args.map((a) => (a === 'S' ? 'S2' : a)))
+})
+
+test('el writer Codex corre en workspace-write sin config, hooks, apps, plugins ni web, y su reporte sale del stream', () => {
+  const l = codexWriterLaunch({ ...t, model: 'gpt-5.6-terra' })
+  assert.deepEqual([l.cmd, l.cwd, l.stdinFile], ['codex', '/r', '/r/p.md'])
+  assert.deepEqual(l.args, [
+    'exec', '--ignore-user-config', '--ignore-rules', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
+    '-c', 'web_search="disabled"', '-s', 'workspace-write', '-C', '/r', '--json', '-m', 'gpt-5.6-terra', '-c', 'model_reasoning_effort=high', '-',
+  ])
+  // Sin archivo de resultado: el sandbox del writer no tiene que alcanzar ninguna ruta de salida.
+  assert.equal(l.args.includes('--output-last-message'), false)
+})
+
+test('el writer Claude corre con edición, sin Bash ni web y en modo restringido', () => {
+  const l = claudeWriterLaunch({ ...t, model: 'sonnet' })
+  assert.deepEqual([l.cmd, l.cwd, l.stdinFile], ['claude', '/r', '/r/p.md'])
+  assert.deepEqual(l.args, [
+    '-p', '--safe-mode', '--permission-mode', 'default', '--permission-prompts', 'none', '--restricted', '--strict-mcp-config',
+    '--tools=Read,Grep,Glob,Edit,Write', '--allowedTools=Read,Grep,Glob,Edit(./**),Write',
+    '--output-format', 'stream-json', '--verbose', '--session-id', 'S', '--model', 'sonnet', '--effort', 'high',
+  ])
+  assert.equal(l.args.some((a) => /Bash|WebFetch|WebSearch/.test(a)), false)
+})
+
+test('la reanudación de un writer Codex conserva workspace-write y el aislamiento', () => {
+  assert.deepEqual(codexResume(codexWriterLaunch(t).args, 'T', '/r/out-resume.md'), [
+    'exec', 'resume', '--ignore-user-config', '--ignore-rules', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
+    '-c', 'web_search="disabled"', '--json', '-m', 'opus', '-c', 'model_reasoning_effort=high',
+    '-c', 'sandbox_mode="workspace-write"', 'T', '-',
+  ])
+  // Los de lectura siguen reanudando en solo lectura.
+  assert.ok(codexResume(codexLaunch(t).args, 'T', '/r/o.md')?.includes('sandbox_mode="read-only"'))
+})
+
+test('la reanudación de un writer Claude conserva su argv', () => {
+  const args = claudeWriterLaunch(t).args
+  assert.deepEqual(claudeResume(args), args.map((a) => (a === '--session-id' ? '--resume' : a)))
 })

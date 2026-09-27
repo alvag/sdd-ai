@@ -378,3 +378,131 @@ test('wait, review status y un launch_failed directo marcan la entrega', () => {
   assert.equal(existsSync(join(native.repo, '.sdd-ai', 'runs', stale.out.id, 'delivered.json')), true)
 })
 
+
+// --- La revisión de una cosecha: --harvest y --untracked ---
+
+/** Un writer Codex que termina con su cosecha: el conductor es Claude y la config trae las dos familias. */
+function harvested(s: Setup, script: object): string {
+  const env = { ...s.env, FAKE_MODE: 'writer', FAKE_WRITER: JSON.stringify(script), CLAUDE_CODE_SESSION_ID: 's' }
+  const prompt = join(mkdtempSync(join(tmpdir(), 'sdd-ai-prompt-')), 'p.md')
+  writeFileSync(prompt, 'Encargo.\n')
+  const r = spawnSync(BIN, ['run', '--role', 'implement', '--prompt-file', prompt], { cwd: s.repo, env, encoding: 'utf8' })
+  const id = JSON.parse(r.stdout).id as string
+  assert.ok(id, r.stdout + r.stderr)
+  return id
+}
+
+const waitFor = (s: Setup, id: string, env: Record<string, string> = {}) =>
+  JSON.parse(spawnSync(BIN, ['wait', id, '--max', '30'], { cwd: s.repo, env: { ...s.env, ...env }, encoding: 'utf8' }).stdout)
+
+/** Ejecuta un `next` que empieza con `./bin/sdd-ai`. */
+function runNext(s: Setup, next: string, env: Record<string, string> = {}) {
+  const cmd = /\.\/bin\/sdd-ai ([^;]+?)(?:\)|$)/.exec(next)?.[1] ?? ''
+  const args = cmd.trim().split(/\s+/)
+  const r = spawnSync(BIN, args, { cwd: s.repo, env: { ...s.env, ...env }, encoding: 'utf8' })
+  return { code: r.status, out: JSON.parse(r.stdout || 'null'), args }
+}
+
+test('review start --harvest revisa la cosecha con los nuevos y se niega ante otro árbol, otra base, otro autor o una cosecha pendiente', () => {
+  const s = setup({ families: '[codex, claude]', bins: ['codex', 'claude'] })
+  const id = harvested(s, { actions: [{ write: 'nuevo.txt', content: 'nuevo\n' }, { append: 'a.txt', content: 'once\n' }], hang: true })
+  const pending = cli(s, ['review', 'start', '--harvest', id, '--base', s.base, '--author', 'codex'])
+  assert.deepEqual([pending.code, pending.out.code, pending.out.next], [2, 'harvest_pending', `./bin/sdd-ai wait ${id}`])
+  assert.equal(runs(s).length, 1)
+  const until = Date.now() + 15_000
+  while (!existsSync(join(s.repo, 'nuevo.txt')) && Date.now() < until) spawnSync('sleep', ['0.05'])
+  spawnSync(BIN, ['cancel', id], { cwd: s.repo, env: s.env })
+  assert.equal(waitFor(s, id).state, 'cancelled')
+
+  const r = cli(s, ['review', 'start', '--harvest', id, '--base', s.base, '--author', 'codex'])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual([[...r.out.files].sort(), r.out.left_out, r.out.family], [['a.txt', 'nuevo.txt'], [], 'claude'])
+  assert.deepEqual(runJson(s, r.out.id, 'request.json').selection, { base: s.base, context: [], untracked: true, harvest: id })
+
+  const other = git(s.repo, 'commit-tree', git(s.repo, 'rev-parse', `${s.base}^{tree}`), '-m', 'otra')
+  const wrongBase = cli(s, ['review', 'start', '--harvest', id, '--base', other, '--author', 'codex'])
+  assert.deepEqual([wrongBase.code, wrongBase.out.code], [2, 'harvest_mismatch'])
+  const wrongAuthor = cli(s, ['review', 'start', '--harvest', id, '--base', s.base, '--author', 'claude'])
+  assert.deepEqual([wrongAuthor.code, wrongAuthor.out.code], [2, 'harvest_mismatch'])
+  writeFileSync(join(s.repo, 'nuevo.txt'), 'cambiado\n')
+  const stale = cli(s, ['review', 'start', '--harvest', id, '--base', s.base, '--author', 'codex'])
+  assert.deepEqual([stale.code, stale.out.code], [2, 'harvest_stale'])
+  assert.match(stale.out.next, new RegExp(`review start --base ${s.base} --author codex --untracked\\)`))
+  assert.doesNotMatch(stale.out.next, /--harvest/)
+})
+
+test('--untracked sobrevive a las rondas, a la vigencia y a los next de reinicio, y el next de una cosecha vencida lanza sin --harvest', () => {
+  const s = setup({ families: '[codex, claude]', bins: ['codex', 'claude'] })
+  const id = harvested(s, { actions: [{ write: 'nuevo.txt', content: 'uno\ndos\n' }] })
+  assert.equal(waitFor(s, id).state, 'done')
+
+  const work = mkdtempSync(join(tmpdir(), 'sdd-ai-fake-'))
+  const grave = { axis: 'quality', severity: 'CRITICAL', location: 'nuevo.txt:1', claim: 'falta validar', causality: 'introduced', evidence: 'deterministic' }
+  const first = (findings: unknown[]) => `{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":$PATHS},"findings":${JSON.stringify(findings)}}`
+  // El reinicio por riesgo alto corre la base y las cuatro lentes: cinco respuestas.
+  writeFileSync(join(work, 'answers.json'), JSON.stringify([
+    first([grave]), first([]), first([]), first([]), first([]), first([]),
+    `{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":$PATHS},"responses":[{"id":"F-1","answer":"resolved"}],"findings":[]}`,
+    first([]),
+  ]))
+  const scripted = { FAKE_MODE: 'scripted', FAKE_ANSWERS: join(work, 'answers.json'), FAKE_CALLS_FILE: join(work, 'calls') }
+  const env = { ...s.env, ...scripted }
+  const call = (args: string[]) => {
+    const r = spawnSync(BIN, args, { cwd: s.repo, env, encoding: 'utf8' })
+    return { code: r.status, out: JSON.parse(r.stdout || 'null') }
+  }
+  const start = call(['review', 'start', '--harvest', id, '--base', s.base, '--author', 'codex'])
+  assert.equal(start.code, 0, JSON.stringify(start.out))
+  const review = start.out.id
+  waitFor(s, review, scripted)
+  assert.equal(call(['review', 'decide', review, 'accept', 'F-1']).code, 0)
+
+  // Riesgo alto en la corrección: el reinicio propuesto conserva los nuevos y, con el árbol cambiado, no ata a la cosecha.
+  writeFileSync(join(s.repo, 'nuevo.txt'), 'uno\ndos\nspawn(x)\n')
+  const high = call(['review', 'round', review])
+  assert.deepEqual([high.code, high.out.code], [2, 'risk_high'])
+  assert.match(high.out.next, /--untracked --risk high$/)
+  assert.doesNotMatch(high.out.next, /--harvest/)
+  const restarted = runNext(s, high.out.next, scripted)
+  assert.equal(restarted.code, 0, JSON.stringify(restarted.out))
+  assert.ok(restarted.out.files.includes('nuevo.txt'))
+  waitFor(s, restarted.out.id, scripted)
+
+  // La ronda 2 vuelve a congelar con los nuevos.
+  writeFileSync(join(s.repo, 'nuevo.txt'), 'uno validado\ndos\n')
+  const round = call(['review', 'round', review])
+  assert.equal(round.code, 0, JSON.stringify(round.out))
+  waitFor(s, review, scripted)
+  assert.ok(runJson(s, review, 'candidate-r2.json').files.some((f: { path: string }) => f.path === 'nuevo.txt'))
+  const fresh = call(['review', 'status', review])
+  assert.equal(fresh.out.stale, false, JSON.stringify(fresh.out))
+
+  // La vigencia ve el cambio en un archivo nuevo, y su reinicio lanza sin --harvest.
+  writeFileSync(join(s.repo, 'nuevo.txt'), 'otra cosa\n')
+  const stale = call(['review', 'status', review])
+  assert.equal(stale.out.stale, true)
+  assert.match(stale.out.next, new RegExp(`review start --base ${s.base} --author codex --untracked$`))
+  const relaunched = runNext(s, stale.out.next, scripted)
+  assert.equal(relaunched.code, 0, JSON.stringify(relaunched.out))
+  assert.ok(relaunched.out.files.includes('nuevo.txt'))
+  assert.equal(relaunched.args.includes('--harvest'), false)
+})
+
+test('la vigencia de una revisión con --untracked no escribe en .git: con los objetos inmutables sigue vigente', () => {
+  const s = setup({ families: '[codex, claude]', bins: ['codex'] })
+  writeFileSync(join(s.repo, 'nuevo.txt'), 'nuevo\n')
+  const r = cli(s, ['review', 'start', '--base', s.base, '--untracked', '--author', 'claude'])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual(r.out.files, ['nuevo.txt'])
+  cli(s, ['wait', r.out.id, '--max', '20'])
+  // Inmutables, como los deja el sandbox de Codex: ni siquiera se puede refrescar un objeto que ya existe.
+  const objects = join(s.repo, '.git', 'objects')
+  execFileSync('chflags', ['-R', 'uchg', objects])
+  let v
+  try {
+    v = cli(s, ['review', 'status', r.out.id])
+  } finally {
+    execFileSync('chflags', ['-R', 'nouchg', objects])
+  }
+  assert.equal(v.out.stale, false, JSON.stringify(v.out))
+})

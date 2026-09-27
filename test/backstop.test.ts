@@ -167,7 +167,7 @@ test('recuerda al cruzar 20 llamadas, 5 lecturas o 2 ediciones, con todos los um
   assert.equal(repeat(edits - 1, () => countTool(tool('codex', 'post-tool-use-apply-patch', editsRepo), editsRepo, 's1', 'codex')), '')
   const byEdits = countTool(tool('codex', 'post-tool-use-apply-patch', editsRepo), editsRepo, 's1', 'codex')
   assert.match(byEdits, new RegExp(`${edits} ediciones \\(umbral: ${edits}\\)`))
-  assert.match(byEdits, /4b.*se le propone SDD al usuario/)
+  assert.match(byEdits, /--role implement.*se le propone SDD/)
 
   // La quinta lectura que es también la vigésima llamada: un solo recordatorio con los dos.
   const both = sddRepo()
@@ -236,7 +236,7 @@ test('el recordatorio se entiende sin el bootstrap', () => {
   const repo = sddRepo()
   const out = repeat(ROUTE.backstop.edits, () => countTool(tool('codex', 'post-tool-use-apply-patch', repo), repo, 's1', 'codex'))
   assert.match(out, /^Recordatorio de sdd-ai/)
-  assert.ok(out.includes('4b'))
+  assert.ok(out.includes('`./bin/sdd-ai run --role implement --prompt-file <encargo>`'))
   const reads = sddRepo()
   const byReads = repeat(ROUTE.backstop.reads, () => countTool(tool('codex', 'post-tool-use-bash', reads), reads, 's1', 'codex'))
   assert.ok(byReads.includes(EXPLORE))

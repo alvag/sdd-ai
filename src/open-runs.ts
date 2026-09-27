@@ -1,9 +1,10 @@
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { launchState } from './native-launch.ts'
 import { type Ledger, undecided } from './review/ledger.ts'
+import { gitDirs } from './git.ts'
 import { isDelivered, readJson, readStatus } from './runs.ts'
-import { type NativeProfile, TERMINAL } from './types.ts'
+import { type NativeProfile, type RunState, type Status, TERMINAL } from './types.ts'
 
 /**
  * Por qué una corrida sigue abierta para su conductor: un worker o una revisión que todavía corren o
@@ -20,20 +21,61 @@ export interface OpenRun {
 
 interface RunRequest { session?: unknown; kind?: string }
 
-/** Sin `.sdd-ai/runs` no hay nada abierto. Una corrida ilegible o sin sesión dueña se salta sin afectar a las demás. */
+/**
+ * Donde viven los almacenes de writer de este checkout; nada si no hay repo. Con `.git` como directorio
+ * no hace falta lanzar Git; en un worktree, sí.
+ */
+function writersDir(root: string): string | undefined {
+  try {
+    const dotGit = join(root, '.git')
+    const gitDir = statSync(dotGit).isDirectory() ? dotGit : gitDirs(root).gitDir
+    return join(gitDir, 'sdd-ai', 'runs')
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Sin corridas ni almacenes de writer no hay nada abierto. Una corrida ilegible o sin sesión dueña se
+ * salta sin afectar a las demás. La de un writer se lee de su almacén: su corrida visible la pudo
+ * cambiar o borrar el propio writer. El directorio de Git se resuelve una vez: los hooks llaman acá
+ * en cada evento.
+ */
 export function openRuns(root: string): OpenRun[] {
   const runs = join(root, '.sdd-ai', 'runs')
-  if (!existsSync(runs)) return []
+  const writers = writersDir(root)
+  const stores = writers && existsSync(writers) ? readdirSync(writers) : []
+  const ids = new Set([...(existsSync(runs) ? readdirSync(runs) : []), ...stores])
   const open: OpenRun[] = []
-  for (const id of readdirSync(runs).sort()) {
+  for (const id of [...ids].sort()) {
     try {
-      const run = classify(join(runs, id), id)
+      const store = writers ? join(writers, id) : undefined
+      const run = store && existsSync(join(store, 'control.json')) ? classifyWriter(store, join(runs, id), id) : classify(join(runs, id), id)
       if (run) open.push(run)
     } catch {
       // Una corrida a medio escribir o corrupta no es asunto del hook.
     }
   }
   return open
+}
+
+/**
+ * Un writer sigue abierto mientras no haya cosecha congelada, y después hasta que `wait` la entregue.
+ * La entrega se lee del almacén, o de la corrida visible cuando `wait` no pudo escribir el almacén. La
+ * visible no vale si ya estaba al congelar la cosecha: la dejó el writer, y la cosecha la anotó como
+ * corrida alterada.
+ */
+function classifyWriter(store: string, run: string, id: string): OpenRun | undefined {
+  const session = readJson<{ session?: unknown }>(join(store, 'control.json')).session
+  if (typeof session !== 'string' || session === '') return undefined
+  const worker: OpenRun = { id, session, kind: 'worker', open: 'running', next: `./bin/sdd-ai wait ${id}` }
+  const harvestFile = join(store, 'harvest.json')
+  if (!existsSync(harvestFile)) return worker
+  const harvest = readJson<{ state: RunState; runAltered?: Array<{ path: string }> }>(harvestFile)
+  const status = { state: harvest.state } as Status
+  const planted = (harvest.runAltered ?? []).some((f) => f.path === './delivered.json' || f.path === '.')
+  if (!isDelivered(store, status) && (planted || !isDelivered(run, status))) return { ...worker, open: 'undelivered' }
+  return undefined
 }
 
 function classify(dir: string, id: string): OpenRun | undefined {

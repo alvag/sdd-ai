@@ -1,12 +1,18 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
+import { buildIndex, gitDirs, indexEnv } from '../git.ts'
 import { SddError } from '../types.ts'
 import type { ArtifactKind, ArtifactRole } from './artifact.ts'
 import type { ChangedRanges } from './ledger.ts'
 
-export interface Selection { base: string; head?: string; context: string[] }
+/**
+ * Lo que se revisa. `untracked` suma los archivos nuevos que Git no ignora, armando el candidato desde
+ * un índice propio; `harvest` ata la revisión a la cosecha de un writer, que la implica.
+ */
+export interface Selection { base: string; head?: string; context: string[]; untracked?: boolean; harvest?: string }
 export interface CandidateFile {
   path: string; status: 'A' | 'M' | 'D' | 'R' | 'T'; from?: string; mode: string
   sha256: string | null; binary: boolean; lines: number; visible: Array<[number, number]>
@@ -32,12 +38,14 @@ export function baseOf(c: Candidate): string {
 // diff externo y textconv cambian el texto y las rutas que el revisor tiene que citar.
 const DIFF_FLAGS = ['--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', '-M']
 
-function gitBytes(root: string, args: string[]): Buffer {
-  return execFileSync('git', ['-c', 'core.quotePath=false', ...args], { cwd: root, maxBuffer: 256 * 1024 * 1024 })
+function gitBytes(root: string, args: string[], env?: Record<string, string>): Buffer {
+  return execFileSync('git', ['-c', 'core.quotePath=false', ...args], {
+    cwd: root, maxBuffer: 256 * 1024 * 1024, ...(env ? { env: { ...process.env, ...env } } : {}),
+  })
 }
 
-function git(root: string, args: string[]): string {
-  return gitBytes(root, args).toString('utf8')
+function git(root: string, args: string[], env?: Record<string, string>): string {
+  return gitBytes(root, args, env).toString('utf8')
 }
 
 export const sha256 = (b: Buffer | string) => createHash('sha256').update(b).digest('hex')
@@ -154,10 +162,28 @@ export function readContextFile(root: string, p: string, what = 'el contexto'): 
 export function freeze(root: string, sel: Selection): Candidate {
   const baseSha = resolveCommit(root, sel.base)
   const headSha = sel.head ? resolveCommit(root, sel.head) : null
-  const range = headSha ? [baseSha, headSha] : [baseSha]
-  const changes = parseRaw(git(root, ['diff', '--raw', '-z', '-M', ...range]))
-  const binaries = parseBinaries(git(root, ['diff', '--numstat', '-z', '-M', ...range]))
-  const diff = git(root, ['diff', ...DIFF_FLAGS, '--unified=3', ...range])
+  // Con `untracked`, el diff sale de un índice propio con el árbol entero, archivos nuevos incluidos.
+  const scratch = !headSha && sel.untracked ? mkdtempSync(join(tmpdir(), 'sdd-ai-index-')) : undefined
+  try {
+    let env: Record<string, string> | undefined
+    let range = headSha ? [baseSha, headSha] : [baseSha]
+    if (scratch) {
+      const indexFile = join(scratch, 'index')
+      const checkout = { root, gitDir: gitDirs(root).gitDir }
+      buildIndex(checkout, baseSha, indexFile)
+      env = indexEnv(checkout, indexFile)
+      range = ['--cached', baseSha]
+    }
+    return freezeRange(root, sel, baseSha, headSha, range, env)
+  } finally {
+    if (scratch) rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
+function freezeRange(root: string, sel: Selection, baseSha: string, headSha: string | null, range: string[], env?: Record<string, string>): Candidate {
+  const changes = parseRaw(git(root, ['diff', '--raw', '-z', '-M', ...range], env))
+  const binaries = parseBinaries(git(root, ['diff', '--numstat', '-z', '-M', ...range], env))
+  const diff = git(root, ['diff', ...DIFF_FLAGS, '--unified=3', ...range], env)
   const visible = parseVisible(diff)
 
   const files: CandidateFile[] = changes.map((ch) => {
@@ -180,7 +206,7 @@ export function freeze(root: string, sel: Selection): Candidate {
     return { path, sha256: sha256(bytes), lines: countLines(bytes.toString('utf8')) }
   })
 
-  const leftOut = headSha
+  const leftOut = headSha || env
     ? []
     : git(root, ['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter((p) => p !== '')
 

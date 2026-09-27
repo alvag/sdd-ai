@@ -359,7 +359,10 @@ export function fits(prompt: string): boolean {
 }
 
 /** Lo que recibe una sesión reanudada después de agotar su tope: que entregue lo que tenga. */
-export function closingMessage(kind: 'run' | 'review'): string {
+export function closingMessage(kind: 'run' | 'review' | 'write'): string {
+  if (kind === 'write') {
+    return 'Se agotó el tiempo de esta tarea. Termina el archivo que estés escribiendo para que ninguno quede a medio escribir, no empieces cambios nuevos y entrega ya tu reporte con lo que hiciste y lo que faltó, cerrado con la línea STATUS: done.'
+  }
   if (kind === 'review') {
     return 'Se agotó el tiempo de esta revisión. Entrega ya tu respuesta: el único objeto JSON del esquema, con los hallazgos que tengas. Si no llegaste a inspeccionar el candidato completo, declara inspection.status "unavailable" con el motivo.'
   }

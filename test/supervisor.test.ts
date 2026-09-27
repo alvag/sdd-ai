@@ -9,7 +9,7 @@ import { createRun, readStatus, writeJsonAtomic } from '../src/runs.ts'
 import { sliceCandidate } from '../src/review/batch.ts'
 import { type Candidate, freeze, snapshot } from '../src/review/candidate.ts'
 import { type Ledger, type Reviewer, type RoundPlan, decide, openLedger, targets } from '../src/review/ledger.ts'
-import { CORRECTION_RESERVE, REVIEW_PROMPT_BUDGET, renderMaterial, renderReviewPrompt, renderRoundPrompt } from '../src/review/prompt.ts'
+import { CORRECTION_RESERVE, REVIEW_PROMPT_BUDGET, closingMessage, renderMaterial, renderReviewPrompt, renderRoundPrompt } from '../src/review/prompt.ts'
 import { type ArgvFile, cleanEnv, removeScratch, supervise, writeReceipt } from '../src/supervisor.ts'
 import { ARTIFACT_SYSTEM_PROMPT, REFUTER_SYSTEM_PROMPT } from '../src/workers/claude.ts'
 import { renderArtifactMaterial, renderArtifactPrompt } from '../src/review/artifact-prompt.ts'
@@ -1055,4 +1055,13 @@ test('el recibo de un artefacto dice que el gate lo decide la persona y no menci
   assert.deepEqual(receipt.informative, [{ id: 'F-2', of: '.plans/spec.md', severity: 'CRITICAL', claim: 'la spec se contradice', location: '.plans/spec.md:3' }])
   assert.deepEqual(readRunJson(dir, 'verdict.json').informative, receipt.informative)
   assert.equal(readRunJson(dir, 'verdict.json').spec, 'fail')
+})
+
+test('el cierre del writer pide terminar sin archivos a medio escribir', () => {
+  const m = closingMessage('write')
+  assert.match(m, /Se agotó el tiempo/)
+  assert.match(m, /a medio escribir/)
+  assert.match(m, /no empieces cambios nuevos/)
+  assert.match(m, /STATUS: done/)
+  assert.notEqual(m, closingMessage('run'))
 })

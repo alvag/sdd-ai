@@ -1,11 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, openRuns, runKey } from '../src/open-runs.ts'
 import { createRun, setStatus, writeJsonAtomic } from '../src/runs.ts'
 import type { Status } from '../src/types.ts'
+import { gitDirs } from '../src/git.ts'
+import { storeDir, writeControl } from '../src/writer-store.ts'
+import { makeRepo } from './helpers.ts'
 
 const root = () => mkdtempSync(join(tmpdir(), 'sdd-ai-open-'))
 
@@ -75,4 +78,25 @@ test('openRuns clasifica las cinco formas de corrida abierta', () => {
 
 test('sin .sdd-ai/runs no hay corridas abiertas', () => {
   assert.deepEqual(openRuns(root()), [])
+})
+
+test('openRuns identifica al dueño de una corrida de writer por la sesión del almacén aunque el writer cambie su request.json', () => {
+  const r = makeRepo()
+  const id = '20260101-0009-wwww'
+  const dir = makeRun(r, id, { state: 'launching' }, { session: 'dueña' })
+  writeControl(r, {
+    id, base: 'b', family: 'codex', prompt: 'x', session: 'dueña', checkout: { root: r, ...gitDirs(r) },
+    request: { role: 'implement', conductor: { family: 'claude' }, deadline_sec: 60 }, preLaunch: {}, inventory: {}, runDir: { dev: 0, ino: 0 },
+  })
+  // El writer cambia su corrida visible: la sesión, el estado, o la borra entera.
+  writeJsonAtomic(join(dir, 'request.json'), { session: 'otra', role: 'explore' })
+  setStatus(dir, { state: 'done' })
+  assert.deepEqual(openRuns(r).map((x) => [x.id, x.session, x.kind, x.open]), [[id, 'dueña', 'worker', 'running']])
+  rmSync(dir, { recursive: true })
+  assert.deepEqual(openRuns(r).map((x) => [x.id, x.session, x.open]), [[id, 'dueña', 'running']])
+  // Congelada la cosecha, queda sin entregar hasta que `wait` la anota en el almacén.
+  writeJsonAtomic(join(storeDir(r, id), 'harvest.json'), { state: 'done' })
+  assert.deepEqual(openRuns(r).map((x) => x.open), ['undelivered'])
+  writeJsonAtomic(join(storeDir(r, id), 'delivered.json'), { round: null, launch: null })
+  assert.deepEqual(openRuns(r), [])
 })

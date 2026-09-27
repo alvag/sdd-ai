@@ -6,6 +6,7 @@ import {
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 import { createInterface } from 'node:readline'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { type Outcome, type StreamFacts, classify, emptyFacts, scanLine } from './outcome.ts'
 import { type Admission, type AdmittedReview, type RoundReview, type Unverifiable, admit, admitRefutation, admitRound, parseLocation } from './review/admit.ts'
 import { sliceCandidate } from './review/batch.ts'
@@ -16,12 +17,16 @@ import {
 } from './review/ledger.ts'
 import { REVIEW_PROMPT_BUDGET, closingMessage, fits, renderCorrectionPrompt, renderMaterial, renderRefutePrompt } from './review/prompt.ts'
 import { type RiskRecord, readRisk } from './review/risk.ts'
+import { dirtyPaths, headCommit } from './git.ts'
 import { readJson, setStatus, writeJsonAtomic } from './runs.ts'
 import type {
   AttemptKind, AttemptMetrics, Family, LaunchSpec, RejectedField, Resolution, ResumeInfo, RetryInfo, RunState, Status, WorkerTask,
 } from './types.ts'
 import { ARTIFACT_SYSTEM_PROMPT, REFUTER_SYSTEM_PROMPT, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId } from './workers/claude.ts'
 import { codexResume, codexRetry, codexReviewLaunch, withResultFile } from './workers/codex.ts'
+import {
+  type GroupIdentity, captureTreeAtBase, freezeHarvest, groupState, readControl, readProcess, recordGroup, writeControl,
+} from './writer-store.ts'
 
 /** Un revisor sobre un lote. `prompt` es la ruta de su prompt, ya medido y escrito por la CLI. */
 export interface ReviewJob { key: string; reviewer: Reviewer; batch: number; paths: string[]; prompt: string; targets?: Target[] }
@@ -42,7 +47,10 @@ export interface ArgvFile {
   launch?: LaunchSpec
   /** Tope de la reanudación que sigue a un `timeout`; el de la corrida ya venció a esa altura. */
   resume_sec?: number
-  kind?: 'run' | 'review'
+  kind?: 'run' | 'review' | 'writer'
+  /** Un writer: la raíz del checkout que lo lanzó y su corrida. El supervisor corre en su almacén. */
+  root?: string
+  id?: string
   candidate?: string
   /** Ronda de la revisión; por defecto 1. */
   round?: number
@@ -109,8 +117,13 @@ export function cleanEnv(env: Record<string, string | undefined>): Record<string
   return out
 }
 
+/**
+ * Señala al grupo solo si todavía existe: un id de grupo no se reutiliza mientras tenga procesos, pero
+ * uno vacío sí. Queda la ventana mínima entre la consulta y la señal.
+ */
 function killGroup(pid: number, signal: NodeJS.Signals): void {
   try {
+    process.kill(-pid, 0)
     process.kill(-pid, signal)
   } catch {
     // El grupo ya no existe.
@@ -157,6 +170,10 @@ interface RunContext {
   argv: ArgvFile
   job?: { reviewer: Reviewer | 'refute'; batch: number; launch: number }
   once: { started: boolean }
+  /** Un writer: su identidad de grupo se registra en el almacén al arrancar. */
+  writer?: { root: string; id: string }
+  /** Antes del reintento por perfil: si devuelve falso, no se reintenta. */
+  canRetry?: () => Promise<boolean>
 }
 interface Attempt {
   outcome: Outcome; facts: StreamFacts; resultFile: string
@@ -168,6 +185,15 @@ function resultFileOf(family: Family, launch: LaunchSpec, dir: string, name: str
   const i = launch.args.indexOf('--output-last-message')
   if (family === 'codex' && i >= 0 && i + 1 < launch.args.length) return launch.args[i + 1]
   return join(dir, `result${name}.md`)
+}
+
+/** La identidad del grupo del writer, leída de `ps` una vez que el CLI ya corre. */
+function recordLeader(w: { root: string; id: string }, pid: number): void {
+  const seen = readProcess(pid)
+  const g: GroupIdentity = seen && seen !== 'gone'
+    ? { pid, pgid: seen.pgid, lstart: seen.lstart, argvHash: seen.argvHash }
+    : { pid, pgid: pid, lstart: null, argvHash: '' }
+  recordGroup(w.root, w.id, g)
 }
 
 /**
@@ -202,6 +228,7 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
     child.once('close', (code) => resolve({ code }))
   })
 
+  let leaderRecorded = false
   if (child.pid !== undefined) {
     const pid = child.pid
     const running: Partial<Status> = { state: 'running', worker_pid: pid, supervisor_pid: process.pid }
@@ -211,6 +238,11 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
     }
     setStatus(dir, running)
     createInterface({ input: child.stdout! }).on('line', (line) => {
+      // La primera línea prueba que el CLI ya corre su propio código: su comando es el definitivo.
+      if (ctx.writer && !leaderRecorded) {
+        leaderRecorded = true
+        recordLeader(ctx.writer, pid)
+      }
       writeSync(stdoutFd, `${line}\n`)
       scanLine(family, facts, line)
     })
@@ -233,6 +265,10 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
   clearTimeout(deadline)
   clearTimeout(graceTimer)
   clearInterval(cancelWatch)
+  // Un writer que terminó sin escribir nada: su grupo se registra igual, sin hora de inicio.
+  if (ctx.writer && !leaderRecorded && child.pid !== undefined) {
+    recordGroup(ctx.writer.root, ctx.writer.id, { pid: child.pid, pgid: child.pid, lstart: null, argvHash: '' })
+  }
   // Un nieto que sobrevivió al worker no debe quedar vivo.
   if (child.pid !== undefined) killGroup(child.pid, 'SIGKILL')
   for (const fd of [stdinFd, stdoutFd, stderrFd]) closeSync(fd)
@@ -244,7 +280,8 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
     return { ...common, outcome: { state: 'launch_failed', reason: missing ? 'cli_missing' : 'unknown', detail: spawnError.message } }
   }
   let resultText = ''
-  if (family === 'claude') {
+  // Claude entrega la respuesta en el stream; Codex también, cuando no se le pidió archivo.
+  if (family === 'claude' || !launch.args.includes('--output-last-message')) {
     // Sin resultado en el stream no hay archivo: un archivo vacío se leería como una respuesta.
     if (facts.result !== undefined) {
       resultText = facts.result
@@ -606,7 +643,7 @@ interface Attempts {
  * pedido, relanza una sola vez sin ese campo; si se agota el tope, reanuda una sola vez la misma
  * sesión para que entregue lo que tenga.
  */
-async function runAttempts(ctx: RunContext, launch: LaunchSpec, until: number, resumeSec: number, kind: 'run' | 'review'): Promise<Attempts> {
+async function runAttempts(ctx: RunContext, launch: LaunchSpec, until: number, resumeSec: number, kind: 'run' | 'review' | 'write'): Promise<Attempts> {
   const { dir, cancelFile, argv } = ctx
   let last = await attempt(ctx, launch, '', until)
   recordAttempt(ctx, 'initial', '', launch, last)
@@ -616,7 +653,7 @@ async function runAttempts(ctx: RunContext, launch: LaunchSpec, until: number, r
   let retry: RetryInfo | undefined
   const rejected = outcome.state === 'launch_failed' ? facts.rejected : undefined
   const next = rejected ? retryArgs(ctx, launch.args, rejected.field) : null
-  if (rejected && next) {
+  if (rejected && next && (await ctx.canRetry?.() ?? true)) {
     if (existsSync(cancelFile)) {
       outcome = { state: 'cancelled' }
     } else {
@@ -799,6 +836,7 @@ export async function supervise(dir: string, argvName = 'argv.json'): Promise<St
   }
   const resumeSec = argv.resume_sec ?? DEFAULT_RESUME_SEC
   if (argv.kind === 'review') return superviseReview(ctx, resumeSec)
+  if (argv.kind === 'writer') return superviseWriter(ctx, resumeSec)
   // Un cancel que llegó antes de que hubiera worker: no se lanza nada.
   if (existsSync(cancelFile)) return setStatus(dir, { state: 'cancelled', ended_at: new Date().toISOString() })
   if (!argv.launch) throw new Error('la corrida no trae su lanzamiento')
@@ -810,4 +848,66 @@ export async function supervise(dir: string, argvName = 'argv.json'): Promise<St
   if (r.retry) patch.retry = r.retry
   if (r.resume) patch.resume = r.resume
   return setStatus(dir, patch)
+}
+
+/**
+ * Espera a que el grupo del writer quede vacío, con `SIGKILL` mientras exista, hasta `graceMs`.
+ * Devuelve el último estado que vio: solo `gone` acredita el cese.
+ */
+export async function settleGroup(g: GroupIdentity, graceMs: number, state: (g: GroupIdentity) => 'gone' | 'alive' | 'unknown' = groupState):
+  Promise<'gone' | 'alive' | 'unknown'> {
+  const until = Date.now() + graceMs
+  for (;;) {
+    const s = state(g)
+    if (s === 'gone') return s
+    if (s === 'alive') killGroup(g.pgid, 'SIGKILL')
+    if (Date.now() >= until) return s
+    await sleep(100)
+  }
+}
+
+/**
+ * El writer de una corrida: corre en su almacén y no escribe nada en `.sdd-ai/runs/<id>/`. Antes de
+ * lanzar comprueba que el árbol siga en la base; al terminar, confirma que el grupo cesó y recién
+ * entonces congela la cosecha, que es el terminal y libera la reserva. Sin cese confirmado, deja
+ * `cessation_uncertain` con la reserva tomada.
+ */
+async function superviseWriter(ctx: RunContext, resumeSec: number): Promise<Status> {
+  const { dir, argv, cancelFile } = ctx
+  if (!argv.root || !argv.id || !argv.launch) throw new Error('la corrida del writer no trae su checkout, su id o su lanzamiento')
+  const { root, id } = argv
+  const control = readControl(root, id)
+  const done = async (outcome: Outcome, report?: string): Promise<Status> => {
+    const record = await freezeHarvest(root, id, outcome, report)
+    return setStatus(dir, { state: record.state, ended_at: new Date().toISOString() })
+  }
+  if (existsSync(cancelFile)) return done({ state: 'cancelled' })
+  // Un cambio en el árbol entre `run` y el arranque no es del writer: no se lanza.
+  const dirty = dirtyPaths(root)
+  if (dirty.length > 0 || headCommit(root) !== control.base) {
+    const detail = dirty.length > 0 ? `cambió: ${dirty.join(', ')}` : 'HEAD ya no es la base'
+    return done({ state: 'launch_failed', reason: 'tree_changed', detail })
+  }
+  writeControl(root, { ...control, spawning: new Date().toISOString() })
+  const wctx: RunContext = {
+    ...ctx, writer: { root, id },
+    // Un primer intento que ya cambió el árbol no se reintenta: se congela lo que dejó.
+    canRetry: async () => captureTreeAtBase(root, id),
+  }
+  const r = await runAttempts(wctx, argv.launch, Date.now() + argv.deadline_sec * 1000, resumeSec, 'write')
+  const patch: Partial<Status> = {}
+  if (r.facts.sessionId) patch.session_id = r.facts.sessionId
+  if (r.retry) patch.retry = r.retry
+  if (r.resume) patch.resume = r.resume
+  setStatus(dir, patch)
+  const g = readControl(root, id).group
+  const settled = g ? await settleGroup(g, ctx.grace) : 'gone'
+  if (settled !== 'gone') {
+    return setStatus(dir, {
+      state: 'cessation_uncertain', reason: settled === 'alive' ? 'group_alive' : 'group_unknown',
+      detail: `el grupo ${g?.pgid} del writer sigue ${settled === 'alive' ? 'vivo' : 'sin poder consultarse'} después de SIGKILL`,
+    })
+  }
+  const report = existsSync(r.last.resultFile) ? readFileSync(r.last.resultFile, 'utf8') : undefined
+  return done(r.outcome, report)
 }

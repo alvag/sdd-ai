@@ -75,6 +75,8 @@ export function scanLine(family: Family, facts: StreamFacts, line: string): void
       facts.started = true
       const kind = e.item?.type
       if (e.type === 'item.completed' && typeof kind === 'string' && !NON_TOOL_ITEMS.has(kind)) facts.toolEvents.push(kind)
+      // El último mensaje del agente es su respuesta: un worker sin archivo de resultado la entrega así.
+      if (e.type === 'item.completed' && kind === 'agent_message' && typeof e.item.text === 'string') facts.result = e.item.text
     }
   } else if (e.type === 'turn.completed' && typeof e.usage === 'object' && e.usage !== null) {
     facts.usage = addCodexUsage(facts.usage, e.usage)

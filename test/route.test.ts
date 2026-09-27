@@ -80,7 +80,7 @@ test('la skill no repite los números de la constante', () => {
   ]) assert.ok(!hasPhrase(skill, phrase), `la skill repite: ${phrase}`)
 })
 
-test('el texto del writer sigue a implement: mientras run lo rechace, dice que llega en 4b', () => {
+test('el texto del writer sigue a implement: con run aceptándolo, el bootstrap y el recordatorio nombran la escritura delegada', () => {
   const repo = makeRepo()
   mkdirSync(join(repo, '.sdd-ai'))
   writeFileSync(join(repo, '.sdd-ai', 'config.yml'), 'cross_model:\n  schema_version: 1\n  families: [codex]\n  selection: full\n')
@@ -89,10 +89,33 @@ test('el texto del writer sigue a implement: mientras run lo rechace, dice que l
   const r = spawnSync(process.execPath, [BIN, 'run', '--role', 'implement', '--prompt-file', prompt], {
     cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 's1' },
   })
-  const out = JSON.parse(r.stdout || 'null') as { code?: string; message?: string } | null
-  // Si run deja de rechazar implement, este test falla hasta que el bootstrap nombre la escritura delegada.
-  assert.equal(out?.code, 'usage', r.stdout + r.stderr)
-  assert.match(out?.message ?? '', /implement/)
-  assert.ok(renderBootstrap().includes('llega con la fase 4b de sdd-ai'))
-  assert.ok(!renderBootstrap().includes('--role implement'))
+  const out = JSON.parse(r.stdout || 'null') as { code?: string } | null
+  // run acepta el rol: lo que lo frena en este repo sin commits es la base, no el rol.
+  assert.notEqual(out?.code, 'usage', r.stdout + r.stderr)
+  assert.ok(renderBootstrap().includes('--role implement'))
+  assert.ok(!renderBootstrap().includes('llega con la fase 4b'))
+  assert.ok(!renderReminder(['edits'], { calls: 0, reads: 0, edits: 3 }).includes('llega con la fase 4b'))
+})
+
+test('con implement despachable el bootstrap nombra el comando del writer, la regla de 20 líneas, las rutas que no se delegan y la pregunta de permiso', () => {
+  const b = renderBootstrap(SENTINEL, true)
+  const writer = b.split('\n').find((l) => l.includes('--role implement')) ?? ''
+  assert.match(writer, new RegExp(`Con ${SENTINEL.writerMinFiles} o más archivos no triviales para escribir`))
+  assert.ok(writer.includes('`./bin/sdd-ai run --role implement --prompt-file <encargo>`'))
+  assert.match(writer, /misma pregunta que escribir inline/)
+  for (const p of ['`.git`', '`.sdd-ai/`', '`.claude/`', '`.codex/`', '`.agents/`', 'archivos que Git ignora']) assert.ok(writer.includes(p), p)
+  assert.match(writer, /va inline o se propone SDD/)
+  const lines = b.split('\n').find((l) => l.includes(`menos de ${SENTINEL.minDelegateLines} líneas`)) ?? ''
+  assert.match(lines, new RegExp(`no se delega aunque toque ${SENTINEL.writerMinFiles} o más archivos`))
+  // Sin el writer, el texto de antes: nada que delegar.
+  assert.ok(!renderBootstrap(SENTINEL, false).includes('--role implement'))
+})
+
+test('el recordatorio de ediciones remite al comando del writer', () => {
+  const r = renderReminder(['edits'], { calls: 0, reads: 0, edits: 3 }, SENTINEL, true)
+  assert.ok(r.includes('`./bin/sdd-ai run --role implement --prompt-file <encargo>`'))
+  assert.match(r, new RegExp(`${SENTINEL.writerMinFiles} o más archivos no triviales`))
+  assert.match(r, new RegExp(`${SENTINEL.minDelegateLines} líneas`))
+  assert.match(r, /con permiso del usuario/)
+  assert.ok(!renderReminder(['edits'], { calls: 0, reads: 0, edits: 3 }, SENTINEL, false).includes('--role implement'))
 })

@@ -64,3 +64,22 @@ test('un CLI que no está en PATH hace fallar el diagnóstico', () => {
   assert.equal(claude?.inPath, false)
   assert.equal(report.clis.find((c) => c.family === 'codex')?.version, '0.156.1')
 })
+
+test('doctor comprueba los flags del writer en exec y resume', () => {
+  const claude = emittedFlags('claude')
+  for (const f of ['--restricted', '--strict-mcp-config', '--permission-mode', '--allowedTools']) assert.ok(claude.includes(f), f)
+  assert.ok(emittedFlags('codex').includes('--ignore-rules'))
+  assert.ok(emittedFlags('codex', 'resume').includes('--ignore-rules'))
+  const resumeHelp = CODEX_RESUME_HELP.split('\n').filter((l) => !l.includes('--ignore-rules')).join('\n')
+  const claudeHelp = CLAUDE_HELP.split('\n').filter((l) => !l.includes('--restricted')).join('\n')
+  const report = doctor((cmd, args) => {
+    if (args.includes('--version')) return { status: 0, stdout: cmd === 'claude' ? '2.1.283 (Claude Code)' : 'codex-cli 0.157.1' }
+    if (cmd === 'claude') return { status: 0, stdout: claudeHelp }
+    return { status: 0, stdout: args.includes('resume') ? resumeHelp : CODEX_HELP }
+  })
+  assert.equal(report.ok, false)
+  assert.equal(report.clis.find((c) => c.family === 'claude')?.flags.find((f) => f.flag === '--restricted')?.present, false)
+  const codex = report.clis.find((c) => c.family === 'codex')?.flags ?? []
+  assert.equal(codex.find((f) => f.flag === 'resume --ignore-rules')?.present, false)
+  assert.equal(codex.find((f) => f.flag === '--ignore-rules')?.present, true)
+})

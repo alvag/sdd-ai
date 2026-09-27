@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { accessSync, constants, existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
@@ -8,7 +9,7 @@ import { type RoleProfiles, agentName, agentsState, syncAgents } from './agents.
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, parseFamiliesFlag } from './config.ts'
 import { doctor } from './doctor.ts'
-import { repoRoot } from './git.ts'
+import { buildIndex, dirtyPaths, gitDirs, headCommit, repoRoot } from './git.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { nativeProfile, resolve } from './resolve.ts'
@@ -25,16 +26,25 @@ import {
 } from './review/ledger.ts'
 import { fits, renderMaterial, renderReviewPrompt } from './review/prompt.ts'
 import { type Risk, type RiskRecord, classify, classifyDelta, readRisk } from './review/risk.ts'
-import { createRun, isAlive, markDelivered, newRunId, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
 import {
-  ARTIFACT_NOTE, type ArgvFile, type JobRecord, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, supervise, writeReceipt,
+  createRun, isAlive, markDelivered, newRunId, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic,
+} from './runs.ts'
+import {
+  ARTIFACT_NOTE, type ArgvFile, type JobRecord, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, settleGroup, supervise,
+  writeReceipt,
 } from './supervisor.ts'
 import {
-  type Conductor, type Family, type NativeProfile, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
-  type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isFamily, isReadOnlyRole, opposite, toNativeEffort,
+  type Conductor, DISPATCHABLE_ROLES, type Family, type NativeProfile, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
+  type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isDispatchableRole, isFamily, opposite, toNativeEffort,
 } from './types.ts'
-import { claudeLaunch } from './workers/claude.ts'
-import { codexLaunch } from './workers/codex.ts'
+import { claudeLaunch, claudeWriterLaunch } from './workers/claude.ts'
+import { codexLaunch, codexWriterLaunch } from './workers/codex.ts'
+import { writerPrompt } from './writer.ts'
+import {
+  type HarvestRecord, type WriterControl, canWriteStore, captureTreeAtBase, freezeHarvest, groupState, isWriterRun, leaderMatches,
+  readControl, readHarvest, readProcess, readReservation, releaseWriter, reserveWriter, runDirIdentity, runInventory, sensitiveInventory,
+  storeDir, writeControl,
+} from './writer-store.ts'
 
 type Env = Record<string, string | undefined>
 interface Result { code: number; out: unknown }
@@ -127,19 +137,19 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   if (env.SDD_AI_WORKER === '1') {
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   }
-  if (values.retry) {
+  // Un writer se relanza con lo que guardó su almacén, nunca con su corrida visible, que pudo cambiar.
+  const retryWriter = values.retry && isWriterRun(repoRoot(cwd), values.retry) ? readControl(repoRoot(cwd), values.retry) : undefined
+  if (retryWriter) {
+    const r = retryWriter.request
+    inheritRetry(values, { role: r.role, conductor: r.conductor, overrides: { families: r.families, model: r.model, effort: r.effort, deadline_sec: r.deadline_sec } })
+  } else if (values.retry) {
     const request = join(runDir(repoRoot(cwd), values.retry), 'request.json')
     inheritRetry(values, existsSync(request) ? readJson<RunRequest>(request) : {})
   }
   const roleArg = values.role ?? 'explore'
   const renamed = RETIRED_ROLES.get(roleArg)
   if (renamed) throw new SddError('usage', `el rol \`${roleArg}\` ahora se llama \`${renamed}\``, { next: `usa --role ${renamed}` })
-  if (roleArg === 'implement') {
-    throw new SddError('usage', 'el rol implement necesita un worker que escriba, y sdd-ai todavía solo tiene workers de solo lectura', {
-      next: `usa uno de: ${READ_ONLY_ROLES.join(', ')}`,
-    })
-  }
-  if (!isReadOnlyRole(roleArg)) throw new SddError('usage', `rol desconocido: ${roleArg}`, { next: `usa uno de: ${READ_ONLY_ROLES.join(', ')}` })
+  if (!isDispatchableRole(roleArg)) throw new SddError('usage', `rol desconocido: ${roleArg}`, { next: `usa uno de: ${DISPATCHABLE_ROLES.join(', ')}` })
   const role = roleArg
   const deadlineArg = values.deadline ?? '600'
   const deadline = Number(deadlineArg)
@@ -157,6 +167,8 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   if (values.model) flags.model = values.model
   if (values.effort) flags.effort = toNativeEffort(values.effort)
   const resolution = resolve({ conductor, families, workers, role, flags, codexRoot })
+  // El writer no tiene agente nativo: su borde de escritura lo pone el CLI que lanza el binario.
+  if (role === 'implement') resolution.via = 'process'
   const session = ownerSession(env, conductor.family)
   // Una nativa la lanza el conductor desde su sesión: sin ese dato, sus hooks nunca la reconocerían.
   if (resolution.via === 'native' && !session) {
@@ -164,7 +176,9 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   }
 
   let prompt: string
-  if (values.retry) {
+  if (retryWriter) {
+    prompt = retryWriter.prompt
+  } else if (values.retry) {
     prompt = readFileSync(join(runDir(root, values.retry), 'prompt.md'), 'utf8')
   } else if (values['prompt-file']) {
     const file = isAbsolute(values['prompt-file']) ? values['prompt-file'] : resolvePath(cwd, values['prompt-file'])
@@ -172,6 +186,14 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
     prompt = readFileSync(file, 'utf8')
   } else {
     throw new SddError('usage', 'falta el encargo', { next: 'pasa --prompt-file <archivo> o --retry <id>' })
+  }
+
+  if (role === 'implement') {
+    return runWriter({
+      root, env, conductor, session, resolution, prompt, deadline, retryOf: values.retry,
+      request: { role, families: values.families, model: values.model, effort: values.effort, conductor, deadline_sec: deadline },
+      source: values.retry ? `--retry ${values.retry}` : `--prompt-file ${shellArg(values['prompt-file'] ?? '')}`,
+    })
   }
 
   const id = newRunId()
@@ -229,6 +251,93 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   return { code: 0, out: { id, via: 'process', family: resolution.family } }
 }
 
+interface WriterLaunch {
+  root: string; env: Env; conductor: Conductor; session?: string; resolution: Resolution; prompt: string; deadline: number
+  retryOf?: string; request: WriterControl['request']
+  /** Cómo nombrar el encargo en un `next`: el archivo o el `--retry`. */
+  source: string
+}
+
+/** Lo que dice el rechazo de un árbol sucio: el usuario decide, sdd-ai no toca nada. */
+const DIRTY_NEXT = 'pregunta al usuario si conserva el cambio o lo revierte. Si lo conserva, el writer queda descartado en este checkout hasta que él deje el árbol limpio, por ejemplo commiteando, y mientras tanto sigues inline. sdd-ai no hace stash, commit ni revert'
+
+/**
+ * `run --role implement`. Los rechazos van antes de crear nada, en orden: el almacén, la reserva (un
+ * writer abierto prevalece sobre el árbol sucio), un commit en `HEAD` y el árbol limpio. Todo lo que
+ * decide queda en el almacén antes de lanzar; en la corrida visible, solo lo previo al lanzamiento.
+ */
+function runWriter(w: WriterLaunch): Result {
+  const { root, env, conductor, resolution } = w
+  if (!inPath(resolution.family, env)) {
+    const c = conductor
+    throw new SddError('cli_missing', `${resolution.family} no está en PATH`, {
+      next: `pregunta al usuario si cae a ${c.family}; solo con un sí: ./bin/sdd-ai run --role implement ${w.source} --families ${c.family} --conductor ${c.family}`,
+    })
+  }
+  if (!canWriteStore(root)) {
+    const e = controlUnavailable()
+    e.next = `${e.next}. Si el usuario no la aprueba, escribe inline`
+    throw e
+  }
+  const id = newRunId()
+  const reserved = reserveWriter(root, id)
+  if (!reserved.ok) {
+    throw new SddError('writer_open', `ya hay un writer abierto en este repositorio: ${reserved.holder}`, {
+      next: `espera o recibe esa corrida (./bin/sdd-ai wait ${reserved.holder}) antes de lanzar otro writer`,
+    })
+  }
+  let launched = false
+  try {
+    const base = headCommit(root)
+    if (!base) {
+      throw new SddError('no_head', 'HEAD no tiene commit: el writer necesita una base', {
+        next: 'pregunta al usuario si commitea primero; mientras tanto, escribe inline',
+      })
+    }
+    const dirty = dirtyPaths(root)
+    if (dirty.length > 0) throw new SddError('tree_dirty', `el árbol tiene cambios sin commitear: ${dirty.join(', ')}`, { detail: dirty.join('\n'), next: DIRTY_NEXT })
+
+    const dir = createRun(root, id)
+    const store = storeDir(root, id)
+    mkdirSync(store, { recursive: true })
+    const storePrompt = join(store, 'prompt.md')
+    writeFileSync(storePrompt, writerPrompt(w.prompt))
+    const task: WorkerTask = { cwd: root, promptFile: storePrompt, resultFile: join(store, 'result.md'), sessionId: randomUUID() }
+    if (resolution.model) task.model = resolution.model
+    if (resolution.effort) task.effort = resolution.effort
+    const launch = resolution.family === 'claude' ? claudeWriterLaunch(task) : codexWriterLaunch(task)
+    const argv: ArgvFile = { family: resolution.family, deadline_sec: w.deadline, kind: 'writer', root, id, launch }
+
+    // La corrida visible: lo que los hooks y el conductor leen. Después de lanzar, sdd-ai no escribe ahí.
+    writeFileSync(join(dir, 'prompt.md'), w.prompt)
+    writeJsonAtomic(join(dir, 'request.json'), {
+      role: 'implement', conductor, session: w.session, retry_of: w.retryOf, base,
+      overrides: { families: w.request.families, model: w.request.model, effort: w.request.effort, deadline_sec: w.deadline },
+    })
+    writeJsonAtomic(join(dir, 'resolved.json'), resolution)
+    writeJsonAtomic(join(dir, 'argv.json'), argv)
+    writeJsonAtomic(join(dir, 'status.json'), { state: 'launching' })
+
+    const identity = runDirIdentity(root, id)
+    if (!identity) throw new Error(`la corrida ${id} desapareció antes de lanzar`)
+    const control: WriterControl = {
+      id, base, family: resolution.family, prompt: w.prompt, checkout: { root, ...gitDirs(root) }, request: w.request,
+      preLaunch: runInventory(root, id), inventory: sensitiveInventory(root), runDir: identity,
+      ...(w.session ? { session: w.session } : {}),
+    }
+    writeControl(root, control)
+    writeJsonAtomic(join(store, 'argv.json'), argv)
+    setStatus(store, { state: 'launching' })
+    const supervisor = spawn(process.execPath, [BIN_PATH, '__supervise', store, 'argv.json'], { detached: true, stdio: 'ignore', env: definedEnv(env) })
+    supervisor.unref()
+    if (supervisor.pid !== undefined) writeFileSync(join(store, 'supervisor.pid'), String(supervisor.pid))
+    launched = true
+    return { code: 0, out: { id, via: 'process', family: resolution.family, base, next: `./bin/sdd-ai wait ${id}` } }
+  } finally {
+    if (!launched) releaseWriter(root, id)
+  }
+}
+
 /** Deja la corrida en `launching` y lanza al supervisor desprendido, que sobrevive al shell del conductor. */
 function launchSupervisor(dir: string, argv: ArgvFile, env: Env, status: Partial<Status>, argvName = 'argv.json'): void {
   writeJsonAtomic(join(dir, argvName), argv)
@@ -272,16 +381,75 @@ function diffSelection(req: ReviewRequest): Selection {
   return req.selection
 }
 
+/** Lo que una selección arrastra entre rondas y reinicios: los archivos nuevos y la cosecha. */
+const untrackedOf = (sel: Selection): Pick<Selection, 'untracked' | 'harvest'> =>
+  ({ ...(sel.untracked ? { untracked: true } : {}), ...(sel.harvest ? { harvest: sel.harvest } : {}) })
+
+/** Si el árbol de trabajo sigue siendo el que congeló la cosecha de ese writer. */
+function harvestTreeHolds(root: string, id: string): boolean {
+  try {
+    const h = readHarvest(root, id)
+    if (!h) return false
+    const { checkout, base } = readControl(root, id)
+    const scratch = mkdtempSync(join(tmpdir(), 'sdd-ai-index-'))
+    try {
+      return buildIndex({ root: checkout.root, gitDir: checkout.gitDir }, base, join(scratch, 'index')) === h.tree
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  } catch {
+    return false
+  }
+}
+
 /** Un delta con riesgo alto: la ronda no corre y se propone reiniciar con lentes, con el mismo head. */
-function riskHigh(req: ReviewRequest, delta: Risk, head: string | undefined): SddError {
+function riskHigh(root: string, req: ReviewRequest, delta: Risk, head: string | undefined): SddError {
   const sel = diffSelection(req)
-  const selection: Selection = { base: sel.base, context: sel.context }
+  const selection: Selection = { base: sel.base, context: sel.context, ...untrackedOf(sel) }
   if (head) selection.head = head
-  const restart = restartCommand({ ...req, selection, risk: { ...readRisk(req), forced: true } })
+  const restart = restartCommand({ ...req, selection, risk: { ...readRisk(req), forced: true } }, root)
   return new SddError('risk_high', 'la corrección introduce riesgo alto', {
     detail: delta.reasons.map((r) => `${r.signal} en ${r.path}: ${r.detail}`).join(', '),
     next: `pregunta al usuario si reinicia la revisión con lentes: ${restart}`,
   })
+}
+
+interface Harvested { id: string; base: string; author: Family }
+
+function harvestStale(h: Harvested): SddError {
+  return new SddError('harvest_stale', `el árbol ya no es el de la cosecha de ${h.id}`, {
+    next: `díselo al usuario: la revisión atada a la cosecha ya no vale para lo que hay. Si siguen, revisa el árbol actual (./bin/sdd-ai review start --base ${h.base} --author ${h.author} --untracked) y declara que la autoría quedó mezclada si tú también editaste`,
+  })
+}
+
+/**
+ * La revisión de una cosecha: la base y el autor salen del almacén y se niegan si el conductor pasó
+ * otros; la cosecha tiene que estar congelada y el árbol tiene que seguir siendo el suyo.
+ */
+function harvestSelection(root: string, id: string, base: string | undefined, author: string | undefined): Harvested {
+  if (!isWriterRun(root, id)) throw new SddError('run_not_found', `no existe la corrida de writer ${id} en este checkout`)
+  const c = readControl(root, id)
+  if (!readHarvest(root, id)) {
+    throw new SddError('harvest_pending', `la cosecha de ${id} todavía no está congelada`, { next: `./bin/sdd-ai wait ${id}` })
+  }
+  if (base !== undefined && headOrRef(root, base) !== c.base) {
+    throw new SddError('harvest_mismatch', `--base ${base} no es la base de la cosecha (${c.base})`, { next: `usa --base ${c.base}` })
+  }
+  if (author !== undefined && author !== c.family) {
+    throw new SddError('harvest_mismatch', `--author ${author} no es la familia del writer (${c.family})`, { next: `usa --author ${c.family}` })
+  }
+  const h: Harvested = { id, base: c.base, author: c.family }
+  if (!harvestTreeHolds(root, id)) throw harvestStale(h)
+  return h
+}
+
+/** El commit al que resuelve una ref, o la ref tal cual si no resuelve. */
+function headOrRef(root: string, ref: string): string {
+  try {
+    return execFileSync('git', ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: root, encoding: 'utf8' }).trim()
+  } catch {
+    return ref
+  }
 }
 
 /**
@@ -310,6 +478,8 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
       request: { type: 'string' },
       spec: { type: 'string' },
       plan: { type: 'string' },
+      harvest: { type: 'string' },
+      untracked: { type: 'boolean', default: false },
     },
   })
   if (env.SDD_AI_WORKER === '1') {
@@ -323,7 +493,12 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   } else if (values.kind !== undefined || values.request !== undefined || values.spec !== undefined || values.plan !== undefined) {
     throw new SddError('usage', '--kind, --request, --spec y --plan solo se usan con --artifact')
   }
-  if (!artifact && !values.base) throw new SddError('usage', 'falta --base', { next: './bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>] [--risk high]' })
+  if ((values.harvest !== undefined || values.untracked) && (artifact || values.head !== undefined)) {
+    throw new SddError('usage', '--harvest y --untracked revisan el árbol de trabajo: no se combinan con --artifact ni con --head')
+  }
+  if (!artifact && !values.base && values.harvest === undefined) {
+    throw new SddError('usage', 'falta --base', { next: './bin/sdd-ai review start --base <ref> [--head <ref>] [--context <ruta>] [--untracked] [--risk high]' })
+  }
   if (values.risk !== undefined && values.risk !== 'high') {
     throw new SddError('usage', '--risk solo acepta high: el nivel se sube, nunca se baja')
   }
@@ -335,7 +510,8 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
     conductor: values.conductor, conductorModel: values['conductor-model'], conductorEffort: values['conductor-effort'],
   })
   if (values.author !== undefined && !isFamily(values.author)) throw new SddError('usage', `--author inválido: ${values.author}`, { next: 'usa claude o codex' })
-  const author: Family = values.author ?? conductor.family
+  const harvested = values.harvest !== undefined ? harvestSelection(root, values.harvest, values.base, values.author) : undefined
+  const author: Family = harvested?.author ?? values.author ?? conductor.family
   const config = loadCrossModel(root, FAMILIES.filter((f) => inPath(f, env)))
   const families = effectiveFamilies(config.families, values.families ? parseFamiliesFlag(values.families) : undefined)
   const flags: Profile = {}
@@ -357,9 +533,13 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   // El refutador es de la familia del revisor, con el perfil de su propio rol.
   const refuter = resolve({ conductor: { family: opposite(family) }, families: [family], workers, role: 'refute', flags: {}, codexRoot })
 
-  const selection: Selection = { base: values.base ?? '', context: values.context.map(abs) }
+  const selection: Selection = harvested
+    ? { base: harvested.base, context: values.context.map(abs), untracked: true, harvest: values.harvest }
+    : { base: values.base ?? '', context: values.context.map(abs), ...(values.untracked ? { untracked: true } : {}) }
   if (values.head) selection.head = values.head
   const candidate = freezeStable(root, selection)
+  // Lo que se congeló tiene que ser la cosecha: si el árbol cambió en el medio, no se revisa.
+  if (harvested && !harvestTreeHolds(root, harvested.id)) throw harvestStale(harvested)
   const classified = classify(candidate)
   const forced = values.risk === 'high'
   const risk: RiskRecord = { level: forced ? 'high' : classified.level, classified: classified.level, reasons: classified.reasons, forced }
@@ -406,7 +586,11 @@ function shellArg(s: string): string {
   return /^[\w./@:+=,-]+$/.test(s) ? s : `'${s.replaceAll("'", `'\\''`)}'`
 }
 
-function restartCommand(req: ReviewRequest): string {
+/**
+ * El `review start` que vuelve a revisar. Una revisión de cosecha conserva `--harvest` solo si el árbol
+ * sigue siendo el de la cosecha; si cambió, revisa el árbol actual con los archivos nuevos.
+ */
+function restartCommand(req: ReviewRequest, root?: string): string {
   if (isArtifact(req.selection)) {
     const sel = req.selection
     const parts = ['./bin/sdd-ai review start', `--artifact ${shellArg(sel.artifact)}`, `--kind ${sel.kind}`]
@@ -415,10 +599,13 @@ function restartCommand(req: ReviewRequest): string {
     parts.push(`--author ${req.author}`)
     return parts.join(' ')
   }
-  const parts = ['./bin/sdd-ai review start', `--base ${shellArg(req.selection.base)}`]
-  if (req.selection.head) parts.push(`--head ${shellArg(req.selection.head)}`)
-  for (const c of req.selection.context) parts.push(`--context ${shellArg(c)}`)
+  const sel = req.selection
+  const harvest = sel.harvest && root && harvestTreeHolds(root, sel.harvest) ? sel.harvest : undefined
+  const parts = ['./bin/sdd-ai review start', ...(harvest ? [`--harvest ${harvest}`] : []), `--base ${shellArg(sel.base)}`]
+  if (sel.head) parts.push(`--head ${shellArg(sel.head)}`)
+  for (const c of sel.context) parts.push(`--context ${shellArg(c)}`)
   parts.push(`--author ${req.author}`)
+  if (sel.untracked && !harvest) parts.push('--untracked')
   if (req.risk?.forced) parts.push('--risk high')
   return parts.join(' ')
 }
@@ -448,7 +635,7 @@ function freshness(root: string, req: ReviewRequest, c: Candidate, head: string 
       const moved = !resolvesTo(root, head, c.head_sha) || !resolvesTo(root, sel.base, c.base_sha)
       return { stale: again.hash !== c.hash, ref_moved: moved }
     }
-    return { stale: freeze(root, { base: sel.base, context: sel.context }).hash !== c.hash }
+    return { stale: freeze(root, { base: sel.base, context: sel.context, ...untrackedOf(sel) }).hash !== c.hash }
   } catch {
     return { stale: true }
   }
@@ -493,7 +680,7 @@ function relaunchNext(id: string, dir: string, req: ReviewRequest, s: Status, ro
  * El paso siguiente, por prioridad: esperar, relanzar una ronda que no terminó, decidir, preguntar
  * por las disputas, el checkpoint del tope, corregir y lanzar, y por último la vigencia.
  */
-function roundNext(id: string, dir: string, req: ReviewRequest, s: Status, round: number, ledger: Ledger, fresh: Freshness): string {
+function roundNext(root: string, id: string, dir: string, req: ReviewRequest, s: Status, round: number, ledger: Ledger, fresh: Freshness): string {
   if (!TERMINAL.has(s.state)) return `./bin/sdd-ai wait ${id}`
   // Con un insumo cambiado, decidir o relanzar sería trabajo perdido: review round lo va a rechazar.
   if (fresh.stale_reason === 'inputs') return inputsChanged(id, req)
@@ -518,7 +705,7 @@ function roundNext(id: string, dir: string, req: ReviewRequest, s: Status, round
     if (fresh.stale) return `el artefacto cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
     return `la revisión está vigente; ${ARTIFACT_NOTE}`
   }
-  if (fresh.stale) return `el diff cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
+  if (fresh.stale) return `el diff cambió desde la revisión; revisa de nuevo: ${restartCommand(req, root)}`
   return 'la revisión está vigente; el recibo informa y no autoriza commit ni push'
 }
 
@@ -612,7 +799,7 @@ function reviewView(root: string, id: string, dir: string, s: Status): Result {
     tool_events: rounds.filter((r) => r.state === 'done').at(-1)?.tool_events ?? receipt.tool_events,
     ...(ledger.artifact ? artifactView(ledger, rounds) : {}),
     ...common,
-    next: roundNext(id, dir, req, s, round, ledger, fresh),
+    next: roundNext(root, id, dir, req, s, round, ledger, fresh),
   }
   return { code, out }
 }
@@ -896,7 +1083,7 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
   const prev = ledger ? readJson<Candidate>(join(dir, `candidate${tagOf(completed)}.json`)) : first
   let selection: Selection
   if (ledger) {
-    selection = { base: baseOf(first), context: req.selection.context }
+    selection = { base: baseOf(first), context: req.selection.context, ...untrackedOf(diffSelection(req)) }
     if (values.head) selection.head = values.head
   } else {
     selection = values.head ? { ...diffSelection(req), head: values.head } : diffSelection(req)
@@ -919,7 +1106,7 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
     const changed = identical ? {} : changedRanges(prev, candidate, dir)
     if (!identical) {
       const delta = classifyDelta(prev, candidate, changed)
-      if (delta.level === 'high') throw riskHigh(req, delta, selection.head)
+      if (delta.level === 'high') throw riskHigh(root, req, delta, selection.head)
     }
     const contextTexts = readContext(root, candidate)
     material = renderMaterial(candidate, contextTexts)
@@ -1047,7 +1234,6 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
   const id = positionals[0]
   if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai wait <id>' })
   const root = repoRoot(cwd)
-  const dir = runDir(root, id)
   let max: number
   if (values.max !== undefined) {
     max = Number(values.max)
@@ -1060,6 +1246,8 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
     }
   }
 
+  if (isWriterRun(root, id)) return waitWriter(root, id, max, env)
+  const dir = runDir(root, id)
   const until = Date.now() + max * 1000
   for (;;) {
     let s = readStatus(dir)
@@ -1084,11 +1272,15 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
   }
 }
 
-function cancel(args: string[], cwd: string): Result {
-  const { positionals } = parseArgs({ args, strict: true, allowPositionals: true, options: {} })
+async function cancel(args: string[], cwd: string): Promise<Result> {
+  const { values, positionals } = parseArgs({ args, strict: true, allowPositionals: true, options: { 'writer-gone': { type: 'boolean', default: false } } })
   const id = positionals[0]
   if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai cancel <id>' })
-  const dir = runDir(repoRoot(cwd), id)
+  const root = repoRoot(cwd)
+  if (isWriterRun(root, id)) return cancelWriter(root, id, values['writer-gone'])
+  if (readReservation(root)?.id === id) return releaseOrphan(root, id)
+  if (values['writer-gone']) throw new SddError('usage', '--writer-gone solo se usa con la corrida de un writer')
+  const dir = runDir(root, id)
   if (existsSync(join(dir, 'native.json')) && cancelNative(dir)) return { code: 0, out: { id, state: 'cancelled' } }
   const s = readStatus(dir)
   if (TERMINAL.has(s.state)) return { code: 0, out: { id, state: s.state } }
@@ -1101,6 +1293,223 @@ function cancel(args: string[], cwd: string): Result {
     }
   }
   return { code: 0, out: { id, state: 'cancel_requested', next: `./bin/sdd-ai wait ${id}` } }
+}
+
+/** Lo que falta para proponer la revisión de una cosecha: cada condición que falló, con palabras. */
+function harvestFailures(h: HarvestRecord): string[] {
+  const failed: string[] = []
+  if (h.state !== 'done') failed.push(`el writer terminó en ${h.state}${h.reason ? `/${h.reason}` : ''}`)
+  if (!h.endMark) failed.push('el reporte no cierra con la marca de fin')
+  if (h.files.length === 0) failed.push('el cambio está vacío')
+  if (h.flagged.length > 0) failed.push(`hay rutas señaladas: ${h.flagged.map((f) => f.path).join(', ')}`)
+  if (h.runAltered.length > 0) failed.push(`el writer alteró su corrida: ${h.runAltered.map((f) => f.path).join(', ')}`)
+  if (h.headMoved) failed.push('HEAD ya no es la base')
+  return failed
+}
+
+function harvestNext(id: string, h: HarvestRecord, family: Family): string {
+  const failed = harvestFailures(h)
+  if (failed.length === 0) {
+    return `mira el diff completo (${h.patchFile}) y lanza la revisión antes de correr nada que cambie el árbol: ./bin/sdd-ai review start --harvest ${id} --base ${h.base} --author ${family}`
+  }
+  if (h.files.length === 0 && h.flagged.length === 0 && h.runAltered.length === 0 && !h.headMoved) {
+    const why = h.state === 'done' ? 'el writer terminó sin cambios' : failed[0]
+    return `no hay nada que conservar ni revertir (${why}); pregunta al usuario si relanza: ./bin/sdd-ai run --retry ${id}`
+  }
+  return `no se propone revisión: ${failed.join('; ')}. Pregunta al usuario si conserva el cambio o lo revierte; sdd-ai no revierte nada`
+}
+
+/**
+ * Anota la entrega, solo si la consulta viene de la sesión dueña que guardó el control. Va al almacén;
+ * si el almacén no se puede escribir, como dentro del sandbox de un conductor Codex, va a la corrida
+ * visible. Eso se hace solo con la cosecha ya congelada, cuando el writer dejó de escribir, y solo si
+ * su ruta real es la de siempre.
+ */
+function markWriterDelivered(root: string, id: string, state: Status['state'], env: Env): void {
+  try {
+    const c = readControl(root, id)
+    if (!TERMINAL.has(state) || !c.session || ownerSession(env, c.request.conductor.family) !== c.session) return
+    const mark = { round: null, launch: null }
+    try {
+      writeJsonAtomic(join(storeDir(root, id), 'delivered.json'), mark)
+    } catch {
+      // Ningún tramo de la ruta puede ser un enlace que dejó el writer: `.sdd-ai`, `runs` ni la corrida.
+      const run = join(root, '.sdd-ai', 'runs', id)
+      if (realpathSync(run) === join(realpathSync(root), '.sdd-ai', 'runs', id)) writeJsonAtomic(join(run, 'delivered.json'), mark)
+    }
+  } catch {
+    // Anotar la entrega nunca impide devolverla.
+  }
+}
+
+/** Lo que responde un comando del writer que necesita escribir el almacén y no puede. */
+function controlUnavailable(): SddError {
+  return new SddError('control_unavailable', 'sdd-ai no puede escribir el almacén de control del writer en el directorio de Git', {
+    next: 'vuelve a correr el mismo comando pidiendo salir del sandbox (escalada): el almacén vive en el directorio de Git, que el sandbox deja en solo lectura',
+  })
+}
+
+function writerReport(root: string, id: string, h: HarvestRecord, env: Env): Result {
+  const c = readControl(root, id)
+  const s = readStatus(storeDir(root, id))
+  const out: Record<string, unknown> = { id, state: h.state }
+  if (h.reason) out.reason = h.reason
+  if (h.detail) out.detail = h.detail
+  Object.assign(out, {
+    base: h.base, files: h.files, diff: h.patchFile, flagged: h.flagged, run_altered: h.runAltered, head_moved: h.headMoved,
+    report: h.report ?? null, end_mark: h.endMark,
+  })
+  const failed = harvestFailures(h)
+  if (failed.length > 0) out.failed = failed
+  if (s.session_id) out.session_id = s.session_id
+  const warnings = profileWarnings(s)
+  if (warnings.length > 0) out.warnings = warnings
+  out.next = harvestNext(id, h, c.family)
+  markWriterDelivered(root, id, h.state, env)
+  return { code: h.state === 'done' ? 0 : 1, out }
+}
+
+const writerGoneNext = (id: string) =>
+  `detente y pregúntale al usuario si el writer ya no corre, sin tocar el árbol; solo con su confirmación: ./bin/sdd-ai cancel ${id} --writer-gone (congela la cosecha y libera la reserva sin enviar ninguna señal)`
+
+function uncertain(root: string, id: string, reason: string, detail: string): Result {
+  setStatus(storeDir(root, id), { state: 'cessation_uncertain', reason, detail })
+  return { code: 1, out: { id, state: 'cessation_uncertain', reason, detail, next: writerGoneNext(id) } }
+}
+
+/**
+ * La corrida de un writer cuyo supervisor desapareció sin terminal. Si el writer nunca se lanzó, se
+ * congela lo que hay; si se lanzó, solo se cosecha con el grupo confirmado vacío. Sin identidad
+ * registrada, o con el grupo vivo, el cese queda incierto y la reserva sigue tomada.
+ */
+async function recoverWriter(root: string, id: string, env: Env): Promise<Result> {
+  if (!canWriteStore(root)) throw controlUnavailable()
+  const c = readControl(root, id)
+  if (!c.spawning) {
+    const outcome = captureTreeAtBase(root, id)
+      ? { state: 'failed' as const, reason: 'supervisor_lost', detail: 'el supervisor terminó antes de lanzar al writer' }
+      : { state: 'launch_failed' as const, reason: 'tree_changed', detail: 'el árbol cambió y el writer nunca se lanzó' }
+    return writerReport(root, id, await freezeHarvest(root, id, outcome), env)
+  }
+  if (!c.group) return uncertain(root, id, 'no_identity', 'el supervisor terminó mientras lanzaba al writer, antes de registrar su grupo')
+  const state = groupState(c.group)
+  if (state !== 'gone') {
+    return uncertain(root, id, state === 'alive' ? 'group_alive' : 'group_unknown',
+      `el supervisor terminó y el grupo ${c.group.pgid} del writer ${state === 'alive' ? 'sigue vivo' : 'no se puede consultar'}`)
+  }
+  const record = await freezeHarvest(root, id, { state: 'failed', reason: 'supervisor_lost', detail: 'el supervisor terminó sin escribir un estado final' })
+  return writerReport(root, id, record, env)
+}
+
+/** `wait` de un writer: solo el terminal del almacén lo hace volver, nunca un estado de la corrida visible. */
+async function waitWriter(root: string, id: string, max: number, env: Env): Promise<Result> {
+  const store = storeDir(root, id)
+  const until = Date.now() + max * 1000
+  for (;;) {
+    const h = readHarvest(root, id)
+    if (h) {
+      // Una caída entre publicar el registro y liberar deja la reserva tomada: la libera quien lo lee,
+      // si puede escribir el almacén.
+      try {
+        releaseWriter(root, id)
+      } catch {
+        // Dentro del sandbox no se puede: la liberará el próximo que lea con permiso.
+      }
+      return writerReport(root, id, h, env)
+    }
+    const s = readStatus(store)
+    if (s.state === 'cessation_uncertain') {
+      return { code: 1, out: { id, state: s.state, reason: s.reason, detail: s.detail, next: writerGoneNext(id) } }
+    }
+    const pid = s.supervisor_pid ?? readSupervisorPid(store)
+    if (pid !== undefined && !isAlive(pid)) {
+      // El supervisor pudo publicar la cosecha justo antes de terminar.
+      const late = readHarvest(root, id)
+      return late ? writerReport(root, id, late, env) : recoverWriter(root, id, env)
+    }
+    if (Date.now() >= until) return { code: 3, out: { id, state: s.state, next: `./bin/sdd-ai wait ${id}` } }
+    await sleep(250)
+  }
+}
+
+function signalGroup(pgid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pgid, 0)
+    process.kill(-pgid, signal)
+  } catch {
+    // El grupo ya no existe.
+  }
+}
+
+/**
+ * `cancel` de un writer. Con el supervisor vivo, pide la cancelación en el almacén y, si acredita al
+ * líder del grupo, lo señala; el supervisor congela. Con el supervisor muerto, detiene el grupo solo
+ * si lo acredita, confirma el cese y congela. `--writer-gone` congela y libera sin señalar, después de
+ * que el usuario confirmó que el writer ya no corre.
+ */
+async function cancelWriter(root: string, id: string, writerGone: boolean): Promise<Result> {
+  const store = storeDir(root, id)
+  const done = readHarvest(root, id)
+  if (done) {
+    try {
+      releaseWriter(root, id)
+    } catch {
+      // Dentro del sandbox no se puede: la liberará el próximo que lea con permiso.
+    }
+    return { code: 0, out: { id, state: done.state } }
+  }
+  if (!canWriteStore(root)) throw controlUnavailable()
+  const freeze = async (reason?: string, detail?: string) => {
+    const r = await freezeHarvest(root, id, { state: 'cancelled', ...(reason ? { reason } : {}), ...(detail ? { detail } : {}) })
+    return { code: 0, out: { id, state: r.state, next: `./bin/sdd-ai wait ${id}` } }
+  }
+  if (writerGone) return freeze('writer_gone', 'el usuario confirmó que el writer ya no corre')
+  writeFileSync(join(store, 'cancel.request'), new Date().toISOString())
+  const c = readControl(root, id)
+  const supervisorPid = readStatus(store).supervisor_pid ?? readSupervisorPid(store)
+  const supervised = supervisorPid !== undefined && isAlive(supervisorPid)
+  const requested = { code: 0, out: { id, state: 'cancel_requested', next: `./bin/sdd-ai wait ${id}` } }
+  if (!c.spawning) {
+    // El supervisor ve el pedido antes de lanzar; si murió, el writer nunca se lanzó.
+    if (supervised) return requested
+    if (captureTreeAtBase(root, id)) return freeze('not_launched', 'el writer nunca se lanzó')
+    const r = await freezeHarvest(root, id, { state: 'launch_failed', reason: 'tree_changed', detail: 'el árbol cambió y el writer nunca se lanzó' })
+    return { code: 0, out: { id, state: r.state, reason: r.reason, next: `./bin/sdd-ai wait ${id}` } }
+  }
+  if (!c.group) {
+    if (supervised) return requested
+    return uncertain(root, id, 'no_identity', 'el writer se lanzó sin que quedara registrado su grupo')
+  }
+  if (groupState(c.group) === 'gone') return supervised ? requested : freeze()
+  const matches = leaderMatches(c.group)
+  if (matches !== true) {
+    return uncertain(root, id, matches === false ? 'identity_mismatch' : 'identity_unverifiable',
+      `el grupo ${c.group.pgid} sigue vivo y su líder ${matches === false ? 'ya no es el writer registrado' : 'no se puede acreditar'}: no se envió ninguna señal`)
+  }
+  signalGroup(c.group.pgid, 'SIGTERM')
+  if (supervised) return requested
+  if (await settleGroup(c.group, 10_000) !== 'gone') {
+    return uncertain(root, id, 'group_alive', `el grupo ${c.group.pgid} sigue vivo después de SIGKILL`)
+  }
+  return freeze()
+}
+
+/**
+ * Una reserva sin control: `run` la tomó y no llegó a escribir el almacén. Se libera solo desde el
+ * checkout que la tomó, y solo si el proceso que la tomó ya no existe o no es el mismo; si sigue vivo,
+ * está lanzando y no se toca. Desde otro worktree, la corrida no existe.
+ */
+function releaseOrphan(root: string, id: string): Result {
+  const r = readReservation(root)
+  if (!r || r.id !== id) return { code: 0, out: { id, state: 'released' } }
+  if (r.gitDir !== gitDirs(root).gitDir) {
+    throw new SddError('run_not_found', `no existe la corrida ${id} en este checkout`, { next: 'corre el comando desde el checkout que la lanzó' })
+  }
+  const seen = readProcess(r.pid)
+  const alive = seen === undefined ? isAlive(r.pid) : seen !== 'gone' && (r.lstart === null || seen.lstart === r.lstart)
+  if (alive) return { code: 1, out: { id, state: 'launching', next: `run todavía está lanzando ${id}; vuelve a consultar con ./bin/sdd-ai wait ${id}` } }
+  releaseWriter(root, id)
+  return { code: 0, out: { id, state: 'released' } }
 }
 
 function agents(args: string[], env: Env, cwd: string): Result {
@@ -1117,7 +1526,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'run': return await run(rest, env, cwd)
       case 'review': return await review(rest, env, cwd)
       case 'wait': return await wait(rest, env, cwd)
-      case 'cancel': return cancel(rest, cwd)
+      case 'cancel': return await cancel(rest, cwd)
       case 'agents': return agents(rest, env, cwd)
       case 'doctor': {
         const report = doctor()

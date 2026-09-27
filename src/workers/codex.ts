@@ -21,6 +21,23 @@ export function codexLaunch(t: WorkerTask): LaunchSpec {
 }
 
 /**
+ * El writer: `workspace-write` en la raíz del repo, sin la config del usuario ni sus hooks, apps,
+ * plugins o búsqueda web, y sin sus reglas de execpolicy: una regla `allow` hace correr el comando fuera
+ * del sandbox, y `--ignore-user-config` no las apaga. Conserva el shell para leer el código. No tiene
+ * archivo de resultado: su reporte sale del stream.
+ */
+export function codexWriterLaunch(t: WorkerTask): LaunchSpec {
+  const args = [
+    'exec', '--ignore-user-config', '--ignore-rules', '--disable', 'hooks', '--disable', 'apps', '--disable', 'plugins',
+    '-c', 'web_search="disabled"', '-s', 'workspace-write', '-C', t.cwd, '--json',
+  ]
+  if (t.model) args.push('-m', t.model)
+  if (t.effort) args.push('-c', `${EFFORT_KEY}${t.effort}`)
+  args.push('-')
+  return { cmd: 'codex', args, cwd: t.cwd, stdinFile: t.promptFile }
+}
+
+/**
  * El revisor: sin shell ni búsqueda web, sin la config del usuario y en un directorio vacío que no es
  * un repo. `tools.web_search=false` no apaga la búsqueda; `web_search="disabled"` sí.
  */
@@ -54,15 +71,19 @@ export function withResultFile(args: string[], resultFile: string): string[] {
 
 /**
  * Argv para reanudar un hilo que se quedó sin tiempo. `exec resume` no acepta `-C` ni `-s`: el
- * sandbox viaja como config y el directorio es el cwd del proceso. El resto del aislamiento se
- * conserva tal cual.
+ * sandbox del lanzamiento viaja como config y el directorio es el cwd del proceso. El resto del
+ * aislamiento se conserva tal cual.
  */
 export function codexResume(args: string[], threadId: string, resultFile: string): string[] | null {
   if (args[0] !== 'exec') return null
   const out = ['exec', 'resume']
+  let sandbox = 'read-only'
   for (let i = 1; i < args.length; i++) {
     const a = args[i]
-    if (a === '-s' || a === '-C') {
+    if (a === '-s') {
+      sandbox = args[i + 1] ?? sandbox
+      i++
+    } else if (a === '-C') {
       i++
     } else if (a === '--output-last-message') {
       out.push(a, resultFile)
@@ -71,6 +92,6 @@ export function codexResume(args: string[], threadId: string, resultFile: string
       out.push(a)
     }
   }
-  out.push('-c', 'sandbox_mode="read-only"', threadId, '-')
+  out.push('-c', `sandbox_mode="${sandbox}"`, threadId, '-')
   return out
 }

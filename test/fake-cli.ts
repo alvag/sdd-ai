@@ -1,8 +1,10 @@
 // CLI falso para probar el supervisor. El comportamiento sale de FAKE_MODE; las salidas son las
 // muestras reales de test/fixtures.
 import { spawn } from 'node:child_process'
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
+} from 'node:fs'
+import { dirname, join } from 'node:path'
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')
 const args = process.argv.slice(2)
@@ -111,6 +113,88 @@ function scripted(): void {
 }
 
 
+/** Una acción del writer falso, con rutas relativas a su cwd; `run*` actúa sobre cada corrida visible. */
+type WriterAction =
+  | { write: string; content: string } | { append: string; content: string } | { delete: string } | { rename: [string, string] }
+  | { binary: string } | { chmod: [string, string] } | { symlink: [string, string] }
+  | { runWrite: string; content: string } | { runLink: [string, string] } | { runDelete: string } | { runSwap: string }
+  | { runFuture: string } | { runsSwap: string }
+
+interface WriterScript {
+  actions?: WriterAction[]; report?: string
+  /** Se cuelga después de actuar; con `hangUnlessResume`, solo en el primer lanzamiento. */
+  hang?: boolean; hangUnlessResume?: boolean
+  /** La reanudación sale con 1 sin responder. */
+  resumeFail?: boolean
+  /** Sale enseguida sin escribir nada en el stream. */
+  silent?: boolean
+  /** Con `-m`, el proveedor rechaza el modelo, después de actuar. */
+  rejectModel?: boolean
+  /** Deja un hijo vivo en su grupo, que sobrevive al writer. */
+  child?: boolean
+  exit?: number
+}
+
+const runDirs = () => {
+  const runs = join('.sdd-ai', 'runs')
+  return existsSync(runs) ? readdirSync(runs).map((id) => join(runs, id)) : []
+}
+
+function act(a: WriterAction): void {
+  const mk = (p: string) => mkdirSync(dirname(p), { recursive: true })
+  if ('write' in a) { mk(a.write); writeFileSync(a.write, a.content) }
+  else if ('append' in a) appendFileSync(a.append, a.content)
+  else if ('delete' in a) rmSync(a.delete, { force: true, recursive: true })
+  else if ('rename' in a) renameSync(a.rename[0], a.rename[1])
+  else if ('binary' in a) { mk(a.binary); writeFileSync(a.binary, Buffer.from([0, 1, 2, 255, 0])) }
+  else if ('chmod' in a) chmodSync(a.chmod[0], Number.parseInt(a.chmod[1], 8))
+  else if ('symlink' in a) { mk(a.symlink[1]); symlinkSync(a.symlink[0], a.symlink[1]) }
+  else if ('runWrite' in a) for (const d of runDirs()) writeFileSync(join(d, a.runWrite), a.content)
+  else if ('runLink' in a) for (const d of runDirs()) { rmSync(join(d, a.runLink[0]), { force: true }); symlinkSync(a.runLink[1], join(d, a.runLink[0])) }
+  else if ('runDelete' in a) for (const d of runDirs()) rmSync(join(d, a.runDelete), { force: true, recursive: true })
+  else if ('runSwap' in a) for (const d of runDirs()) { rmSync(d, { recursive: true, force: true }); symlinkSync(a.runSwap, d) }
+  else if ('runFuture' in a) for (const d of runDirs()) { const t = new Date(Date.now() + 86_400_000); utimesSync(join(d, a.runFuture), t, t) }
+  else if ('runsSwap' in a) { renameSync(join('.sdd-ai', 'runs'), a.runsSwap); symlinkSync(a.runsSwap, join('.sdd-ai', 'runs')) }
+}
+
+/** El writer falso: lee su prompt, actúa sobre el árbol y responde en el stream de su familia. */
+function writer(): void {
+  const script = JSON.parse(process.env.FAKE_WRITER ?? '{}') as WriterScript
+  const prompt = readFileSync(0, 'utf8')
+  if (process.env.FAKE_PROMPTS_FILE) appendFileSync(process.env.FAKE_PROMPTS_FILE, `${JSON.stringify(prompt)}\n`)
+  if (script.silent) return
+  const codex = args[0] === 'exec'
+  const resumed = codex ? args[1] === 'resume' : args.includes('--resume')
+  if (resumed && script.resumeFail) {
+    process.exitCode = 1
+    return
+  }
+  process.stdout.write(`${codex ? codexThread : claudeInit()}\n`)
+  if (!resumed) for (const a of script.actions ?? []) act(a)
+  if (script.rejectModel && (args.includes('-m') || args.includes('--model'))) {
+    fail(codex ? 'codex-modelo-rechazado.jsonl' : 'claude-modelo-rechazado.jsonl')
+    return
+  }
+  if (script.child) {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    writeFileSync(process.env.FAKE_PID_FILE ?? '/dev/null', `${process.pid},${child.pid}`)
+  }
+  if (script.hang || (script.hangUnlessResume && !resumed)) {
+    setInterval(() => {}, 1000)
+    return
+  }
+  const report = script.report ?? 'Hice el cambio pedido.\nSTATUS: done'
+  if (codex) {
+    process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: report } })}\n`)
+    process.stdout.write('{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n')
+  } else {
+    process.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"."}]}}\n')
+    process.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: report, usage: { input_tokens: 10, output_tokens: 5 } })}\n`)
+  }
+  if (script.child) setTimeout(() => process.exit(script.exit ?? 0), 50)
+  else process.exitCode = script.exit ?? 0
+}
+
 function fail(stdout: string, stderr = ''): void {
   process.stdout.write(fixture(stdout))
   if (stderr) process.stderr.write(fixture(stderr))
@@ -156,6 +240,9 @@ switch (process.env.FAKE_MODE) {
     break
   case 'scripted':
     scripted()
+    break
+  case 'writer':
+    writer()
     break
   case 'review-unavailable':
     reviewer('unavailable')

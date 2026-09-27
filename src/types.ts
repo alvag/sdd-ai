@@ -8,9 +8,11 @@ export type Origin = 'flag' | 'workers' | 'heredado'
 export const ROLES = ['explore', 'counter-plan', 'investigate', 'debate',
   'design-review', 'implement', 'refute', 'code-review'] as const
 export type Role = typeof ROLES[number]
-/** Hasta que exista un worker que escriba, `implement` no se despacha. */
+/** Los roles que solo leen: tienen agente nativo y perfil propio. `implement` escribe y no tiene agente. */
 export type ReadOnlyRole = Exclude<Role, 'implement'>
 export const READ_ONLY_ROLES: readonly ReadOnlyRole[] = ROLES.filter((r): r is ReadOnlyRole => r !== 'implement')
+/** Lo que `run` despacha: los roles de lectura y el writer, que sale siempre por proceso. */
+export const DISPATCHABLE_ROLES: readonly Role[] = [...READ_ONLY_ROLES, 'implement']
 /**
  * Roles que pueden buscar en la web: explorar e investigar a veces necesitan documentación de afuera.
  * Los demás responden solo con el encargo y el repositorio, porque lo que traen de la web no se puede
@@ -44,8 +46,9 @@ export interface WorkerTask {
 }
 export interface LaunchSpec { cmd: string; args: string[]; cwd: string; stdinFile: string }
 
+/** `cessation_uncertain` no es terminal: el writer puede seguir escribiendo y su reserva sigue tomada. */
 export type RunState = 'launching' | 'running' | 'done' | 'failed' | 'launch_failed'
-  | 'timeout' | 'cancelled' | 'delegated' | 'unavailable'
+  | 'timeout' | 'cancelled' | 'delegated' | 'unavailable' | 'cessation_uncertain'
 export const TERMINAL: ReadonlySet<RunState> = new Set<RunState>(
   ['done', 'failed', 'launch_failed', 'timeout', 'cancelled', 'delegated', 'unavailable'])
 export interface ResumeInfo { session_id: string; started_at: string; outcome?: RunState }
@@ -103,6 +106,10 @@ export function isFamily(v: unknown): v is Family {
 
 export function isReadOnlyRole(v: unknown): v is ReadOnlyRole {
   return typeof v === 'string' && (READ_ONLY_ROLES as readonly string[]).includes(v)
+}
+
+export function isDispatchableRole(v: unknown): v is Role {
+  return typeof v === 'string' && (DISPATCHABLE_ROLES as readonly string[]).includes(v)
 }
 
 export function isNativeEffort(v: unknown): v is Effort {
