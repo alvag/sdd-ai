@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { defaultWaitMax } from '../src/cli.ts'
-import { createRun, readStatus, setStatus } from '../src/runs.ts'
+import { createRun, isDelivered, markDelivered, readStatus, setStatus } from '../src/runs.ts'
 import { TERMINAL } from '../src/types.ts'
 import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
@@ -32,6 +32,7 @@ function setup(opts: { families?: string; bins?: Array<'claude' | 'codex'>; mode
     PATH: `${bin}:/usr/bin:/bin`,
     HOME: process.env.HOME ?? '',
     CLAUDECODE: '1',
+    CLAUDE_CODE_SESSION_ID: 's-claude',
     CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')),
     FAKE_MODE: opts.mode ?? 'ok-codex',
   }
@@ -45,6 +46,7 @@ function cli(s: Setup, args: string[], extraEnv: Record<string, string> = {}) {
 }
 
 const sha = (file: string) => createHash('sha256').update(readFileSync(file)).digest('hex')
+const nativeOf = (repo: string, id: string) => JSON.parse(readFileSync(join(repo, '.sdd-ai', 'runs', id, 'native.json'), 'utf8'))
 
 test('run por proceso responde en menos de 1 s', () => {
   // Un worker que nunca termina: si run esperara al worker, este test no respondería a tiempo.
@@ -106,7 +108,7 @@ test('CLI ausente: launch_failed por cli_missing con la propuesta de caída', ()
   assert.match(r.out.next, /--families claude .*--model claude-opus-5-5 --effort xhigh/)
 })
 
-const AS_CODEX = { CLAUDECODE: '', CODEX_THREAD_ID: 't' }
+const AS_CODEX = { CLAUDECODE: '', CODEX_THREAD_ID: 't', CODEX_SESSION_ID: 's-codex' }
 
 test('vía nativa Claude: el modelo distinto al del agente viaja; el esfuerzo se avisa', () => {
   const s = setup({ families: '[claude]' })
@@ -117,6 +119,8 @@ test('vía nativa Claude: el modelo distinto al del agente viaja; el esfuerzo se
   assert.equal(r.code, 0)
   assert.deepEqual([r.out.via, r.out.model, r.out.effort], ['native', 'sonnet', undefined])
   assert.match(r.out.warnings.join(' '), /esfuerzo/)
+  // native.json guarda lo que run le mostró al conductor: en Claude, sin esfuerzo.
+  assert.deepEqual(nativeOf(s.repo, r.out.id), { agent: r.out.agent, family: 'claude', role: 'explore', model: 'sonnet' })
 })
 
 test('vía nativa: el perfil del rol vive en su agente', () => {
@@ -143,9 +147,10 @@ test('vía nativa: cada rol responde con su agente', () => {
 test('vía nativa Codex: el esfuerzo viaja para spawn_agent', () => {
   const s = setup({ families: '[codex]' })
   cli(s, ['agents', 'sync'], AS_CODEX)
-  const r = cli(s, ['run', '--prompt-file', s.prompt, '--effort', 'maximo'], AS_CODEX)
+  const r = cli(s, ['run', '--prompt-file', s.prompt, '--effort', 'maximo', '--model', 'gpt-prueba'], AS_CODEX)
   assert.equal(r.code, 0)
-  assert.deepEqual([r.out.via, r.out.effort], ['native', 'max'])
+  assert.deepEqual([r.out.via, r.out.effort, r.out.model], ['native', 'max', 'gpt-prueba'])
+  assert.deepEqual(nativeOf(s.repo, r.out.id), { agent: r.out.agent, family: 'codex', role: 'explore', model: 'gpt-prueba', effort: 'max' })
 })
 
 test('wait informa el reintento', () => {
@@ -195,6 +200,54 @@ const runsIn = (repo: string) => {
   const runs = join(repo, '.sdd-ai', 'runs')
   return existsSync(runs) ? readdirSync(runs) : []
 }
+
+const requestOf = (repo: string, id: string) => JSON.parse(readFileSync(join(repo, '.sdd-ai', 'runs', id, 'request.json'), 'utf8'))
+
+test('run guarda la sesión dueña según la familia del conductor', () => {
+  // Las dos variables presentes: manda la de la familia del conductor, no la primera que aparezca.
+  const s = setup({ families: '[codex]', bins: ['codex'] })
+  const claude = cli(s, ['run', '--prompt-file', s.prompt], { CODEX_SESSION_ID: 's-codex' })
+  assert.equal(claude.code, 0, claude.stderr)
+  assert.equal(requestOf(s.repo, claude.out.id).session, 's-claude')
+  const x = setup({ families: '[claude]', bins: ['claude'] })
+  const codex = cli(x, ['run', '--prompt-file', x.prompt], AS_CODEX)
+  assert.equal(codex.code, 0, codex.stderr)
+  assert.equal(requestOf(x.repo, codex.out.id).session, 's-codex')
+  cli(s, ['wait', claude.out.id, '--max', '10'])
+  cli(x, ['wait', codex.out.id, '--max', '10'], AS_CODEX)
+})
+
+test('run --retry hereda rol, overrides y familia del conductor', () => {
+  // Conductor Codex declarado y familia Claude sin CLI: las dos corridas quedan en cli_missing.
+  const s = setup({ families: '[claude]' })
+  const first = cli(s, ['run', '--prompt-file', s.prompt, '--conductor', 'codex', '--role', 'code-review', '--model', 'sonnet', '--deadline', '900'])
+  assert.equal(first.out.reason, 'cli_missing', JSON.stringify(first.out))
+  const retry = cli(s, ['run', '--retry', first.out.id])
+  assert.equal(retry.out.reason, 'cli_missing', JSON.stringify(retry.out))
+  const req = requestOf(s.repo, retry.out.id)
+  assert.deepEqual([req.role, req.overrides.model, req.overrides.deadline_sec, req.conductor.family], ['code-review', 'sonnet', 900, 'codex'])
+  const plain = requestOf(s.repo, cli(s, ['run', '--prompt-file', s.prompt, '--conductor', 'codex']).out.id)
+  assert.deepEqual([plain.role, plain.overrides.deadline_sec], ['explore', 600])
+})
+
+test('un fallback con modelo de la otra familia no hereda ese modelo', () => {
+  const s = setup({ families: '[codex]' })
+  const first = cli(s, ['run', '--prompt-file', s.prompt, '--families', 'codex', '--model', 'gpt-6-sol', '--role', 'design-review'])
+  assert.equal(first.out.reason, 'cli_missing', JSON.stringify(first.out))
+  const retry = cli(s, ['run', '--retry', first.out.id, '--families', 'claude', '--conductor', 'claude'])
+  const req = requestOf(s.repo, retry.out.id)
+  assert.equal(req.overrides.model, undefined)
+  assert.equal(req.role, 'design-review')
+})
+
+test('un run nativo sin id de sesión falla sin crear la corrida', () => {
+  const s = setup({ families: '[claude]' })
+  assert.equal(cli(s, ['agents', 'sync']).code, 0)
+  const r = cli(s, ['run', '--prompt-file', s.prompt], { CLAUDE_CODE_SESSION_ID: '' })
+  assert.equal(r.code, 2)
+  assert.equal(r.out.code, 'session_unknown')
+  assert.deepEqual(runsIn(s.repo), [])
+})
 
 test('--role pr da el aviso de migración', () => {
   const s = setup({ families: '[codex]', bins: ['codex'] })
@@ -300,3 +353,44 @@ test('el tope por defecto de wait depende del conductor', () => {
   assert.equal(defaultWaitMax('claude'), 540)
   assert.equal(defaultWaitMax('codex'), 100)
 })
+
+const deliveredIn = (repo: string, id: string) => existsSync(join(repo, '.sdd-ai', 'runs', id, 'delivered.json'))
+
+test('una consulta desde otra sesión no marca la entrega', () => {
+  const s = setup({ families: '[codex]', bins: ['codex'] })
+  const r = cli(s, ['run', '--prompt-file', s.prompt])
+  assert.equal(r.code, 0, r.stderr)
+  const other = cli(s, ['wait', r.out.id, '--max', '10'], { CLAUDE_CODE_SESSION_ID: 's-otra' })
+  assert.equal(other.out.state, 'done')
+  assert.equal(deliveredIn(s.repo, r.out.id), false)
+  assert.equal(cli(s, ['wait', r.out.id, '--max', '10']).out.state, 'done')
+  assert.equal(deliveredIn(s.repo, r.out.id), true)
+})
+
+test('la entrega usa la familia guardada aunque el entorno tenga señales de los dos CLIs', () => {
+  const s = setup({ families: '[codex]', bins: ['codex'] })
+  const r = cli(s, ['run', '--prompt-file', s.prompt])
+  assert.equal(r.code, 0, r.stderr)
+  const w = cli(s, ['wait', r.out.id, '--max', '10'], { CODEX_THREAD_ID: 't', CODEX_SESSION_ID: 's-codex' })
+  assert.equal(w.out.state, 'done')
+  assert.equal(deliveredIn(s.repo, r.out.id), true)
+})
+
+test('una ronda o un relanzamiento nuevos quedan sin entregar', () => {
+  const s = setup({ families: '[codex]' })
+  const dir = createRun(s.repo, '20260101-0000-aaaa')
+  writeFileSync(join(dir, 'request.json'), JSON.stringify({ session: 's-claude', conductor: { family: 'claude' } }))
+  const done = setStatus(dir, { state: 'done', round: 1, launch: 1 })
+  markDelivered(dir, done, { CLAUDE_CODE_SESSION_ID: 's-claude' })
+  assert.equal(isDelivered(dir, done), true)
+  assert.equal(isDelivered(dir, setStatus(dir, { round: 2 })), false)
+  assert.equal(isDelivered(dir, setStatus(dir, { round: 1, launch: 2 })), false)
+  // Una respuesta que no se pudo armar no queda entregada.
+  const broken = createRun(s.repo, '20260101-0000-bbbb')
+  writeFileSync(join(broken, 'request.json'), JSON.stringify({ session: 's-claude', conductor: { family: 'claude' } }))
+  setStatus(broken, { state: 'done' })
+  const w = cli(s, ['wait', '20260101-0000-bbbb', '--max', '1'])
+  assert.notEqual(w.code, 0)
+  assert.equal(existsSync(join(broken, 'delivered.json')), false)
+})
+

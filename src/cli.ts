@@ -9,6 +9,7 @@ import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, parseFamiliesFlag } from './config.ts'
 import { doctor } from './doctor.ts'
 import { repoRoot } from './git.ts'
+import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { nativeProfile, resolve } from './resolve.ts'
 import { renderArtifactMaterial, renderArtifactPrompt, renderArtifactRoundPrompt } from './review/artifact-prompt.ts'
@@ -24,12 +25,12 @@ import {
 } from './review/ledger.ts'
 import { fits, renderMaterial, renderReviewPrompt } from './review/prompt.ts'
 import { type Risk, type RiskRecord, classify, classifyDelta, readRisk } from './review/risk.ts'
-import { createRun, isAlive, newRunId, readJson, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
+import { createRun, isAlive, markDelivered, newRunId, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic } from './runs.ts'
 import {
   ARTIFACT_NOTE, type ArgvFile, type JobRecord, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, supervise, writeReceipt,
 } from './supervisor.ts'
 import {
-  type Conductor, type Family, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
+  type Conductor, type Family, type NativeProfile, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
   type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isFamily, isReadOnlyRole, opposite, toNativeEffort,
 } from './types.ts'
 import { claudeLaunch } from './workers/claude.ts'
@@ -83,37 +84,66 @@ function fallbackNext(id: string, c: Conductor): string {
   return `pregunta al usuario si cae a ${c.family}; solo con un sí: ./bin/sdd-ai run ${args.join(' ')}`
 }
 
+/** Lo que `run` deja en `request.json` y un reintento vuelve a leer. */
+interface RunRequest {
+  role?: string; conductor?: Conductor
+  overrides?: { families?: string; model?: string; effort?: string; deadline_sec?: number }
+}
+
+interface RunFlags { role?: string; families?: string; model?: string; effort?: string; conductor?: string; deadline?: string }
+
+/**
+ * Lo que un reintento toma de la corrida original. El rol y el plazo se heredan cada uno si falta.
+ * Familias, modelo, esfuerzo y conductor van juntos o no van: un fallback fija familia y conductor, y
+ * el modelo o el esfuerzo de la familia que faltó no le sirven a la otra.
+ */
+function inheritRetry(values: RunFlags, original: RunRequest): void {
+  values.role ??= original.role
+  if (values.deadline === undefined && original.overrides?.deadline_sec !== undefined) values.deadline = String(original.overrides.deadline_sec)
+  if ([values.families, values.model, values.effort, values.conductor].some((v) => v !== undefined)) return
+  values.families = original.overrides?.families
+  values.model = original.overrides?.model
+  values.effort = original.overrides?.effort
+  values.conductor = original.conductor?.family
+}
+
 async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   const { values } = parseArgs({
     args,
     strict: true,
     options: {
       'prompt-file': { type: 'string' },
-      role: { type: 'string', default: 'explore' },
+      role: { type: 'string' },
       families: { type: 'string' },
       model: { type: 'string' },
       effort: { type: 'string' },
       conductor: { type: 'string' },
       'conductor-model': { type: 'string' },
       'conductor-effort': { type: 'string' },
-      deadline: { type: 'string', default: '600' },
+      deadline: { type: 'string' },
       retry: { type: 'string' },
     },
   })
   if (env.SDD_AI_WORKER === '1') {
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   }
-  const renamed = RETIRED_ROLES.get(values.role)
-  if (renamed) throw new SddError('usage', `el rol \`${values.role}\` ahora se llama \`${renamed}\``, { next: `usa --role ${renamed}` })
-  if (values.role === 'implement') {
+  if (values.retry) {
+    const request = join(runDir(repoRoot(cwd), values.retry), 'request.json')
+    inheritRetry(values, existsSync(request) ? readJson<RunRequest>(request) : {})
+  }
+  const roleArg = values.role ?? 'explore'
+  const renamed = RETIRED_ROLES.get(roleArg)
+  if (renamed) throw new SddError('usage', `el rol \`${roleArg}\` ahora se llama \`${renamed}\``, { next: `usa --role ${renamed}` })
+  if (roleArg === 'implement') {
     throw new SddError('usage', 'el rol implement necesita un worker que escriba, y sdd-ai todavía solo tiene workers de solo lectura', {
       next: `usa uno de: ${READ_ONLY_ROLES.join(', ')}`,
     })
   }
-  if (!isReadOnlyRole(values.role)) throw new SddError('usage', `rol desconocido: ${values.role}`, { next: `usa uno de: ${READ_ONLY_ROLES.join(', ')}` })
-  const role = values.role
-  const deadline = Number(values.deadline)
-  if (!Number.isFinite(deadline) || deadline <= 0) throw new SddError('usage', `--deadline inválido: ${values.deadline}`)
+  if (!isReadOnlyRole(roleArg)) throw new SddError('usage', `rol desconocido: ${roleArg}`, { next: `usa uno de: ${READ_ONLY_ROLES.join(', ')}` })
+  const role = roleArg
+  const deadlineArg = values.deadline ?? '600'
+  const deadline = Number(deadlineArg)
+  if (!Number.isFinite(deadline) || deadline <= 0) throw new SddError('usage', `--deadline inválido: ${deadlineArg}`)
 
   const root = repoRoot(cwd)
   const conductor = detectConductor(env, {
@@ -127,6 +157,11 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   if (values.model) flags.model = values.model
   if (values.effort) flags.effort = toNativeEffort(values.effort)
   const resolution = resolve({ conductor, families, workers, role, flags, codexRoot })
+  const session = ownerSession(env, conductor.family)
+  // Una nativa la lanza el conductor desde su sesión: sin ese dato, sus hooks nunca la reconocerían.
+  if (resolution.via === 'native' && !session) {
+    throw new SddError('session_unknown', 'falta el id de la sesión del conductor', { next: 'corre sdd-ai desde una sesión de Claude Code o de Codex' })
+  }
 
   let prompt: string
   if (values.retry) {
@@ -144,7 +179,7 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   const promptFile = join(dir, 'prompt.md')
   writeFileSync(promptFile, prompt)
   writeJsonAtomic(join(dir, 'request.json'), {
-    role, conductor, retry_of: values.retry,
+    role, conductor, session, retry_of: values.retry,
     overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline },
   })
   writeJsonAtomic(join(dir, 'resolved.json'), resolution)
@@ -154,30 +189,34 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
     const state = agentsState(root, PKG_DIR, resolution.family, role, profiles)
     if (state !== 'ok') {
       const detail = state === 'missing' ? 'no existe el agente generado' : 'el agente generado no coincide con sus fuentes'
-      setStatus(dir, { state: 'launch_failed', reason: 'agents_stale', detail })
+      markDelivered(dir, setStatus(dir, { state: 'launch_failed', reason: 'agents_stale', detail }), env)
       return { code: 1, out: { id, state: 'launch_failed', reason: 'agents_stale', detail, next: './bin/sdd-ai agents sync y reabrir la sesión' } }
     }
-    setStatus(dir, { state: 'delegated' })
-    const out: Record<string, unknown> = { id, via: 'native', family: resolution.family, agent: agentName(role), prompt_file: promptFile }
+    const native: NativeProfile = { agent: agentName(role), family: resolution.family, role }
     // El agente generado trae el perfil de su rol. Lo que la corrida resolvió distinto (un override, la
     // caída al conductor) viaja para que el conductor lo pase a su herramienta.
     const agent = profiles[role][resolution.family]
     const warnings: string[] = []
-    if (resolution.model !== undefined && resolution.model !== agent.model) out.model = resolution.model
+    if (resolution.model !== undefined && resolution.model !== agent.model) native.model = resolution.model
     if (resolution.effort !== undefined && resolution.effort !== agent.effort) {
       if (resolution.family === 'claude') {
         warnings.push(`Claude Code no permite fijar el esfuerzo de un subagente por llamada: el worker usa ${agent.effort ?? 'el esfuerzo por defecto'} y no ${resolution.effort}`)
       } else {
-        out.effort = resolution.effort
+        native.effort = resolution.effort
       }
     }
+    writeJsonAtomic(join(dir, 'native.json'), native)
+    setStatus(dir, { state: 'delegated' })
+    const out: Record<string, unknown> = { id, via: 'native', family: native.family, agent: native.agent, prompt_file: promptFile }
+    if (native.model !== undefined) out.model = native.model
+    if (native.effort !== undefined) out.effort = native.effort
     if (warnings.length > 0) out.warnings = warnings
     return { code: 0, out }
   }
 
   if (!inPath(resolution.family, env)) {
     const detail = `${resolution.family} no está en PATH`
-    setStatus(dir, { state: 'launch_failed', reason: 'cli_missing', detail, fallback: conductor })
+    markDelivered(dir, setStatus(dir, { state: 'launch_failed', reason: 'cli_missing', detail, fallback: conductor }), env)
     return { code: 1, out: { id, state: 'launch_failed', reason: 'cli_missing', detail, fallback: conductor, next: fallbackNext(id, conductor) } }
   }
 
@@ -339,6 +378,8 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
     kind: 'review', selection, author, degradations, conductor,
     overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline }, risk,
   }
+  const session = ownerSession(env, conductor.family)
+  if (session) request.session = session
   writeJsonAtomic(join(dir, 'request.json'), request)
   writeJsonAtomic(join(dir, 'resolved.json'), resolution)
   writeJsonAtomic(join(dir, 'resolved-refute.json'), refuter)
@@ -656,6 +697,8 @@ function startArtifact(o: {
   const request: ReviewRequest & Record<string, unknown> = {
     kind: 'review', selection: o.sel, author: o.author, degradations: o.degradations, conductor: o.conductor, overrides: o.overrides,
   }
+  const session = ownerSession(o.env, o.conductor.family)
+  if (session) request.session = session
   writeJsonAtomic(join(dir, 'request.json'), request)
   writeJsonAtomic(join(dir, 'resolved.json'), o.resolution)
   writeFileSync(join(dir, 'material.md'), renderArtifactMaterial(candidate, bytes))
@@ -943,7 +986,10 @@ async function review(args: string[], env: Env, cwd: string): Promise<Result> {
     if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review status <id>' })
     const root = repoRoot(cwd)
     const dir = runDir(root, id)
-    return reviewView(root, id, dir, readStatus(dir))
+    const s = readStatus(dir)
+    const view = reviewView(root, id, dir, s)
+    markDelivered(dir, s, env)
+    return view
   }
   throw new SddError('usage', `subcomando desconocido: review ${sub ?? ''}`, { next: 'usa review start | status | decide | round' })
 }
@@ -970,7 +1016,14 @@ function profileWarnings(s: Status): string[] {
   return warnings
 }
 
-function report(root: string, id: string, dir: string, s: Status): Result {
+/** Arma la respuesta de un estado terminal y recién entonces anota la entrega: si armarla falla, no se anota. */
+function report(root: string, id: string, dir: string, s: Status, env: Env): Result {
+  const result = reportOf(root, id, dir, s)
+  markDelivered(dir, s, env)
+  return result
+}
+
+function reportOf(root: string, id: string, dir: string, s: Status): Result {
   const request = existsSync(join(dir, 'request.json')) ? readJson<{ kind?: string }>(join(dir, 'request.json')) : {}
   if (request.kind === 'review' && TERMINAL.has(s.state)) return reviewView(root, id, dir, s)
   const out: Record<string, unknown> = { id, state: s.state }
@@ -1010,14 +1063,14 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
   const until = Date.now() + max * 1000
   for (;;) {
     let s = readStatus(dir)
-    if (TERMINAL.has(s.state)) return report(root, id, dir, s)
+    if (TERMINAL.has(s.state)) return report(root, id, dir, s, env)
     const supervisorPid = s.supervisor_pid ?? readSupervisorPid(dir)
     if (supervisorPid !== undefined && !isAlive(supervisorPid)) {
       // El supervisor pudo escribir el estado final justo antes de terminar.
       s = readStatus(dir)
-      if (TERMINAL.has(s.state)) return report(root, id, dir, s)
+      if (TERMINAL.has(s.state)) return report(root, id, dir, s, env)
       s = setStatus(dir, { state: 'failed', reason: 'supervisor_lost', detail: `el supervisor ${supervisorPid} terminó sin escribir un estado final` })
-      return report(root, id, dir, s)
+      return report(root, id, dir, s, env)
     }
     if (Date.now() >= until) {
       const out: Record<string, unknown> = { id, state: s.state }
@@ -1036,6 +1089,7 @@ function cancel(args: string[], cwd: string): Result {
   const id = positionals[0]
   if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai cancel <id>' })
   const dir = runDir(repoRoot(cwd), id)
+  if (existsSync(join(dir, 'native.json')) && cancelNative(dir)) return { code: 0, out: { id, state: 'cancelled' } }
   const s = readStatus(dir)
   if (TERMINAL.has(s.state)) return { code: 0, out: { id, state: s.state } }
   writeFileSync(join(dir, 'cancel.request'), new Date().toISOString())

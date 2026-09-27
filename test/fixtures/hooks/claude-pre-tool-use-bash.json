@@ -1,0 +1,13 @@
+{
+  "session_id": "8f2c1e0a-1b2c-4d5e-8f90-a1b2c3d4e5f6",
+  "transcript_path": "/Users/max/.claude/projects/-repo/8f2c1e0a-1b2c-4d5e-8f90-a1b2c3d4e5f6.jsonl",
+  "cwd": "/repo",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "ls",
+    "description": "Listar archivos"
+  },
+  "tool_use_id": "toolu_01BASH"
+}

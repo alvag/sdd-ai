@@ -1,0 +1,18 @@
+{
+  "session_id": "01a0dfaf-618f-74b0-8f94-4adaaec7274b",
+  "transcript_path": "/Users/max/.codex/sessions/2026/09/26/rollout-2026-09-26T16-46-54-01a0dfaf-618f-74b0-8f94-4adaaec7274b.jsonl",
+  "cwd": "/repo",
+  "permission_mode": "default",
+  "model": "gpt-6-sol",
+  "turn_id": "01a0dfaf-6b1e-7c02-9d3a-5e4f3a2b1c0d",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "collaborationspawn_agent",
+  "tool_input": {
+    "task_name": "explorar",
+    "agent_type": "sdd-ai-explore",
+    "fork_turns": "all",
+    "message": "gAAAAABquE_NGg9lnrq1cXr2R5exVXeEYU1YwatY32isuEpWYwaeI_bOLQjI2_EwWnhURyNp2Z-ikxDHiiz56MqWc3mPG555kV2kGBy5Yfrl578uhz4KWwQ="
+  },
+  "tool_response": "{\"task_name\":\"/root/explorar\"}",
+  "tool_use_id": "call_v2abc123"
+}

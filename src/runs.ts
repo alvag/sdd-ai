@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { SddError, type Status } from './types.ts'
+import { type Conductor, type Family, SddError, type Status, TERMINAL } from './types.ts'
 
 /**
  * `<raíz>/.sdd-ai/runs`. Vive en el árbol de trabajo y no en `.git/` porque el sandbox de Codex deja
@@ -28,6 +28,15 @@ export function createRun(root: string, id: string): string {
   const dir = join(runsRoot(root), id)
   mkdirSync(dir)
   return dir
+}
+
+/**
+ * La sesión del CLI que conduce: la misma que reciben sus hooks como `session_id`. Se lee de la familia
+ * del conductor porque una sesión de Codex abierta desde Claude Code hereda las dos variables.
+ */
+export function ownerSession(env: Record<string, string | undefined>, family: Family): string | undefined {
+  const id = family === 'claude' ? env.CLAUDE_CODE_SESSION_ID : env.CODEX_SESSION_ID
+  return id || undefined
 }
 
 export function runDir(root: string, id: string): string {
@@ -58,6 +67,40 @@ export function setStatus(dir: string, patch: Partial<Status>): Status {
   const next = { ...current, ...patch }
   writeJsonAtomic(file, next)
   return next
+}
+
+interface Delivery { round: number | null; launch: number | null }
+
+const deliveryOf = (s: Status): Delivery => ({ round: s.round ?? null, launch: s.launch ?? null })
+
+/**
+ * Anota que el conductor dueño ya recibió este estado terminal. Solo lo anota la sesión que creó la
+ * corrida, reconocida con la familia guardada: una consulta desde otra sesión no le quita el
+ * recordatorio a la dueña. Se guarda la ronda y el lanzamiento para que uno nuevo vuelva a quedar
+ * pendiente.
+ */
+export function markDelivered(dir: string, s: Status, env: Record<string, string | undefined>): void {
+  try {
+    if (!TERMINAL.has(s.state)) return
+    const request = readJson<{ session?: string; conductor?: Conductor }>(join(dir, 'request.json'))
+    if (!request.session || !request.conductor) return
+    if (ownerSession(env, request.conductor.family) !== request.session) return
+    writeJsonAtomic(join(dir, 'delivered.json'), deliveryOf(s))
+  } catch {
+    // Anotar la entrega nunca impide devolverla: en el peor caso, el recordatorio se repite.
+  }
+}
+
+export function isDelivered(dir: string, s: Status): boolean {
+  const file = join(dir, 'delivered.json')
+  if (!existsSync(file)) return false
+  try {
+    const delivered = readJson<Delivery>(file)
+    const current = deliveryOf(s)
+    return delivered.round === current.round && delivered.launch === current.launch
+  } catch {
+    return false
+  }
 }
 
 export function isAlive(pid: number): boolean {

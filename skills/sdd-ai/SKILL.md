@@ -50,8 +50,23 @@ autosuficiente (qué hacer, dónde mirar, qué formato de respuesta).
   corresponda (`opus`, `sonnet`, `haiku` o `fable`).
 - Si la respuesta trae `warnings`, muéstraselas al usuario antes de lanzar: dicen qué parte del
   perfil pedido no se puede aplicar (por ejemplo, el esfuerzo de un subagente de Claude Code).
-- Si tu herramienta rechaza el agente, el modelo o el esfuerzo, muéstrale el error al usuario tal
-  cual y no reintentes: el reintento automático existe solo en la vía `process`.
+- El hook de `PreToolUse` liga el despacho a su corrida y **reescribe el input entero**: el mensaje
+  canónico, el modelo y el esfuerzo de la corrida y, en Codex, sin historial. Lo que agregues de más
+  se descarta. Si tienes más de una corrida nativa sin lanzar para ese agente, cita en el mensaje el
+  `prompt_file` de la que despachas.
+- **Codex con `spawn_agent` v2** (el que tiene `task_name` y `fork_turns`): el mensaje va cifrado y el
+  hook no lo puede leer ni reescribir. Escríbelo igual, con el mensaje canónico, y despacha con una
+  sola corrida nativa sin lanzar para ese agente: si hay varias, cancela las que no vas a despachar.
+- **Si el lanzamiento falla y tu CLI lo informa** (solo Claude Code, que libera la reserva):
+  muéstrale el error al usuario tal cual y no reintentes por tu cuenta. Si el usuario decide
+  reintentar, despacha la misma corrida citando su `prompt_file`.
+- **Si queda una reserva sin confirmar** (un fallo en Codex, que no informa fallos, o cualquier
+  despacho que no llegó a confirmarse), un nuevo despacho de esa corrida se niega: pregúntale al
+  usuario. Si decide reintentar o descartar, primero `./bin/sdd-ai cancel <id>`, que cambia solo el
+  registro local y no detiene a un agente que quizá arrancó. Para reintentar, después
+  `./bin/sdd-ai run --retry <id>`: hereda el encargo, el rol, los overrides y la familia del
+  conductor. Si la config cambió desde entonces, la resolución puede ser otra y la respuesta de `run`
+  lo muestra: es una corrida nueva.
 
 **`"via": "process"`**: el binario ya lanzó al worker. Espera el resultado:
 
@@ -255,8 +270,11 @@ de `design-review`. No hay nivel de riesgo, lentes, lotes ni refutador.
 
 - **`launch_failed`**: muestra `reason` y `detail` al usuario y **pregúntale** si quiere caer a tu
   familia, tu modelo y tu esfuerzo (`fallback`). Solo con un sí, corre el comando exacto que trae
-  `next` (reutiliza el encargo con `--retry` y fija `--families`, `--model` y `--effort`). Nunca
-  cambies de familia sin preguntar.
+  `next` (reutiliza el encargo, el rol y el plazo con `--retry`, y fija `--families`, `--model` y
+  `--effort`). Nunca cambies de familia sin preguntar.
+- **`session_unknown`**: una corrida nativa necesita el id de tu sesión (`CLAUDE_CODE_SESSION_ID` en
+  Claude Code, `CODEX_SESSION_ID` en Codex), porque sin él ningún hook la dejaría lanzar. Díselo al
+  usuario.
 - **Rol `implement`**: da un error de uso porque todavía no hay un worker que escriba. Díselo al
   usuario y no lo cambies por otro rol sin preguntarle.
 - **Rol `pr`**: ahora se llama `code-review`. El error de migración vale para `--role pr` y para una
@@ -266,7 +284,11 @@ de `design-review`. No hay nivel de riesgo, lentes, lotes ni refutador.
 - **`config_missing`**: muestra el bloque que trae `next` y pregunta si lo creas. No escribas la
   config sin permiso.
 - Para cortar una corrida: `./bin/sdd-ai cancel <id>`. En una revisión detiene el trabajo en curso y
-  no lanza los que faltan.
+  no lanza los que faltan. En una nativa sin lanzar o con una reserva sin confirmar, solo la marca
+  como cancelada: no detiene a un agente que quizá llegó a arrancar.
+- **Codex no corre los hooks del proyecto**: si al abrir avisa "Hooks need review", o los hooks no
+  responden, pídele al usuario que los apruebe en `/hooks`. Hace falta la primera vez y cada vez que
+  cambian las definiciones de `.codex/hooks.json`.
 - **Límites declarados de `review`**: si el supervisor muere en medio de una ronda, no deja su
   registro y el relanzamiento corre todos los trabajos, no solo los que faltaban. Las sesiones del
   revisor Claude dejan un directorio de proyecto en `~/.claude/projects/`: el binario solo borra su
@@ -274,3 +296,36 @@ de `design-review`. No hay nivel de riesgo, lentes, lotes ni refutador.
 
 Después de cada `./bin/sdd-ai agents sync` hay que reabrir la sesión para que el CLI cargue los
 agentes y esta skill.
+
+## 7. Los hooks
+
+`.claude/settings.json` y `.codex/hooks.json` instalan hooks que hacen cumplir esta skill. Todos
+llaman al lanzador `bin/sdd-ai-hook`, que corre `./bin/sdd-ai hook <claude|codex>`, y callan en un
+repositorio sin `.sdd-ai/` o ante cualquier error. La excepción es un despacho `sdd-ai-*` que no se
+puede comprobar: ese se niega.
+
+- **`SessionStart`**: al retomar o compactar, te devuelve las corridas abiertas de tu sesión, cada
+  una con lo que sigue. Al abrir o limpiar, lista en una línea las abiertas de otras sesiones, solo
+  como dato.
+- **`Stop`**: si terminas el turno con corridas propias abiertas, lo reabre una vez con qué corrida,
+  en qué estado y qué sigue. Una corrida está abierta si:
+  - un worker o una revisión siguen corriendo;
+  - terminaron y nadie te devolvió su estado (`wait`, `review status` o el propio `run`);
+  - es una nativa sin lanzar o con una reserva sin confirmar;
+  - es una revisión con hallazgos sin decidir.
+  Vuelve a recordar solo si ese conjunto cambia.
+- **`PreToolUse` sobre `Agent` y `spawn_agent`** (también la v2 de Codex): deja pasar un `sdd-ai-*`
+  solo si corresponde a una nativa sin lanzar ni reservar de tu sesión, de ese rol y de tu CLI.
+  Reserva la corrida y reescribe el input (§3); en la v2 de Codex, todo menos el mensaje cifrado.
+  Desde un subagente, lo niega. Los agentes que no son `sdd-ai-*` no se tocan.
+- **`PostToolUse`**, y en Claude Code también **`PostToolUseFailure`**: confirman o liberan la
+  reserva del despacho.
+- **`PreToolUse` sobre `Bash`**: dentro de un subagente, niega `sdd-ai run`, `review`, `wait` y
+  `cancel`. Un worker no delega ni toca las corridas del conductor.
+
+Claude Code carga los hooks del repositorio sin pedir nada. Codex los ejecuta solo después de que el
+usuario los aprueba en `/hooks`, y vuelve a pedirlo cada vez que cambian sus definiciones.
+
+**Ante una negación, sigue el motivo**: dice qué correr, qué citar o que le preguntes al usuario. No
+busques un rodeo, como otro agente, otro nombre o lanzar el CLI a mano.
+

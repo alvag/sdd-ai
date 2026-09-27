@@ -1,6 +1,15 @@
 #!/usr/bin/env node
-import { main } from '../src/cli.ts'
-
-const { code, out } = await main(process.argv.slice(2), process.env, process.cwd())
-process.stdout.write(`${JSON.stringify(out)}\n`)
-process.exitCode = code
+// Un hook corre en cada evento de la sesión: no carga el CLI entero, solo lo que responde el evento.
+if (process.argv[2] === 'hook') {
+  const { runHook } = await import('../src/hooks.ts')
+  const cli = process.argv[3]
+  const chunks = []
+  for await (const chunk of process.stdin) chunks.push(chunk)
+  if (cli === 'claude' || cli === 'codex') process.stdout.write(runHook(Buffer.concat(chunks).toString('utf8'), cli))
+  process.exitCode = 0
+} else {
+  const { main } = await import('../src/cli.ts')
+  const { code, out } = await main(process.argv.slice(2), process.env, process.cwd())
+  process.stdout.write(`${JSON.stringify(out)}\n`)
+  process.exitCode = code
+}

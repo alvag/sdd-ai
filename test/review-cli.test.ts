@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LENSES } from '../src/review/ledger.ts'
@@ -329,3 +329,52 @@ test('start, status y wait muestran el nivel, los motivos, los revisores y los l
     assert.equal(out.jobs.length, 10)
   }
 })
+
+test('review start guarda la sesión dueña', () => {
+  // La sesión sale de la familia del conductor (Claude), no de --author.
+  const s = setup({ families: '[codex, claude]', bins: ['codex', 'claude'] })
+  s.env.CLAUDE_CODE_SESSION_ID = 's-claude'
+  s.env.CODEX_SESSION_ID = 's-codex'
+  writeFileSync(join(s.repo, 'a.txt'), lines(11))
+  const diff = cli(s, ['review', 'start', '--base', s.base, '--author', 'codex'])
+  assert.equal(diff.code, 0, diff.stderr)
+  assert.equal(runJson(s, diff.out.id, 'request.json').session, 's-claude')
+
+  writeFileSync(join(s.repo, '.git', 'info', 'exclude'), '.plans/\n')
+  mkdirSync(join(s.repo, '.plans'))
+  writeFileSync(join(s.repo, '.plans', 'spec.md'), '# Spec\n\n- AC-1: algo observable.\n')
+  writeFileSync(join(s.repo, '.plans', 'pedido.md'), 'Quiero algo observable.\n')
+  const artifact = cli(s, ['review', 'start', '--artifact', '.plans/spec.md', '--kind', 'spec', '--request', '.plans/pedido.md', '--author', 'codex'])
+  assert.equal(artifact.code, 0, artifact.stderr)
+  assert.equal(runJson(s, artifact.out.id, 'request.json').session, 's-claude')
+
+  delete s.env.CLAUDE_CODE_SESSION_ID
+  const none = cli(s, ['review', 'start', '--base', s.base])
+  assert.equal(none.code, 0, none.stderr)
+  assert.equal('session' in runJson(s, none.out.id, 'request.json'), false)
+})
+
+test('wait, review status y un launch_failed directo marcan la entrega', () => {
+  const s = setup({ families: '[codex, claude]', bins: ['codex'] })
+  s.env.CLAUDE_CODE_SESSION_ID = 's-claude'
+  writeFileSync(join(s.repo, 'a.txt'), lines(11))
+  const r = cli(s, ['review', 'start', '--base', s.base])
+  assert.equal(r.code, 0, r.stderr)
+  const delivered = join(s.repo, '.sdd-ai', 'runs', r.out.id, 'delivered.json')
+  const w = cli(s, ['wait', r.out.id, '--max', '20'])
+  assert.equal(w.code, 0, JSON.stringify(w.out))
+  const status = runJson(s, r.out.id, 'status.json')
+  assert.deepEqual(JSON.parse(readFileSync(delivered, 'utf8')), { round: status.round ?? null, launch: status.launch ?? null })
+  rmSync(delivered)
+  assert.equal(cli(s, ['review', 'status', r.out.id]).code, 0)
+  assert.equal(existsSync(delivered), true)
+
+  const native = setup({ families: '[claude]', bins: [] })
+  native.env.CLAUDE_CODE_SESSION_ID = 's-claude'
+  const prompt = join(mkdtempSync(join(tmpdir(), 'sdd-ai-prompt-')), 'p.md')
+  writeFileSync(prompt, 'Encargo.\n')
+  const stale = cli(native, ['run', '--prompt-file', prompt])
+  assert.equal(stale.out.reason, 'agents_stale', JSON.stringify(stale.out))
+  assert.equal(existsSync(join(native.repo, '.sdd-ai', 'runs', stale.out.id, 'delivered.json')), true)
+})
+

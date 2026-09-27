@@ -28,6 +28,8 @@ export type RejectedField = 'model' | 'effort'
 export interface RetryInfo { field: RejectedField; requested: string; effective: string; diagnostic: string }
 
 export interface Conductor { family: Family; model?: string; effort?: Effort }
+/** Lo que `run` le devolvió al conductor para lanzar una nativa: su hook lo vuelve a poner en el despacho. */
+export interface NativeProfile { agent: string; family: Family; role: Role; model?: string; effort?: Effort }
 export interface Profile { model?: string; effort?: Effort }
 export interface Resolution {
   family: Family; via: Via; model?: string; effort?: Effort

@@ -1,0 +1,56 @@
+#!/usr/bin/env node
+// Lanzador de los hooks: Claude Code y Codex lo llaman en cada evento, con el payload por stdin. Vive
+// fuera del binario para poder negar un despacho `sdd-ai-*` aunque el binario no arranque. Fuera de
+// ese caso nunca falla: cualquier error sale con 0 y sin salida.
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+
+const MAX_PAYLOAD = 1024 * 1024
+/** Tope del binario. El timeout de cada hook en la config le deja al menos 5 s al lanzador para negar. */
+const BINARY_TIMEOUT_MS = 5000
+const cli = process.argv[2]
+
+function launch(input) {
+  const p = JSON.parse(input)
+  // Un comando de shell fuera de un subagente nunca se niega: no vale la pena arrancar el binario.
+  if (p.tool_name === 'Bash' && !p.agent_id) return ''
+  // La raíz sale del payload y no del proceso, para que el mismo lanzador sirva desde la config global.
+  const root = execFileSync('git', ['-C', String(p.cwd), 'rev-parse', '--show-toplevel'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim()
+  const r = spawnSync(process.execPath, [join(root, 'bin', 'sdd-ai'), 'hook', cli], { input, encoding: 'utf8', timeout: BINARY_TIMEOUT_MS })
+  // Una salida 0 sin nada impreso es un silencio del hook, y se respeta.
+  if (r.status === 0) return r.stdout
+  const tool = p.tool_input ?? {}
+  const type = tool.subagent_type ?? tool.agent_type
+  const tools = ['Agent', 'spawn_agent', 'collaborationspawn_agent']
+  const dispatch = tools.includes(p.tool_name) && typeof type === 'string' && type.startsWith('sdd-ai-')
+  if (!dispatch || !existsSync(join(root, '.sdd-ai'))) return ''
+  const why = r.error ? r.error.message : `salió con ${r.status ?? r.signal}`
+  return JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse', permissionDecision: 'deny',
+      permissionDecisionReason: `sdd-ai: el hook no pudo comprobar el despacho (${why})`,
+    },
+  })
+}
+
+let size = 0
+const chunks = []
+process.stdout.on('error', () => {})
+process.stdin.on('error', () => { process.exitCode = 0 })
+process.stdin.on('data', (chunk) => {
+  size += chunk.length
+  if (size <= MAX_PAYLOAD) chunks.push(chunk)
+})
+process.stdin.on('end', () => {
+  let out = ''
+  try {
+    if (size <= MAX_PAYLOAD) out = launch(Buffer.concat(chunks).toString('utf8'))
+  } catch {
+    out = ''
+  }
+  process.stdout.write(out)
+  process.exitCode = 0
+})
