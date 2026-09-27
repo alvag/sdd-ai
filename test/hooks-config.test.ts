@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRun, setStatus, writeJsonAtomic } from '../src/runs.ts'
@@ -57,6 +57,8 @@ function testRepo(bin: 'real' | 'none' | 'fails' | 'hangs' = 'real'): string {
   if (bin === 'real') {
     symlinkSync(join(ROOT, 'bin', 'sdd-ai'), join(repo, 'bin', 'sdd-ai'))
     symlinkSync(LAUNCHER, join(repo, 'bin', 'sdd-ai-hook'))
+    // El lanzador cuenta en su propio proceso con el código de la raíz del payload.
+    symlinkSync(join(ROOT, 'src'), join(repo, 'src'))
   } else writeFileSync(join(repo, 'bin', 'sdd-ai'), bin === 'fails' ? 'process.exit(1)\n' : 'setTimeout(() => {}, 60000)\n')
   return repo
 }
@@ -68,8 +70,8 @@ const dispatchOf = (cli: Cli, repo: string, patch: Record<string, unknown> = {})
 
 test('los dos archivos declaran los hooks con el lanzador fijo y timeouts cortos', () => {
   const events: Record<Cli, Record<string, string | undefined>> = {
-    claude: { SessionStart: undefined, Stop: undefined, PreToolUse: 'Agent|Bash', PostToolUse: 'Agent', PostToolUseFailure: 'Agent' },
-    codex: { SessionStart: undefined, Stop: undefined, PreToolUse: 'Agent|Bash|collaborationspawn_agent', PostToolUse: 'Agent|collaborationspawn_agent' },
+    claude: { SessionStart: undefined, Stop: undefined, PreToolUse: 'Agent|Bash', PostToolUse: '*', PostToolUseFailure: 'Agent' },
+    codex: { SessionStart: undefined, Stop: undefined, PreToolUse: 'Agent|Bash|collaborationspawn_agent', PostToolUse: '*' },
   }
   for (const cli of CLIS) {
     const hooks = config(cli).hooks
@@ -87,6 +89,17 @@ test('los dos archivos declaran los hooks con el lanzador fijo y timeouts cortos
   const internal = Number(/BINARY_TIMEOUT_MS = (\d+)/.exec(readFileSync(LAUNCHER, 'utf8'))?.[1])
   assert.ok(internal > 0, 'el lanzador declara su tope interno')
   assert.ok(10 * 1000 - internal >= 5000, `tope interno ${internal} ms`)
+})
+
+test('los dos archivos declaran PostToolUse para todas las herramientas con el lanzador fijo', () => {
+  for (const cli of CLIS) {
+    const groups = config(cli).hooks.PostToolUse
+    assert.equal(groups.length, 1, cli)
+    assert.equal(groups[0].matcher, '*', cli)
+    assert.deepEqual(groups[0].hooks, [{ type: 'command', command: COMMANDS[cli], timeout: 10 }], cli)
+    // El resto de los eventos usa el mismo comando.
+    for (const [event, list] of Object.entries(config(cli).hooks)) assert.equal(list[0].hooks[0].command, COMMANDS[cli], `${cli} ${event}`)
+  }
 })
 
 test('el lanzador encuentra el binario desde el cwd del payload', () => {
@@ -138,5 +151,58 @@ test('el lanzador niega un despacho sdd-ai-* si el binario falla', () => {
       // Fuera de un despacho sdd-ai-*, un binario roto no niega ni recuerda nada.
       assert.deepEqual(launch(cli, stopOf(cli, repo)), { code: 0, out: '' }, `${cli} ${bin}`)
     }
+  }
+})
+
+const toolOf = (cli: Cli, repo: string, name: string, patch: Record<string, unknown> = {}) =>
+  JSON.stringify(payload(cli, name, { cwd: repo, session_id: 's1', ...patch }))
+const routeOf = (repo: string, session = 's1') => join(repo, '.sdd-ai', 'hooks', 'route', `${session}.json`)
+const trailOf = (repo: string) =>
+  readFileSync(join(repo, '.sdd-ai', 'hooks', 'route', 's1.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>)
+
+test('el lanzador deja pasar el Bash del conductor en PostToolUse', () => {
+  for (const cli of CLIS) {
+    const repo = testRepo()
+    assert.deepEqual(launch(cli, toolOf(cli, repo, 'post-tool-use-bash')), { code: 0, out: '' })
+    const state = JSON.parse(readFileSync(routeOf(repo), 'utf8')) as Record<string, number>
+    assert.deepEqual([state.calls, state.reads], [1, 1], 'el Bash de la sonda es una lectura')
+  }
+})
+
+test('el lanzador calla ante una herramienta de subagente sin arrancar el binario', () => {
+  for (const cli of CLIS) {
+    // Un binario que se cuelga: si el lanzador lo arrancara, tardaría su tope entero.
+    const repo = testRepo('hangs')
+    const name = cli === 'claude' ? 'post-tool-use-read-subagent' : 'post-tool-use-bash-subagent'
+    const started = Date.now()
+    assert.deepEqual(launch(cli, toolOf(cli, repo, name)), { code: 0, out: '' })
+    assert.ok(Date.now() - started < 2000, `tardó ${Date.now() - started} ms`)
+    assert.equal(existsSync(join(repo, '.sdd-ai', 'hooks')), false)
+  }
+})
+
+test('el lanzador en proceso ignora un session_id inválido', () => {
+  for (const cli of CLIS) {
+    const repo = testRepo()
+    assert.deepEqual(launch(cli, toolOf(cli, repo, 'post-tool-use-bash', { session_id: '../x' })), { code: 0, out: '' })
+    assert.deepEqual(launch(cli, toolOf(cli, repo, 'pre-tool-use-bash', { session_id: '../x' })), { code: 0, out: '' })
+    assert.equal(existsSync(join(repo, '.sdd-ai', 'hooks')), false)
+  }
+})
+
+test('una sesión abierta antes de los hooks registra como run la corrida que lanza su primer Bash', () => {
+  for (const cli of CLIS) {
+    const repo = testRepo()
+    writeJsonAtomic(join(repo, '.sdd-ai', 'runs', '20260101-0001-aaaa', 'resolved.json'), { family: cli, via: 'process' })
+    assert.deepEqual(launch(cli, toolOf(cli, repo, 'pre-tool-use-bash')), { code: 0, out: '' })
+    assert.ok(existsSync(routeOf(repo)), 'el primer Bash empieza el rastro')
+    const dir = createRun(repo, '20260101-0002-aaaa')
+    writeJsonAtomic(join(dir, 'request.json'), { session: 's1', conductor: { family: cli }, role: 'explore' })
+    writeJsonAtomic(join(dir, 'resolved.json'), { family: cli, via: 'process' })
+    assert.deepEqual(launch(cli, toolOf(cli, repo, 'post-tool-use-bash')), { code: 0, out: '' })
+    const lines = trailOf(repo)
+    assert.deepEqual(lines.map((l) => [l.event, l.run]), [['start', undefined], ['existing', '20260101-0001-aaaa'], ['run', '20260101-0002-aaaa']])
+    assert.equal(lines[0].via, 'PreToolUse')
+    assert.deepEqual(readdirSync(join(repo, '.sdd-ai', 'hooks', 'route')).sort(), ['s1.json', 's1.jsonl'])
   }
 })

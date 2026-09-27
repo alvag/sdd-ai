@@ -135,3 +135,16 @@ test('el estado del agente de un rol pasa de missing a ok y a stale', () => {
   writeFileSync(claude, readFileSync(claude, 'utf8').replace('Lee tu encargo.', 'Haz otra cosa.'))
   assert.equal(agentsState(root, pkg, 'claude', 'code-review', p), 'stale')
 })
+
+test('las copias de la skill son iguales a la fuente después de agents sync', () => {
+  const pkg = join(import.meta.dirname, '..')
+  const source = readFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'))
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-repo-'))
+  syncAgents(root, pkg, profiles())
+  // Las de un repo recién sincronizado y las de este repo, que se sincroniza con cada cambio de la skill.
+  for (const base of [root, pkg]) {
+    for (const copy of [join('.claude', 'skills', 'sdd-ai', 'SKILL.md'), join('.agents', 'skills', 'sdd-ai', 'SKILL.md')]) {
+      assert.ok(readFileSync(join(base, copy)).equals(source), `${base}/${copy}`)
+    }
+  }
+})

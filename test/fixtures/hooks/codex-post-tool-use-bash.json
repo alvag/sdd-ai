@@ -1,0 +1,15 @@
+{
+  "session_id": "01a0dfaf-618f-74b0-8f94-4adaaec7274b",
+  "turn_id": "01a0e2f6-8edd-77a2-a031-c6916272276b",
+  "transcript_path": "/Users/max/.codex/sessions/2026/09/26/rollout-2026-09-26T16-46-54-01a0dfaf-618f-74b0-8f94-4adaaec7274b.jsonl",
+  "cwd": "/repo",
+  "hook_event_name": "PostToolUse",
+  "model": "gpt-6-sol",
+  "permission_mode": "default",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cat notas.txt"
+  },
+  "tool_response": "uno\ndos\ntres\n",
+  "tool_use_id": "exec-cf73cb69-7252-49f6-ae71-0c98abb0feaa"
+}

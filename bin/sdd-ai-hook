@@ -1,31 +1,79 @@
 #!/usr/bin/env node
 // Lanzador de los hooks: Claude Code y Codex lo llaman en cada evento, con el payload por stdin. Vive
-// fuera del binario para poder negar un despacho `sdd-ai-*` aunque el binario no arranque. Fuera de
-// ese caso nunca falla: cualquier error sale con 0 y sin salida.
+// fuera del binario para poder negar un despacho `sdd-ai-*` aunque el binario no arranque, y para
+// contar las herramientas del conductor sin arrancarlo. Fuera de ese caso nunca falla: cualquier error
+// sale con 0 y sin salida.
 import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { enableCompileCache } from 'node:module'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const MAX_PAYLOAD = 1024 * 1024
 /** Tope del binario. El timeout de cada hook en la config le deja al menos 5 s al lanzador para negar. */
 const BINARY_TIMEOUT_MS = 5000
 const cli = process.argv[2]
+const DISPATCH_TOOLS = ['Agent', 'spawn_agent', 'collaborationspawn_agent']
 
-function launch(input) {
-  const p = JSON.parse(input)
-  // Un comando de shell fuera de un subagente nunca se niega: no vale la pena arrancar el binario.
-  if (p.tool_name === 'Bash' && !p.agent_id) return ''
-  // La raíz sale del payload y no del proceso, para que el mismo lanzador sirva desde la config global.
-  const root = execFileSync('git', ['-C', String(p.cwd), 'rev-parse', '--show-toplevel'], {
+/** La raíz sale del payload y no del proceso, para que el mismo lanzador sirva desde la config global. */
+function rootOf(p) {
+  return execFileSync('git', ['-C', String(p.cwd), 'rev-parse', '--show-toplevel'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
   }).trim()
+}
+
+/**
+ * El contador solo depende de `node:fs`: cargarlo acá cuesta menos que arrancar el binario. Lo que
+ * cuesta es preparar TypeScript, y la caché de compilación de Node, fuera del repo, lo evita desde la
+ * segunda vez.
+ */
+async function backstop(root) {
+  try {
+    enableCompileCache()
+  } catch {
+    // Sin caché el conteo sale igual, más lento.
+  }
+  return import(pathToFileURL(join(root, 'src', 'backstop.ts')).href)
+}
+
+/**
+ * Empieza el rastro de una sesión que todavía no lo tiene, como una abierta antes de los hooks: así
+ * un `run` que lance este comando queda después de la instantánea y se registra como corrida nueva.
+ */
+async function startTrailIfMissing(p) {
+  if (typeof p.session_id !== 'string') return
+  const root = rootOf(p)
+  if (!existsSync(join(root, '.sdd-ai'))) return
+  if (existsSync(join(root, '.sdd-ai', 'hooks', 'route', `${p.session_id}.json`))) return
+  ;(await backstop(root)).startTrail(root, p.session_id, 'PreToolUse')
+}
+
+async function countHere(p) {
+  if (typeof p.session_id !== 'string') return ''
+  const root = rootOf(p)
+  if (!existsSync(join(root, '.sdd-ai'))) return ''
+  const reminder = (await backstop(root)).countTool(p, root, p.session_id, cli)
+  return reminder === '' ? '' : JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: reminder } })
+}
+
+async function launch(input) {
+  const p = JSON.parse(input)
+  if (p.hook_event_name === 'PreToolUse' && p.tool_name === 'Bash' && !p.agent_id) {
+    // Un comando de shell fuera de un subagente nunca se niega: no vale la pena arrancar el binario.
+    await startTrailIfMissing(p)
+    return ''
+  }
+  if (p.hook_event_name === 'PostToolUse' && !DISPATCH_TOOLS.includes(p.tool_name)) {
+    // La herramienta de un subagente no cuenta; la del conductor se cuenta en este proceso.
+    return p.agent_id ? '' : await countHere(p)
+  }
+  const root = rootOf(p)
   const r = spawnSync(process.execPath, [join(root, 'bin', 'sdd-ai'), 'hook', cli], { input, encoding: 'utf8', timeout: BINARY_TIMEOUT_MS })
   // Una salida 0 sin nada impreso es un silencio del hook, y se respeta.
   if (r.status === 0) return r.stdout
   const tool = p.tool_input ?? {}
   const type = tool.subagent_type ?? tool.agent_type
-  const tools = ['Agent', 'spawn_agent', 'collaborationspawn_agent']
-  const dispatch = tools.includes(p.tool_name) && typeof type === 'string' && type.startsWith('sdd-ai-')
+  const dispatch = DISPATCH_TOOLS.includes(p.tool_name) && typeof type === 'string' && type.startsWith('sdd-ai-')
   if (!dispatch || !existsSync(join(root, '.sdd-ai'))) return ''
   const why = r.error ? r.error.message : `salió con ${r.status ?? r.signal}`
   return JSON.stringify({
@@ -44,10 +92,10 @@ process.stdin.on('data', (chunk) => {
   size += chunk.length
   if (size <= MAX_PAYLOAD) chunks.push(chunk)
 })
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
   let out = ''
   try {
-    if (size <= MAX_PAYLOAD) out = launch(Buffer.concat(chunks).toString('utf8'))
+    if (size <= MAX_PAYLOAD) out = await launch(Buffer.concat(chunks).toString('utf8'))
   } catch {
     out = ''
   }

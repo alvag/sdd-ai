@@ -1,17 +1,21 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
+import { countTool, markBootstrap, startTrail } from './backstop.ts'
 import { repoRoot } from './git.ts'
 import { confirm, release, reserve } from './native-launch.ts'
 import { type OpenRun, type OpenState, describe, openRuns, runKey } from './open-runs.ts'
+import { renderBootstrap } from './route.ts'
 import { readJson, readStatus, writeJsonAtomic } from './runs.ts'
+import { shellSegments } from './shell.ts'
 import type { NativeProfile } from './types.ts'
 
 export type HookCli = 'claude' | 'codex'
 
-/** Lo que el hook lee del payload; cada CLI manda más campos y el hook no los necesita. */
+/** Lo que el hook lee del payload; cada CLI manda más campos, que pasan tal cual al contador. */
 export interface Payload {
   hook_event_name?: unknown; session_id?: unknown; cwd?: unknown; source?: unknown; stop_hook_active?: unknown
-  tool_name?: unknown; tool_input?: unknown; tool_use_id?: unknown; agent_id?: unknown
+  tool_name?: unknown; tool_input?: unknown; tool_use_id?: unknown; agent_id?: unknown; transcript_path?: unknown
+  [campo: string]: unknown
 }
 
 const MAX_PAYLOAD = 1024 * 1024
@@ -33,11 +37,14 @@ export function runHook(stdin: string, cli: HookCli): string {
     const root = repoRoot(p.cwd)
     // `existsSync` y no `runsRoot`, que lo crearía: un repo sin sdd-ai no se toca.
     if (!existsSync(join(root, '.sdd-ai'))) return ''
+    // El rastro empieza con el primer evento que ve de la sesión, también si abrió antes de los hooks.
+    const via = p.hook_event_name === 'SessionStart' ? `SessionStart:${String(p.source)}` : String(p.hook_event_name)
+    startTrail(root, p.session_id, via)
     switch (p.hook_event_name) {
       case 'SessionStart': return sessionStart(p, root, p.session_id)
       case 'Stop': return stop(p, root, p.session_id, cli)
       case 'PreToolUse': return preToolUse(p, root, p.session_id, cli)
-      case 'PostToolUse': return postDispatch(p, root, 'confirm')
+      case 'PostToolUse': return postToolUse(p, root, p.session_id, cli)
       case 'PostToolUseFailure': return postDispatch(p, root, 'release')
       default: return ''
     }
@@ -61,21 +68,43 @@ function context(event: string, additionalContext: string): string {
 }
 
 /**
- * Al retomar o compactar, el conductor recupera las corridas que dejó abiertas. Al empezar o limpiar,
- * ve en una línea las de otras sesiones, solo como dato. Una sesión bifurcada hereda el contexto de la
- * original y no recibe nada.
+ * El bootstrap de la ruta directa, seguido de la lista de corridas, en una sola salida. Una sesión
+ * bifurcada hereda el contexto de la original y no recibe nada.
  */
 function sessionStart(p: Payload, root: string, session: string): string {
+  const text = [bootstrap(p, root, session), runList(p, root, session)].filter(Boolean).join('\n\n')
+  return text === '' ? '' : context('SessionStart', text)
+}
+
+/**
+ * Al empezar, limpiar o compactar, el contexto anterior ya no está y el bootstrap vuelve. Una sesión
+ * retomada conserva el contexto de su arranque con el mismo `session_id`, así que lo recibe solo si
+ * nunca lo tuvo, como una que abrió antes de estos hooks.
+ */
+function bootstrap(p: Payload, root: string, session: string): string {
+  if (p.source === 'startup' || p.source === 'clear' || p.source === 'compact') {
+    markBootstrap(root, session)
+    return renderBootstrap()
+  }
+  if (p.source === 'resume') return markBootstrap(root, session) ? '' : renderBootstrap()
+  return ''
+}
+
+/**
+ * Al retomar o compactar, el conductor recupera las corridas que dejó abiertas. Al empezar o limpiar,
+ * ve en una línea las de otras sesiones, solo como dato.
+ */
+function runList(p: Payload, root: string, session: string): string {
   const runs = openRuns(root)
   if (p.source === 'resume' || p.source === 'compact') {
     const own = runs.filter((r) => r.session === session)
-    return own.length === 0 ? '' : context('SessionStart', ownRuns(own))
+    return own.length === 0 ? '' : ownRuns(own)
   }
   if (p.source === 'startup' || p.source === 'clear') {
     const others = runs.filter((r) => r.session !== session)
     if (others.length === 0) return ''
     const list = others.map((r) => `${r.id} (${OPEN_LABEL[r.open]})`).join(', ')
-    return context('SessionStart', `Corridas de sdd-ai abiertas en otras sesiones, solo como dato: ${list}`)
+    return `Corridas de sdd-ai abiertas en otras sesiones, solo como dato: ${list}`
   }
   return ''
 }
@@ -209,6 +238,10 @@ export function guardDispatch(p: Payload, root: string, session: string, cli: Ho
     const v2 = p.tool_name === SPAWN_AGENT_V2 || 'task_name' in input
     const cited = v2 ? [] : [...new Set(texts(input).flatMap((t) => [...t.matchAll(CITATION)].map((m) => m[1])))]
     const role = type.slice(AGENT_PREFIX.length)
+    if (eligible.length === 0) {
+      const reserved = unconfirmed(runs, runsDir, session, cli, type)
+      if (reserved.length > 0) return deny(unconfirmedReason(reserved, cited[0], type))
+    }
     if (cited.length > 1) return deny(`el mensaje cita más de una corrida (${cited.join(', ')}): cita solo el prompt_file de la que despachas`)
     let chosen = eligible[0]
     if (cited.length === 1) {
@@ -242,6 +275,46 @@ export function guardDispatch(p: Payload, root: string, session: string, cli: Ho
 }
 
 /**
+ * Las nativas de esta sesión, de este agente y de la familia de este CLI con un despacho reservado sin
+ * confirmar. Nadie sabe si su agente llegó a lanzarse, y eso lo decide el usuario, no otro `run`.
+ */
+function unconfirmed(runs: OpenRun[], runsDir: string, session: string, cli: HookCli, type: string): OpenRun[] {
+  return runs.filter((r) => {
+    if (r.kind !== 'native' || r.open !== 'native_unconfirmed' || r.session !== session) return false
+    const native = readJson<NativeProfile>(join(runsDir, r.id, 'native.json'))
+    return native.family === cli && native.agent === type
+  })
+}
+
+/** Nombra las reservadas, primero la citada, cada una con lo que sigue, y advierte el riesgo de duplicar. */
+function unconfirmedReason(reserved: OpenRun[], cited: string | undefined, type: string): string {
+  const first = reserved.find((r) => r.id === cited)
+  const ordered = first ? [first, ...reserved.filter((r) => r !== first)] : reserved
+  const head = ordered.length === 1
+    ? `la corrida ${ordered[0].id} de esta sesión para ${type} tiene un despacho reservado sin confirmar`
+    : `hay ${ordered.length} corridas de esta sesión para ${type} con un despacho reservado sin confirmar`
+  const items = ordered.map((r) => `${r.id}: ${r.next}`).join('; ')
+  return `${head}, y no se sabe si su agente llegó a lanzarse. Sigue, para ${items}. ` +
+    '`cancel` solo cambia el registro local de sdd-ai: si el agente sí se lanzó, reintentar puede lanzar otro agente con el mismo encargo'
+}
+
+/**
+ * Primero confirma el despacho, como siempre; después cuenta la herramienta para el recordatorio de
+ * sesión larga. Un error de cualquiera de los dos no cambia lo que hizo el otro.
+ */
+function postToolUse(p: Payload, root: string, session: string, cli: HookCli): string {
+  let out = ''
+  try {
+    out = postDispatch(p, root, 'confirm')
+  } catch {
+    // Un despacho que no se pudo confirmar sigue sin confirmar, igual que antes del contador.
+  }
+  if (out !== '') return out
+  const reminder = countTool(p, root, session, cli)
+  return reminder === '' ? '' : context('PostToolUse', reminder)
+}
+
+/**
  * Confirma o libera la reserva del despacho con este `tool_use_id`. Claude Code avisa el fallo con
  * `PostToolUseFailure`; Codex solo corre `PostToolUse` tras un éxito, así que ahí un fallo deja la
  * reserva sin confirmar.
@@ -258,56 +331,6 @@ function postDispatch(p: Payload, root: string, action: 'confirm' | 'release'): 
     }
   }
   return ''
-}
-
-/**
- * Parte un comando de shell en tramos por `&&`, `||`, `;`, `|` y el salto de línea, solo donde el
- * separador está fuera de comillas y sin escapar: `echo "a; sdd-ai run"` es un solo tramo.
- */
-function shellSegments(command: string): string[] {
-  const segments: string[] = []
-  let current = ''
-  let quote: '"' | "'" | null = null
-  let escaped = false
-  for (let i = 0; i < command.length; i++) {
-    const c = command[i]
-    if (escaped) {
-      current += c
-      escaped = false
-      continue
-    }
-    // Entre comillas simples la barra no escapa nada.
-    if (c === '\\' && quote !== "'") {
-      current += c
-      escaped = true
-      continue
-    }
-    if (quote) {
-      if (c === quote) quote = null
-      current += c
-      continue
-    }
-    if (c === '"' || c === "'") {
-      quote = c
-      current += c
-      continue
-    }
-    const pair = command.slice(i, i + 2)
-    if (pair === '&&' || pair === '||') {
-      segments.push(current)
-      current = ''
-      i++
-      continue
-    }
-    if (c === ';' || c === '|' || c === '\n') {
-      segments.push(current)
-      current = ''
-      continue
-    }
-    current += c
-  }
-  segments.push(current)
-  return segments
 }
 
 const RUN_COMMANDS = new Set(['run', 'review', 'wait', 'cancel'])

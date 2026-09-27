@@ -1,12 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { guardDispatch, runHook } from '../src/hooks.ts'
 import { cancelNative, launchState, release, reserve } from '../src/native-launch.ts'
 import { openRuns, runKey } from '../src/open-runs.ts'
+import { ROUTE, renderBootstrap } from '../src/route.ts'
 import { createRun, readStatus, setStatus, writeJsonAtomic } from '../src/runs.ts'
 import type { Status } from '../src/types.ts'
 import { checkOutput, payload } from './hook-contract.ts'
@@ -120,15 +121,15 @@ test('SessionStart resume y compact inyectan las abiertas propias', () => {
   }
 })
 
-test('sin corridas abiertas SessionStart no inyecta nada', () => {
+test('sin corridas abiertas SessionStart solo trae el bootstrap', () => {
   for (const cli of CLIS) {
     const empty = makeRepo()
     mkdirSync(join(empty, '.sdd-ai'))
-    assert.equal(fire(cli, 'session-start', empty, { session_id: 's1', source: 'resume' }), '')
+    assert.equal(text(fire(cli, 'session-start', empty, { session_id: 's1', source: 'resume' })), renderBootstrap())
     const repo = makeRepo()
     const done: Status = { state: 'done' }
     delivered(makeRun(repo, '20260101-0001-aaaa', done), done)
-    for (const source of ['resume', 'compact']) assert.equal(fire(cli, 'session-start', repo, { session_id: 's1', source }), '')
+    for (const source of ['resume', 'compact']) assert.equal(text(fire(cli, 'session-start', repo, { session_id: `s-${source}`, source })), renderBootstrap())
   }
 })
 
@@ -142,7 +143,7 @@ test('SessionStart startup y clear listan en una línea las abiertas de otras se
     for (const source of ['startup', 'clear']) {
       const out = fire(cli, 'session-start', repo, { session_id: 's1', source })
       assert.deepEqual(checkOutput(cli, 'SessionStart', out), [], `${cli} ${source}`)
-      const ctx = text(out)
+      const ctx = text(out).slice(renderBootstrap().length + 2)
       assert.equal(ctx.includes('\n'), false, 'una sola línea')
       assert.match(ctx, /20260101-0002-aaaa \(corriendo\)/)
       assert.match(ctx, /20260101-0003-aaaa \(nativa sin lanzar\)/)
@@ -151,8 +152,61 @@ test('SessionStart startup y clear listan en una línea las abiertas de otras se
     assert.equal(fire(cli, 'session-start', repo, { session_id: 's1', source: 'fork' }), '')
     const alone = makeRepo()
     makeRun(alone, '20260101-0001-aaaa', { state: 'running' })
-    assert.equal(fire(cli, 'session-start', alone, { session_id: 's1', source: 'startup' }), '')
+    assert.equal(text(fire(cli, 'session-start', alone, { session_id: 's1', source: 'startup' })), renderBootstrap())
   }
+})
+
+test('SessionStart startup, clear y compact anteponen el bootstrap a la lista de corridas', () => {
+  for (const cli of CLIS) {
+    for (const source of ['startup', 'clear', 'compact']) {
+      const empty = makeRepo()
+      mkdirSync(join(empty, '.sdd-ai'))
+      const alone = fire(cli, 'session-start', empty, { session_id: 's1', source })
+      assert.deepEqual(checkOutput(cli, 'SessionStart', alone), [], `${cli} ${source}`)
+      assert.equal(text(alone), renderBootstrap())
+      const repo = makeRepo()
+      makeRun(repo, '20260101-0001-aaaa', { state: 'running' }, { session: source === 'compact' ? 's1' : 's2' })
+      const out = fire(cli, 'session-start', repo, { session_id: 's1', source })
+      assert.deepEqual(checkOutput(cli, 'SessionStart', out), [], `${cli} ${source}`)
+      const [bootstrap, list, ...rest] = text(out).split('\n\n')
+      assert.equal(bootstrap, renderBootstrap())
+      assert.match(list, /20260101-0001-aaaa/)
+      assert.deepEqual(rest, [])
+      // Cada fuente vuelve a traerlo, también en la misma sesión.
+      assert.ok(text(fire(cli, 'session-start', repo, { session_id: 's1', source })).startsWith(renderBootstrap()))
+    }
+  }
+})
+
+test('SessionStart resume entrega el bootstrap según la regla de la sonda, sin duplicarlo', () => {
+  for (const cli of CLIS) {
+    const repo = makeRepo()
+    mkdirSync(join(repo, '.sdd-ai'))
+    assert.equal(text(fire(cli, 'session-start', repo, { session_id: 's1', source: 'startup' })), renderBootstrap())
+    // La sesión retomada conserva el contexto del arranque: no se repite.
+    assert.equal(fire(cli, 'session-start', repo, { session_id: 's1', source: 'resume' }), '')
+    makeRun(repo, '20260101-0001-aaaa', { state: 'running' })
+    const withRuns = text(fire(cli, 'session-start', repo, { session_id: 's1', source: 'resume' }))
+    assert.ok(!withRuns.includes(renderBootstrap()), 'la lista sale sin el bootstrap')
+    assert.match(withRuns, /20260101-0001-aaaa/)
+    // Una sesión que no lo recibió nunca, como una abierta antes de los hooks, lo recibe al retomar.
+    assert.equal(text(fire(cli, 'session-start', repo, { session_id: 's2', source: 'resume' })), renderBootstrap())
+    assert.equal(fire(cli, 'session-start', repo, { session_id: 's2', source: 'resume' }), '')
+  }
+})
+
+test('sin .sdd-ai SessionStart sigue callando', () => {
+  for (const cli of CLIS) {
+    const repo = makeRepo()
+    for (const source of ['startup', 'clear', 'compact', 'resume', 'fork']) assert.equal(fire(cli, 'session-start', repo, { session_id: 's1', source }), '')
+    assert.equal(existsSync(join(repo, '.sdd-ai')), false)
+  }
+})
+
+test('sin la guarda, un SessionStart de Codex con transcript_path null recibe el bootstrap', () => {
+  const repo = makeRepo()
+  mkdirSync(join(repo, '.sdd-ai'))
+  assert.equal(text(fire('codex', 'session-start', repo, { session_id: 's1', source: 'startup', transcript_path: null })), renderBootstrap())
 })
 
 test('Stop recuerda una vez las corridas abiertas propias con lo que sigue', () => {
@@ -448,6 +502,72 @@ test('PostToolUse confirma y PostToolUseFailure libera por tool_use_id', () => {
   assert.deepEqual(launchState(v2Dir, readStatus(v2Dir)), { kind: 'launched' })
 })
 
+const EDIT = { claude: 'post-tool-use-edit', codex: 'post-tool-use-apply-patch' } as const
+const routeFile = (repo: string, ext: string) => join(repo, '.sdd-ai', 'hooks', 'route', `s1.${ext}`)
+const postTool = (cli: Cli, repo: string, name: string = EDIT[cli]) =>
+  runHook(JSON.stringify(payload(cli, name, { cwd: repo, session_id: 's1' })), cli)
+
+test('PostToolUse confirma el despacho antes de contar y un error del contador no cambia la salida', () => {
+  for (const cli of CLIS) {
+    const repo = sddRepo(cli)
+    const run = nativeRun(repo, cli)
+    const dir = join(repo, '.sdd-ai', 'runs', run.id)
+    assert.equal(decision(dispatch(cli, repo, { [typeKey(cli)]: 'sdd-ai-explore' })), 'allow')
+    mkdirSync(join(repo, '.sdd-ai', 'hooks', 'route'), { recursive: true })
+    writeFileSync(routeFile(repo, 'json'), '{"calls":')
+    const name = cli === 'claude' ? 'post-tool-use-agent' : 'post-tool-use-spawn-agent'
+    assert.equal(runHook(JSON.stringify(payload(cli, name, { cwd: repo, session_id: 's1', tool_use_id: 'tu-1' })), cli), '')
+    assert.deepEqual(launchState(dir, readStatus(dir)), { kind: 'launched' })
+    assert.equal(readFileSync(routeFile(repo, 'json'), 'utf8'), '{"calls":')
+  }
+})
+
+test('un error del rastro no saltea la guarda de despacho', () => {
+  for (const cli of CLIS) {
+    for (const broken of ['state', 'lock'] as const) {
+      const repo = sddRepo(cli)
+      mkdirSync(join(repo, '.sdd-ai', 'hooks', 'route'), { recursive: true })
+      if (broken === 'state') writeFileSync(routeFile(repo, 'json'), 'no es json')
+      else writeFileSync(routeFile(repo, 'lock'), '')
+      const out = dispatch(cli, repo, { [typeKey(cli)]: 'sdd-ai-explore' })
+      assert.match(denial(out), /\.\/bin\/sdd-ai run --role explore/, `${cli} ${broken}`)
+    }
+  }
+})
+
+test('el recordatorio solo agrega contexto: nunca niega ni bloquea', () => {
+  for (const cli of CLIS) {
+    const repo = sddRepo(cli)
+    for (let i = 1; i < ROUTE.backstop.edits; i++) assert.equal(postTool(cli, repo), '')
+    const out = JSON.parse(postTool(cli, repo)) as Out
+    assert.deepEqual(checkOutput(cli, 'PostToolUse', out), [], JSON.stringify(out))
+    assert.deepEqual(Object.keys(out), ['hookSpecificOutput'])
+    assert.deepEqual(Object.keys(out.hookSpecificOutput).sort(), ['additionalContext', 'hookEventName'])
+    assert.equal(out.hookSpecificOutput.hookEventName, 'PostToolUse')
+    assert.match(out.hookSpecificOutput.additionalContext, /^Recordatorio de sdd-ai/)
+  }
+})
+
+test('sin poder tomar el lock el contador calla', () => {
+  const postBash = (cli: Cli, repo: string) => postTool(cli, repo, 'post-tool-use-bash')
+  for (const cli of CLIS) {
+    const repo = sddRepo(cli)
+    assert.equal(postBash(cli, repo), '')
+    const before = readFileSync(routeFile(repo, 'json'), 'utf8')
+    writeFileSync(routeFile(repo, 'lock'), '')
+    const started = Date.now()
+    assert.equal(postBash(cli, repo), '')
+    assert.ok(Date.now() - started < 1000, `tardó ${Date.now() - started} ms`)
+    assert.equal(readFileSync(routeFile(repo, 'json'), 'utf8'), before)
+    // Un lock de hace 11 s quedó de un hook que murió: se reemplaza y cuenta.
+    const old = (Date.now() - 11_000) / 1000
+    utimesSync(routeFile(repo, 'lock'), old, old)
+    assert.equal(postBash(cli, repo), '')
+    assert.equal(JSON.parse(readFileSync(routeFile(repo, 'json'), 'utf8')).calls, 2)
+    assert.equal(existsSync(routeFile(repo, 'lock')), false)
+  }
+})
+
 test('en Codex v2 se niega a los hijos, sin corrida y con varias pendientes', () => {
   const repo = sddRepo('codex')
   const none = dispatchV2(repo)
@@ -481,8 +601,8 @@ test('una reserva sin confirmar se niega y Stop pide preguntar', () => {
     const run = nativeRun(repo, cli)
     const type = { [typeKey(cli)]: 'sdd-ai-explore' }
     assert.equal(decision(dispatch(cli, repo, type)), 'allow')
-    assert.match(denial(dispatch(cli, repo, { ...type, [textKey(cli)]: run.prompt_file }, { tool_use_id: 'tu-2' })), new RegExp(`${run.id} no se puede despachar`))
-    assert.match(denial(dispatch(cli, repo, type, { tool_use_id: 'tu-3' })), /sdd-ai run/)
+    assert.match(denial(dispatch(cli, repo, { ...type, [textKey(cli)]: run.prompt_file }, { tool_use_id: 'tu-2' })), new RegExp(`${run.id} .*preguntarle al usuario`))
+    assert.match(denial(dispatch(cli, repo, type, { tool_use_id: 'tu-3' })), new RegExp(`${run.id} .*preguntarle al usuario`))
     assert.match(text(fire(cli, 'stop', repo, { session_id: 's1' })), new RegExp(`${run.id} .*sigue: preguntarle al usuario`))
   }
   // Cancelada entre la elegibilidad y la reserva: se libera y se niega.
@@ -492,6 +612,71 @@ test('una reserva sin confirmar se niega y Stop pide preguntar', () => {
   const out = JSON.parse(guardDispatch(p, repo, 's1', 'claude', (dir) => { cancelNative(dir) })) as Out
   assert.match(denial(out), /se canceló/)
   assert.equal(existsSync(join(repo, '.sdd-ai', 'runs', run.id, 'launch.json')), false)
+})
+
+/** Una nativa de `run` con su despacho reservado y sin confirmar, como la deja un lanzamiento que no avisó. */
+function reservedRun(repo: string, cli: Cli, toolUseId: string): Out {
+  const run = nativeRun(repo, cli)
+  assert.equal(reserve(join(repo, '.sdd-ai', 'runs', run.id), toolUseId), true)
+  return run
+}
+
+/** La negación de H-30: nombra la corrida, remite a preguntar y advierte que reintentar puede duplicar el agente. */
+function assertUnconfirmed(out: Out | '', cli: Cli, ids: string[]): string {
+  const reason = denial(out)
+  assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [])
+  for (const id of ids) {
+    assert.ok(reason.includes(id), `no nombra ${id}: ${reason}`)
+    assert.ok(reason.includes(`./bin/sdd-ai cancel ${id}`) && reason.includes(`./bin/sdd-ai run --retry ${id}`), reason)
+  }
+  assert.match(reason, /preguntarle al usuario/)
+  assert.match(reason, /`cancel` solo cambia el registro local/)
+  assert.match(reason, /reintentar puede lanzar otro agente/)
+  assert.doesNotMatch(reason, /no es una nativa sin lanzar ni reservar/)
+  return reason
+}
+
+test('una reserva sin confirmar, sin otra pendiente, se niega nombrándola, remitiendo a preguntar y advirtiendo el riesgo de duplicar', () => {
+  for (const cli of CLIS) {
+    const repo = sddRepo(cli)
+    const type = { [typeKey(cli)]: 'sdd-ai-explore' }
+    const a = reservedRun(repo, cli, 'tu-a')
+    const other = nativeRun(repo, cli, [], 's2')
+    assertUnconfirmed(dispatch(cli, repo, type), cli, [a.id])
+    assertUnconfirmed(dispatch(cli, repo, { ...type, [textKey(cli)]: canonical(a.prompt_file) }), cli, [a.id])
+    assertUnconfirmed(dispatch(cli, repo, { ...type, [textKey(cli)]: canonical(other.prompt_file) }), cli, [a.id])
+    const b = reservedRun(repo, cli, 'tu-b')
+    assertUnconfirmed(dispatch(cli, repo, type), cli, [a.id, b.id])
+    for (const [first, second] of [[a, b], [b, a]]) {
+      const cited = assertUnconfirmed(dispatch(cli, repo, { ...type, [textKey(cli)]: canonical(first.prompt_file) }), cli, [a.id, b.id])
+      assert.ok(cited.indexOf(first.id) < cited.indexOf(second.id), cited)
+    }
+    for (const run of [a, b]) assert.equal(JSON.parse(readFileSync(join(repo, '.sdd-ai', 'runs', run.id, 'launch.json'), 'utf8')).tool_use_id, `tu-${run === a ? 'a' : 'b'}`)
+  }
+  const v2 = sddRepo('codex')
+  const r = reservedRun(v2, 'codex', 'tu-r')
+  assertUnconfirmed(dispatchV2(v2), 'codex', [r.id])
+})
+
+test('con otra pendiente del mismo agente el despacho sigue las reglas de la fase 3', () => {
+  for (const cli of CLIS) {
+    const repo = sddRepo(cli)
+    const type = { [typeKey(cli)]: 'sdd-ai-explore' }
+    const reserved = reservedRun(repo, cli, 'tu-r')
+    const pending = nativeRun(repo, cli)
+    const cited = denial(dispatch(cli, repo, { ...type, [textKey(cli)]: canonical(reserved.prompt_file) }))
+    assert.match(cited, new RegExp(`${reserved.id} no se puede despachar`))
+    assert.doesNotMatch(cited, /preguntarle al usuario/)
+    assert.equal(decision(dispatch(cli, repo, type)), 'allow')
+    assert.equal(JSON.parse(readFileSync(join(repo, '.sdd-ai', 'runs', pending.id, 'launch.json'), 'utf8')).tool_use_id, 'tu-1')
+  }
+  const v2 = sddRepo('codex')
+  reservedRun(v2, 'codex', 'tu-r')
+  nativeRun(v2, 'codex')
+  nativeRun(v2, 'codex')
+  const many = denial(dispatchV2(v2))
+  assert.match(many, /hay 2 corridas sin lanzar.*cifrado/)
+  assert.doesNotMatch(many, /preguntarle al usuario/)
 })
 
 test('cada salida cumple el esquema de salida de Codex y la forma de Claude', () => {

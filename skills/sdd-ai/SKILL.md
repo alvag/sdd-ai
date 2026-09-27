@@ -10,8 +10,8 @@ responde y le preguntas al usuario ante cualquier fallo. Todo comando imprime un
 
 ## 1. Escribe el encargo
 
-Escribe el encargo en un archivo. El worker no ve esta conversación: el encargo tiene que ser
-autosuficiente (qué hacer, dónde mirar, qué formato de respuesta).
+Escribe el encargo en un archivo temporal fuera del repositorio. El worker no ve esta conversación:
+el encargo tiene que ser autosuficiente (qué hacer, dónde mirar, qué formato de respuesta).
 
 ## 2. Pide el despacho
 
@@ -34,6 +34,9 @@ autosuficiente (qué hacer, dónde mirar, qué formato de respuesta).
   escalamiento siempre.
 
 ## 3. Sigue la respuesta
+
+Cuando `run` devuelve un `id`, ya copió el encargo a la corrida: borra el temporal. Si `run` falla
+antes, consérvalo para reintentar.
 
 **`"via": "native"`**: lánzalo tú, sin heredar esta conversación.
 
@@ -318,13 +321,63 @@ puede comprobar: ese se niega.
   solo si corresponde a una nativa sin lanzar ni reservar de tu sesión, de ese rol y de tu CLI.
   Reserva la corrida y reescribe el input (§3); en la v2 de Codex, todo menos el mensaje cifrado.
   Desde un subagente, lo niega. Los agentes que no son `sdd-ai-*` no se tocan.
-- **`PostToolUse`**, y en Claude Code también **`PostToolUseFailure`**: confirman o liberan la
-  reserva del despacho.
+  Si la única corrida de ese agente tiene una reserva sin confirmar, la negación la nombra y remite a
+  preguntarle al usuario si reintenta o la descarta: `cancel` solo cambia el registro local, y
+  reintentar puede lanzar otro agente si el primero llegó a arrancar.
+- **`PostToolUse`**, sobre todas las herramientas: confirma la reserva de un despacho y cuenta la
+  herramienta para el recordatorio de sesión larga. En Claude Code, **`PostToolUseFailure`** libera
+  la reserva de un despacho que falló.
 - **`PreToolUse` sobre `Bash`**: dentro de un subagente, niega `sdd-ai run`, `review`, `wait` y
   `cancel`. Un worker no delega ni toca las corridas del conductor.
 
 Claude Code carga los hooks del repositorio sin pedir nada. Codex los ejecuta solo después de que el
 usuario los aprueba en `/hooks`, y vuelve a pedirlo cada vez que cambian sus definiciones.
+
+### La ruta directa
+
+Para el trabajo que no va por SDD, los hooks le dan al conductor una guía y un recordatorio. Los
+números salen de una constante del binario: esta skill no los repite y los nombra "los umbrales del
+bootstrap".
+
+- **El bootstrap** llega por `SessionStart` al abrir, limpiar, compactar o retomar, antes de la lista
+  de corridas. Dice cuándo la exploración se delega y con qué comando, que la escritura delegada llega
+  con la fase 4b, que el tamaño y el riesgo solo proponen SDD, y cómo se cierra. Al retomar sale solo
+  si la sesión no lo tenía, porque la conversación retomada conserva el de su arranque. Los subagentes
+  nativos no lo reciben, porque no disparan `SessionStart`, y los workers por proceso tampoco, porque
+  corren con los hooks apagados.
+- **El recordatorio de sesión larga** cuenta las llamadas, lecturas y ediciones del conductor desde el
+  último `run` o `review` de su sesión. Cuando alguna llega a su umbral del bootstrap, agrega un
+  recordatorio como contexto, con los umbrales que se cruzaron y qué hacer, y los contadores vuelven
+  a cero. Nunca bloquea una herramienta. El conteo es aproximado:
+  - un `Bash` es una lectura si es un comando de lectura (`cat`, `sed -n`, `rg`, `grep`, `ls`, `find`,
+    `head`, `tail`, `nl`, `wc`), en los dos CLIs; Claude Code no tiene `Grep` ni `Glob`, y busca por
+    `Bash`;
+  - en Claude Code, `Read`, `Grep` y `Glob` son lecturas, y `Edit`, `Write` y `NotebookEdit`,
+    ediciones; en Codex, `apply_patch` es una edición;
+  - toda edición cuenta, también una mecánica;
+  - las herramientas de un subagente (las que llegan con `agent_id`) no cuentan;
+  - una llamada fallida no cuenta, salvo un `Bash` de Codex: su hook no recibe el código de salida;
+  - la llamada que crea una corrida no cuenta, y un `run` o un `review` de la sesión reinicia los
+    contadores.
+- **El rastro** de cada sesión queda en `.sdd-ai/hooks/route/<sesión>.jsonl`, con su estado en
+  `<sesión>.json`. Registra solo hechos: el inicio (`start`), las corridas que ya existían
+  (`existing`), cada recordatorio emitido (`reminder`) y cada corrida nueva de la sesión (`run`). No
+  registra si el conductor leyó el recordatorio ni qué ruta siguió: esa ruta la declara el conductor
+  al cerrar.
+
+Límites declarados:
+
+- Todo esto actúa solo en un repositorio con `.sdd-ai/`. Habilitarlo en otro repositorio queda para
+  la instalación de la fase 6: hoy el runtime (`bin/sdd-ai`, `bin/sdd-ai-hook` y `src/`) y las
+  definiciones de los hooks viven en este repositorio, y crear `.sdd-ai/` en otro no alcanza.
+- Codex abre a veces sesiones internas que disparan `SessionStart`. La sonda no encontró una señal que
+  las distinga de un conductor sin callar a alguno, así que si aparecen, reciben el bootstrap.
+- Si Codex tuviera subagentes internos cuyas herramientas llegaran sin `agent_id`, contarían como del
+  conductor. La sonda no vio ninguno.
+- Con `jira_approval` activo siempre hay spec, pero sdd-ai todavía no aplica esa regla: llega con su
+  ruta SDD propia, en la fase 5.
+- Cada cambio de `.codex/hooks.json` exige que el usuario vuelva a aprobar los hooks en `/hooks` de
+  Codex.
 
 **Ante una negación, sigue el motivo**: dice qué correr, qué citar o que le preguntes al usuario. No
 busques un rodeo, como otro agente, otro nombre o lanzar el CLI a mano.

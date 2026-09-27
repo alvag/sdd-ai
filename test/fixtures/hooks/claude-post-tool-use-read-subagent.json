@@ -1,0 +1,30 @@
+{
+  "session_id": "8f2c1e0a-1b2c-4d5e-8f90-a1b2c3d4e5f6",
+  "transcript_path": "/Users/max/.claude/projects/-repo/8f2c1e0a-1b2c-4d5e-8f90-a1b2c3d4e5f6.jsonl",
+  "cwd": "/repo",
+  "scratchpad_dir": "/tmp/claude-501/-repo/8f2c1e0a-1b2c-4d5e-8f90-a1b2c3d4e5f6/scratchpad",
+  "prompt_id": "e96fcef7-8944-4d24-b905-e0fa19d51163",
+  "permission_mode": "auto",
+  "agent_id": "a7accad2c943b54d2",
+  "agent_type": "general-purpose",
+  "effort": {
+    "level": "xhigh"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/repo/docs/guia.md"
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "/repo/docs/guia.md",
+      "content": "# Guía\n\nLa palabra clave es ciruela.\n",
+      "numLines": 4,
+      "startLine": 1,
+      "totalLines": 4
+    }
+  },
+  "tool_use_id": "toolu_01BPC4fMQrc21fR7tejJHjkS",
+  "duration_ms": 1
+}
