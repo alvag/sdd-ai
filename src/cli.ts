@@ -37,6 +37,9 @@ import {
   type Conductor, DISPATCHABLE_ROLES, type Family, type NativeProfile, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
   type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isDispatchableRole, isFamily, opposite, toNativeEffort,
 } from './types.ts'
+import { approve } from './sdd/approve.ts'
+import { listFlows, readFlow } from './sdd/read.ts'
+import { resolve as resolveFlow } from './sdd/status.ts'
 import { claudeLaunch, claudeWriterLaunch } from './workers/claude.ts'
 import { codexLaunch, codexWriterLaunch } from './workers/codex.ts'
 import { writerPrompt } from './writer.ts'
@@ -1519,6 +1522,27 @@ function agents(args: string[], env: Env, cwd: string): Result {
   return { code: 0, out: { written, removed, next: 'reabre la sesión para que el CLI cargue los agentes y la skill' } }
 }
 
+/**
+ * El estado de los flujos SDD de `.plans/`. `status` solo lee y sale con 0 aunque el flujo esté
+ * bloqueado; `approve` registra la aprobación de un gate y responde el estado nuevo.
+ */
+function sdd(args: string[], cwd: string): Result {
+  const [sub, ...rest] = args
+  if (sub === 'status') {
+    const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { json: { type: 'boolean', default: false } } })
+    if (positionals.length > 1) throw new SddError('usage', 'sdd status recibe un solo id', { next: './bin/sdd-ai sdd status [<id>]' })
+    const root = repoRoot(cwd)
+    if (positionals.length === 0) return { code: 0, out: { flows: listFlows(root) } }
+    return { code: 0, out: resolveFlow(readFlow(root, positionals[0]).facts) }
+  }
+  if (sub === 'approve') {
+    const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: {} })
+    if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate>' })
+    return { code: 0, out: approve(repoRoot(cwd), positionals[0], positionals[1], new Date()) }
+  }
+  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate>' })
+}
+
 export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {
   const [cmd, ...rest] = argv
   try {
@@ -1528,17 +1552,18 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'wait': return await wait(rest, env, cwd)
       case 'cancel': return await cancel(rest, cwd)
       case 'agents': return agents(rest, env, cwd)
+      case 'sdd': return sdd(rest, cwd)
       case 'doctor': {
         const report = doctor()
         return { code: report.ok ? 0 : 1, out: report }
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }
       default:
-        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa run | review | wait | cancel | agents sync | doctor' })
+        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa run | review | wait | cancel | agents sync | sdd status | sdd approve | doctor' })
     }
   } catch (e) {
     if (e instanceof SddError) {
-      return { code: e.code === 'run_not_found' ? 1 : 2, out: { state: 'error', code: e.code, message: e.message, detail: e.detail, next: e.next } }
+      return { code: e.code === 'run_not_found' || e.code === 'flow_not_found' ? 1 : 2, out: { state: 'error', code: e.code, message: e.message, detail: e.detail, next: e.next } }
     }
     if ((e as { code?: string }).code?.startsWith('ERR_PARSE_ARGS')) {
       return { code: 2, out: { state: 'error', code: 'usage', message: (e as Error).message } }

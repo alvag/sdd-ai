@@ -391,8 +391,8 @@ puede comprobar: ese se niega.
 - **`PostToolUse`**, sobre todas las herramientas: confirma la reserva de un despacho y cuenta la
   herramienta para el recordatorio de sesión larga. En Claude Code, **`PostToolUseFailure`** libera
   la reserva de un despacho que falló.
-- **`PreToolUse` sobre `Bash`**: dentro de un subagente, niega `sdd-ai run`, `review`, `wait` y
-  `cancel`. Un worker no delega ni toca las corridas del conductor.
+- **`PreToolUse` sobre `Bash`**: dentro de un subagente, niega `sdd-ai run`, `review`, `wait`,
+  `cancel` y `sdd approve`. Un worker no delega, no toca las corridas del conductor ni aprueba gates.
 
 Claude Code carga los hooks del repositorio sin pedir nada. Codex los ejecuta solo después de que el
 usuario los aprueba en `/hooks`, y vuelve a pedirlo cada vez que cambian sus definiciones.
@@ -446,3 +446,38 @@ Límites declarados:
 **Ante una negación, sigue el motivo**: dice qué correr, qué citar o que le preguntes al usuario. No
 busques un rodeo, como otro agente, otro nombre o lanzar el CLI a mano.
 
+## 9. El estado de un flujo SDD
+
+`sdd status` calcula el estado de un flujo de `.plans/<id>/` desde sus archivos, en solo lectura: su
+profundidad, sus gates, sus tasks, el paso siguiente y lo que lo bloquea. `sdd approve` registra la
+aprobación de un gate con la huella de sus artefactos y la de los gates anteriores: si después
+cambian, `status` devuelve el flujo a ese gate.
+
+```
+./bin/sdd-ai sdd status [<id>]
+./bin/sdd-ai sdd approve <id> <gate>
+```
+
+- **Lo que trae `sdd status <id>`**: `depth`, los `gates` de esa profundidad con su `state`
+  (`pending`, `approved`, `approved_unfingerprinted` o `stale`), las `tasks` con la primera pendiente,
+  `next` con su `step`, y `blocked_reasons` y `notes`, cada una con su `code` y su `detail`. Sale con 0
+  aunque el flujo esté bloqueado; con bloqueos, `next` es `resolve_blockers`. Sin id, lista los
+  flujos de `.plans/` con su `next`.
+- **`status` es el estado del flujo para sdd-ai, y `sdd-flow` sigue leyendo sus headers.** Cuando
+  discrepan, `status` lo dice en `notes`: `header_behind` si una aprobación registrada todavía no
+  llegó al header, y `header_ahead` si el header da por aprobado un gate cuya aprobación registrada
+  venció.
+- **`sdd approve` se corre solo después del "aprobado" explícito del usuario en ese gate**, nunca por
+  iniciativa propia, y antes de actualizar el header que pide `sdd-flow`. Los gates son `single` en
+  `corta`, `spec` y `plan-tasks` en `normal`, y `spec`, `plan` y `tasks` en `completa`.
+- **Un gate `approved_unfingerprinted`** es uno que el header da por aprobado sin una aprobación
+  registrada: un cambio en sus artefactos no se detecta. Regístralo con `sdd approve` solo si el
+  usuario confirma que lo que hay ahora es lo que aprobó.
+- **Ante `header_ahead`, el gate vuelve al usuario** antes de seguir con `sdd-flow`, que por su header
+  retomaría más adelante de lo que el registro sostiene.
+- **`next` no autoriza avanzar sobre un gate externo pendiente.** La nota `external_gate` dice que el
+  handoff espera la aprobación externa de la spec, y ahí `next` es `external_gate` en vez de
+  `implement`: seguir sin esa aprobación lo decide el usuario.
+- **El registro todavía no prueba que el usuario aprobó.** Lo escribe el conductor, y nada impide
+  correr `sdd approve` sin su "aprobado" ni editar el registro a mano. Un subagente no puede correrlo:
+  el hook lo niega (sección 8).

@@ -333,24 +333,30 @@ function postDispatch(p: Payload, root: string, action: 'confirm' | 'release'): 
   return ''
 }
 
+/** Los comandos de corridas; `sdd approve` se suma aparte, porque `sdd status` sí lo puede correr un worker. */
 const RUN_COMMANDS = new Set(['run', 'review', 'wait', 'cancel'])
 
-/** Si el tramo invoca `sdd-ai`, una ruta que termina en `bin/sdd-ai` o `node <ruta>/bin/sdd-ai`, con uno de los comandos de corridas. */
-function invokesRuns(segment: string): boolean {
+/**
+ * Si el tramo invoca `sdd-ai`, una ruta que termina en `bin/sdd-ai` o `node <ruta>/bin/sdd-ai`, con uno
+ * de los comandos de corridas o con `sdd approve`.
+ */
+function invokesConductorCommand(segment: string): boolean {
   const tokens = segment.trim().split(/\s+/)
   if (tokens[0] === 'node') tokens.shift()
-  const [bin, command] = tokens
-  return (bin === 'sdd-ai' || (bin ?? '').endsWith('bin/sdd-ai')) && RUN_COMMANDS.has(command ?? '')
+  const [bin, command, sub] = tokens
+  if (bin !== 'sdd-ai' && !(bin ?? '').endsWith('bin/sdd-ai')) return false
+  return RUN_COMMANDS.has(command ?? '') || (command === 'sdd' && sub === 'approve')
 }
 
 /**
- * Dentro de un subagente, un comando de shell no lanza ni toca corridas: esas son del conductor. Es
- * una guarda para el caso honesto; una variable o un script intermedio la esquivan.
+ * Dentro de un subagente, un comando de shell no lanza ni toca corridas, ni aprueba un gate: las dos
+ * cosas son del conductor. Es una guarda para el caso honesto; una variable o un script intermedio la
+ * esquivan.
  */
 function guardShell(p: Payload): string {
   if (typeof p.agent_id !== 'string' || p.agent_id === '') return ''
   const command = isRecord(p.tool_input) ? p.tool_input.command : undefined
   if (typeof command !== 'string') return ''
-  return shellSegments(command).some(invokesRuns) ? deny('un worker no delega ni toca las corridas del conductor') : ''
+  return shellSegments(command).some(invokesConductorCommand) ? deny('un worker no delega ni toca las corridas del conductor') : ''
 }
 

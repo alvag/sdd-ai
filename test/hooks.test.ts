@@ -745,3 +745,21 @@ test('fuera de un hijo nunca se niega un comando de shell', () => {
   }
 })
 
+test('dentro de un hijo se niega sdd approve en sus formas directas y no sdd status', () => {
+  const approves = WORKER_COMMANDS.map((c) => c.replace(/sdd-ai (run|review|wait|cancel)\b.*$/, 'sdd-ai sdd approve fase-x spec'))
+  assert.equal(approves.filter((c) => c.includes('sdd approve')).length, WORKER_COMMANDS.length)
+  for (const cli of CLIS) {
+    const repo = makeRepo()
+    mkdirSync(join(repo, '.sdd-ai'))
+    for (const command of approves) {
+      const out = shell(cli, repo, command, CHILD)
+      assert.match(denial(out), /un worker no delega ni toca las corridas del conductor/, command)
+      assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [], command)
+      assert.equal(shell(cli, repo, command), '', `fuera de un hijo: ${command}`)
+    }
+    for (const command of ['./bin/sdd-ai sdd status', './bin/sdd-ai sdd status fase-x', 'node /abs/repo/bin/sdd-ai sdd status fase-x --json']) {
+      assert.equal(shell(cli, repo, command, CHILD), '', command)
+    }
+  }
+})
+
