@@ -1,3 +1,4 @@
+import type { Proof } from '../approval/proof.ts'
 import type { HeaderResult, SectionState, TaskCount } from './markdown.ts'
 
 // El estado de un flujo SDD como función pura de sus hechos: no lee el disco, no mira el reloj y no
@@ -20,7 +21,8 @@ export const STATUSES = ['planned', 'plan-approved', 'tasks-ready', 'implementin
 export type PlanStatus = (typeof STATUSES)[number]
 
 export type FileState = 'absent' | 'empty' | 'present' | 'unreadable'
-export interface Approval { gate: GateId; depth: Depth; fingerprint: string; previous: Partial<Record<GateId, string>>; at: string }
+/** Una aprobación registrada; `proof` falta en las de antes de que `sdd approve` exigiera la respuesta del usuario. */
+export interface Approval { gate: GateId; depth: Depth; fingerprint: string; previous: Partial<Record<GateId, string>>; at: string; proof?: Proof }
 export type ApprovalLog = { state: 'absent' } | { state: 'invalid'; detail: string } | { state: 'ok'; approvals: Approval[] }
 export interface FlowFacts {
   id: string
@@ -153,6 +155,9 @@ export function resolveGates(facts: FlowFacts): GateResolution {
     let state: GateState
     if (last) {
       state = isFresh(last, facts.fingerprints) ? 'approved' : 'stale'
+      if (state === 'approved' && last.proof === undefined) {
+        notes.push({ code: 'approval_unproven', detail: `el gate ${gate} tiene una aprobación registrada sin prueba del runner: se registró antes de que sdd approve exigiera la respuesta del usuario` })
+      }
       if (state === 'approved' && !byHeader) {
         notes.push({ code: 'header_behind', detail: `el gate ${gate} tiene una aprobación registrada vigente que el header de sdd-flow todavía no refleja` })
       }
@@ -163,7 +168,7 @@ export function resolveGates(facts: FlowFacts): GateResolution {
       // Un gate aprobado cuyo artefacto quedó vacío vence; si lo que falta son las tasks, lo dice tasks_empty.
       state = missingParts(facts, gate).some((p) => p.step !== 'tasks') ? 'stale' : 'approved_unfingerprinted'
       if (state === 'approved_unfingerprinted') {
-        notes.push({ code: 'approved_unfingerprinted', detail: `el header de sdd-flow da por aprobado el gate ${gate} sin una aprobación registrada con sdd approve: un cambio en sus artefactos no se detecta` })
+        notes.push({ code: 'approved_unfingerprinted', detail: `el header de sdd-flow da por aprobado el gate ${gate} sin una aprobación registrada con sdd approve ni prueba del runner: un cambio en sus artefactos no se detecta` })
       }
     } else {
       state = 'pending'

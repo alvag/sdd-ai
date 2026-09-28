@@ -325,3 +325,20 @@ test('resolve da la misma respuesta con los mismos hechos, armados en memoria', 
   assert.deepEqual(resolve(facts), first)
   assert.deepEqual(resolve(structuredClone(facts)), first)
 })
+
+test('una aprobación sin proof cuenta y deja la nota approval_unproven', () => {
+  const proof = { runner: 'claude' as const, source: 'ask_user_question' as const, ref: 'tu-1:0123456789abcdef', session: 's-1', answered_at: '2026-09-28T12:00:00.000Z' }
+  const r = resolveGates(flow('completa', 'planned', {
+    handoffHeader: hdr({ profundidad: 'completa' }),
+    log: log(approval('spec', 'completa', FP.spec), { ...approval('plan', 'completa', FP.plan, { spec: FP.spec }), proof }),
+  }))
+  assert.deepEqual(states(r), { spec: 'approved', plan: 'approved', tasks: 'pending' })
+  assert.equal(noteFor(r, 'approval_unproven').length, 1)
+  assert.match(noteFor(r, 'approval_unproven')[0], /gate spec/)
+  assert.deepEqual(r.blocked, [])
+})
+
+test('la nota de approved_unfingerprinted dice que no tiene prueba del runner', () => {
+  const r = resolveGates(flow('completa', 'planned'))
+  assert.match(noteFor(r, 'approved_unfingerprinted')[0], /sin una aprobación registrada con sdd approve ni prueba del runner/)
+})

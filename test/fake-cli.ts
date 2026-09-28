@@ -12,6 +12,9 @@ const args = process.argv.slice(2)
 if (process.env.FAKE_CALLS_FILE) {
   appendFileSync(process.env.FAKE_CALLS_FILE, `${JSON.stringify(args)}\n`)
   appendFileSync(`${process.env.FAKE_CALLS_FILE}.cwd`, `${process.cwd()}\n`)
+  // Lo que había en un archivo cuando corrió el worker: prueba qué se escribió antes del lanzamiento.
+  const probe = process.env.FAKE_PROBE_FILE
+  if (probe) appendFileSync(`${process.env.FAKE_CALLS_FILE}.probe`, `${existsSync(probe) ? readFileSync(probe, 'utf8').trim() : 'ausente'}\n`)
 }
 
 function okClaude(): void {

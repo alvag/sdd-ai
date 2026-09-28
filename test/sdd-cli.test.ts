@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import {
   appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, symlinkSync,
   writeFileSync,
@@ -10,7 +11,9 @@ import { join, relative } from 'node:path'
 import { approve } from '../src/sdd/approve.ts'
 import { readFlow } from '../src/sdd/read.ts'
 import { SddError } from '../src/types.ts'
-import { makeRepo } from './helpers.ts'
+import { prove } from '../src/approval/proof.ts'
+import { gateQuestionFor, renderForText } from '../src/approval/question.ts'
+import { answerGate, askPair, codexItem, makeRepo, writeClaudeTranscript, writeCodexRollout } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 
@@ -21,9 +24,25 @@ const handoff = (depth = 'completa') => `---\nphase: implementing\nprofundidad: 
 
 interface Out { code: number | null; out: Record<string, any> }
 
+const sessions = new Map<string, Record<string, string>>()
+
+/**
+ * El entorno de una sesión de Claude Code de fixture, una por repo, con su transcript fuera del repo. Los
+ * comandos no heredan la sesión real del proceso que corre los tests.
+ */
+function envOf(repo: string): Record<string, string> {
+  let env = sessions.get(repo)
+  if (env === undefined) {
+    env = { HOME: process.env.HOME ?? '', PATH: process.env.PATH ?? '', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: outsideDir() }
+    sessions.set(repo, env)
+  }
+  return env
+}
+const answer = (repo: string, id: string, gate: string) => answerGate(repo, envOf(repo), id, gate)
+
 /** Corre `sdd-ai sdd …` con un tope de 5 s: un comando que abre un FIFO para leer se cuelga y no llega a responder. */
 function sdd(repo: string, ...args: string[]): Out {
-  const r = spawnSync(BIN, ['sdd', ...args], { cwd: repo, encoding: 'utf8', timeout: 5000 })
+  const r = spawnSync(BIN, ['sdd', ...args], { cwd: repo, encoding: 'utf8', timeout: 5000, env: envOf(repo) })
   assert.equal(r.error, undefined, `sdd ${args.join(' ')}: ${String(r.error)}`)
   return { code: r.status, out: JSON.parse(r.stdout) }
 }
@@ -37,6 +56,12 @@ function writeFlow(repo: string, id: string, files: Record<string, string>): str
 
 const completa = (repo: string, id = 'f', status = 'implementing') =>
   writeFlow(repo, id, { 'spec.md': SPEC, 'plan.md': plan(status), 'tasks.md': TASKS, 'handoff.md': handoff() })
+/** El árbol sin el `mtime` de los directorios: un lock temporal que se crea y se borra lo cambia y no cuenta como escritura. */
+const files = (repo: string) => tree(repo).map((l) => (l.split(' ')[1] === 'd' ? l.split(' ').slice(0, 2).join(' ') : l))
+
+/** Un flujo en el gate de la spec: sin plan, y con un handoff que todavía no la aprobó. */
+const specOnly = (repo: string, id = 'f') =>
+  writeFlow(repo, id, { 'spec.md': SPEC, 'handoff.md': '---\nprofundidad: completa\nspec_approved_at: null\n---\n\n# Handoff\n' })
 const mkfifo = (path: string) => execFileSync('mkfifo', [path])
 const outsideDir = () => realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-outside-')))
 const codes = (reasons: Array<{ code: string }>) => reasons.map((r) => r.code)
@@ -220,7 +245,7 @@ const corta = (status: string, spec = '- AC-1: algo observable.', tasks = '- [ ]
 /** Lanza `sdd approve` sin esperar: dos de estos compiten por el mismo flujo. */
 function approveAsync(repo: string, gate: string): Promise<Out> {
   return new Promise((done) => {
-    const child = spawn(BIN, ['sdd', 'approve', 'f', gate], { cwd: repo })
+    const child = spawn(BIN, ['sdd', 'approve', 'f', gate], { cwd: repo, env: envOf(repo) })
     let stdout = ''
     child.stdout.on('data', (b: Buffer) => { stdout += b.toString('utf8') })
     child.on('close', (code) => done({ code, out: JSON.parse(stdout) }))
@@ -233,19 +258,21 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
   const artifacts = ['spec.md', 'plan.md', 'tasks.md', 'handoff.md']
   const before = artifacts.map((n) => `${readFileSync(join(dir, n), 'utf8')} ${lstatSync(join(dir, n)).mtimeMs}`)
 
+  answer(repo, 'f', 'spec')
   const spec = sdd(repo, 'approve', 'f', 'spec')
   assert.equal(spec.code, 0, JSON.stringify(spec.out))
   assert.deepEqual(gateStates(spec.out), { spec: 'approved', plan: 'pending', tasks: 'pending' })
   assert.deepEqual(spec.out.next, { step: 'gate', gate: 'plan', artifacts: ['plan.md'] })
   const [first] = registry(dir).approvals
   assert.equal(registry(dir).schema_version, 1)
-  assert.deepEqual(Object.keys(first), ['gate', 'depth', 'fingerprint', 'previous', 'at'])
+  assert.deepEqual(Object.keys(first), ['gate', 'depth', 'fingerprint', 'previous', 'at', 'proof'])
   assert.equal(first.gate, 'spec')
   assert.equal(first.depth, 'completa')
   assert.match(first.fingerprint, FINGERPRINT)
   assert.deepEqual(first.previous, {})
   assert.ok(!Number.isNaN(Date.parse(first.at)))
 
+  answer(repo, 'f', 'plan')
   const plan = sdd(repo, 'approve', 'f', 'plan')
   assert.equal(plan.code, 0, JSON.stringify(plan.out))
   assert.deepEqual(gateStates(plan.out), { spec: 'approved', plan: 'approved', tasks: 'pending' })
@@ -253,7 +280,10 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
   const second = registry(dir).approvals[1]
   assert.equal(second.gate, 'plan')
   assert.deepEqual(second.previous, { spec: first.fingerprint })
-  assert.deepEqual(sdd(repo, 'status', 'f').out, plan.out)
+  // Solo `status` trae la pregunta del gate siguiente.
+  const { question, ...next } = sdd(repo, 'status', 'f').out.next
+  assert.equal(typeof question?.question, 'string')
+  assert.deepEqual({ ...sdd(repo, 'status', 'f').out, next }, plan.out)
 
   assert.deepEqual(artifacts.map((n) => `${readFileSync(join(dir, n), 'utf8')} ${lstatSync(join(dir, n)).mtimeMs}`), before)
   assert.equal(existsSync(join(dir, LOCK)), false)
@@ -318,6 +348,8 @@ test('dos approve concurrentes sobre el mismo flujo no pierden entradas: uno reg
   for (let i = 0; i < 3; i++) {
     const repo = makeRepo()
     const dir = completa(repo, 'f', 'plan-approved')
+    answer(repo, 'f', 'spec')
+    answer(repo, 'f', 'plan')
     const results = await Promise.all([approveAsync(repo, 'spec'), approveAsync(repo, 'plan')])
     const approved = results.filter((r) => r.code === 0)
     assert.ok(approved.length >= 1, JSON.stringify(results.map((r) => r.out)))
@@ -351,6 +383,110 @@ test('un lock existente, también de un proceso muerto o que sea un enlace, rech
   assert.equal(existsSync(join(linked, REGISTRY)), false)
 })
 
+const LOCK_TS = join(import.meta.dirname, '..', 'src', 'lock.ts')
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** Espera una línea de `stdout` de un hijo que empiece con `prefix`. */
+function lineFrom(child: ReturnType<typeof spawn>, prefix: string): Promise<string> {
+  return new Promise((done, fail) => {
+    let buf = ''
+    const on = (b: Buffer) => {
+      buf += b.toString('utf8')
+      const line = buf.split('\n').find((l) => l.startsWith(prefix))
+      if (line !== undefined) {
+        child.stdout?.off('data', on)
+        done(line)
+      }
+    }
+    child.stdout?.on('data', on)
+    child.on('close', () => fail(new Error(`el hijo terminó sin escribir ${prefix}: ${buf}`)))
+  })
+}
+
+test('un lock de un proceso muerto o reciclado, o sin lstart como los de 5a, rechaza enseguida sin robarlo', () => {
+  const locks = [
+    `${JSON.stringify({ pid: 999999, lstart: 'Mon Sep 28 10:00:00 2026' })}\n`,
+    `${JSON.stringify({ pid: process.pid, lstart: 'Thu Jan  1 00:00:00 2001' })}\n`,
+    '999999\n',
+  ]
+  for (const content of locks) {
+    const repo = makeRepo()
+    const dir = completa(repo, 'f', 'planned')
+    writeFileSync(join(dir, LOCK), content)
+    const started = Date.now()
+    const r = sdd(repo, 'approve', 'f', 'spec')
+    assert.ok(Date.now() - started < 4000, content)
+    assert.equal(r.code, 2, content)
+    assert.equal(r.out.code, 'approve_in_progress', `${content}: ${JSON.stringify(r.out)}`)
+    assert.equal(readFileSync(join(dir, LOCK), 'utf8'), content)
+    assert.equal(existsSync(join(dir, REGISTRY)), false)
+  }
+})
+
+test('el lock nace completo: un competidor nunca lo ve vacío', async () => {
+  const { withLock } = await import('../src/lock.ts')
+  const dir = outsideDir()
+  const lock = join(dir, 'x.lock')
+  const seen = join(dir, 'visto')
+  const stop = join(dir, 'fin')
+  const probe = `const fs = require('fs'); const [lock, seen, stop] = process.argv.slice(1)
+let complete = 0, empty = 0, partial = 0, flagged = false
+process.stdout.write('listo\\n')
+while (!fs.existsSync(stop)) {
+  let t
+  try { t = fs.readFileSync(lock, 'utf8') } catch { continue }
+  if (t === '') empty++
+  else { try { const v = JSON.parse(t); if (typeof v.pid === 'number') complete++; else partial++ } catch { partial++ } }
+  if (complete > 0 && !flagged) { fs.writeFileSync(seen, ''); flagged = true }
+}
+process.stdout.write(JSON.stringify({ complete, empty, partial }) + '\\n')`
+  const child = spawn(process.execPath, ['-e', probe, lock, seen, stop])
+  await lineFrom(child, 'listo')
+  const busy = () => new SddError('busy', 'ocupado')
+  withLock(lock, busy, () => {
+    const until = Date.now() + 5000
+    while (!existsSync(seen) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+  })
+  for (let i = 0; i < 200; i++) withLock(lock, busy, () => undefined)
+  const report = lineFrom(child, '{')
+  writeFileSync(stop, '')
+  const counts = JSON.parse(await report)
+  assert.deepEqual({ empty: counts.empty, partial: counts.partial }, { empty: 0, partial: 0 })
+  assert.ok(counts.complete >= 1, JSON.stringify(counts))
+})
+
+test('con un titular vivo que retiene el lock, el segundo comando espera y registra al soltarse', async () => {
+  const repo = makeRepo()
+  const dir = completa(repo, 'f', 'planned')
+  const release = join(outsideDir(), 'soltar')
+  const holder = `import { withLock } from ${JSON.stringify(LOCK_TS)}
+import { existsSync } from 'node:fs'
+const [lock, release] = process.argv.slice(1)
+withLock(lock, () => new Error('ocupado'), () => {
+  process.stdout.write('tomado\\n')
+  while (!existsSync(release)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+})`
+  const child = spawn(process.execPath, ['--input-type=module', '-e', holder, join(dir, LOCK), release])
+  let r: Out
+  try {
+    await lineFrom(child, 'tomado')
+    let finished = false
+    answer(repo, 'f', 'spec')
+    const second = approveAsync(repo, 'spec').then((x) => { finished = true; return x })
+    await wait(800)
+    assert.equal(finished, false)
+    assert.equal(existsSync(join(dir, REGISTRY)), false)
+    writeFileSync(release, '')
+    r = await second
+  } finally {
+    writeFileSync(release, '')
+    child.kill()
+  }
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual(registry(dir).approvals.map((a: { gate: string }) => a.gate), ['spec'])
+  assert.equal(existsSync(join(dir, LOCK)), false)
+})
+
 test('un registro corrupto, uno que parsea pero no cumple el esquema (un gate de otra profundidad, anteriores incompletos) o un artefacto ilegible bloquean status y approve los rechaza', () => {
   const repo = makeRepo()
   const fp = `sha256:${'a'.repeat(64)}`
@@ -382,18 +518,22 @@ test('un registro corrupto, uno que parsea pero no cumple el esquema (un gate de
 test('editar la spec aprobada la devuelve a su gate y reaprobarla deja vencidos plan y tasks', () => {
   const repo = makeRepo()
   const dir = completa(repo)
-  for (const gate of ['spec', 'plan', 'tasks']) assert.equal(sdd(repo, 'approve', 'f', gate).code, 0, gate)
+  for (const gate of ['spec', 'plan', 'tasks']) {
+    answer(repo, 'f', gate)
+    assert.equal(sdd(repo, 'approve', 'f', gate).code, 0, gate)
+  }
   assert.deepEqual(gateStates(sdd(repo, 'status', 'f').out), { spec: 'approved', plan: 'approved', tasks: 'approved' })
 
   writeFileSync(join(dir, 'spec.md'), SPEC.replace('algo observable', 'algo más observable'))
   const edited = sdd(repo, 'status', 'f').out
   assert.deepEqual(gateStates(edited), { spec: 'stale', plan: 'stale', tasks: 'stale' })
-  assert.deepEqual(edited.next, { step: 'gate', gate: 'spec', artifacts: ['spec.md'] })
+  assert.deepEqual({ ...edited.next, question: undefined }, { step: 'gate', gate: 'spec', artifacts: ['spec.md'], question: undefined })
 
+  answer(repo, 'f', 'spec')
   assert.equal(sdd(repo, 'approve', 'f', 'spec').code, 0)
   const reapproved = sdd(repo, 'status', 'f').out
   assert.deepEqual(gateStates(reapproved), { spec: 'approved', plan: 'stale', tasks: 'stale' })
-  assert.deepEqual(reapproved.next, { step: 'gate', gate: 'plan', artifacts: ['plan.md'] })
+  assert.deepEqual({ ...reapproved.next, question: undefined }, { step: 'gate', gate: 'plan', artifacts: ['plan.md'], question: undefined })
 })
 
 test('approve single rechaza una sección Spec o Tasks vacía', () => {
@@ -410,7 +550,10 @@ test('approve single rechaza una sección Spec o Tasks vacía', () => {
 test('tras approve, los cambios inocuos no vencen plan-tasks ni single y los sustantivos sí', () => {
   const repo = makeRepo()
   const normal = writeFlow(repo, 'f', { 'spec.md': SPEC, 'plan.md': plan('planned', 'normal'), 'tasks.md': TASKS, 'handoff.md': handoff('normal') })
-  for (const gate of ['spec', 'plan-tasks']) assert.equal(sdd(repo, 'approve', 'f', gate).code, 0, gate)
+  for (const gate of ['spec', 'plan-tasks']) {
+    answer(repo, 'f', gate)
+    assert.equal(sdd(repo, 'approve', 'f', gate).code, 0, gate)
+  }
   writeFileSync(join(normal, 'plan.md'), plan('implementing', 'normal'))
   writeFileSync(join(normal, 'tasks.md'), TASKS.replace('- [ ] **T2', '- [x] **T2'))
   assert.equal(gateStates(sdd(repo, 'status', 'f').out)['plan-tasks'], 'approved')
@@ -418,9 +561,133 @@ test('tras approve, los cambios inocuos no vencen plan-tasks ni single y los sus
   assert.equal(gateStates(sdd(repo, 'status', 'f').out)['plan-tasks'], 'stale')
 
   const single = writeFlow(repo, 'c', { 'plan.md': corta('planned'), 'handoff.md': handoff('corta') })
+  answer(repo, 'c', 'single')
   assert.equal(sdd(repo, 'approve', 'c', 'single').code, 0)
   writeFileSync(join(single, 'plan.md'), corta('implementing', undefined, '- [x] T1 — hacerlo\n- [ ] T2 — probarlo'))
   assert.deepEqual(gateStates(sdd(repo, 'status', 'c').out), { single: 'approved' })
   writeFileSync(join(single, 'plan.md'), corta('implementing', undefined, '- [x] T1 — hacerlo\n- [ ] T2 — probarlo dos veces'))
   assert.deepEqual(gateStates(sdd(repo, 'status', 'c').out), { single: 'stale' })
+})
+
+test('approve exige la respuesta del usuario y sin ella no escribe nada', () => {
+  const repo = makeRepo()
+  const dir = specOnly(repo)
+  const before = files(repo)
+  const question = sdd(repo, 'status', 'f').out.next.question
+  const missing = sdd(repo, 'approve', 'f', 'spec')
+  assert.equal(missing.code, 2)
+  assert.equal(missing.out.code, 'approval_missing', JSON.stringify(missing.out))
+  assert.ok(missing.out.next.includes(question.question), missing.out.next)
+  answerGate(repo, envOf(repo), 'f', 'spec', 'No aprobar')
+  const contradicted = sdd(repo, 'approve', 'f', 'spec')
+  assert.equal(contradicted.out.code, 'approval_contradicted', JSON.stringify(contradicted.out))
+  assert.deepEqual(files(repo), before)
+  assert.equal(existsSync(join(dir, LOCK)), false)
+})
+
+test('approve con el entorno de un worker rechaza con runner_required', () => {
+  const repo = makeRepo()
+  const dir = completa(repo, 'f', 'planned')
+  answer(repo, 'f', 'spec')
+  const r = spawnSync(BIN, ['sdd', 'approve', 'f', 'spec'], { cwd: repo, encoding: 'utf8', timeout: 5000, env: { ...envOf(repo), SDD_AI_WORKER: '1' } })
+  const out = JSON.parse(r.stdout)
+  assert.equal(r.status, 2)
+  assert.equal(out.code, 'runner_required')
+  assert.match(out.next, /usuario/)
+  assert.equal(existsSync(join(dir, REGISTRY)), false)
+})
+
+test('sdd approve --conductor elige la sesión cuando están las dos señales', () => {
+  const repo = makeRepo()
+  const dir = completa(repo, 'f', 'planned')
+  const codexHome = outsideDir()
+  const env = { ...envOf(repo), CODEX_THREAD_ID: 't-1', CODEX_SESSION_ID: 'c-1', CODEX_HOME: codexHome }
+  const { facts } = readFlow(repo, 'f')
+  const q = gateQuestionFor('f', 'completa', 'spec', facts.fingerprints)
+  writeCodexRollout(codexHome, 'c-1', [codexItem('AgentMessage', renderForText(q)), codexItem('UserMessage', 'Aprobar', { id: 'um-1' })])
+  const run = (...extra: string[]) => {
+    const r = spawnSync(BIN, ['sdd', 'approve', 'f', 'spec', ...extra], { cwd: repo, encoding: 'utf8', timeout: 5000, env })
+    return { code: r.status, out: JSON.parse(r.stdout) }
+  }
+  assert.equal(run().out.code, 'conductor_unknown')
+  assert.equal(run('--conductor', 'claude').out.code, 'approval_missing')
+  assert.equal(existsSync(join(dir, REGISTRY)), false)
+  assert.equal(run('--conductor', 'codex').code, 0)
+  assert.deepEqual(registry(dir).approvals[0].proof, { runner: 'codex', source: 'rollout_message', ref: 'um-1', session: 'c-1', answered_at: '2026-09-28T12:00:00.000Z' })
+})
+
+test('sdd status trae next.question en el paso gate', () => {
+  const repo = makeRepo()
+  specOnly(repo)
+  const out = sdd(repo, 'status', 'f').out
+  assert.deepEqual(out.next.question, gateQuestionFor('f', 'completa', 'spec', readFlow(repo, 'f').facts.fingerprints))
+  assert.deepEqual(Object.keys(out.next), ['step', 'gate', 'artifacts', 'question'])
+  const other = makeRepo()
+  completa(other, 'f', 'implementing')
+  assert.equal('question' in sdd(other, 'status', 'f').out.next, false)
+})
+
+test('una respuesta posterior a la lectura, también una que llega antes de la escritura, no revoca la decisión', () => {
+  const repo = makeRepo()
+  const dir = completa(repo, 'f', 'planned')
+  const env = envOf(repo)
+  const q = answer(repo, 'f', 'spec')
+  const late: typeof prove = (o) => {
+    const proof = prove(o)
+    writeClaudeTranscript(env.CLAUDE_CONFIG_DIR, env.CLAUDE_CODE_SESSION_ID, askPair(env.CLAUDE_CODE_SESSION_ID, 'tu-late', q, 'No aprobar'))
+    return proof
+  }
+  approve(repo, 'f', 'spec', new Date(), readFlow, late, env)
+  const [entry] = registry(dir).approvals
+  assert.equal(entry.gate, 'spec')
+  assert.notEqual(entry.proof.ref.split(':')[0], 'tu-late')
+  assert.throws(() => approve(repo, 'f', 'spec', new Date(), readFlow, prove, env), (e: unknown) => e instanceof SddError && e.code === 'approval_contradicted')
+})
+
+test('una respuesta a la huella anterior no aprueba la actual', () => {
+  const repo = makeRepo()
+  const dir = specOnly(repo)
+  answer(repo, 'f', 'spec')
+  writeFileSync(join(dir, 'spec.md'), SPEC.replace('algo observable', 'algo distinto'))
+  const fresh = sdd(repo, 'status', 'f').out.next.question
+  const r = sdd(repo, 'approve', 'f', 'spec')
+  assert.equal(r.out.code, 'approval_missing', JSON.stringify(r.out))
+  assert.ok(r.out.next.includes(fresh.question))
+  assert.equal(existsSync(join(dir, REGISTRY)), false)
+})
+
+test('una prueba usada rechaza con approval_reused', () => {
+  const repo = makeRepo()
+  const dir = completa(repo, 'f', 'planned')
+  answer(repo, 'f', 'spec')
+  assert.equal(sdd(repo, 'approve', 'f', 'spec').code, 0)
+  writeFileSync(join(dir, 'spec.md'), SPEC.replace('algo observable', 'algo distinto'))
+  assert.equal(gateStates(sdd(repo, 'status', 'f').out).spec, 'stale')
+  writeFileSync(join(dir, 'spec.md'), SPEC)
+  const r = sdd(repo, 'approve', 'f', 'spec')
+  assert.equal(r.out.code, 'approval_reused', JSON.stringify(r.out))
+  assert.equal(registry(dir).approvals.length, 1)
+})
+
+test('la entrada registrada trae proof con runner, source, ref, session y answered_at', () => {
+  const repo = makeRepo()
+  const dir = completa(repo, 'f', 'planned')
+  answer(repo, 'f', 'spec')
+  assert.equal(sdd(repo, 'approve', 'f', 'spec').code, 0)
+  const { proof } = registry(dir).approvals[0]
+  assert.deepEqual(Object.keys(proof), ['runner', 'source', 'ref', 'session', 'answered_at'])
+  assert.deepEqual({ runner: proof.runner, source: proof.source, session: proof.session },
+    { runner: 'claude', source: 'ask_user_question', session: envOf(repo).CLAUDE_CODE_SESSION_ID })
+  assert.match(proof.ref, /^tu-[0-9a-f]+:[0-9a-f]{16}$/)
+
+  // Un registro de 5a, sin proof, se sigue leyendo; uno con una prueba incompleta no sirve.
+  const old = completa(repo, 'viejo', 'planned')
+  const { proof: _, ...legacy } = registry(dir).approvals[0]
+  writeFileSync(join(old, REGISTRY), JSON.stringify({ schema_version: 1, approvals: [legacy] }))
+  const status = sdd(repo, 'status', 'viejo').out
+  assert.equal(gateStates(status).spec, 'approved')
+  assert.deepEqual(codes(status.blocked_reasons), [])
+  const broken = completa(repo, 'roto', 'planned')
+  writeFileSync(join(broken, REGISTRY), JSON.stringify({ schema_version: 1, approvals: [{ ...legacy, proof: { ...proof, ref: '' } }] }))
+  assert.deepEqual(codes(sdd(repo, 'status', 'roto').out.blocked_reasons), ['approvals_invalid'])
 })

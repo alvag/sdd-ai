@@ -2,8 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Finding } from '../src/review/admit.ts'
 import {
-  LENSES, type Ledger, REVIEWERS, type Reviewer, applyRefutation, applyRound, axesOf, byProvenance, decide, openLedger,
-  refutationBatch, targets, undecided,
+  LENSES, type Ledger, REVIEWERS, type Reviewer, applyRefutation, applyRound, axesOf, byProvenance, decide, disputable, lastRejection,
+  openLedger, refutationBatch, targets, undecided,
 } from '../src/review/ledger.ts'
 import { SddError } from '../src/types.ts'
 
@@ -251,4 +251,44 @@ test('en un artefacto, una regresión de la ronda N se abre aunque traiga causal
   const next = applyRound(l, 2, [{ id: 'F-1', answer: 'resolved' }], [grave('scope', 'pre-existing')])
   assert.equal(next.artifact, true)
   assert.deepEqual(next.entries.map((e) => [e.id, e.state]), [['F-1', 'resuelto'], ['F-2', 'abierto']])
+})
+
+/** Un ledger con F-1 en disputa después de la ronda 2: el conductor lo rechazó y el revisor lo mantuvo. */
+function disputed(): Ledger {
+  const l = decide(openLedger([grave('scope', 'introduced'), grave('quality', 'introduced')]), 'reject', ['F-1'], 'es intencional')
+  return applyRound(l, 2, [{ id: 'F-1', answer: 'maintained' }], [])
+}
+const proofOf = (ref: string) => ({ runner: 'claude' as const, source: 'ask_user_question' as const, ref, session: 's-1', answered_at: '2026-09-28T12:00:00.000Z' })
+
+test('disputable y lastRejection: una disputa, su redecisión en la misma ronda y el motivo del último rechazo', () => {
+  const l = disputed()
+  const [f1, f2] = l.entries
+  assert.equal(disputable(f1!, 2), true)
+  assert.equal(disputable(f2!, 2), false)
+  assert.equal(lastRejection(f1!), 'es intencional')
+  assert.equal(lastRejection(f2!), undefined)
+  const accepted = decide(l, 'accept', ['F-1'], undefined, { 'F-1': proofOf('r-1') })
+  const e = accepted.entries[0]!
+  assert.equal(e.state, 'aceptado')
+  assert.equal(disputable(e, 2), true)
+  assert.equal(disputable(e, 3), false)
+  assert.equal(lastRejection(e), 'es intencional')
+})
+
+test('decide con pruebas guarda en superseded la decisión reemplazada de una disputa o con prueba, y no la de un hallazgo común', () => {
+  const l = disputed()
+  const once = decide(l, 'accept', ['F-1'], undefined, { 'F-1': proofOf('r-1') })
+  assert.deepEqual(once.entries[0]!.decision, { action: 'accept', from: 'en-disputa', after_round: 2, proof: proofOf('r-1') })
+  assert.deepEqual(once.entries[0]!.superseded, [{ action: 'reject', reason: 'es intencional', from: 'abierto', after_round: 1 }])
+  const twice = decide(once, 'reject', ['F-1'], 'es intencional', { 'F-1': proofOf('r-2') })
+  assert.deepEqual(twice.entries[0]!.superseded?.map((d) => d.action), ['reject', 'accept'])
+  assert.deepEqual(twice.entries[0]!.decision?.proof, proofOf('r-2'))
+  assert.equal(twice.entries[0]!.state, 'cerrado')
+
+  // Un hallazgo común se redecide como siempre, y una decisión con prueba se guarda aunque ya no sea una disputa.
+  const common = decide(decide(l, 'accept', ['F-2']), 'reject', ['F-2'], 'no aplica')
+  assert.equal(common.entries[1]!.superseded, undefined)
+  const withProof = decide(decide(l, 'accept', ['F-2'], undefined, { 'F-2': proofOf('r-3') }), 'reject', ['F-2'], 'no aplica')
+  assert.deepEqual(withProof.entries[1]!.superseded?.map((d) => d.proof?.ref), ['r-3'])
+  assert.deepEqual(decide(l, 'accept', ['F-2']), decide(l, 'accept', ['F-2'], undefined, {}))
 })

@@ -113,7 +113,24 @@ function logProblem(data: unknown): string | null {
       return `${where}.previous no trae las huellas de ${previous.length > 0 ? previous.join(', ') : 'ningún gate'}`
     }
     if (typeof a.at !== 'string' || !ISO_8601.test(a.at) || Number.isNaN(Date.parse(a.at))) return `${where}.at no es una fecha ISO 8601`
+    if (a.proof !== undefined) {
+      const problem = proofProblem(a.proof)
+      if (problem !== null) return `${where}.proof ${problem}`
+    }
   }
+  return null
+}
+
+const SOURCE_OF = { claude: 'ask_user_question', codex: 'rollout_message' } as const
+
+/** Una prueba trae sus cinco campos como strings no vacíos, y su fuente es la de su runner. */
+function proofProblem(p: unknown): string | null {
+  if (!isRecord(p)) return 'no es un objeto'
+  for (const key of ['runner', 'source', 'ref', 'session', 'answered_at']) {
+    if (typeof p[key] !== 'string' || p[key] === '') return `no trae ${key} como texto no vacío`
+  }
+  if (p.runner !== 'claude' && p.runner !== 'codex') return 'tiene un runner que no es claude ni codex'
+  if (p.source !== SOURCE_OF[p.runner]) return `tiene una fuente que no es la de ${p.runner}`
   return null
 }
 

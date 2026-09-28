@@ -6,10 +6,14 @@ import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
 import { type RoleProfiles, agentName, agentsState, syncAgents } from './agents.ts'
+import { type Proof, askNext, prove } from './approval/proof.ts'
+import { DISPUTE_OPTIONS, type Question, disputeQuestion, extraOptions, extraQuestion, gateQuestionFor } from './approval/question.ts'
+import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, parseFamiliesFlag } from './config.ts'
 import { doctor } from './doctor.ts'
 import { buildIndex, dirtyPaths, gitDirs, headCommit, repoRoot } from './git.ts'
+import { withLock, withLockAsync } from './lock.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { nativeProfile, resolve } from './resolve.ts'
@@ -22,7 +26,7 @@ import {
 } from './review/candidate.ts'
 import { type PlannedJob, planJobs, planRoundJobs, sliceCandidate } from './review/batch.ts'
 import {
-  type Ledger, REVIEWERS, type Reviewer, type RoundPlan, axesOf, decide, targets, undecided, withProvenance,
+  type Ledger, REVIEWERS, type Reviewer, type RoundPlan, axesOf, decide, disputable, lastRejection, targets, undecided, withProvenance,
 } from './review/ledger.ts'
 import { fits, renderMaterial, renderReviewPrompt } from './review/prompt.ts'
 import { type Risk, type RiskRecord, classify, classifyDelta, readRisk } from './review/risk.ts'
@@ -670,36 +674,82 @@ function headOf(dir: string, req: ReviewRequest, n: number): string | undefined 
   return existsSync(file) ? readJson<RoundPlan>(file).head : undefined
 }
 
+/** El lock que serializa `review decide` y `review round` sobre una revisión. */
+const REVIEW_LOCK = 'review.lock'
+const reviewBusy = (dir: string) => existsSync(join(dir, REVIEW_LOCK))
+const busyNext = (id: string) => `otra operación de la revisión está en curso (decide o round); vuelve a consultar con ./bin/sdd-ai review status ${id}`
+
+/**
+ * Si `review round --extra` pasaría sus precondiciones: el tope alcanzado, hallazgos vigentes, ninguno
+ * sin decidir y los insumos sin cambiar. La vista y la ronda comparten este criterio.
+ */
+function extraLaunchable(ledger: Ledger, fresh: Freshness): boolean {
+  return ledger.completed >= ROUND_CAP && targets(ledger).length > 0 && undecided(ledger).length === 0 && fresh.stale_reason !== 'inputs'
+}
+
+/**
+ * Las preguntas que el conductor le hace al usuario: una por cada disputa que se puede decidir y, en el
+ * tope con hallazgos vigentes, la de la ronda extra. Solo con la ronda terminada y sin otra operación en
+ * curso, que son las condiciones en que la decisión se puede ejecutar.
+ */
+function questionsOf(id: string, dir: string, s: Status, ledger: Ledger, fresh: Freshness): Question[] {
+  if (!TERMINAL.has(s.state) || reviewBusy(dir)) return []
+  const out: Question[] = []
+  for (const e of ledger.entries) {
+    const reason = lastRejection(e)
+    if (disputable(e, ledger.completed) && reason !== undefined) out.push(disputeQuestion(id, e, ledger.completed, reason))
+  }
+  if (extraLaunchable(ledger, fresh)) out.push(extraQuestion(id, ledger.completed + 1))
+  return out
+}
+
+/** Cómo se hace una pregunta canónica de `questions` en cada runner. */
+const HOW_TO_ASK = 'en Claude Code, con AskUserQuestion, pasando tal cual su objeto de questions; en Codex, mostrando solo su texto con'
+  + ' las opciones numeradas como único contenido de un mensaje y esperando el próximo mensaje del usuario'
+
 /** Relanzar una ronda que no terminó: corre solo los trabajos que faltan, con el mismo ref que revisaba. */
-function relaunchNext(id: string, dir: string, req: ReviewRequest, s: Status, round: number, completed: number): string {
+function relaunchNext(id: string, dir: string, req: ReviewRequest, s: Status, round: number, completed: number, env: Env): string {
   const head = headOf(dir, req, round)
   const parts = [`./bin/sdd-ai review round ${id}`]
   if (head) parts.push(`--head ${shellArg(head)}`)
-  if (completed >= ROUND_CAP) parts.push('--extra')
-  return `la ronda ${round} terminó en ${s.state}; pregunta al usuario si la relanza: ${parts.join(' ')}`
+  if (completed < ROUND_CAP) return `la ronda ${round} terminó en ${s.state}; pregunta al usuario si la relanza: ${parts.join(' ')}`
+  parts.push('--extra')
+  // Una ronda extra se relanza con la respuesta que la autorizó, si todavía vale.
+  const reuse = extraReuse(env, undefined, dir, id, round)
+  const proof = reuse.reuse === true
+    ? `el relanzamiento reusa la respuesta que el usuario ya dio para la ronda ${round}`
+    : reuse.reuse === false
+      ? `el relanzamiento pide otra respuesta del usuario (${reuse.reason}): hazle la pregunta de la ronda ${round} de questions, ${HOW_TO_ASK}`
+      : `no se puede determinar si el relanzamiento reusa la respuesta del usuario sin elegir la sesión: ${reuse.reason}`
+  return `la ronda ${round} terminó en ${s.state}; pregunta al usuario si la relanza: ${parts.join(' ')}. ${proof}`
 }
 
 /**
  * El paso siguiente, por prioridad: esperar, relanzar una ronda que no terminó, decidir, preguntar
  * por las disputas, el checkpoint del tope, corregir y lanzar, y por último la vigencia.
  */
-function roundNext(root: string, id: string, dir: string, req: ReviewRequest, s: Status, round: number, ledger: Ledger, fresh: Freshness): string {
+function roundNext(root: string, id: string, dir: string, req: ReviewRequest, s: Status, round: number, ledger: Ledger, fresh: Freshness, env: Env): string {
+  if (reviewBusy(dir)) return busyNext(id)
   if (!TERMINAL.has(s.state)) return `./bin/sdd-ai wait ${id}`
   // Con un insumo cambiado, decidir o relanzar sería trabajo perdido: review round lo va a rechazar.
   if (fresh.stale_reason === 'inputs') return inputsChanged(id, req)
   // Una ronda que avanzó el ledger ya terminó aunque la hayan cancelado en la refutación.
-  if (s.state !== 'done' && ledger.completed !== round) return relaunchNext(id, dir, req, s, round, ledger.completed)
+  if (s.state !== 'done' && ledger.completed !== round) return relaunchNext(id, dir, req, s, round, ledger.completed, env)
   const disputes = ledger.entries.filter((e) => e.state === 'en-disputa').map((e) => e.id)
   const pending = undecided(ledger).filter((x) => !disputes.includes(x))
   if (pending.length > 0) {
     return `decide cada hallazgo (${pending.join(', ')}): ./bin/sdd-ai review decide ${id} accept <F-n>… para corregirlo, o reject <F-n>… --reason "<motivo verificable>"`
   }
   if (disputes.length > 0) {
-    return `pregunta al usuario por cada disputa (${disputes.join(', ')}): aceptar el hallazgo (./bin/sdd-ai review decide ${id} accept <F-n>) o mantener el rechazo (./bin/sdd-ai review decide ${id} reject <F-n> --reason "<motivo>")`
+    return `pregunta al usuario por cada disputa (${disputes.join(', ')}) con su pregunta canónica de questions, ${HOW_TO_ASK}.`
+      + ` Con su respuesta, aceptar el hallazgo (./bin/sdd-ai review decide ${id} accept <F-n>) o mantener el rechazo`
+      + ` (./bin/sdd-ai review decide ${id} reject <F-n>, con el motivo que mostró la pregunta)`
   }
   const goals = targets(ledger)
   if (goals.length > 0 && ledger.completed >= ROUND_CAP) {
-    return `se completaron ${ledger.completed} rondas y quedan hallazgos vigentes: pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está`
+    return `se completaron ${ledger.completed} rondas y quedan hallazgos vigentes: pregunta al usuario si quiere una ronda más`
+      + ` (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está, con la pregunta de la ronda ${ledger.completed + 1}`
+      + ` de questions, ${HOW_TO_ASK}`
   }
   const verify = goals.filter((t) => t.kind === 'verify').map((t) => t.id)
   if (verify.length > 0) return `corrige los aceptados (${verify.join(', ')}) y lanza ./bin/sdd-ai review round ${id}`
@@ -756,7 +806,7 @@ function artifactView(ledger: Ledger, rounds: RoundRecord[]): Record<string, unk
 }
 
 /** Lo que el conductor necesita de una revisión: estado, revisor, ledger, ejes, vigencia y el paso siguiente. */
-function reviewView(root: string, id: string, dir: string, s: Status): Result {
+function reviewView(root: string, id: string, dir: string, s: Status, env: Env): Result {
   const req = readJson<ReviewRequest>(join(dir, 'request.json'))
   const resolved = readJson<Resolution>(join(dir, 'resolved.json'))
   const round = s.round ?? 1
@@ -775,11 +825,12 @@ function reviewView(root: string, id: string, dir: string, s: Status): Result {
     const fresh = freshness(root, req, c, headOf(dir, req, 1))
     const out: Record<string, unknown> = {
       id, state: s.state, round, candidate_hash: c.hash, reviewer, degradations: req.degradations, risk: riskView(req),
-      ...roundShape(dir, s, round), ...fresh, ...common,
+      ...roundShape(dir, s, round), ...fresh, ...common, questions: [],
     }
-    if (!TERMINAL.has(s.state)) out.next = `./bin/sdd-ai wait ${id}`
+    if (reviewBusy(dir)) out.next = busyNext(id)
+    else if (!TERMINAL.has(s.state)) out.next = `./bin/sdd-ai wait ${id}`
     else if (fresh.stale_reason === 'inputs') out.next = inputsChanged(id, req)
-    else out.next = relaunchNext(id, dir, req, s, round, 0)
+    else out.next = relaunchNext(id, dir, req, s, round, 0, env)
     return { code, out }
   }
 
@@ -802,29 +853,169 @@ function reviewView(root: string, id: string, dir: string, s: Status): Result {
     tool_events: rounds.filter((r) => r.state === 'done').at(-1)?.tool_events ?? receipt.tool_events,
     ...(ledger.artifact ? artifactView(ledger, rounds) : {}),
     ...common,
-    next: roundNext(root, id, dir, req, s, round, ledger, fresh),
+    questions: questionsOf(id, dir, s, ledger, fresh),
+    next: roundNext(root, id, dir, req, s, round, ledger, fresh, env),
   }
   return { code, out }
 }
 
-/** Registra la decisión del conductor (o de la persona, en una disputa) y devuelve la vista actualizada. */
-function reviewDecide(args: string[], cwd: string): Result {
-  const { values, positionals } = parseArgs({ args, strict: true, allowPositionals: true, options: { reason: { type: 'string' } } })
+/** Las pruebas de las rondas extra, en `extra-approvals.json`: las entradas solo se agregan. */
+interface ExtraApprovals { schema_version: 1; rounds: Array<{ round: number; proof: Proof }> }
+const EXTRA_APPROVALS = 'extra-approvals.json'
+function readExtraApprovals(dir: string): ExtraApprovals {
+  const file = join(dir, EXTRA_APPROVALS)
+  return existsSync(file) ? readJson<ExtraApprovals>(file) : { schema_version: 1, rounds: [] }
+}
+
+/** Las respuestas ya usadas en la revisión: las de sus decisiones, también las reemplazadas, y las de sus rondas extra. */
+function consumedRefs(ledger: Ledger | undefined, dir: string): Set<string> {
+  const refs = new Set<string>()
+  for (const e of ledger?.entries ?? []) {
+    for (const d of [...(e.superseded ?? []), ...(e.decision ? [e.decision] : [])]) if (d.proof) refs.add(d.proof.ref)
+  }
+  for (const r of readExtraApprovals(dir).rounds) refs.add(r.proof.ref)
+  return refs
+}
+
+/** Si relanzar la ronda extra `round` puede reusar su prueba registrada, o por qué no; con dos sesiones no se puede saber. */
+export type ExtraReuse = { reuse: true; proof: Proof } | { reuse: false; reason: string } | { reuse: 'unknown'; reason: string }
+
+/**
+ * La prueba vigente de la ronda sirve para relanzarla si es de esta misma sesión y su respuesta sigue
+ * siendo la última a esa pregunta: así se descarta un `Dejar` posterior. Si el archivo de la sesión no
+ * se puede leer, no se puede descartar, y se pide otra respuesta.
+ */
+export function extraReuse(env: Env, conductor: Family | undefined, dir: string, id: string, round: number): ExtraReuse {
+  const last = readExtraApprovals(dir).rounds.filter((r) => r.round === round).at(-1)
+  if (last === undefined) return { reuse: false, reason: `la ronda ${round} no tiene una respuesta registrada` }
+  let r: Runner
+  try {
+    r = detectRunner(env, conductor)
+  } catch (e) {
+    if (e instanceof SddError && e.code === 'conductor_unknown') {
+      return { reuse: 'unknown', reason: 'el entorno tiene la sesión de Claude Code y la de Codex: review round --extra --conductor claude|codex elige de cuál se lee' }
+    }
+    return { reuse: false, reason: 'el entorno no identifica la sesión de un runner' }
+  }
+  if (r.runner !== last.proof.runner || r.session !== last.proof.session) return { reuse: false, reason: 'la respuesta se dio en otra sesión' }
+  try {
+    const answers = answersFor(r, readTail(sessionFile(env, r)), extraQuestion(id, round))
+    if (answers.at(-1)?.ref !== last.proof.ref) return { reuse: false, reason: 'una respuesta posterior a la misma pregunta la reemplazó' }
+  } catch {
+    return { reuse: false, reason: 'no se pudo leer el archivo de la sesión para descartar una respuesta posterior' }
+  }
+  return { reuse: true, proof: last.proof }
+}
+
+/** El tope sin `--extra`: la ronda siguiente la decide el usuario con la pregunta canónica. */
+const roundCap = (id: string, completed: number) =>
+  new SddError('round_cap', `la revisión ya hizo ${ROUND_CAP} rondas y quedan hallazgos vigentes`, {
+    next: `pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está: `
+      + askNext(extraQuestion(id, completed + 1)),
+  })
+
+/** La respuesta nueva que autoriza la ronda extra `n`, o `undefined` si el relanzamiento reusa la registrada. */
+function extraProof(env: Env, conductor: Family | undefined, dir: string, id: string, n: number, ledger: Ledger | undefined): Proof | undefined {
+  if (extraReuse(env, conductor, dir, id, n).reuse === true) return undefined
+  return prove({ env, conductor, q: extraQuestion(id, n), authorizes: extraOptions(n).launch, consumed: consumedRefs(ledger, dir) })
+}
+
+/** Agrega la prueba de la ronda `n`: la vigente es la última con ese número. */
+function registerExtra(dir: string, n: number, proof: Proof | undefined): void {
+  if (proof === undefined) return
+  const current = readExtraApprovals(dir)
+  writeJsonAtomic(join(dir, EXTRA_APPROVALS), { schema_version: 1, rounds: [...current.rounds, { round: n, proof }] })
+}
+
+const reviewInProgress = (id: string) => () => new SddError('review_in_progress', `otra operación tiene tomada la revisión ${id}`, {
+  next: `si no hay otro review decide ni review round corriendo, borra .sdd-ai/runs/${id}/${REVIEW_LOCK} y vuelve a correr el comando`,
+})
+const decisionConflict = (id: string, what: string) => new SddError('decision_conflict', `otro comando registró ${what} mientras este esperaba`, {
+  next: `corre ./bin/sdd-ai review status ${id} para ver el estado nuevo`,
+})
+
+/**
+ * Registra la decisión del conductor, o la del usuario en una disputa, y devuelve la vista actualizada.
+ * Cada disputa exige la respuesta del usuario a su pregunta canónica. Todo se valida con la revisión
+ * tomada y sobre lo que se relee ahí; la vista se arma después de soltarla.
+ */
+function reviewDecide(args: string[], env: Env, cwd: string): Result {
+  const { values, positionals } = parseArgs({
+    args, strict: true, allowPositionals: true, options: { reason: { type: 'string' }, conductor: { type: 'string' } },
+  })
   const [id, action, ...ids] = positionals
-  if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review decide <id> accept|reject <F-n>… [--reason <motivo>]' })
+  if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review decide <id> accept|reject <F-n>… [--reason <motivo>] [--conductor claude|codex]' })
+  const conductor = conductorFlag(values.conductor)
   const root = repoRoot(cwd)
   const dir = runDir(root, id)
-  if (!TERMINAL.has(readStatus(dir).state)) {
-    throw new SddError('usage', 'la ronda está en curso: se decide cuando termine', { next: `./bin/sdd-ai wait ${id}` })
-  }
   const file = join(dir, 'ledger.json')
-  if (!existsSync(file)) throw new SddError('usage', 'la revisión no tiene hallazgos admitidos que decidir', { next: `./bin/sdd-ai review status ${id}` })
-  if (action !== 'accept' && action !== 'reject') {
-    throw new SddError('usage', `acción desconocida: ${action ?? ''}`, { next: 'usa accept o reject' })
+  const check = () => {
+    if (!TERMINAL.has(readStatus(dir).state)) {
+      throw new SddError('usage', 'la ronda está en curso: se decide cuando termine', { next: `./bin/sdd-ai wait ${id}` })
+    }
+    if (!existsSync(file)) throw new SddError('usage', 'la revisión no tiene hallazgos admitidos que decidir', { next: `./bin/sdd-ai review status ${id}` })
+    if (action !== 'accept' && action !== 'reject') {
+      throw new SddError('usage', `acción desconocida: ${action ?? ''}`, { next: 'usa accept o reject' })
+    }
+    return readJson<Ledger>(file)
   }
-  writeJsonAtomic(file, decide(readJson<Ledger>(file), action, ids, values.reason))
-  writeReceipt(dir)
-  return reviewView(root, id, dir, readStatus(dir))
+  // Lo que se va a decidir, antes de esperar: si otro comando lo cambia mientras tanto, es un conflicto.
+  const observed = check()
+  const decisionOf = (l: Ledger, x: string) => JSON.stringify(l.entries.find((e) => e.id === x)?.decision ?? null)
+  const seen = new Map(ids.map((x) => [x, decisionOf(observed, x)]))
+
+  withLock(join(dir, REVIEW_LOCK), reviewInProgress(id), () => {
+    const ledger = check()
+    const act = action as 'accept' | 'reject'
+    if (ledger.completed !== observed.completed) throw decisionConflict(id, `la ronda ${ledger.completed}`)
+    const changed = ids.filter((x) => decisionOf(ledger, x) !== seen.get(x))
+    if (changed.length > 0) throw decisionConflict(id, `una decisión de ${changed.join(', ')}`)
+
+    const chosen = [...new Set(ids)].flatMap((x) => ledger.entries.filter((e) => e.id === x))
+    const disputes = chosen.filter((e) => disputable(e, ledger.completed))
+    const shown = new Map(disputes.map((e) => [e.id, lastRejection(e)]))
+    const unknown = disputes.filter((e) => shown.get(e.id) === undefined).map((e) => e.id)
+    if (unknown.length > 0) {
+      throw new SddError('usage', `la disputa ${unknown.join(', ')} no tiene un motivo de rechazo registrado: su pregunta no se puede armar`, {
+        next: `./bin/sdd-ai review status ${id}`,
+      })
+    }
+    let reason = values.reason
+    if (act === 'reject' && disputes.length > 0) {
+      const reasons = [...new Set(shown.values())] as string[]
+      if (reasons.length > 1) {
+        throw new SddError('approval_contradicted', 'las disputas del reject muestran motivos de rechazo distintos', {
+          detail: `motivos: ${reasons.map((r) => JSON.stringify(r)).join(', ')}`,
+          next: `decide cada disputa por separado: ./bin/sdd-ai review decide ${id} reject <F-n>`,
+        })
+      }
+      const mixed = disputes.length < chosen.length
+      if (mixed && reason === undefined) {
+        throw new SddError('usage', 'un reject que mezcla disputas y otros hallazgos necesita --reason igual al motivo mostrado de sus disputas', {
+          next: `decide las disputas (${disputes.map((e) => e.id).join(', ')}) por separado de los demás hallazgos`,
+        })
+      }
+      if (reason !== undefined && reason !== reasons[0]) {
+        throw new SddError('approval_contradicted', 'el --reason no es el motivo que mostró la pregunta de la disputa', {
+          detail: `la pregunta mostró ${JSON.stringify(reasons[0])}`,
+          next: `corre ./bin/sdd-ai review decide ${id} reject ${disputes.map((e) => e.id).join(' ')} sin --reason, o con el motivo mostrado`,
+        })
+      }
+      reason = reasons[0]
+    }
+
+    const consumed = consumedRefs(ledger, dir)
+    const proofs: Record<string, Proof> = {}
+    for (const e of disputes) {
+      const q = disputeQuestion(id, e, ledger.completed, shown.get(e.id)!)
+      const proof = prove({ env, conductor, q, authorizes: act === 'accept' ? DISPUTE_OPTIONS.accept : DISPUTE_OPTIONS.reject, consumed })
+      consumed.add(proof.ref)
+      proofs[e.id] = proof
+    }
+    writeJsonAtomic(file, decide(ledger, act, ids, reason, proofs))
+    writeReceipt(dir)
+  })
+  return reviewView(root, id, dir, readStatus(dir), env)
 }
 
 /** Los trabajos de una ronda 1: la base, y con el nivel alto también las lentes, repartidos en lotes si hace falta. */
@@ -915,7 +1106,7 @@ function startArtifact(o: {
  * perdido; después las decisiones pendientes; después el artefacto, que cambia a propósito.
  */
 async function reviewRoundArtifact(o: {
-  root: string; dir: string; id: string; req: ReviewRequest; sel: ArtifactSelection; head?: string; extra: boolean; env: Env
+  root: string; dir: string; id: string; req: ReviewRequest; sel: ArtifactSelection; head?: string; extra: boolean; env: Env; conductor?: Family
 }): Promise<Result> {
   const { root, dir, id, req, sel } = o
   if (o.head !== undefined) {
@@ -944,15 +1135,12 @@ async function reviewRoundArtifact(o: {
     if (goals.length === 0) {
       throw new SddError('usage', 'no hay nada que verificar ni responder', { next: `./bin/sdd-ai review status ${id}` })
     }
-    if (completed >= ROUND_CAP && !o.extra) {
-      throw new SddError('round_cap', `la revisión ya hizo ${ROUND_CAP} rondas y quedan hallazgos vigentes`, {
-        next: `pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está`,
-      })
-    }
+    if (completed >= ROUND_CAP && !o.extra) throw roundCap(id, completed)
   }
 
   const n = completed + 1
   const tag = tagOf(n)
+  const proof = o.extra ? extraProof(o.env, o.conductor, dir, id, n, ledger) : undefined
   const { candidate, bytes } = freezeStableWith(root, sel, freezeArtifact, (r) => r.candidate.hash)
   // Un insumo que cambió entre la validación y el congelado también invalida la corrida.
   const same = (a: Candidate['context'], b: Candidate['context']) =>
@@ -1010,6 +1198,7 @@ async function reviewRoundArtifact(o: {
   })
 
   const k = nextLaunch(dir, tag)
+  registerExtra(dir, n, proof)
   writeJsonAtomic(join(dir, `candidate${tag}.json`), candidate)
   writeFileSync(join(dir, `material${tag}.md`), renderArtifactMaterial(candidate, bytes))
   const jobs = writeJobs(dir, `${tag}-l${k}`, toRun)
@@ -1027,7 +1216,7 @@ async function reviewRoundArtifact(o: {
       id, round: n, launch: k, family: resolved.family, candidate_hash: candidate.hash, identical,
       ...(plan ? { targets: goals, changed: plan.changed[path] ?? [], removed: plan.removed ?? [] } : { reviewers: ['base'] }),
       ...(kept.length > 0 ? { kept: kept.map((j) => j.key) } : {}),
-      next: `./bin/sdd-ai wait ${id}`,
+      questions: [], next: `./bin/sdd-ai wait ${id}`,
     },
   }
 }
@@ -1039,20 +1228,48 @@ async function reviewRoundArtifact(o: {
  */
 async function reviewRound(args: string[], env: Env, cwd: string): Promise<Result> {
   const { values, positionals } = parseArgs({
-    args, strict: true, allowPositionals: true, options: { head: { type: 'string' }, extra: { type: 'boolean', default: false } },
+    args, strict: true, allowPositionals: true,
+    options: { head: { type: 'string' }, extra: { type: 'boolean', default: false }, conductor: { type: 'string' } },
   })
   const id = positionals[0]
-  if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review round <id> [--head <ref>] [--extra]' })
+  if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review round <id> [--head <ref>] [--extra] [--conductor claude|codex]' })
   if (env.SDD_AI_WORKER === '1') {
+    // La ronda extra la decide el usuario: desde un worker no hay sesión de la que leer su respuesta.
+    if (values.extra) detectRunner(env)
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   }
+  const conductor = conductorFlag(values.conductor)
   const root = repoRoot(cwd)
   const dir = runDir(root, id)
-  if (!TERMINAL.has(readStatus(dir).state)) {
+  // La ronda que se va a lanzar, antes de esperar: si otro comando la lanza mientras tanto, es un conflicto.
+  const observe = () => {
+    const ledgerFile = join(dir, 'ledger.json')
+    const completed = existsSync(ledgerFile) ? readJson<Ledger>(ledgerFile).completed : 0
+    return { terminal: TERMINAL.has(readStatus(dir).state), completed, launch: nextLaunch(dir, tagOf(completed + 1)) }
+  }
+  const observed = observe()
+  if (!observed.terminal) {
     throw new SddError('usage', 'la ronda anterior sigue en curso', { next: `./bin/sdd-ai wait ${id}` })
   }
-  const req = readJson<ReviewRequest>(join(dir, 'request.json'))
-  if (isArtifact(req.selection)) return reviewRoundArtifact({ root, dir, id, req, sel: req.selection, head: values.head, extra: values.extra, env })
+  return withLockAsync(join(dir, REVIEW_LOCK), reviewInProgress(id), async () => {
+    const now = observe()
+    if (!now.terminal || now.completed !== observed.completed || now.launch !== observed.launch) {
+      throw decisionConflict(id, `la ronda ${observed.completed + 1}`)
+    }
+    const req = readJson<ReviewRequest>(join(dir, 'request.json'))
+    if (isArtifact(req.selection)) {
+      return reviewRoundArtifact({ root, dir, id, req, sel: req.selection, head: values.head, extra: values.extra, env, conductor })
+    }
+    return reviewRoundDiff({ root, dir, id, req, head: values.head, extra: values.extra, env, conductor })
+  })
+}
+
+/** La ronda de una revisión de diff, con la revisión ya tomada. */
+async function reviewRoundDiff(o: {
+  root: string; dir: string; id: string; req: ReviewRequest; head?: string; extra: boolean; env: Env; conductor?: Family
+}): Promise<Result> {
+  const { root, dir, id, req, env } = o
+  const values = { head: o.head, extra: o.extra }
   const ledgerFile = join(dir, 'ledger.json')
   // Sin ledger, la ronda 1 no terminó: se relanza.
   const ledger = existsSync(ledgerFile) ? readJson<Ledger>(ledgerFile) : undefined
@@ -1073,15 +1290,12 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
     if (goals.length === 0) {
       throw new SddError('usage', 'no hay nada que verificar ni responder', { next: `./bin/sdd-ai review status ${id}` })
     }
-    if (completed >= ROUND_CAP && !values.extra) {
-      throw new SddError('round_cap', `la revisión ya hizo ${ROUND_CAP} rondas y quedan hallazgos vigentes`, {
-        next: `pregunta al usuario si quiere una ronda más (./bin/sdd-ai review round ${id} --extra) o dejar la revisión como está`,
-      })
-    }
+    if (completed >= ROUND_CAP && !values.extra) throw roundCap(id, completed)
   }
 
   const n = completed + 1
   const tag = tagOf(n)
+  const proof = values.extra ? extraProof(env, o.conductor, dir, id, n, ledger) : undefined
   const first = readJson<Candidate>(join(dir, 'candidate.json'))
   const prev = ledger ? readJson<Candidate>(join(dir, `candidate${tagOf(completed)}.json`)) : first
   let selection: Selection
@@ -1140,6 +1354,7 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
   })
 
   const k = nextLaunch(dir, tag)
+  registerExtra(dir, n, proof)
   writeJsonAtomic(join(dir, `candidate${tag}.json`), candidate)
   writeFileSync(join(dir, `material${tag}.md`), material)
   const jobs = writeJobs(dir, `${tag}-l${k}`, toRun)
@@ -1160,7 +1375,7 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
       ...(plan ? { targets: goals, changed: Object.keys(plan.changed) } : { reviewers: planned.reviewers }),
       ...(planned.batches.length > 1 ? { batches: planned.batches.map((paths, i) => ({ n: i + 1, paths })) } : {}),
       ...(kept.length > 0 ? { kept: kept.map((j) => j.key) } : {}),
-      left_out: candidate.left_out, next: `./bin/sdd-ai wait ${id}`,
+      left_out: candidate.left_out, questions: [], next: `./bin/sdd-ai wait ${id}`,
     },
   }
 }
@@ -1168,7 +1383,7 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
 async function review(args: string[], env: Env, cwd: string): Promise<Result> {
   const [sub, ...rest] = args
   if (sub === 'start') return reviewStart(rest, env, cwd)
-  if (sub === 'decide') return reviewDecide(rest, cwd)
+  if (sub === 'decide') return reviewDecide(rest, env, cwd)
   if (sub === 'round') return reviewRound(rest, env, cwd)
   if (sub === 'status') {
     const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: {} })
@@ -1177,7 +1392,7 @@ async function review(args: string[], env: Env, cwd: string): Promise<Result> {
     const root = repoRoot(cwd)
     const dir = runDir(root, id)
     const s = readStatus(dir)
-    const view = reviewView(root, id, dir, s)
+    const view = reviewView(root, id, dir, s, env)
     markDelivered(dir, s, env)
     return view
   }
@@ -1208,14 +1423,14 @@ function profileWarnings(s: Status): string[] {
 
 /** Arma la respuesta de un estado terminal y recién entonces anota la entrega: si armarla falla, no se anota. */
 function report(root: string, id: string, dir: string, s: Status, env: Env): Result {
-  const result = reportOf(root, id, dir, s)
+  const result = reportOf(root, id, dir, s, env)
   markDelivered(dir, s, env)
   return result
 }
 
-function reportOf(root: string, id: string, dir: string, s: Status): Result {
+function reportOf(root: string, id: string, dir: string, s: Status, env: Env): Result {
   const request = existsSync(join(dir, 'request.json')) ? readJson<{ kind?: string }>(join(dir, 'request.json')) : {}
-  if (request.kind === 'review' && TERMINAL.has(s.state)) return reviewView(root, id, dir, s)
+  if (request.kind === 'review' && TERMINAL.has(s.state)) return reviewView(root, id, dir, s, env)
   const out: Record<string, unknown> = { id, state: s.state }
   if (s.reason) out.reason = s.reason
   if (s.detail) out.detail = s.detail
@@ -1526,21 +1741,33 @@ function agents(args: string[], env: Env, cwd: string): Result {
  * El estado de los flujos SDD de `.plans/`. `status` solo lee y sale con 0 aunque el flujo esté
  * bloqueado; `approve` registra la aprobación de un gate y responde el estado nuevo.
  */
-function sdd(args: string[], cwd: string): Result {
+function sdd(args: string[], env: Env, cwd: string): Result {
   const [sub, ...rest] = args
   if (sub === 'status') {
     const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { json: { type: 'boolean', default: false } } })
     if (positionals.length > 1) throw new SddError('usage', 'sdd status recibe un solo id', { next: './bin/sdd-ai sdd status [<id>]' })
     const root = repoRoot(cwd)
     if (positionals.length === 0) return { code: 0, out: { flows: listFlows(root) } }
-    return { code: 0, out: resolveFlow(readFlow(root, positionals[0]).facts) }
+    const { facts } = readFlow(root, positionals[0])
+    const status = resolveFlow(facts)
+    // En un gate, la pregunta que el conductor le hace al usuario antes de sdd approve.
+    if (status.next.step !== 'gate' || status.next.gate === undefined || status.depth === null) return { code: 0, out: status }
+    const question = gateQuestionFor(positionals[0], status.depth, status.next.gate, facts.fingerprints)
+    return { code: 0, out: { ...status, next: { ...status.next, question } } }
   }
   if (sub === 'approve') {
-    const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: {} })
-    if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate>' })
-    return { code: 0, out: approve(repoRoot(cwd), positionals[0], positionals[1], new Date()) }
+    const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { conductor: { type: 'string' } } })
+    if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
+    return { code: 0, out: approve(repoRoot(cwd), positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor)) }
   }
   throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate>' })
+}
+
+/** El `--conductor` de un comando protegido: elige de qué sesión se lee la respuesta del usuario. */
+function conductorFlag(v: string | undefined): Family | undefined {
+  if (v === undefined) return undefined
+  if (!isFamily(v)) throw new SddError('usage', `conductor desconocido: ${v}`, { next: 'usa --conductor claude|codex' })
+  return v
 }
 
 export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {
@@ -1552,7 +1779,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'wait': return await wait(rest, env, cwd)
       case 'cancel': return await cancel(rest, cwd)
       case 'agents': return agents(rest, env, cwd)
-      case 'sdd': return sdd(rest, cwd)
+      case 'sdd': return sdd(rest, env, cwd)
       case 'doctor': {
         const report = doctor()
         return { code: report.ok ? 0 : 1, out: report }

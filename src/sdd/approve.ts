@@ -1,8 +1,10 @@
-import { closeSync, openSync, rmSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
+import { type Proof, prove } from '../approval/proof.ts'
+import { GATE_OPTIONS, gateQuestion } from '../approval/question.ts'
+import { withLock } from '../lock.ts'
 import { freezeStableWith } from '../review/candidate.ts'
 import { writeJsonAtomic } from '../runs.ts'
-import { SddError } from '../types.ts'
+import { type Family, SddError } from '../types.ts'
 import { APPROVALS_FILE, FILE_NAMES, type FlowRead, LOCK_FILE, flowDir, lstatOrNull, pathInvalid, readFlow } from './read.ts'
 import { type Approval, type Depth, type FlowStatus, GATE_IDS, GATES, type GateId, missingParts, resolve } from './status.ts'
 
@@ -41,33 +43,27 @@ function check(read: FlowRead, gate: string): { depth: Depth; gate: GateId } {
 
 /**
  * Registra la aprobación de un gate con la huella de sus artefactos y las de los gates anteriores. Se
- * serializa por flujo con un lock de archivo, que no se recupera solo: robarle un lock viejo a otro
- * proceso abriría una carrera entre dos que lo ven a la vez. Con el lock tomado lee el flujo dos veces
- * y registra solo si las dos lecturas coinciden. Nunca escribe la spec, el plan, las tasks ni el
+ * serializa por flujo con un lock de archivo: espera mientras lo tenga otro proceso vivo, y uno huérfano
+ * no se recupera solo, porque robarle un lock viejo a otro proceso abriría una carrera entre dos que lo
+ * ven a la vez. Con el lock tomado lee el flujo dos veces
+ * y registra solo si las dos lecturas coinciden y el usuario respondió `Aprobar` a la pregunta canónica
+ * de ese gate con esas huellas, en la sesión del runner. Nunca escribe la spec, el plan, las tasks ni el
  * handoff, y un rechazo deja el directorio como estaba.
  */
-export function approve(root: string, id: string, gate: string, now: Date, read: typeof readFlow = readFlow): FlowStatus {
-  check(read(root, id), gate)
+export function approve(root: string, id: string, gate: string, now: Date, read: typeof readFlow = readFlow,
+  proveFn: typeof prove = prove, env: Record<string, string | undefined> = process.env, conductor?: Family): FlowStatus {
+  const observed = read(root, id)
+  check(observed, gate)
+  const registered = (r: FlowRead) => (r.facts.log.state === 'ok' ? r.facts.log.approvals.filter((a) => a.gate === gate).length : 0)
+  const seen = registered(observed)
   const dir = flowDir(root, id)
   const lock = join(dir, LOCK_FILE)
   if (lstatOrNull(lock)?.isSymbolicLink()) throw pathInvalid(`.plans/${id}/${LOCK_FILE}`, 'es un enlace simbólico')
 
-  let fd: number
-  try {
-    fd = openSync(lock, 'wx')
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
-    throw new SddError('approve_in_progress', `otro sdd approve tiene tomado el flujo ${id}`, {
-      next: `si no hay otro sdd approve corriendo, borra .plans/${id}/${LOCK_FILE} y vuelve a correr el comando`,
-    })
-  }
-  try {
-    try {
-      writeSync(fd, `${process.pid}\n`)
-    } finally {
-      closeSync(fd)
-    }
-
+  const busy = () => new SddError('approve_in_progress', `otro sdd approve tiene tomado el flujo ${id}`, {
+    next: `si no hay otro sdd approve corriendo, borra .plans/${id}/${LOCK_FILE} y vuelve a correr el comando`,
+  })
+  return withLock(lock, busy, () => {
     let stable: FlowRead
     try {
       stable = freezeStableWith(root, id, read, (r) => JSON.stringify(r.digests))
@@ -98,11 +94,18 @@ export function approve(root: string, id: string, gate: string, now: Date, read:
     if (fingerprint === undefined || Object.values(previous).some((f) => f === undefined)) {
       throw rejected(`faltan huellas para el gate ${approved.gate} o sus anteriores`)
     }
-    const entry: Approval = { gate: approved.gate, depth: approved.depth, fingerprint, previous, at: now.toISOString() }
-    const approvals = [...(stable.facts.log.state === 'ok' ? stable.facts.log.approvals : []), entry]
+    const logged = stable.facts.log.state === 'ok' ? stable.facts.log.approvals : []
+    if (registered(stable) > seen) {
+      throw new SddError('decision_conflict', `otro comando registró el gate ${approved.gate} mientras este esperaba`, {
+        next: `corre ./bin/sdd-ai sdd status ${id} para ver el estado nuevo`,
+      })
+    }
+    const consumed = new Set(logged.flatMap((a) => (a.proof ? [a.proof.ref] : [])))
+    const q = gateQuestion(id, approved.gate, fingerprint, previous as Partial<Record<GateId, string>>)
+    const proof: Proof = proveFn({ env, conductor, q, authorizes: GATE_OPTIONS.approve, consumed })
+    const entry: Approval = { gate: approved.gate, depth: approved.depth, fingerprint, previous, at: now.toISOString(), proof }
+    const approvals = [...logged, entry]
     writeJsonAtomic(join(dir, APPROVALS_FILE), { schema_version: 1, approvals })
     return resolve({ ...stable.facts, log: { state: 'ok', approvals } })
-  } finally {
-    rmSync(lock, { force: true })
-  }
+  })
 }

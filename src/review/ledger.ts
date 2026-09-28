@@ -1,3 +1,4 @@
+import type { Proof } from '../approval/proof.ts'
 import { SddError } from '../types.ts'
 import { type Finding, GRAVE } from './admit.ts'
 
@@ -6,7 +7,8 @@ export type FindingState = 'abierto' | 'aceptado' | 'rechazado' | 'en-disputa'
   | 'resuelto' | 'cerrado' | 'refutado' | 'fuera-de-alcance' | 'informativo'
 export type Answer = 'resolved' | 'unresolved' | 'withdrawn' | 'maintained'
 export type RefuteResult = 'corroborated' | 'refuted' | 'inconclusive'
-export interface Decision { action: 'accept' | 'reject'; reason?: string; from: FindingState; after_round: number }
+/** `proof` es la respuesta del usuario a la pregunta canónica: la trae la decisión de una disputa. */
+export interface Decision { action: 'accept' | 'reject'; reason?: string; from: FindingState; after_round: number; proof?: Proof }
 export interface RoundResponse { round: number; answer: Answer; evidence?: string; note?: string }
 /** Quién revisó: la revisión base o una de las cuatro lentes del nivel alto. */
 export type Reviewer = 'base' | 'risk' | 'resilience' | 'reliability' | 'readability'
@@ -26,6 +28,8 @@ export interface LedgerEntry extends Finding {
   reviewer?: Reviewer; batch?: number
   decision?: Decision; responses: RoundResponse[]
   refutation?: { result: RefuteResult; evidence?: string; note?: string; reason?: string }
+  /** Las decisiones reemplazadas de una disputa, o que traían prueba, en orden: conservan su motivo y su prueba. */
+  superseded?: Decision[]
 }
 /** `artifact` marca el ledger de una revisión de artefacto; uno sin la marca es de un diff. */
 export interface Ledger { completed: number; next_id: number; entries: LedgerEntry[]; artifact?: true }
@@ -92,8 +96,24 @@ function awaitsDecision(e: LedgerEntry, completed: number): boolean {
   return e.state === 'aceptado' && last?.round === completed && last.answer === 'unresolved'
 }
 
-/** Aplica la decisión a todos los IDs o a ninguno: la lista se valida entera antes de cambiar nada. */
-export function decide(l: Ledger, action: 'accept' | 'reject', ids: string[], reason?: string): Ledger {
+/**
+ * Una disputa: está en disputa, o su decisión es de esta ronda y partió de una disputa, así que todavía
+ * se puede redecidir. Es lo que el usuario decide, nunca el conductor.
+ */
+export function disputable(e: LedgerEntry, completed: number): boolean {
+  return e.state === 'en-disputa' || (e.decision?.after_round === completed && e.decision.from === 'en-disputa')
+}
+
+/** El motivo del último rechazo del hallazgo, aunque una decisión posterior lo haya reemplazado. */
+export function lastRejection(e: LedgerEntry): string | undefined {
+  return [...(e.superseded ?? []), ...(e.decision ? [e.decision] : [])].findLast((d) => d.action === 'reject')?.reason
+}
+
+/**
+ * Aplica la decisión a todos los IDs o a ninguno: la lista se valida entera antes de cambiar nada. La
+ * decisión que reemplaza a la de una disputa, o a una que traía prueba, la guarda en `superseded`.
+ */
+export function decide(l: Ledger, action: 'accept' | 'reject', ids: string[], reason?: string, proofs: Record<string, Proof> = {}): Ledger {
   const unique = [...new Set(ids)]
   if (unique.length === 0) throw new SddError('usage', 'falta al menos un ID de hallazgo (F-n)')
   if (action === 'reject' && (reason === undefined || reason.trim() === '')) {
@@ -111,7 +131,9 @@ export function decide(l: Ledger, action: 'accept' | 'reject', ids: string[], re
     const from = e.decision?.after_round === next.completed ? e.decision.from : e.state
     const to = DECISION_STATE[from]?.[action]
     if (!to) throw new Error(`transición de decisión sin definir: ${from} con ${action}`)
-    e.decision = { action, ...(reason !== undefined && reason.trim() !== '' ? { reason } : {}), from, after_round: next.completed }
+    if (e.decision && (disputable(e, next.completed) || e.decision.proof)) e.superseded = [...(e.superseded ?? []), e.decision]
+    const proof = proofs[e.id]
+    e.decision = { action, ...(reason !== undefined && reason.trim() !== '' ? { reason } : {}), from, after_round: next.completed, ...(proof ? { proof } : {}) }
     e.state = to
   }
   return next

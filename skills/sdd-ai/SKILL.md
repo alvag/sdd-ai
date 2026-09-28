@@ -198,13 +198,20 @@ se lanza nada y la corrida queda como estaba. El mensaje dice qué no entra:
 
 ### Lo que decide el usuario, nunca tú
 
+Estas dos decisiones se preguntan con la **pregunta canónica** que trae la vista en `questions`, y se
+registran después de la respuesta. El comando lee esa respuesta en la sesión y sin ella no escribe
+nada (cómo se pregunta en cada runner, en la sección 9).
+
 - **`en-disputa`** (los de `disputes`): el revisor mantuvo un hallazgo que rechazaste. Tú fuiste parte
-  de esa discusión, así que no la decides: muéstrale al usuario tu motivo y la evidencia del revisor,
-  pregúntale, y registra lo que diga con `review decide` (`accept` para corregirlo, `reject` para
-  cerrarlo).
+  de esa discusión, así que no la decides. Muéstrale al usuario la evidencia del revisor y hazle la
+  pregunta de esa disputa: sus opciones traen lo que afirma el hallazgo y tu último motivo. Registra
+  lo que responda con `review decide`: `accept` si eligió `Aceptar el hallazgo`, y `reject`, sin
+  `--reason` o con el motivo que mostró la pregunta, si eligió `Mantener el rechazo`. Cada disputa
+  necesita su respuesta, y redecidirla necesita otra.
 - **El tope**: una revisión tiene hasta 3 rondas. Si se terminó la tercera y quedan hallazgos
-  vigentes, pregúntale al usuario si quiere una ronda más (`review round <id> --extra`, que concede
-  una sola) o dejar la revisión como está.
+  vigentes, hazle al usuario la pregunta de la ronda siguiente: si elige `Lanzar la ronda <n>`, corre
+  `review round <id> --extra`, que concede solo esa ronda. Relanzar esa misma ronda reusa su
+  respuesta, salvo lo que diga `next`.
 
 ### Refutación
 
@@ -455,7 +462,7 @@ cambian, `status` devuelve el flujo a ese gate.
 
 ```
 ./bin/sdd-ai sdd status [<id>]
-./bin/sdd-ai sdd approve <id> <gate>
+./bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]
 ```
 
 - **Lo que trae `sdd status <id>`**: `depth`, los `gates` de esa profundidad con su `state`
@@ -467,17 +474,44 @@ cambian, `status` devuelve el flujo a ese gate.
   discrepan, `status` lo dice en `notes`: `header_behind` si una aprobación registrada todavía no
   llegó al header, y `header_ahead` si el header da por aprobado un gate cuya aprobación registrada
   venció.
-- **`sdd approve` se corre solo después del "aprobado" explícito del usuario en ese gate**, nunca por
-  iniciativa propia, y antes de actualizar el header que pide `sdd-flow`. Los gates son `single` en
+- **`sdd approve` exige la respuesta del usuario a la pregunta canónica del gate**, la que trae
+  `next.question` cuando `next.step` es `gate`. La pregunta lleva un código atado a las huellas de ese
+  gate y de los anteriores: si un artefacto cambia después de la respuesta, hay que volver a
+  preguntar. Registra solo si la última respuesta a esa pregunta es `Aprobar`, y cada respuesta sirve
+  una vez. Se corre antes de actualizar el header que pide `sdd-flow`. Los gates son `single` en
   `corta`, `spec` y `plan-tasks` en `normal`, y `spec`, `plan` y `tasks` en `completa`.
+- **`sdd-flow` pide el "aprobado" a su manera.** Cuando el usuario aprueba en su gate, hazle además la
+  pregunta canónica antes de `sdd approve`: el "aprobado" escrito no es una respuesta a esa pregunta.
+- **Cómo se hace la pregunta canónica**, para un gate, una disputa o la ronda extra:
+  - **En Claude Code**, con `AskUserQuestion`, pasando el objeto tal cual como su única pregunta, con
+    selección simple. No cambies el texto, el header ni las opciones.
+  - **En Codex**, con un mensaje cuyo único contenido es la pregunta con sus opciones numeradas, como la
+    trae `next` de un rechazo. El contexto va en un mensaje anterior. Después se espera el próximo
+    mensaje del usuario: vale la etiqueta de una opción o su número.
+- **Cuando el comando rechaza**, el `next` trae la pregunta y cómo hacerla:
+  - `runner_required`: el entorno no identifica la sesión de Claude Code ni la de Codex, o el comando
+    corre en un worker. La decisión la toma el usuario en la sesión del conductor.
+  - `conductor_unknown`: el entorno tiene las dos sesiones, como Codex abierto desde Claude Code. Agrega
+    `--conductor claude|codex` con la sesión donde preguntaste.
+  - `approval_missing`: no hay respuesta, la última no es una opción, o el archivo de la sesión no se
+    pudo leer. Haz la pregunta y vuelve a correr el comando.
+  - `approval_contradicted`: la última respuesta no autoriza esa acción, o el `--reason` de un `reject`
+    no es el motivo que mostró la disputa. No insistas: la decisión ya está tomada.
+  - `approval_reused`: esa respuesta ya registró una decisión. Si el usuario quiere otra, pregúntale de
+    nuevo.
+  - `review_in_progress`: otro `review decide` o `review round` tiene tomada la revisión. Si no hay
+    ninguno corriendo, el `next` dice qué lock borrar.
+  - `decision_conflict`: otro comando decidió lo mismo mientras este esperaba. Mira el estado nuevo
+    con `status` antes de decidir nada.
+- **La prueba frena el atajo del modelo, no la forja.** El transcript, el rollout y los registros son
+  archivos que se pueden editar desde el shell. Un subagente no puede correr `sdd approve`: el hook lo
+  niega (sección 8).
 - **Un gate `approved_unfingerprinted`** es uno que el header da por aprobado sin una aprobación
-  registrada: un cambio en sus artefactos no se detecta. Regístralo con `sdd approve` solo si el
-  usuario confirma que lo que hay ahora es lo que aprobó.
+  registrada ni prueba del runner: un cambio en sus artefactos no se detecta. Regístralo con `sdd
+  approve` solo si el usuario responde que lo que hay ahora es lo que aprobó. Una aprobación
+  registrada antes de que existiera la prueba sigue contando, con la nota `approval_unproven`.
 - **Ante `header_ahead`, el gate vuelve al usuario** antes de seguir con `sdd-flow`, que por su header
   retomaría más adelante de lo que el registro sostiene.
 - **`next` no autoriza avanzar sobre un gate externo pendiente.** La nota `external_gate` dice que el
   handoff espera la aprobación externa de la spec, y ahí `next` es `external_gate` en vez de
   `implement`: seguir sin esa aprobación lo decide el usuario.
-- **El registro todavía no prueba que el usuario aprobó.** Lo escribe el conductor, y nada impide
-  correr `sdd approve` sin su "aprobado" ni editar el registro a mano. Un subagente no puede correrlo:
-  el hook lo niega (sección 8).
