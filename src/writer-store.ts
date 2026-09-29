@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { type HarvestFile, buildIndex, captureTree, gitDirs, removeIndex } from './git.ts'
 import type { Outcome } from './outcome.ts'
-import { readJson, writeJsonAtomic } from './runs.ts'
+import { isAlive, readJson, writeJsonAtomic } from './runs.ts'
 import { type Conductor, type Family, type RunState, SddError } from './types.ts'
 import { artifactHash, headerHash, readFlow } from './sdd/read.ts'
 import { hasEndMark } from './writer.ts'
@@ -25,6 +25,13 @@ export function storeRoot(root: string): string {
 
 export function storeDir(root: string, id: string): string {
   return join(gitDirs(root).gitDir, 'sdd-ai', 'runs', id)
+}
+
+/** Lo que responde un comando que necesita escribir el almacén y no puede. */
+export function controlUnavailable(): SddError {
+  return new SddError('control_unavailable', 'sdd-ai no puede escribir el almacén de control del writer en el directorio de Git', {
+    next: 'vuelve a correr el mismo comando pidiendo salir del sandbox (escalada): el almacén vive en el directorio de Git, que el sandbox deja en solo lectura',
+  })
 }
 
 /**
@@ -46,8 +53,12 @@ export function canWriteStore(root: string): boolean {
   return true
 }
 
-/** Quién tiene la reserva: la corrida, el proceso `run` que la tomó y el directorio de Git de su checkout. */
-export interface Reservation { id: string; pid: number; lstart: string | null; gitDir: string }
+/**
+ * Quién tiene la reserva: la corrida, el proceso que la tomó y el directorio de Git de su checkout. `kind`
+ * es `verify` cuando la tomó `sdd verify` para revertir y restaurar filas; su `id` es el del recibo, y
+ * `group`, el grupo de procesos de la fila que está corriendo.
+ */
+export interface Reservation { id: string; pid: number; lstart: string | null; gitDir: string; kind?: 'verify'; group?: number }
 
 const lockOf = (root: string) => join(storeRoot(root), 'writer.lock')
 
@@ -63,11 +74,13 @@ export function readReservation(root: string): Reservation | undefined {
  * Toma la reserva de writer del repositorio. El contenido se escribe en un temporal propio y el lock
  * nace con `link`, que falla si ya existe y lo deja completo desde que aparece.
  */
-export function reserveWriter(root: string, id: string): { ok: true } | { ok: false; holder: string } {
+export function reserveWriter(root: string, id: string, kind?: 'verify'): { ok: true } | { ok: false; holder: string; verify?: true } {
   const dir = storeRoot(root)
   mkdirSync(dir, { recursive: true })
   const seen = readProcess(process.pid)
-  const mine: Reservation = { id, pid: process.pid, lstart: seen && seen !== 'gone' ? seen.lstart : null, gitDir: gitDirs(root).gitDir }
+  const mine: Reservation = {
+    id, pid: process.pid, lstart: seen && seen !== 'gone' ? seen.lstart : null, gitDir: gitDirs(root).gitDir, ...(kind ? { kind } : {}),
+  }
   const tmp = join(dir, `writer.lock.${process.pid}.${randomBytes(4).toString('hex')}`)
   writeFileSync(tmp, `${JSON.stringify(mine)}\n`)
   try {
@@ -75,10 +88,68 @@ export function reserveWriter(root: string, id: string): { ok: true } | { ok: fa
     return { ok: true }
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
-    return { ok: false, holder: readReservation(root)?.id ?? 'desconocida' }
+    const held = readReservation(root)
+    return held?.kind === 'verify' ? { ok: false, holder: `la verificación ${held.id}`, verify: true } : { ok: false, holder: held?.id ?? 'desconocida' }
   } finally {
     unlinkSync(tmp)
   }
+}
+
+/**
+ * Si el proceso sigue vivo: con su hora de arranque, es el mismo si `ps` lo encuentra con esa hora. Si `ps`
+ * no responde, o no hay hora, solo se comprueba el pid: un pid reciclado cuenta como vivo, y lo que depende
+ * de esta respuesta se retiene en vez de liberarse.
+ */
+export function processAlive(pid: number, lstart: string | null): boolean {
+  if (lstart !== null) {
+    const seen = readProcess(pid)
+    if (seen !== undefined) return seen !== 'gone' && seen.lstart === lstart
+  }
+  return isAlive(pid)
+}
+
+/**
+ * Anota en la reserva de la verificación `id` el grupo de la fila que acaba de lanzar, o lo quita con
+ * `null` cuando la fila terminó. La reserva de otra corrida no se toca.
+ */
+export function recordVerifyGroup(root: string, id: string, pgid: number | null): void {
+  const r = readReservation(root)
+  if (r?.id !== id || r.kind !== 'verify') return
+  const { group: _previous, ...rest } = r
+  writeJsonAtomic(lockOf(root), pgid === null ? rest : { ...rest, group: pgid })
+}
+
+/**
+ * El grupo de la fila que la verificación `id` dejó corriendo, si sigue vivo. Un `sdd verify` que muere
+ * con SIGKILL no alcanza a terminar el grupo de su fila, que corre aparte y puede seguir escribiendo en el
+ * árbol: mientras viva, ni la reserva ni la restauración se liberan.
+ */
+export function liveVerifyGroup(root: string, id: string): number | null {
+  const r = readReservation(root)
+  if (r?.id !== id || r.kind !== 'verify' || r.group === undefined) return null
+  // `kill(-1)` alcanza a todos los procesos del usuario y `kill(-0)` al grupo propio: nunca se consultan.
+  if (!Number.isInteger(r.group) || r.group <= 1) return null
+  try {
+    process.kill(-r.group, 0)
+    return r.group
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ESRCH' ? null : r.group
+  }
+}
+
+/**
+ * Libera la reserva si la tomó una verificación cuyo proceso ya murió y cuya última fila ya no corre, y dice
+ * si la liberó. Una reserva de writer nunca se toca acá: la resuelven `wait` y `cancel` de su corrida.
+ */
+export function releaseOrphanVerifyReservation(root: string): boolean {
+  const r = readReservation(root)
+  if (r?.kind !== 'verify' || processAlive(r.pid, r.lstart) || liveVerifyGroup(root, r.id) !== null) return false
+  try {
+    unlinkSync(lockOf(root))
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+  }
+  return true
 }
 
 /** Libera la reserva solo si es de esta corrida. */
@@ -302,6 +373,40 @@ const harvestFile = (dir: string) => join(dir, 'harvest.json')
 export function readHarvest(root: string, id: string): HarvestRecord | undefined {
   const file = harvestFile(storeDir(root, id))
   return existsSync(file) ? readJson<HarvestRecord>(file) : undefined
+}
+
+/**
+ * Los writers de este checkout que lanzó la fase implement de `flow`, del más viejo al más nuevo. Un
+ * writer relanzado con `run --retry` no guarda `phase` y no se atribuye al flujo.
+ */
+export function flowWriterRuns(root: string, flow: string): WriterControl[] {
+  const dir = join(gitDirs(root).gitDir, 'sdd-ai', 'runs')
+  if (!existsSync(dir)) return []
+  const out: WriterControl[] = []
+  for (const id of readdirSync(dir)) {
+    if (!isWriterRun(root, id)) continue
+    const c = readControl(root, id)
+    if (c.phase?.flow === flow) out.push(c)
+  }
+  // El id ordena por minuto; dentro del mismo minuto manda la hora en que el supervisor empezó a lanzar.
+  const key = (c: WriterControl) => `${c.id.slice(0, 13)}|${c.spawning ?? ''}|${c.id}`
+  return out.sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0))
+}
+
+/** La cosecha del writer más reciente del flujo, o `null` si el flujo no tuvo writer o el último no cosechó. */
+export function latestFlowHarvest(root: string, flow: string): { run: string; harvest: HarvestRecord } | null {
+  const last = flowWriterRuns(root, flow).at(-1)
+  const harvest = last && readHarvest(root, last.id)
+  return last && harvest ? { run: last.id, harvest } : null
+}
+
+/** Si alguno de los writers del flujo sigue abierto: sin cosecha congelada o con su grupo de procesos vivo. */
+export function flowWriterOpen(root: string, flow: string): string | null {
+  for (const c of flowWriterRuns(root, flow)) {
+    if (!readHarvest(root, c.id)) return c.id
+    if (c.group && groupState(c.group) !== 'gone') return c.id
+  }
+  return null
 }
 
 /** El proceso dueño de una reclamación: vive si `ps` lo ve con la misma hora de inicio. */

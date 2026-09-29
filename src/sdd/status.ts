@@ -45,6 +45,10 @@ export interface FlowFacts {
   hasRemote: boolean
   /** El modo de Jira del flujo, con el override del handoff ya aplicado; sin el campo vale `off`. */
   jira?: JiraMode
+  /** Si `## Verification` trae el contrato estructurado de sdd-ai o es prosa, como en `sdd-flow`. */
+  contract?: 'structured' | 'prose'
+  /** Con un contrato estructurado y el header en `verified`: si el último recibo final sigue valiendo. */
+  receipt?: 'valid' | 'stale'
 }
 
 export type GateState = 'pending' | 'approved' | 'approved_unfingerprinted' | 'stale'
@@ -255,6 +259,14 @@ export function resolve(facts: FlowFacts): FlowStatus {
     // Sin remoto no hay push ni PR posibles: `committed` y `pushed` pasan a archivar.
     if (!facts.hasRemote && (status === 'committed' || status === 'pushed')) return { step: 'archive' }
     if (status === 'pushed') return { step: typeof plan?.pr_url === 'string' && plan.pr_url !== '' ? 'archive' : 'open_pr' }
+    // Con contrato estructurado, `verified` vale solo con un recibo vigente; en prosa rige el header.
+    if (status === 'verified' && facts.contract === 'structured' && facts.receipt !== 'valid') {
+      notes.push({ code: 'verified_stale', detail: 'verified vencido: no hay un recibo final íntegro y verde del árbol de ahora y del plan aprobado; hay que volver a correr sdd verify' })
+      return { step: 'verify' }
+    }
+    if (status === 'verified' && facts.contract === 'prose') {
+      notes.push({ code: 'verified_unreceipted', detail: 'verified sin recibo: contrato en prosa, así que rige lo que dice el header' })
+    }
     const closing = status !== null ? CLOSING[status] : undefined
     if (closing) return held && closing === 'review_and_commit' ? { step: 'external_gate' } : { step: closing }
     if (pending > 0) return external || held ? { step: 'external_gate' } : { step: 'implement', task: count.firstPending ?? '' }

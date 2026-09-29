@@ -3,6 +3,7 @@ import { type Admission, Rejection, admitWith, extractObjects } from '../review/
 import { ARTIFACT_MANDATES } from '../review/artifact-prompt.ts'
 import { WRITER_END_MARK, hasEndMark } from '../writer.ts'
 import { countTasks, criteriaIds, proseProblems, taskLines } from './markdown.ts'
+import { type VerificationContract, admitVerification, renderVerification, roundTrips } from './verification-contract.ts'
 
 // Las fases SDD que corre un worker hijo: el prompt que escribe el binario, la admisión del contrato
 // que devuelve el hijo y el artefacto que el binario arma desde ese contrato. Todo es puro: los
@@ -19,7 +20,7 @@ export interface SpecifyContract {
 }
 export interface PlanContract {
   phase: 'plan'; assumptions: string[]; blocking_questions: string[]; missing_context: string[]
-  approach: string; decisions: string; files: string; verification: string
+  approach: string; decisions: string; files: string; verification: VerificationContract
 }
 export interface TasksContract {
   phase: 'tasks'; assumptions: string[]; blocking_questions: string[]; missing_context: string[]
@@ -88,8 +89,19 @@ const SCHEMA: Record<PhaseStep, string> = {
   "approach": "<el enfoque, paso a paso>",
   "decisions": "<decisiones y trade-offs, o ninguno>",
   "files": "<los archivos a tocar, cada uno con qué cambia>",
-  "verification": "<la tabla del contrato de verificación: una fila por criterio, con su evidencia, el comando u observación y lo esperado>"
+  "verification": {
+    "schema_version": 1,
+    "rows": [
+      { "id": "V1", "acs": ["AC-1"], "kind": "test", "obligation": "red_on_revert" | "green_on_base" | "none", "obligation_reason": "<solo con none: por qué no se confirma>", "argv": ["node", "--test", "--test-reporter=tap", "<ruta de la prueba>"], "timeout_ms": 120000, "expect": { "exit_code": 0, "output_pattern": "<opcional: RegExp de JavaScript, sin flags>" }, "implementation_paths": ["<ruta que habilita el criterio>"], "test_paths": ["<ruta de la prueba>"], "test_name": "<nombre exacto del test en el reporte>", "report_format": "tap" },
+      { "id": "V2", "acs": ["AC-2"], "kind": "build" | "inspección", "obligation": "none", "obligation_reason": "<por qué no se confirma>", "argv": ["<ejecutable>", "<argumento>"], "timeout_ms": 300000, "expect": { "exit_code": 0 } },
+      { "id": "V3", "acs": ["AC-3"], "kind": "manual", "obligation": "none", "obligation_reason": "<por qué no se confirma>", "observation": "<qué tiene que observar una persona>" }
+    ]
+  }
 }
+- \`verification\` es el contrato que va a ejecutar \`sdd verify\`. Cada criterio de la spec tiene al menos una fila, cada fila cita solo criterios de la spec y los ids \`V<n>\` no se repiten.
+- \`obligation\`: \`red_on_revert\` si, con las rutas de implementación en la base, el test tiene que fallar; \`green_on_base\` si tiene que pasar, como el caracterizador de un refactor; \`none\`, con \`obligation_reason\`, en cualquier otro caso. Solo una fila \`test\` admite una obligación distinta de \`none\`.
+- \`argv\` se ejecuta literal, sin shell: nada de pipes, redirecciones ni \`&&\`. Las rutas son relativas a la raíz del repositorio, sin \`..\`.
+- En cada fila pregunta: ¿el esperado se cumpliría aunque el requisito fuera falso? ¿fallaría aunque el requisito fuera verdadero? La admisión valida la forma y la cobertura; esa pertinencia no la puede comprobar, y la revisa una persona en el gate del plan.
 - \`approach\`, \`files\` y \`verification\` no pueden ir vacíos; \`decisions\` puede decir "ninguno".
 - ${PROSE} El header de \`plan.md\` lo arma sdd-ai.`,
   tasks: `{
@@ -232,14 +244,14 @@ function checkSpecify(raw: Record<string, unknown>): Admission<SpecifyContract> 
   })
 }
 
-function checkPlan(raw: Record<string, unknown>): Admission<PlanContract> {
+function checkPlan(raw: Record<string, unknown>, criteria: readonly string[]): Admission<PlanContract> {
   const c = contract(raw, 'plan', ['phase', ...LIST_KEYS, 'approach', 'decisions', 'files', 'verification'])
   return admitted({
     phase: 'plan',
     assumptions: texts(c.assumptions, 'assumptions'), blocking_questions: texts(c.blocking_questions, 'blocking_questions'),
     missing_context: texts(c.missing_context, 'missing_context'),
     approach: prose(c.approach, 'approach', PLAN_RESERVED), decisions: prose(c.decisions, 'decisions', PLAN_RESERVED, { empty: true }),
-    files: prose(c.files, 'files', PLAN_RESERVED), verification: prose(c.verification, 'verification', PLAN_RESERVED),
+    files: prose(c.files, 'files', PLAN_RESERVED), verification: admitVerification(c.verification, criteria),
   })
 }
 
@@ -249,8 +261,8 @@ export function admitSpecify(text: string): Admission<SpecifyContract> {
 }
 
 /** El contrato de `plan`: el documento del plan con sus cuatro secciones; decisiones admite ninguno. */
-export function admitPlan(text: string): Admission<PlanContract> {
-  return admitWith(text, checkPlan, 'phase')
+export function admitPlan(text: string, criteria: readonly string[]): Admission<PlanContract> {
+  return admitWith(text, (raw) => checkPlan(raw, criteria), 'phase')
 }
 
 /** Un ítem de lista con sus líneas siguientes sangradas: nada de lo que trae abre otro ítem ni una sección. */
@@ -322,13 +334,19 @@ function scalar(v: string): string {
   return read === v ? v : JSON.stringify(v)
 }
 
-/** `plan.md` desde el contrato admitido, con el header que arma el binario y las secciones de la plantilla. */
-export function renderPlan(c: PlanContract, h: PlanHeader): string {
+/**
+ * `plan.md` desde el contrato admitido, con el header que arma el binario y las secciones de la plantilla.
+ * Antes de devolverlo relee `## Verification` con los criterios congelados de la spec: un plan que no
+ * conserva su contrato no se publica.
+ */
+export function renderPlan(c: PlanContract, h: PlanHeader, criteria: readonly string[]): string {
   const header = Object.entries(h).map(([k, v]) => `${k}: ${scalar(v)}`).join('\n')
-  return `---\n${header}\n---\n\n# Plan\n\n${sections([
+  const plan = `---\n${header}\n---\n\n# Plan\n\n${sections([
     ['Enfoque', c.approach], ['Decisiones y trade-offs', c.decisions.trim() === '' ? 'Ninguno.' : c.decisions],
-    ['Archivos a tocar', c.files], ['Verification', c.verification],
+    ['Archivos a tocar', c.files], ['Verification', renderVerification(c.verification)],
   ])}\n`
+  if (!roundTrips(plan, c.verification, criteria)) throw new Error('el plan armado no conserva su contrato de verificación')
+  return plan
 }
 
 const TASK_ID = /^T\d+$/

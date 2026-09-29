@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { currentBranch, headCommit } from '../src/git.ts'
 import { parseWorkers } from '../src/profiles.ts'
-import { readHeader } from '../src/sdd/markdown.ts'
+import { criteriaIds, readHeader } from '../src/sdd/markdown.ts'
 import { type PlanContract, type SpecifyContract, type TasksContract, planHeaderFrom, renderPhasePrompt, renderSpec, renderTasks } from '../src/sdd/phase.ts'
 import { readPhaseRecord } from '../src/sdd/phase-state.ts'
 import { type FrozenLaunch, type PublishOutcome, freezeLaunch, publishPhase } from '../src/sdd/publish.ts'
@@ -98,7 +98,11 @@ const SPECIFY_C: SpecifyContract = {
 }
 const PLAN_CONTRACT: PlanContract = {
   phase: 'plan', assumptions: [], blocking_questions: [], missing_context: [],
-  approach: 'Directo.', decisions: 'ninguno', files: '- `src/a.ts`', verification: '| AC-1 | test | `npm test` | verde |',
+  approach: 'Directo.', decisions: 'ninguno', files: '- `src/a.ts`',
+  verification: {
+    schema_version: 1,
+    rows: [{ id: 'V1', acs: ['AC-1', 'AC-2'], kind: 'inspección', obligation: 'none', obligation_reason: 'lectura', argv: ['npm', 'test'], timeout_ms: 60000, expect: { exit_code: 0 } }],
+  },
 }
 const TASKS_CONTRACT: TasksContract = {
   phase: 'tasks', assumptions: [], blocking_questions: [], missing_context: [],
@@ -116,7 +120,7 @@ function launchFor(repo: string, step: 'specify' | 'plan' | 'tasks', o: { reques
   const header = read.facts.handoffHeader?.ok ? read.facts.handoffHeader.data : null
   const h = step === 'plan' ? planHeaderFrom('f', header, currentBranch(repo), headCommit(repo) ?? null, new Date()) : null
   const plan_header = h && 'header' in h ? (({ created_at: _c, ...rest }) => rest)(h.header) : undefined
-  return freezeLaunch(read, { step, depth: 'completa', amended: false, request: file(o.request), context: file(o.context), ...(plan_header ? { plan_header } : {}) })
+  return freezeLaunch(read, { step, depth: 'completa', amended: false, request: file(o.request), context: file(o.context), ...(plan_header ? { plan_header, criteria: criteriaIds(SPEC_MD) } : {}) })
 }
 
 const causeOf = (o: PublishOutcome) => (o.kind === 'published' ? 'published' : o.cause)

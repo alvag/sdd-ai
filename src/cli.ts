@@ -7,7 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
 import { type RoleProfiles, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
 import { type Proof, askNext, prove } from './approval/proof.ts'
-import { DISPUTE_OPTIONS, type Question, disputeQuestion, extraOptions, extraQuestion, gateQuestionFor } from './approval/question.ts'
+import { DISPUTE_OPTIONS, type Question, attestQuestion, disputeQuestion, extraOptions, extraQuestion, gateQuestionFor } from './approval/question.ts'
 import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
@@ -47,12 +47,16 @@ import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, adm
 import { type PhaseRecord, activeRun, readPhaseRecord, withFlowLock, withPhaseNext, writePhaseRecord } from './sdd/phase-state.ts'
 import { freezeLaunch } from './sdd/publish.ts'
 import { FILE_NAMES, type FlowRead, artifactHash, bytesHash, flowDir, headerHash, listFlows, readFlow } from './sdd/read.ts'
+import { recoverPendingRestore } from './sdd/restore.ts'
 import { type FlowStatus, headerData, resolve as resolveFlow } from './sdd/status.ts'
+import type { ManualRow } from './sdd/verification-contract.ts'
+import { attestRow, prepareVerify, runBaseline, runFinal } from './sdd/verify.ts'
+import type { VerifyReceipt, VerifyReceiptRef } from './sdd/verify-receipt.ts'
 import { claudeLaunch, claudeWriterLaunch } from './workers/claude.ts'
 import { codexLaunch, codexWriterLaunch } from './workers/codex.ts'
 import { writerPrompt } from './writer.ts'
 import {
-  type HarvestRecord, type WriterControl, canWriteStore, captureTreeAtBase, freezeHarvest, groupState, harvestTreeHolds, isWriterRun, leaderMatches,
+  type HarvestRecord, type WriterControl, canWriteStore, captureTreeAtBase, controlUnavailable, freezeHarvest, groupState, harvestTreeHolds, isWriterRun, leaderMatches,
   readControl, readHarvest, readProcess, readReservation, releaseWriter, reserveWriter, runDirIdentity, runInventory, sensitiveInventory,
   storeDir, writeControl,
 } from './writer-store.ts'
@@ -330,7 +334,9 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
   const reserved = reserveWriter(root, id)
   if (!reserved.ok) {
     throw new SddError('writer_open', `ya hay un writer abierto en este repositorio: ${reserved.holder}`, {
-      next: `espera o recibe esa corrida (./bin/sdd-ai wait ${reserved.holder}) antes de lanzar otro writer`,
+      next: reserved.verify
+        ? 'espera a que termine sdd verify, que tiene archivos revertidos para confirmar filas, y vuelve a lanzar el writer'
+        : `espera o recibe esa corrida (./bin/sdd-ai wait ${reserved.holder}) antes de lanzar otro writer`,
     })
   }
   let launched = false
@@ -1659,12 +1665,6 @@ function markWriterDelivered(root: string, id: string, state: Status['state'], e
   }
 }
 
-/** Lo que responde un comando del writer que necesita escribir el almacén y no puede. */
-function controlUnavailable(): SddError {
-  return new SddError('control_unavailable', 'sdd-ai no puede escribir el almacén de control del writer en el directorio de Git', {
-    next: 'vuelve a correr el mismo comando pidiendo salir del sandbox (escalada): el almacén vive en el directorio de Git, que el sandbox deja en solo lectura',
-  })
-}
 
 function writerReport(root: string, id: string, h: HarvestRecord, env: Env): Result {
   const c = readControl(root, id)
@@ -2024,10 +2024,10 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     if (name === 'request') inputs.request = requestFile?.bytes.toString('utf8')
     else if (name === 'spec' || name === 'plan' || name === 'tasks') inputs[name] = flowBytes(root, read, name).toString('utf8')
   }
-  const criteria = doc === 'tasks' ? criteriaIds(inputs.spec ?? '') : undefined
+  const criteria = doc === 'tasks' || doc === 'plan' ? criteriaIds(inputs.spec ?? '') : undefined
   if (criteria && criteria.length === 0) {
-    throw new SddError('phase_inline', 'la spec no tiene criterios reconocibles (ítems - **AC-<n>:** en ## Criterios de aceptación): la fase tasks va inline', {
-      next: 'sigue la fase tasks inline, en tu sesión',
+    throw new SddError('phase_inline', `la spec no tiene criterios reconocibles (ítems - **AC-<n>:** en ## Criterios de aceptación): la fase ${doc} va inline`, {
+      next: `sigue la fase ${doc} inline, en tu sesión`,
     })
   }
   if (context) inputs.context = context.bytes.toString('utf8')
@@ -2036,7 +2036,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   const resolution = resolve({ conductor, families, workers: loadWorkers(root), role: doc, flags: {}, codexRoot: loadCodexRoot(env) })
   // Las fases van siempre por proceso: la vía nativa no le devuelve al binario la respuesta del hijo.
   resolution.via = 'process'
-  const launch = freezeLaunch(read, { step: doc, depth, amended: awaiting !== undefined, request: requestFile, context: context && { path: join(root, context.path), bytes: context.bytes }, plan_header })
+  const launch = freezeLaunch(read, { step: doc, depth, amended: awaiting !== undefined, request: requestFile, context: context && { path: join(root, context.path), bytes: context.bytes }, plan_header, criteria })
   const phaseRequest: PhaseRequest = {
     kind: 'phase', flow: id, step: doc, amended: awaiting !== undefined, role: doc, conductor, session: ownerSession(env, conductor.family),
     ...(values.request !== undefined ? { request_file: values.request } : {}), ...(values.context !== undefined ? { context_file: values.context } : {}),
@@ -2097,7 +2097,69 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
     return { code: 0, out: approve(repoRoot(cwd), positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor)) }
   }
-  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id>' })
+  if (sub === 'verify') return sddVerify(rest, env, cwd)
+  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id>' })
+}
+
+const VERIFY_USAGE = './bin/sdd-ai sdd verify <id> [--baseline | --attest V<n>] [--conductor claude|codex]'
+
+/** Lo que devuelve una corrida de verify: el recibo resumido, por fila, sin las salidas completas. */
+function receiptSummary(receipt: VerifyReceipt, ref: VerifyReceiptRef | null): Record<string, unknown> {
+  return {
+    receipt: receipt.id, digest: ref?.digest ?? null, flow: receipt.flow, mode: receipt.mode, green: receipt.green,
+    candidate: receipt.after, ...(receipt.before.tree !== receipt.after.tree ? { candidate_before: receipt.before } : {}),
+    rows: receipt.rows.map((r) => ({
+      row: r.row, outcome: r.outcome, ...(r.execution ? { excerpt: r.execution.excerpt } : {}),
+      ...(r.confirmation && r.confirmation.state !== 'not_required' ? { confirmation: r.confirmation.state, ...(r.confirmation.reason ? { reason: r.confirmation.reason } : {}) } : {}),
+      ...(r.attestation ? { attestation: r.attestation } : {}), ...(r.invalid_attestations ? { invalid_attestations: r.invalid_attestations } : {}),
+      ...(r.baseline ? { baseline: r.baseline } : {}),
+    })),
+    ...(receipt.writer ? { writer: receipt.writer } : {}), ...(receipt.dirtied_paths ? { dirtied_paths: receipt.dirtied_paths } : {}),
+  }
+}
+
+/**
+ * `sdd verify <id>`: la corrida final del contrato del plan, `--baseline` para medir la base antes del
+ * primer writer, o `--attest V<n>` para acreditar una fila manual con la respuesta del usuario. SIGINT y
+ * SIGTERM interrumpen la corrida: la fila en curso termina su grupo y el árbol se restaura antes de salir.
+ */
+async function sddVerify(args: string[], env: Env, cwd: string): Promise<Result> {
+  const { values, positionals } = parseArgs({
+    args, strict: true, allowPositionals: true,
+    options: { baseline: { type: 'boolean', default: false }, attest: { type: 'string' }, conductor: { type: 'string' } },
+  })
+  if (positionals.length !== 1) throw new SddError('usage', 'sdd verify recibe un solo id', { next: VERIFY_USAGE })
+  if (values.baseline && values.attest !== undefined) throw new SddError('usage', '--baseline y --attest no van juntos', { next: VERIFY_USAGE })
+  const root = repoRoot(cwd)
+  const [id] = positionals
+  if (values.attest !== undefined) {
+    const ref = attestRow(root, id, values.attest, env, conductorFlag(values.conductor))
+    return { code: 0, out: { flow: id, row: ref.row, attestation: ref.id, next: flowNext(root, id) } }
+  }
+  const start = prepareVerify(root, id, values.baseline ? 'baseline' : 'final')
+  const controller = new AbortController()
+  const stop = () => controller.abort()
+  process.once('SIGINT', stop)
+  process.once('SIGTERM', stop)
+  try {
+    if (values.baseline) {
+      const { receipt, ref } = await runBaseline(start, controller.signal)
+      return {
+        code: 0,
+        out: {
+          ...receiptSummary(receipt, ref),
+          next: receipt.dirtied_paths ? `la medición escribió en el árbol: limpia ${receipt.dirtied_paths.join(', ')} antes de lanzar el writer` : flowNext(root, id),
+        },
+      }
+    }
+    const { receipt, ref, projection } = await runFinal(start, controller.signal)
+    const pending = start.contract.rows.filter((r): r is ManualRow => r.kind === 'manual' && receipt.rows.find((x) => x.row === r.id)?.outcome !== 'passed')
+    const questions = pending.map((r) => ({ row: r.id, question: attestQuestion(id, r.id, r.observation, receipt.after, receipt.plan_fingerprint) }))
+    return { code: 0, out: { ...receiptSummary(receipt, ref), projection, ...(questions.length > 0 ? { questions } : {}), next: flowNext(root, id) } }
+  } finally {
+    process.off('SIGINT', stop)
+    process.off('SIGTERM', stop)
+  }
 }
 
 /** El `--conductor` de un comando protegido: elige de qué sesión se lee la respuesta del usuario. */
@@ -2119,9 +2181,29 @@ function skillCheck(cwd: string): SkillCheck {
   return { copies: skillCopies(root, PKG_DIR) }
 }
 
+/** Los comandos que solo consultan: con una verificación en curso, informan en vez de detenerse. */
+const READS = (cmd: string | undefined, rest: string[]) =>
+  cmd === 'wait' || cmd === 'doctor' || (cmd === 'review' && rest[0] === 'status') || (cmd === 'sdd' && rest[0] === 'status')
+
+/**
+ * Antes de cualquier verbo, resuelve una restauración de `sdd verify` que quedó interrumpida en este
+ * checkout. El supervisor interno no la corre: es parte de una corrida en curso, no un verbo.
+ */
+function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string): void {
+  if (!['run', 'review', 'wait', 'cancel', 'agents', 'sdd', 'doctor'].includes(cmd ?? '')) return
+  let root: string
+  try {
+    root = repoRoot(cwd)
+  } catch {
+    return
+  }
+  recoverPendingRestore(root, READS(cmd, rest) ? 'non_blocking' : 'blocking')
+}
+
 export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {
   const [cmd, ...rest] = argv
   try {
+    recoverBeforeVerb(cmd, rest, cwd)
     switch (cmd) {
       case 'run': return await run(rest, env, cwd)
       case 'review': return await review(rest, env, cwd)

@@ -141,3 +141,11 @@ test('la ronda N pide que un hallazgo nuevo sea del artefacto', () => {
   const { prompt, candidate } = roundTwo('plan')
   assert.ok(prompt.includes(`es un defecto del artefacto: su \`of\` es ${candidate.files[0].path}`))
 })
+
+test('la pauta de plan pide revisar la pertinencia de cada fila con dos preguntas', () => {
+  const plan = ARTIFACT_MANDATES.plan.quality
+  assert.match(plan, /¿el esperado se cumpliría aunque el requisito fuera falso\?/)
+  assert.match(plan, /¿fallaría aunque el requisito fuera verdadero\?/)
+  // La pauta de las otras piezas no carga esas preguntas.
+  assert.equal(ARTIFACT_MANDATES.tasks.quality.includes('requisito fuera falso'), false)
+})

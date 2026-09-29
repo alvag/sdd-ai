@@ -25,6 +25,8 @@ export interface FrozenLaunch {
   request_path?: string; context_path?: string
   /** Una ampliación: en `specify`, el pedido es la copia que guardó la primera corrida y no se relee. */
   amended: boolean
+  /** Los ids de AC congelados al lanzar plan, para releer su contrato al publicar. */
+  criteria?: string[]
 }
 
 export type PublishCause = 'artifact_exists' | 'inputs_changed' | 'step_changed' | 'candidate_blocked' | 'write_failed'
@@ -49,7 +51,7 @@ export function fileHash(path: string): string {
  */
 export function freezeLaunch(read: FlowRead, o: {
   step: DocumentStep; depth: 'normal' | 'completa'; amended: boolean
-  request?: { path: string; bytes: Buffer }; context?: { path: string; bytes: Buffer }; plan_header?: Omit<PlanHeader, 'created_at'>
+  request?: { path: string; bytes: Buffer }; context?: { path: string; bytes: Buffer }; plan_header?: Omit<PlanHeader, 'created_at'>; criteria?: string[]
 }): FrozenLaunch {
   const inputs: Record<string, string> = {}
   if (o.step !== 'specify') inputs.spec = artifactHash(read, 'spec')
@@ -58,7 +60,7 @@ export function freezeLaunch(read: FlowRead, o: {
   if (o.context) inputs.context = bytesHash(o.context.bytes)
   return {
     flow: read.facts.id, step: o.step, depth: o.depth, inputs, handoff_header: headerHash(read.facts.handoffHeader),
-    ...(o.plan_header ? { plan_header: o.plan_header } : {}),
+    ...(o.plan_header ? { plan_header: o.plan_header } : {}), ...(o.criteria ? { criteria: o.criteria } : {}),
     ...(o.request ? { request_path: o.request.path } : {}), ...(o.context ? { context_path: o.context.path } : {}), amended: o.amended,
   }
 }
@@ -89,7 +91,8 @@ function render(launch: FrozenLaunch, c: DocumentContract, now: Date): string {
   if (c.phase === 'specify') return renderSpec(c)
   if (c.phase === 'tasks') return renderTasks(c)
   if (!launch.plan_header) throw new Error('una publicación de plan necesita su header congelado')
-  return renderPlan(c, { ...launch.plan_header, created_at: localIso(now) })
+  if (!launch.criteria) throw new Error('una publicación de plan necesita los criterios congelados de la spec')
+  return renderPlan(c, { ...launch.plan_header, created_at: localIso(now) }, launch.criteria)
 }
 
 /**

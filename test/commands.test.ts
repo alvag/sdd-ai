@@ -23,6 +23,16 @@ test('bindingCommand reconoce las formas del binario solo en el primer tramo', (
   for (const command of ['sdd-ai sdd phase', 'sdd-ai sdd phase f1 f2', 'sdd-ai sdd phase f1 --otra x', 'sdd-ai sdd phase f1 --request']) {
     assert.equal(bindingCommand(command), undefined, command)
   }
+  const verifies = [
+    './bin/sdd-ai sdd verify f1',
+    './bin/sdd-ai sdd verify f1 --baseline',
+    './bin/sdd-ai sdd verify --attest V3 f1',
+    './bin/sdd-ai sdd verify f1 --attest=V3 --conductor codex',
+  ]
+  for (const command of verifies) assert.deepEqual(bindingCommand(command), { verb: 'verify', id: 'f1' }, command)
+  for (const command of ['sdd-ai sdd verify', 'sdd-ai sdd verify f1 f2', 'sdd-ai sdd verify f1 --otra', 'sdd-ai sdd verify f1 --attest']) {
+    assert.equal(bindingCommand(command), undefined, command)
+  }
   const none = [
     'cd x && ./bin/sdd-ai sdd status f1',
     'false && ./bin/sdd-ai sdd status f1',

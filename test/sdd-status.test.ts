@@ -8,7 +8,7 @@ import type { HeaderResult } from '../src/sdd/markdown.ts'
 import { readFlow } from '../src/sdd/read.ts'
 import {
   type Approval, type ApprovalLog, type Depth, type FlowFacts, GATE_ARTIFACTS, GATES, type GateId, type GateResolution, type Reason,
-  resolve, resolveGates,
+  STATUSES, resolve, resolveGates,
 } from '../src/sdd/status.ts'
 import { makeRepo } from './helpers.ts'
 
@@ -447,4 +447,21 @@ test('en corta con jira on vale la sección ## Spec, sin layout_mismatch ni esca
   const ready = resolve(flow('corta', 'tasks-ready', { jira: ON, handoffHeader: approved }))
   assert.deepEqual(ready.blocked_reasons, [])
   assert.deepEqual(ready.next, { step: 'implement', task: 'T2 — segunda' })
+})
+
+test('con contrato estructurado, verified pide un recibo vigente; en prosa rige el header con una nota', () => {
+  const done = { total: 2, done: 2, firstPending: null }
+  const verified = (o: Partial<FlowFacts>) => resolve(flow('completa', 'verified', { tasksFile: done, ...o }))
+  assert.equal(verified({}).next.step, 'review_and_commit')
+  assert.equal(verified({ contract: 'structured', receipt: 'valid' }).next.step, 'review_and_commit')
+  for (const receipt of ['stale', undefined] as const) {
+    const r = verified({ contract: 'structured', receipt })
+    assert.deepEqual(r.next, { step: 'verify' })
+    assert.match(r.notes.find((n) => n.code === 'verified_stale')?.detail ?? '', /verified vencido/)
+  }
+  const prose = verified({ contract: 'prose' })
+  assert.equal(prose.next.step, 'review_and_commit')
+  assert.match(prose.notes.find((n) => n.code === 'verified_unreceipted')?.detail ?? '', /verified sin recibo: contrato en prosa/)
+  // El ciclo de status no suma estados.
+  assert.deepEqual([...STATUSES], ['planned', 'plan-approved', 'tasks-ready', 'implementing', 'verified', 'committed', 'pushed', 'pr-open', 'done'])
 })

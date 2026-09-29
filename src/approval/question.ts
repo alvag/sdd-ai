@@ -55,6 +55,25 @@ export function gateQuestionFor(flow: string, depth: Depth, gate: GateId, finger
   return gateQuestion(flow, gate, fingerprint, previous)
 }
 
+export const ATTEST_OPTIONS = { attest: 'Acreditar', decline: 'No acreditar' } as const
+
+/**
+ * La pregunta con que una persona acredita una fila `manual` de verify. El código liga la fila, lo que hay
+ * que observar, el candidato y el plan aprobado: un cambio en cualquiera pide otra respuesta.
+ */
+export function attestQuestion(flow: string, row: string, observation: string, candidate: { base_commit: string; tree: string }, planFingerprint: string): Question {
+  const json = JSON.stringify({ flow, row, observation, base_commit: candidate.base_commit, tree: candidate.tree, plan: planFingerprint })
+  const code = createHash('sha256').update(json).digest('hex').slice(0, 16)
+  return {
+    header: header(`Acreditar ${row}`, row),
+    question: `¿Observaste la fila ${row} del flujo ${flow}: ${observation}? (código ${code})`,
+    options: [
+      { label: ATTEST_OPTIONS.attest, description: `Registra que ${row} se observó en este candidato` },
+      { label: ATTEST_OPTIONS.decline, description: `${row} queda pendiente` },
+    ],
+  }
+}
+
 export function disputeQuestion(review: string, entry: { id: string; claim: string }, completed: number, reason: string): Question {
   return {
     header: header(`Disputa ${entry.id}`, entry.id),

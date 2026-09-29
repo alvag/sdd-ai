@@ -10,6 +10,7 @@ import {
   tasksFingerprint,
 } from './markdown.ts'
 import { type Approval, type ApprovalLog, type Depth, type FileState, type FlowFacts, GATES, type GateId, type Next, type Reason, isDepth, resolve } from './status.ts'
+import { verifyFacts } from './verify-state.ts'
 
 /** El registro de aprobaciones vive en el flujo: viaja con él al archivarlo. */
 export const APPROVALS_FILE = 'sdd-ai-approvals.json'
@@ -228,6 +229,7 @@ export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode
 
   const rel = `.plans/${id}`
   const paths = Object.fromEntries([['dir', rel], ...Object.entries(FILE_NAMES).map(([k, name]) => [k, `${rel}/${name}`])])
+  const verify = planText === null ? {} : verifyFacts(root, id, planText, planHeader, fingerprints, spec ?? planText)
   return {
     facts: {
       id,
@@ -242,6 +244,7 @@ export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode
       paths,
       hasRemote: hasRemote(root),
       jira: flowJira(id, handoffHeader, jira),
+      ...verify,
     },
     digests: {
       spec: files.spec.digest, plan: files.plan.digest, tasks: files.tasks.digest, handoff: files.handoff.digest, approvals: approvals.digest,

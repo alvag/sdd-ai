@@ -88,6 +88,29 @@ export function section(body: string, title: string): string | null {
   return r ? lines.slice(r[0] + 1, r[1]).map((l) => l.text).join('\n') : null
 }
 
+/**
+ * El texto con la sección `## <title>` reemplazada por `body`, o agregada al final si no está. Lo que hay
+ * antes y después de esa sección queda igual.
+ */
+export function replaceSection(text: string, title: string, body: string): string {
+  const raw = splitLines(text)
+  const r = sectionRange(scan(raw), title)
+  const block = [`## ${title}`, '', ...splitLines(body.replace(/\n+$/, ''))]
+  if (!r) return `${text.replace(/\n*$/, '')}\n\n${block.join('\n')}\n`
+  const after = raw.slice(r[1])
+  return [...raw.slice(0, r[0]), ...block, ...(after.length > 0 && after.some((l) => l !== '') ? ['', ...after] : [''])].join('\n')
+}
+
+/** El texto con la línea `status` del header reemplazada; sin header o sin esa línea es un error. */
+export function setHeaderStatus(text: string, status: string): string {
+  const raw = splitLines(text)
+  const close = raw[0]?.trim() === '---' ? raw.findIndex((l, i) => i > 0 && l.trim() === '---') : -1
+  const at = close < 0 ? -1 : raw.findIndex((l, i) => i > 0 && i < close && /^status:/.test(l))
+  if (at < 0) throw new Error('el plan no tiene una línea status en su header')
+  raw[at] = `status: ${status}`
+  return raw.join('\n')
+}
+
 /** Una task es un checkbox de primer nivel, sin sangría y fuera de las cercas; un anidado es texto. */
 export function countTasks(text: string): TaskCount {
   let total = 0

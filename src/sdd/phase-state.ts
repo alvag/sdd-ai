@@ -8,6 +8,7 @@ import { harvestTreeHolds, isWriterRun, readHarvest } from '../writer-store.ts'
 import type { DocumentStep, PhaseStep } from './phase.ts'
 import { LOCK_FILE, flowDir, lstatOrNull, pathInvalid } from './read.ts'
 import type { FlowStatus, Next } from './status.ts'
+import type { AttestationRef, VerifyReceiptRef } from './verify-receipt.ts'
 
 // El estado de las fases de un flujo que no se lee de sus artefactos: la última corrida, la ampliación
 // y el cierre inline, por fase. Vive en el flujo, junto al registro de aprobaciones, y se escribe bajo
@@ -27,6 +28,8 @@ export interface PhaseRecord {
   schema_version: 1
   last_run: { id: string; step: PhaseStep } | null
   phases: Partial<Record<DocumentStep, PhaseEntry>>
+  /** Los recibos de `sdd verify` y las acreditaciones de filas manuales, en orden: solo su id y su digest. */
+  verify?: { receipts: VerifyReceiptRef[]; attestations: AttestationRef[] }
 }
 
 const PHASE_STEPS: readonly string[] = ['specify', 'plan', 'tasks', 'implement']
@@ -61,7 +64,47 @@ export function readPhaseRecord(root: string, id: string): PhaseRecord {
     const problem = entryProblem(entry)
     if (problem !== null) throw invalid(id, `phases.${step} ${problem}`)
   }
+  if (data.verify !== undefined) {
+    const problem = verifyProblem(data.verify)
+    if (problem !== null) throw invalid(id, `verify ${problem}`)
+  }
   return data as unknown as PhaseRecord
+}
+
+const DIGEST = /^sha256:[0-9a-f]{64}$/
+
+/** Qué le falta a la entrada de verify para tener la forma del registro; `null` si la tiene. */
+function verifyProblem(v: unknown): string | null {
+  if (!isRecord(v)) return 'no es un mapa'
+  for (const key of Object.keys(v)) if (!['receipts', 'attestations'].includes(key)) return `trae la clave desconocida ${key}`
+  if (!Array.isArray(v.receipts) || !Array.isArray(v.attestations)) return 'no trae las listas receipts y attestations'
+  const ref = (r: unknown) => isRecord(r) && typeof r.id === 'string' && isRunId(r.id) && typeof r.digest === 'string' && DIGEST.test(r.digest)
+  if (!v.receipts.every((r) => ref(r) && isRecord(r) && (r.mode === 'final' || r.mode === 'baseline'))) return 'tiene un recibo sin id, digest o modo'
+  if (!v.attestations.every((a) => ref(a) && isRecord(a) && text(a.row) && text(a.proof_ref))) return 'tiene una acreditación sin id, digest, fila o prueba'
+  return null
+}
+
+const withVerify = (r: PhaseRecord) => r.verify ?? { receipts: [], attestations: [] }
+
+/** Agrega la referencia de un recibo ya publicado al registro del flujo, bajo su lock. */
+export function appendReceiptRef(root: string, id: string, ref: VerifyReceiptRef): void {
+  withFlowLock(root, id, () => {
+    const r = readPhaseRecord(root, id)
+    const v = withVerify(r)
+    writePhaseRecord(root, id, { ...r, verify: { ...v, receipts: [...v.receipts, ref] } })
+  })
+}
+
+/** Agrega la referencia de una acreditación ya publicada. Va dentro de `withFlowLock`, junto al control de respuestas consumidas. */
+export function appendAttestationRef(root: string, id: string, ref: AttestationRef): void {
+  const r = readPhaseRecord(root, id)
+  const v = withVerify(r)
+  writePhaseRecord(root, id, { ...r, verify: { ...v, attestations: [...v.attestations, ref] } })
+}
+
+/** El último recibo final del flujo; los de `--baseline` no cuentan para `verified`. */
+export function latestFinalReceipt(r: PhaseRecord): VerifyReceiptRef | null {
+  return [...(r.verify?.receipts ?? [])].reverse().find((ref) => ref.mode === 'final') ?? null
 }
 
 const DOCUMENT_STEPS: readonly string[] = ['specify', 'plan', 'tasks']
@@ -159,10 +202,11 @@ export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'de
 }
 
 /**
- * El `next` de un flujo con el comando de su fase, o con el motivo por el que no hay. Un registro que no
+ * El `next` de un flujo con el comando de su fase o de `sdd verify`, o con el motivo por el que no hay. Un registro que no
  * se puede leer no tumba a quien lista: queda dicho en `detail`.
  */
 export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root: string, id: string, status: T): Next {
+  if (status.next.step === 'verify') return { ...status.next, command: `./bin/sdd-ai sdd verify ${id}` }
   if ((status.depth !== 'normal' && status.depth !== 'completa') || !PHASE_STEPS.includes(status.next.step)) return status.next
   try {
     const phase = phaseNext(root, id, status, readPhaseRecord(root, id))

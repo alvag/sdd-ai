@@ -7,7 +7,7 @@ import { isFlowId } from './sdd/id.ts'
 import { shellPipelines } from './shell.ts'
 
 /** Un comando del binario que liga la sesión a un flujo. */
-export interface Binding { verb: 'status' | 'approve' | 'phase'; id: string }
+export interface Binding { verb: 'status' | 'approve' | 'phase' | 'verify'; id: string }
 
 /** Dónde actúa un `git commit`: un directorio, o desconocido si el comando no deja saberlo. */
 export type CommitTarget = { dir: string } | { unknown: true }
@@ -74,6 +74,7 @@ const OPTIONS: Record<Binding['verb'], { flags: string[]; values: string[]; coun
   status: { flags: ['--json'], values: [], count: 1 },
   approve: { flags: [], values: ['--conductor'], count: 2 },
   phase: { flags: [], values: ['--request', '--context', '--families', '--conductor', '--deadline'], count: 1 },
+  verify: { flags: ['--baseline'], values: ['--attest', '--conductor'], count: 1 },
 }
 
 /** Los posicionales como los separa el `parseArgs` estricto de la CLI; `undefined` si ella los rechazaría. */
@@ -97,13 +98,13 @@ function bindingOf(segment: string): Binding | undefined {
   const bin = ws[start]
   if (bin === undefined || (bin !== 'sdd-ai' && !bin.endsWith('bin/sdd-ai')) || ws[start + 1] !== 'sdd') return undefined
   const verb = ws[start + 2]
-  if (verb !== 'status' && verb !== 'approve' && verb !== 'phase') return undefined
+  if (verb !== 'status' && verb !== 'approve' && verb !== 'phase' && verb !== 'verify') return undefined
   const args = positionals(ws.slice(start + 3), OPTIONS[verb])
   if (args === undefined || args.length !== OPTIONS[verb].count || !isFlowId(args[0])) return undefined
   return { verb, id: args[0] }
 }
 
-/** `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` del binario, solo en el primer tramo de la cadena. */
+/** `sdd status <id>`, `sdd approve <id> <gate>`, `sdd phase <id>` o `sdd verify <id>` del binario, solo en el primer tramo de la cadena. */
 export function bindingCommand(command: string): Binding | undefined {
   return bindingOf(shellPipelines(command)[0][0])
 }

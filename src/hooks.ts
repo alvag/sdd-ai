@@ -10,6 +10,7 @@ import { renderBootstrap } from './route.ts'
 import { readJson, readStatus, writeJsonAtomic } from './runs.ts'
 import { withPhaseNext } from './sdd/phase-state.ts'
 import { type ListEntry, listFlows, lstatOrNull, readFlow } from './sdd/read.ts'
+import { restoreIntentOpen } from './sdd/restore.ts'
 import { type FlowStatus, type Reason, type Step, headerData, resolve } from './sdd/status.ts'
 import { shellSegments } from './shell.ts'
 import type { NativeProfile } from './types.ts'
@@ -455,15 +456,15 @@ function postDispatch(p: Payload, root: string, action: 'confirm' | 'release'): 
 }
 
 /**
- * Los comandos de corridas; `sdd approve` y `sdd phase` se suman aparte, porque `sdd status` sí lo puede
- * correr un worker.
+ * Los comandos de corridas; `sdd approve`, `sdd phase` y `sdd verify` se suman aparte, porque `sdd status`
+ * sí lo puede correr un worker.
  */
 const RUN_COMMANDS = new Set(['run', 'review', 'wait', 'cancel'])
-const CONDUCTOR_SDD = new Set(['approve', 'phase'])
+const CONDUCTOR_SDD = new Set(['approve', 'phase', 'verify'])
 
 /**
  * Si el tramo invoca `sdd-ai`, una ruta que termina en `bin/sdd-ai` o `node <ruta>/bin/sdd-ai`, con uno
- * de los comandos de corridas, con `sdd approve` o con `sdd phase`.
+ * de los comandos de corridas, con `sdd approve`, con `sdd phase` o con `sdd verify`.
  */
 function invokesConductorCommand(segment: string): boolean {
   const tokens = segment.trim().split(/\s+/)
@@ -475,7 +476,7 @@ function invokesConductorCommand(segment: string): boolean {
 
 /**
  * Dentro de un subagente, un comando de shell no lanza ni toca corridas, ni aprueba un gate, ni lanza
- * una fase: todo eso es del conductor. Es una guarda para el caso honesto; una variable o un script intermedio la
+ * una fase, ni verifica: todo eso es del conductor. Es una guarda para el caso honesto; una variable o un script intermedio la
  * esquivan.
  */
 function guardShell(p: Payload): string {
@@ -525,6 +526,10 @@ export function guardCommit(p: Payload, root: string, session: string | null): s
     const here = realpathSync(root)
     const places = targets.map((t) => isHere(t, here))
     if (!places.some((h) => h !== false)) return ''
+    // Con una restauración de verify pendiente, el árbol puede tener archivos revertidos a la base.
+    if (restoreIntentOpen(root)) {
+      return deny('sdd verify dejó una restauración pendiente y el árbol puede tener archivos revertidos: corre ./bin/sdd-ai sdd status para que se resuelva, y después el commit')
+    }
     if (invokesBinding(command)) {
       return deny('este comando liga un flujo y hace git commit en la misma cadena: corre sdd status o sdd approve y el commit por separado, ' +
         'porque el commit no se puede decidir con una liga que todavía no existe')

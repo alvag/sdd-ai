@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process'
-import { lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs'
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 import { SddError } from './types.ts'
 
@@ -192,6 +193,74 @@ export function buildIndex(c: Checkout, base: string, indexFile: string): string
   }
   if (updates.length > 0) g.text(['update-index', '-z', '--index-info'], `${updates.join('\0')}\0`)
   return g.text(['write-tree']).trim()
+}
+
+/** Base y árbol de un candidato, los dos sin el directorio de su flujo: iguales si nada cambió afuera. */
+export interface CandidateFingerprint { base_commit: string; base_tree: string; tree: string }
+
+/** Saca `path` del índice propio y escribe su árbol. */
+function treeWithout(c: Checkout, indexFile: string, path: string): string {
+  const g = indexedGit(c, indexFile)
+  g.text(['rm', '--cached', '-r', '-f', '-q', '--ignore-unmatch', '--', path])
+  return g.text(['write-tree']).trim()
+}
+
+/** Un índice propio en un directorio temporal, que se borra al terminar. */
+function withScratchIndex<T>(fn: (indexFile: string) => T): T {
+  const dir = mkdtempSync(join(tmpdir(), 'sdd-ai-index-'))
+  try {
+    const indexFile = join(dir, 'index')
+    mkdirSync(scratchObjects(indexFile), { recursive: true })
+    return fn(indexFile)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/**
+ * La huella del candidato de un flujo: el árbol de trabajo y el de `baseCommit`, los dos sin
+ * `.plans/<flow>/`, así lo que el propio verbo escribe en el flujo no la mueve. Entran los archivos
+ * rastreados y los nuevos que Git no ignora, como en la cosecha: una fila que escribe solo en rutas
+ * ignoradas, como la salida de un build, no cuenta como mutación. No toca el índice del usuario.
+ */
+export function candidateFingerprint(root: string, flow: string, baseCommit: string): CandidateFingerprint {
+  const c: Checkout = { root, gitDir: gitDirs(root).gitDir }
+  const flowPath = `.plans/${flow}`
+  const tree = withScratchIndex((indexFile) => {
+    buildIndex(c, baseCommit, indexFile)
+    return treeWithout(c, indexFile, flowPath)
+  })
+  const base_tree = withScratchIndex((indexFile) => {
+    indexedGit(c, indexFile).text(['read-tree', baseCommit])
+    return treeWithout(c, indexFile, flowPath)
+  })
+  return { base_commit: baseCommit, base_tree, tree }
+}
+
+/**
+ * El árbol de una cosecha sin `.plans/<flow>/`, reconstruido aplicando su patch sobre la base en un índice
+ * propio: la cosecha no conserva el objeto de su árbol. `null` si el patch ya no está o no aplica.
+ */
+export function harvestTreeWithout(root: string, flow: string, base: string, patchFile: string): string | null {
+  const c: Checkout = { root, gitDir: gitDirs(root).gitDir }
+  let size: number
+  try {
+    size = statSync(patchFile).size
+  } catch {
+    return null
+  }
+  return withScratchIndex((indexFile) => {
+    const g = indexedGit(c, indexFile)
+    g.text(['read-tree', base])
+    if (size > 0) {
+      try {
+        g.text(['apply', '--cached', '--binary', patchFile])
+      } catch {
+        return null
+      }
+    }
+    return treeWithout(c, indexFile, `.plans/${flow}`)
+  })
 }
 
 /** Diff del índice armado contra la base, sin diff externo ni textconv, con las rutas de siempre. */

@@ -1247,3 +1247,41 @@ test('sdd phase en subagentes y workers se niega y la sesión del conductor qued
   const worker = spawnSync(BIN, ['sdd', 'phase', 'f1', '--request', 'pedido.md'], { cwd: makeRepo(), encoding: 'utf8', env: { PATH: process.env.PATH, SDD_AI_WORKER: '1' } })
   assert.equal(JSON.parse(worker.stdout).code, 'recursion')
 })
+
+test('dentro de un hijo se niega sdd verify en todas sus formas', () => {
+  for (const cli of CLIS) {
+    const repo = makeRepo()
+    mkdirSync(join(repo, '.sdd-ai'))
+    for (const command of ['./bin/sdd-ai sdd verify f1', 'sdd-ai sdd verify f1 --baseline', 'node /abs/bin/sdd-ai sdd verify f1 --attest V2']) {
+      assert.match(denial(shell(cli, repo, command, CHILD)), /un worker no delega ni toca las corridas del conductor/, command)
+      assert.equal(shell(cli, repo, command), '', command)
+    }
+  }
+})
+
+test('con contrato estructurado, verified sin recibo vigente no abre el commit; en prosa rige el header', () => {
+  for (const cli of CLIS) {
+    const prose = boundRepo(cli, { plan: { status: 'verified' }, tasks: 'done' })
+    assert.equal(stepOf(prose, 'f1'), 'review_and_commit')
+    assert.equal(shell(cli, prose, 'git commit -m x'), '')
+
+    const structured = boundRepo(cli, { plan: { status: 'verified' }, tasks: 'done' })
+    const plan = join(structured, '.plans', 'f1', 'plan.md')
+    writeFileSync(plan, `${readFileSync(plan, 'utf8')}\n## Verification\n\n\`\`\`sdd-ai-verification-v1\n{}\n\`\`\`\n`)
+    assert.equal(stepOf(structured, 'f1'), 'verify')
+    const reason = denial(shell(cli, structured, 'git commit -m x'))
+    assert.match(reason, /flujo f1/)
+    assert.match(reason, /verify/)
+  }
+})
+
+test('una restauración de verify pendiente niega el commit aunque el flujo esté para commitear', () => {
+  for (const cli of CLIS) {
+    const repo = boundRepo(cli, { plan: { status: 'verified' }, tasks: 'done' })
+    mkdirSync(join(repo, '.git', 'sdd-ai', 'verify'), { recursive: true })
+    writeFileSync(join(repo, '.git', 'sdd-ai', 'verify', 'restore-intent.json'), '{}\n')
+    assert.match(denial(shell(cli, repo, 'git commit -m x')), /restauración pendiente/)
+    rmSync(join(repo, '.git', 'sdd-ai', 'verify', 'restore-intent.json'))
+    assert.equal(shell(cli, repo, 'git commit -m x'), '')
+  }
+})

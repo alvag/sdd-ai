@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { countTasks, criteriaIds, readHeader, section, taskLines } from '../src/sdd/markdown.ts'
+import { renderVerification } from '../src/sdd/verification-contract.ts'
 import {
   type FlowData, type FrozenInputs, PHASE_INPUTS, PLAN_TITLES, type PhaseStep, SPEC_TITLES, STATUS_TITLES, admitImplement, admitPlan, admitSpecify,
   admitTasks, planHeaderFrom, renderPhasePrompt, renderPlan, renderSpec, renderTasks,
@@ -117,13 +118,18 @@ test('la admisión de specify arma la spec desde los campos', () => {
 
 const PLAN_C = {
   phase: 'plan', assumptions: [], blocking_questions: [], missing_context: [],
-  approach: 'Un módulo nuevo.', decisions: 'ninguno', files: '- `src/export.ts` — nuevo', verification: '| AC-1 | test | `npm test` | verde |',
+  approach: 'Un módulo nuevo.', decisions: 'ninguno', files: '- `src/export.ts` — nuevo',
+  verification: {
+    schema_version: 1 as const,
+    rows: [{ id: 'V1', acs: ['AC-1'], kind: 'inspección' as const, obligation: 'none' as const, obligation_reason: 'lectura de la salida', argv: ['npm', 'test'], timeout_ms: 60000, expect: { exit_code: 0 } }],
+  },
 }
+const PLAN_ACS = ['AC-1']
 const HANDOFF = { profundidad: 'completa', change_type: 'feat', risk: 'low', spec_approved_at: '2026-09-29T08:59:18-05:00' }
 
 test('la admisión de plan rechaza secciones vacías y títulos reservados', () => {
-  assert.equal(admitPlan(json(PLAN_C)).kind, 'admitted')
-  assert.equal(admitPlan(json({ ...PLAN_C, decisions: '' })).kind, 'admitted')
+  assert.equal(admitPlan(json(PLAN_C), PLAN_ACS).kind, 'admitted')
+  assert.equal(admitPlan(json({ ...PLAN_C, decisions: '' }), PLAN_ACS).kind, 'admitted')
   const cases: Array<[string, unknown, RegExp]> = [
     ['enfoque vacío', { ...PLAN_C, approach: '  ' }, /approach/],
     ['archivos vacíos', { ...PLAN_C, files: '' }, /files/],
@@ -132,7 +138,7 @@ test('la admisión de plan rechaza secciones vacías y títulos reservados', () 
     ['lista que no es lista', { ...PLAN_C, assumptions: 'ninguno' }, /assumptions/],
   ]
   for (const title of [...STATUS_TITLES, ...PLAN_TITLES]) cases.push([`## ${title}`, { ...PLAN_C, approach: `x\n\n## ${title}\n\ny` }, /título reservado/])
-  for (const [name, o, cause] of cases) assert.match(errorOf(admitPlan(json(o))), cause, name)
+  for (const [name, o, cause] of cases) assert.match(errorOf(admitPlan(json(o), PLAN_ACS)), cause, name)
 })
 
 test('la admisión de plan arma el header de sdd-flow y la verificación', () => {
@@ -145,22 +151,22 @@ test('la admisión de plan arma el header de sdd-flow y la verificación', () =>
   assert.match(h.header.created_at, /^2026-09-29T\d{2}:17:42[+-]\d{2}:\d{2}$/)
   assert.equal(Date.parse(h.header.created_at), now.getTime())
 
-  const a = admitPlan(json(PLAN_C))
+  const a = admitPlan(json(PLAN_C), PLAN_ACS)
   assert.equal(a.kind, 'admitted')
   if (a.kind !== 'admitted') return
-  const plan = renderPlan(a.review, h.header)
+  const plan = renderPlan(a.review, h.header, PLAN_ACS)
   const header = readHeader(plan)
   assert.ok(header.ok)
   if (header.ok) {
     assert.deepEqual(header.data, { ...h.header })
     for (const title of PLAN_TITLES) assert.ok(section(header.body, title) !== null, title)
-    assert.equal(section(header.body, 'Verification')?.trim(), PLAN_C.verification)
+    assert.equal(section(header.body, 'Verification')?.trim(), renderVerification(PLAN_C.verification))
     assert.equal(section(header.body, 'Decisiones y trade-offs')?.trim(), 'ninguno')
   }
   // Un SHA que YAML leería como número va entre comillas y se lee como texto.
   const numeric = planHeaderFrom('f', HANDOFF, 'feature/f', '1234e5', now)
   if ('header' in numeric) {
-    const r = readHeader(renderPlan(a.review, numeric.header))
+    const r = readHeader(renderPlan(a.review, numeric.header, PLAN_ACS))
     assert.ok(r.ok && r.data.base_commit === '1234e5')
   }
 
@@ -258,4 +264,14 @@ test('la admisión de plan necesita el header completo: sin sus datos, sdd phase
   assert.deepEqual([r.status, out.code], [2, 'plan_header_incomplete'])
   assert.match(out.message, /risk/)
   assert.equal(existsSync(join(repo, '.sdd-ai', 'runs')), false)
+})
+
+test('el encargo de plan pide filas estructuradas y las dos preguntas de pertinencia, sin atribuírselas a la admisión', () => {
+  const prompt = renderPhasePrompt('plan', flow('plan'), INPUTS)
+  for (const field of ['"schema_version": 1', '"obligation"', '"timeout_ms"', '"implementation_paths"', '"test_name"', '"report_format": "tap"', '"observation"']) {
+    assert.ok(prompt.includes(field), field)
+  }
+  assert.match(prompt, /¿el esperado se cumpliría aunque el requisito fuera falso\?/)
+  assert.match(prompt, /¿fallaría aunque el requisito fuera verdadero\?/)
+  assert.match(prompt, /esa pertinencia no la puede comprobar/)
 })

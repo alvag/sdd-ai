@@ -126,7 +126,7 @@ export function cleanEnv(env: Record<string, string | undefined>): Record<string
  * Señala al grupo solo si todavía existe: un id de grupo no se reutiliza mientras tenga procesos, pero
  * uno vacío sí. Queda la ventana mínima entre la consulta y la señal.
  */
-function killGroup(pid: number, signal: NodeJS.Signals): void {
+export function killGroup(pid: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-pid, 0)
     process.kill(-pid, signal)
@@ -886,7 +886,7 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
 
   const admitFn = (text: string): Admission<DocumentContract> => {
     if (phase.step === 'specify') return admitSpecify(text)
-    if (phase.step === 'plan') return admitPlan(text)
+    if (phase.step === 'plan') return admitPlan(text, phase.criteria ?? [])
     return admitTasks(text, phase.criteria ?? [])
   }
   const admitted = await admitPhase(ctx, r.current, r.last, resumeSec, admitFn, { name: '-fix', suffix: '-fix', kind: 'correction' })

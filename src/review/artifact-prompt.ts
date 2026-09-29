@@ -37,6 +37,7 @@ export const ARTIFACT_MANDATES: Record<ArtifactKind, { spec: string; quality: st
 - Contratos entre componentes: productor y consumidor coinciden en forma y autoridad.
 - Efectos colaterales: las mutaciones, la compatibilidad y el rollback están tratados.
 - Verificación: cada prueba distingue el cumplimiento del incumplimiento.
+- Pertinencia por fila: ¿el esperado se cumpliría aunque el requisito fuera falso? ¿fallaría aunque el requisito fuera verdadero? Una fila formalmente válida puede ser impertinente y debe señalarse.
 ${CODE_CLAIMS}`,
   },
   tasks: {
