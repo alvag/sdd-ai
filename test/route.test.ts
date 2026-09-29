@@ -119,3 +119,33 @@ test('el recordatorio de ediciones remite al comando del writer', () => {
   assert.match(r, /con permiso del usuario/)
   assert.ok(!renderReminder(['edits'], { calls: 0, reads: 0, edits: 3 }, SENTINEL, false).includes('--role implement'))
 })
+
+test('con jira on el bootstrap exige SDD, nombra las dos partes y no ofrece rutas de escritura; con invalid lo dice; con off es el de hoy', () => {
+  for (const wd of [true, false]) assert.equal(renderBootstrap(SENTINEL, wd, 'off'), renderBootstrap(SENTINEL, wd))
+  const on = [
+    'Ruta directa de sdd-ai en este repositorio, con la aprobación de la spec en Jira:',
+    '- Con `jira_approval` en `on`, todo cambio del proyecto va por un flujo SDD, aunque sea `corta`, y la spec se publica en Jira ' +
+      'con dos partes: un resumen para el PO, en lenguaje no técnico, y la definición técnica.',
+    '- Fuera de un flujo SDD el trabajo es de solo lectura. Escribir el encargo de una delegación en un archivo temporal fuera del ' +
+      'repositorio, y el estado que `run` deja en `.sdd-ai/`, no cambian el proyecto.',
+    '- Cuando entender el cambio requiere 91 o más archivos, la exploración se delega, sea cual sea el tamaño del cambio que venga ' +
+      `después: se escribe el encargo en un archivo temporal fuera del repositorio y se corre ${EXPLORE} con esa ruta. El temporal ` +
+      'se borra cuando `run` confirma que copió el encargo a la corrida, y se conserva si `run` falla antes.',
+    '- Si el encargo no se puede escribir, porque el usuario prohíbe toda escritura o porque el entorno no deja escribir fuera del ' +
+      'repositorio, la exploración va inline, y es una excepción admitida.',
+    '- Primero se validan las premisas y se corren checks focalizados; después, los completos.',
+    '- Una refutación de solo lectura se pide con `./bin/sdd-ai run --role refute --prompt-file <encargo>`.',
+    '- Al cerrar, el conductor declara la ruta que siguió y los supuestos que tomó.',
+  ]
+  const detail = '.sdd-ai/config.yml: jira_approval.mode tiene que ser "on" u "off", no true'
+  const invalid = [on[0], `- La config de Jira no se puede leer (${detail}): hasta corregirla rige lo mismo que con \`jira_approval\` en \`on\`.`, ...on.slice(1)]
+  for (const wd of [true, false]) {
+    const texts = [renderBootstrap(SENTINEL, wd, 'on'), renderBootstrap(SENTINEL, wd, 'invalid', detail)]
+    assert.deepEqual(texts[0].split('\n'), on)
+    assert.deepEqual(texts[1].split('\n'), invalid)
+    for (const line of texts.flatMap((t) => t.split('\n'))) {
+      assert.ok(!line.includes('--role implement') && !line.includes('sin permiso previo'), line)
+      assert.ok(!line.includes('inline') || line.includes('la exploración va inline'), line)
+    }
+  }
+})

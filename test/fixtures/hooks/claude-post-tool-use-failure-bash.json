@@ -1,0 +1,21 @@
+{
+  "session_id": "7c514bfc-2c12-4050-b99d-56b25c849e53",
+  "transcript_path": "/Users/max/.claude/projects/-repo/7c514bfc-2c12-4050-b99d-56b25c849e53.jsonl",
+  "cwd": "/repo",
+  "scratchpad_dir": "/tmp/claude-501/-repo/7c514bfc-2c12-4050-b99d-56b25c849e53/scratchpad",
+  "prompt_id": "01cd7d85-1fd4-45ea-86a8-5d7f6ee149ca",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "xhigh"
+  },
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "false",
+    "description": "Ejecutar el comando false"
+  },
+  "tool_use_id": "toolu_0192nEPA3mPy3Y16HYi5NB1s",
+  "error": "Exit code 1",
+  "is_interrupt": false,
+  "duration_ms": 28
+}

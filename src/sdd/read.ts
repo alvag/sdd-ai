@@ -1,9 +1,11 @@
 import { type Stats, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, relative, sep } from 'node:path'
+import { type JiraMode, loadJiraMode } from '../config.ts'
 import { sha256 } from '../review/candidate.ts'
 import { SddError } from '../types.ts'
+import { isFlowId } from './id.ts'
 import {
-  type SectionState, combinedFingerprint, countTasks, planFingerprint, readHeader, section, singleFingerprint, specFingerprint,
+  type HeaderResult, type SectionState, combinedFingerprint, countTasks, planFingerprint, readHeader, section, singleFingerprint, specFingerprint,
   tasksFingerprint,
 } from './markdown.ts'
 import { type Approval, type ApprovalLog, type Depth, type FileState, type FlowFacts, GATES, type GateId, type Next, type Reason, isDepth, resolve } from './status.ts'
@@ -12,7 +14,6 @@ import { type Approval, type ApprovalLog, type Depth, type FileState, type FlowF
 export const APPROVALS_FILE = 'sdd-ai-approvals.json'
 export const LOCK_FILE = 'sdd-ai-approvals.lock'
 
-const ID = /^[A-Za-z0-9._-]{1,128}$/
 const FINGERPRINT = /^sha256:[0-9a-f]{64}$/
 const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/
 const ARTIFACTS = ['spec', 'plan', 'tasks', 'handoff'] as const
@@ -22,8 +23,6 @@ export const FILE_NAMES: Record<FileKey, string> = {
 }
 const START_FLOW = 'para empezar un flujo, corre /sdd-flow en Claude Code o $sdd-flow en Codex'
 
-/** Un id es un solo segmento de ruta: con eso cada flujo tiene una sola identidad bajo `.plans/`. */
-export const isFlowId = (id: string) => ID.test(id) && id !== '.' && id !== '..'
 const outside = (rel: string) => rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
@@ -155,7 +154,19 @@ const sectionState = (s: string | null): SectionState => (s === null ? 'absent' 
  */
 export interface FlowRead { facts: FlowFacts; digests: Record<FileKey, string> }
 
-export function readFlow(root: string, id: string): FlowRead {
+/** El modo de Jira del flujo: un override `"on"` u `"off"` del handoff pisa el de la config, también uno inválido. */
+function flowJira(id: string, handoffHeader: HeaderResult | null, config: JiraMode): JiraMode {
+  const overrides = handoffHeader?.ok ? handoffHeader.data.overrides : undefined
+  const where = `.plans/${id}/handoff.md`
+  if (overrides === undefined || overrides === null) return config
+  if (!isRecord(overrides)) return { mode: 'invalid', detail: `${where}: overrides tiene que ser un mapa` }
+  const v = overrides.jira_approval
+  if (v === undefined || v === null) return config
+  if (v === 'on' || v === 'off') return { mode: v }
+  return { mode: 'invalid', detail: `${where}: overrides.jira_approval tiene que ser "on" u "off", o null para no pisar la config, no ${JSON.stringify(v)}` }
+}
+
+export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode(root)): FlowRead {
   const dir = flowDir(root, id)
   const files = Object.fromEntries(ARTIFACTS.map((a) => [a, readFlowFile(dir, id, a)])) as Record<(typeof ARTIFACTS)[number], FileRead>
   const approvals = readFlowFile(dir, id, 'approvals')
@@ -163,6 +174,7 @@ export function readFlow(root: string, id: string): FlowRead {
   const [spec, planText, tasks, handoff] = ARTIFACTS.map(text)
 
   const planHeader = planText === null ? null : readHeader(planText)
+  const handoffHeader = handoff === null ? null : readHeader(handoff)
   let planSections: FlowFacts['planSections'] = null
   let tasksSection: FlowFacts['tasksSection'] = null
   if (planText !== null) {
@@ -188,13 +200,14 @@ export function readFlow(root: string, id: string): FlowRead {
       id,
       files: { spec: files.spec.state, plan: files.plan.state, tasks: files.tasks.state, handoff: files.handoff.state },
       planHeader,
-      handoffHeader: handoff === null ? null : readHeader(handoff),
+      handoffHeader,
       planSections,
       tasksFile: tasks === null ? null : countTasks(tasks),
       tasksSection,
       fingerprints,
       log: toLog(approvals),
       paths,
+      jira: flowJira(id, handoffHeader, jira),
     },
     digests: {
       spec: files.spec.digest, plan: files.plan.digest, tasks: files.tasks.digest, handoff: files.handoff.digest, approvals: approvals.digest,
@@ -218,6 +231,7 @@ export function listFlows(root: string): ListEntry[] {
   if (st === null) return []
   if (st.isSymbolicLink()) throw pathInvalid('.plans', 'es un enlace simbólico')
   if (!st.isDirectory()) throw pathInvalid('.plans', 'no es un directorio')
+  const jira = loadJiraMode(root)
   const names = readdirSync(plans, { withFileTypes: true })
     .filter((e) => e.name !== 'archived' && (e.isDirectory() || e.isSymbolicLink()))
     .map((e) => e.name)
@@ -225,7 +239,7 @@ export function listFlows(root: string): ListEntry[] {
   return names.map((id): ListEntry => {
     if (!isFlowId(id)) return blockedEntry(id, { code: 'id_invalid', detail: 'el nombre del directorio no es un id de flujo válido' })
     try {
-      const s = resolve(readFlow(root, id).facts)
+      const s = resolve(readFlow(root, id, jira).facts)
       return { id, depth: s.depth, next: s.next, blocked: s.blocked_reasons.length > 0, blocked_reasons: s.blocked_reasons }
     } catch (e) {
       if (e instanceof SddError) return blockedEntry(id, { code: e.code, detail: e.message })

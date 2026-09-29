@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRun, setStatus, writeJsonAtomic } from '../src/runs.ts'
@@ -70,7 +70,7 @@ const dispatchOf = (cli: Cli, repo: string, patch: Record<string, unknown> = {})
 
 test('los dos archivos declaran los hooks con el lanzador fijo y timeouts cortos', () => {
   const events: Record<Cli, Record<string, string | undefined>> = {
-    claude: { SessionStart: undefined, Stop: undefined, PreToolUse: 'Agent|Bash', PostToolUse: '*', PostToolUseFailure: 'Agent' },
+    claude: { SessionStart: undefined, Stop: undefined, PreToolUse: 'Agent|Bash', PostToolUse: '*', PostToolUseFailure: 'Agent|Bash' },
     codex: { SessionStart: undefined, Stop: undefined, PreToolUse: 'Agent|Bash|collaborationspawn_agent', PostToolUse: '*' },
   }
   for (const cli of CLIS) {
@@ -204,5 +204,135 @@ test('una sesión abierta antes de los hooks registra como run la corrida que la
     assert.deepEqual(lines.map((l) => [l.event, l.run]), [['start', undefined], ['existing', '20260101-0001-aaaa'], ['run', '20260101-0002-aaaa']])
     assert.equal(lines[0].via, 'PreToolUse')
     assert.deepEqual(readdirSync(join(repo, '.sdd-ai', 'hooks', 'route')).sort(), ['s1.json', 's1.jsonl'])
+  }
+})
+
+/** Un `bin/sdd-ai` que anota cada evento que recibe en `stub.log` y sale con `code`, o se cuelga. */
+function stubRepo(stub: number | 'hangs', jira?: string): string {
+  const repo = makeRepo()
+  mkdirSync(join(repo, '.sdd-ai'))
+  mkdirSync(join(repo, 'bin'))
+  const body = stub === 'hangs' ? 'setTimeout(() => {}, 60000)' : `process.exit(${stub})`
+  writeFileSync(join(repo, 'bin', 'sdd-ai'),
+    `const fs = require('fs')\nfs.appendFileSync(__dirname + '/../stub.log', JSON.parse(fs.readFileSync(0, 'utf8')).hook_event_name + '\\n')\n${body}\n`)
+  if (jira !== undefined) writeFileSync(join(repo, '.sdd-ai', 'config.yml'), jira)
+  return repo
+}
+const stubCalls = (repo: string) => (existsSync(join(repo, 'stub.log')) ? readFileSync(join(repo, 'stub.log'), 'utf8').trim().split('\n') : [])
+
+/** El payload de un `Bash` con `command`, en el evento de ese fixture. */
+const bashOf = (cli: Cli, repo: string, name: string, command: string, patch: Record<string, unknown> = {}) => {
+  const base = payload(cli, name, {})
+  return JSON.stringify({ ...base, cwd: repo, session_id: 's1', ...patch, tool_input: { ...(base.tool_input as object), command } })
+}
+
+/** Como `launch`, pero sin bloquear: los casos del binario colgado corren a la vez. */
+function launchAsync(cli: Cli, input: string, launcher = LAUNCHER): Promise<{ code: number | null; out: string }> {
+  return new Promise((done) => {
+    const child = spawn(process.execPath, [launcher, cli], { cwd: foreign() })
+    let out = ''
+    child.stdout.on('data', (c: Buffer) => { out += c.toString('utf8') })
+    child.on('close', (code) => done({ code, out }))
+    child.stdin.end(input)
+  })
+}
+
+const BIND = './bin/sdd-ai sdd status f1'
+
+test('el lanzador no arranca el binario para un comando sin git commit y sí para uno con commit', () => {
+  for (const cli of CLIS) {
+    const repo = stubRepo(0)
+    for (const command of ['ls', 'git log --grep commit', 'echo "git commit"', 'git commit-tree x']) {
+      assert.deepEqual(launch(cli, bashOf(cli, repo, 'pre-tool-use-bash', command)), { code: 0, out: '' }, command)
+    }
+    assert.deepEqual(stubCalls(repo), [])
+    assert.deepEqual(launch(cli, bashOf(cli, repo, 'pre-tool-use-bash', 'git add . && git commit -m x')), { code: 0, out: '' })
+    assert.deepEqual(stubCalls(repo), ['PreToolUse'])
+  }
+})
+
+test('el lanzador manda al binario el PostToolUse de un comando de liga y no el de otro comando', () => {
+  for (const cli of CLIS) {
+    const repo = stubRepo(0)
+    assert.deepEqual(launch(cli, bashOf(cli, repo, 'post-tool-use-bash', 'ls')), { code: 0, out: '' })
+    assert.deepEqual(stubCalls(repo), [])
+    assert.deepEqual(launch(cli, bashOf(cli, repo, 'post-tool-use-bash', `${BIND} --json | head`)), { code: 0, out: '' })
+    assert.deepEqual(stubCalls(repo), ['PostToolUse'])
+  }
+  const repo = stubRepo(0)
+  assert.deepEqual(launch('claude', bashOf('claude', repo, 'post-tool-use-failure-bash', 'false')), { code: 0, out: '' })
+  assert.deepEqual(stubCalls(repo), [])
+  assert.deepEqual(launch('claude', bashOf('claude', repo, 'post-tool-use-failure-bash', BIND)), { code: 0, out: '' })
+  assert.deepEqual(stubCalls(repo), ['PostToolUseFailure'])
+})
+
+test('si el binario falla ante un commit, el lanzador niega con liga o con jira_approval en la config y calla sin ninguno', async () => {
+  const cases: Array<Promise<void>> = []
+  for (const cli of CLIS) {
+    for (const stub of [1, 'hangs'] as const) {
+      const check = (name: string, repo: string, denies: RegExp | null) => cases.push(launchAsync(cli, bashOf(cli, repo, 'pre-tool-use-bash', 'git commit -m x')).then((r) => {
+        assert.equal(r.code, 0, name)
+        if (denies === null) return assert.equal(r.out, '', `${cli} ${stub} ${name}`)
+        const out = JSON.parse(r.out) as { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } }
+        assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [], `${cli} ${stub} ${name}`)
+        assert.equal(out.hookSpecificOutput.permissionDecision, 'deny', `${cli} ${stub} ${name}`)
+        assert.match(out.hookSpecificOutput.permissionDecisionReason, denies, `${cli} ${stub} ${name}`)
+        assert.match(out.hookSpecificOutput.permissionDecisionReason, /el commit lo hace el usuario/, `${cli} ${stub} ${name}`)
+      }))
+      const bound = stubRepo(stub)
+      mkdirSync(join(bound, '.sdd-ai', 'hooks', 'route'), { recursive: true })
+      writeFileSync(routeOf(bound), JSON.stringify({ calls: 0, reads: 0, edits: 0, seen: [], snapshot_pending: [], flow: { id: 'f1', step: 'implement', gate: null, at: 'x' } }))
+      check('con liga', bound, /flujo f1/)
+      const broken = stubRepo(stub)
+      mkdirSync(join(broken, '.sdd-ai', 'hooks', 'route'), { recursive: true })
+      writeFileSync(routeOf(broken), '{roto')
+      check('estado ilegible', broken, /el estado de esta sesión no se puede leer/)
+      const nulled = stubRepo(stub)
+      mkdirSync(join(nulled, '.sdd-ai', 'hooks', 'route'), { recursive: true })
+      writeFileSync(routeOf(nulled), 'null')
+      check('estado null', nulled, /el estado de esta sesión no se puede leer/)
+      check('jira on', stubRepo(stub, 'jira_approval:\n  mode: "on"\n'), /jira_approval/)
+      check('jira off', stubRepo(stub, 'jira_approval:\n  mode: "off"\n'), null)
+      check('sin config', stubRepo(stub), null)
+    }
+  }
+  await Promise.all(cases)
+})
+
+test('si el binario falla o vence al ligar, el lanzador avisa con el evento correcto', async () => {
+  const cases: Array<Promise<void>> = []
+  for (const stub of [1, 'hangs'] as const) {
+    const events: Array<[Cli, string, string]> = [['claude', 'post-tool-use-bash', 'PostToolUse'], ['codex', 'post-tool-use-bash', 'PostToolUse'], ['claude', 'post-tool-use-failure-bash', 'PostToolUseFailure']]
+    for (const [cli, name, event] of events) {
+      cases.push(launchAsync(cli, bashOf(cli, stubRepo(stub), name, BIND)).then((r) => {
+        const out = JSON.parse(r.out) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } }
+        assert.deepEqual(checkOutput(cli, event, out), [], `${cli} ${event} ${stub}`)
+        assert.equal(out.hookSpecificOutput.hookEventName, event)
+        assert.match(out.hookSpecificOutput.additionalContext, /^sdd-ai: no se pudo confirmar la liga con el flujo f1 \(.+\); corre \.\/bin\/sdd-ai sdd status f1 otra vez$/)
+      }))
+    }
+  }
+  await Promise.all(cases)
+})
+
+test('si el parser no carga, el evento posterior va al binario y, si también falla, avisa', () => {
+  const copy = join(mkdtempSync(join(tmpdir(), 'sdd-ai-lanzador-')), 'bin')
+  mkdirSync(copy)
+  const launcher = join(copy, 'sdd-ai-hook')
+  copyFileSync(LAUNCHER, launcher)
+  const run = (cli: Cli, input: string) => {
+    const r = spawnSync(process.execPath, [launcher, cli], { cwd: foreign(), input, encoding: 'utf8' })
+    return { code: r.status, out: r.stdout }
+  }
+  for (const cli of CLIS) {
+    const ok = stubRepo(0)
+    assert.deepEqual(run(cli, bashOf(cli, ok, 'post-tool-use-bash', BIND)), { code: 0, out: '' })
+    assert.deepEqual(run(cli, bashOf(cli, ok, 'pre-tool-use-bash', 'git commit -m x')), { code: 0, out: '' })
+    assert.deepEqual(stubCalls(ok), ['PostToolUse', 'PreToolUse'])
+    const failing = stubRepo(1)
+    const r = run(cli, bashOf(cli, failing, 'post-tool-use-bash', BIND))
+    const out = JSON.parse(r.out) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } }
+    assert.deepEqual(checkOutput(cli, 'PostToolUse', out), [], cli)
+    assert.match(out.hookSpecificOutput.additionalContext, /^sdd-ai: no se pudo comprobar si el comando liga un flujo \(.+\); si corriste sdd status <id>, córrelo otra vez$/)
   }
 })

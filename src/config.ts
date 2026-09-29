@@ -76,6 +76,45 @@ export function loadCrossModel(root: string, present: Family[] = []): CrossModel
   return parseCrossModel(doc, present)
 }
 
+/** El modo de la aprobación externa de la spec; `invalid` dice qué está mal y dónde. */
+export type JiraMode = { mode: 'on' | 'off' } | { mode: 'invalid'; detail: string }
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/** Sin bloque o sin `mode` es `off`: la forma de sdd-flow, donde el default es `off`. */
+export function parseJiraMode(doc: unknown): JiraMode {
+  if (doc === null || doc === undefined) return { mode: 'off' }
+  if (!isRecord(doc)) return { mode: 'invalid', detail: `${CONFIG_PATH}: el archivo tiene que ser un mapa` }
+  const block = doc.jira_approval
+  if (block === undefined || block === null) return { mode: 'off' }
+  if (!isRecord(block)) return { mode: 'invalid', detail: `${CONFIG_PATH}: jira_approval tiene que ser un mapa, no ${JSON.stringify(block)}` }
+  const mode = block.mode
+  if (mode === undefined || mode === null) return { mode: 'off' }
+  if (mode === 'on' || mode === 'off') return { mode }
+  return { mode: 'invalid', detail: `${CONFIG_PATH}: jira_approval.mode tiene que ser "on" u "off", no ${JSON.stringify(mode)}` }
+}
+
+/**
+ * El modo de Jira de la config del repo. Sin archivo es `off`; un archivo que existe y no se puede leer
+ * o parsear es `invalid`, para que nadie decida con una config rota. Solo lee.
+ */
+export function loadJiraMode(root: string): JiraMode {
+  let text: string
+  try {
+    text = readFileSync(join(root, CONFIG_PATH), 'utf8')
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { mode: 'off' }
+    return { mode: 'invalid', detail: `${CONFIG_PATH} no se puede leer: ${(e as Error).message}` }
+  }
+  let doc: unknown
+  try {
+    doc = parse(text)
+  } catch (e) {
+    return { mode: 'invalid', detail: `${CONFIG_PATH}: YAML ilegible (${(e as Error).message.split('\n')[0]})` }
+  }
+  return parseJiraMode(doc)
+}
+
 export function parseFamiliesFlag(v: string): Family[] {
   return validateFamilies(v.split(',').map((s) => s.trim()), 'usage', '--families')
 }

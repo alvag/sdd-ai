@@ -375,19 +375,24 @@ agentes y esta skill.
 
 `.claude/settings.json` y `.codex/hooks.json` instalan hooks que hacen cumplir esta skill. Todos
 llaman al lanzador `bin/sdd-ai-hook`, que corre `./bin/sdd-ai hook <claude|codex>`, y callan en un
-repositorio sin `.sdd-ai/` o ante cualquier error. La excepción es un despacho `sdd-ai-*` que no se
-puede comprobar: ese se niega.
+repositorio sin `.sdd-ai/` o ante cualquier error. Las excepciones son un despacho `sdd-ai-*` que no
+se puede comprobar, que se niega, y un `git commit` que no se puede comprobar, que se niega según las
+reglas de la guarda del commit (abajo).
 
 - **`SessionStart`**: al retomar o compactar, te devuelve las corridas abiertas de tu sesión, cada
   una con lo que sigue. Al abrir o limpiar, lista en una línea las abiertas de otras sesiones, solo
-  como dato.
+  como dato. En los cuatro casos suma una línea por flujo SDD activo de `.plans/`, con su
+  profundidad y su paso siguiente. Marca el flujo ligado a tu sesión (§9) y muestra un flujo ilegible
+  con su motivo. Un directorio sin artefactos no es un flujo y no sale.
 - **`Stop`**: si terminas el turno con corridas propias abiertas, lo reabre una vez con qué corrida,
   en qué estado y qué sigue. Una corrida está abierta si:
   - un worker o una revisión siguen corriendo;
   - terminaron y nadie te devolvió su estado (`wait`, `review status` o el propio `run`);
   - es una nativa sin lanzar o con una reserva sin confirmar;
   - es una revisión con hallazgos sin decidir.
-  Vuelve a recordar solo si ese conjunto cambia.
+  Vuelve a recordar solo si ese conjunto cambia. Con la sesión ligada a un flujo (§9), recuerda además
+  su paso siguiente, una vez por cambio de paso o de gate; otra task del mismo paso no cuenta. Si los
+  dos recordatorios coinciden, salen juntos. En Codex, cada uno reabre el turno una sola vez.
 - **`PreToolUse` sobre `Agent` y `spawn_agent`** (también la v2 de Codex): deja pasar un `sdd-ai-*`
   solo si corresponde a una nativa sin lanzar ni reservar de tu sesión, de ese rol y de tu CLI.
   Reserva la corrida y reescribe el input (§3); en la v2 de Codex, todo menos el mensaje cifrado.
@@ -395,14 +400,78 @@ puede comprobar: ese se niega.
   Si la única corrida de ese agente tiene una reserva sin confirmar, la negación la nombra y remite a
   preguntarle al usuario si reintenta o la descarta: `cancel` solo cambia el registro local, y
   reintentar puede lanzar otro agente si el primero llegó a arrancar.
-- **`PostToolUse`**, sobre todas las herramientas: confirma la reserva de un despacho y cuenta la
-  herramienta para el recordatorio de sesión larga. En Claude Code, **`PostToolUseFailure`** libera
-  la reserva de un despacho que falló.
-- **`PreToolUse` sobre `Bash`**: dentro de un subagente, niega `sdd-ai run`, `review`, `wait`,
-  `cancel` y `sdd approve`. Un worker no delega, no toca las corridas del conductor ni aprueba gates.
+- **`PostToolUse`**, sobre todas las herramientas: confirma la reserva de un despacho, liga tu sesión
+  cuando un `Bash` tuyo corre `sdd status <id>` o `sdd approve <id> <gate>` (§9) y cuenta la
+  herramienta para el recordatorio de sesión larga. En Claude Code, **`PostToolUseFailure`** libera la
+  reserva de un despacho que falló y liga igual cuando el comando del `Bash` sale con un código
+  distinto de cero: en Claude Code, ese comando llega por este evento.
+- **`PreToolUse` sobre `Bash`**: en cualquier sesión, aplica la guarda del commit (abajo). Dentro de un
+  subagente, además, niega `sdd-ai run`, `review`, `wait`, `cancel` y `sdd approve`. Un worker no
+  delega, no toca las corridas del conductor ni aprueba gates.
 
 Claude Code carga los hooks del repositorio sin pedir nada. Codex los ejecuta solo después de que el
 usuario los aprueba en `/hooks`, y vuelve a pedirlo cada vez que cambian sus definiciones.
+
+### La guarda del commit
+
+- **Con tu sesión ligada a un flujo**, un `git commit` a este repositorio se niega mientras el paso
+  siguiente del flujo esté antes de `review_and_commit`. Vale tanto para uno tuyo como para uno de un
+  subagente de tu sesión. Desde ahí pasa: `review_and_commit`, `push`, `open_pr` y `archive`. El
+  motivo nombra el flujo y su paso.
+- **Qué cuenta como commit.** Cuenta con opciones globales antes del subcomando (`git -C <dir>
+  commit`, `git -c k=v commit`), con asignaciones o dentro de una subcapa, y en cualquier tramo de la
+  cadena, también después de un `&`. No cuentan `git log --grep commit`, `echo "git commit"` ni `git
+  commit-tree`.
+- **El destino se compara por su raíz Git.** Un commit a otro repositorio, también a uno anidado,
+  pasa. El destino es:
+  - la ruta de un `-C` absoluto;
+  - si no hay, desconocido cuando un tramo anterior hace `cd` o `pushd`;
+  - si tampoco, el directorio del comando con los `-C` relativos.
+
+  Un `-C` que no es una ruta literal, `--git-dir` o `--work-tree` también lo vuelven desconocido. Con
+  liga, un destino desconocido se niega.
+- **Una cadena que liga y hace commit se niega en cualquier sesión**: corre `sdd status` o `sdd
+  approve` y el commit por separado.
+- **Si no se puede leer el estado, se niega.** Con liga, el commit se niega si no se puede leer el
+  estado del flujo o el de tu sesión, o si el binario del hook falla o vence. El motivo pide que el
+  commit lo haga el usuario o que se arregle el flujo.
+- **Sin liga**, la guarda solo mira la regla de Jira (abajo): con `jira_approval` en `on`, o con un
+  valor inválido, se niega un commit a este repositorio o de destino desconocido. Con `off`, pasa, y un
+  error nunca niega.
+- **El commit bloqueado lo hace el usuario.** Tú no tienes cómo saltear la guarda. El usuario
+  commitea desde su terminal, o con la vía para comandos del usuario de su runner, que no pasa por los
+  hooks:
+  - en Claude Code, `!git commit …` desde el prompt;
+  - en Codex, `!git commit …` desde el prompt del TUI, en modo shell.
+
+  La sonda de la fase 5c lo comprobó en Claude Code 2.1.284 y Codex 0.158.0.
+- **Límites declarados:**
+  - no ve un commit dentro de una variable, un alias, un script, `$(…)`, `sh -c` o `eval`;
+  - no mira `merge`, `cherry-pick`, `revert`, `rebase` ni `am`;
+  - los workers por proceso corren sin hooks, así que sus commits quedan fuera;
+  - un `cd` previo niega de más: `cd /otro-repo && git commit` se niega con liga aunque vaya a otro
+    repositorio;
+  - el commit WIP del sub-paso `pause` de `sdd-flow` se niega en `implementing`, así que ese commit
+    también lo hace el usuario.
+
+### La regla de Jira
+
+- **Dónde se configura.** `jira_approval.mode` va en `.sdd-ai/config.yml`, con la forma del bloque de
+  `sdd-flow` (`"on"` u `"off"`, entre comillas). `overrides.jira_approval` del handoff de un flujo la
+  pisa para ese flujo. Sin archivo, sin bloque o sin `mode`, vale `off`.
+- **Con `on`, todo cambio del proyecto va por un flujo SDD**, aunque sea `corta`. La spec se publica
+  en Jira con dos partes: un resumen para el PO, en lenguaje no técnico, y la definición técnica.
+- **Qué cambia con `on`:**
+  - el bootstrap lo dice y no ofrece escribir inline ni delegar la escritura; el trabajo de solo
+    lectura sigue igual;
+  - sin liga, la guarda niega el commit;
+  - en el estado del flujo, sin `gate_status: approved` en el handoff (también si falta),
+    `implement`, `verify` y `review_and_commit` pasan a `external_gate` (§9).
+- **Un valor inválido no cuenta como apagado.** `sdd status` lo informa como `jira_approval_invalid`,
+  la guarda niega el commit y el bootstrap dice que rige lo mismo que con `on`. Mientras dure, los
+  flujos quedan en `resolve_blockers` y `sdd approve` se traba: corrige la config primero.
+- **Límite:** con Jira activo y sin liga, el recordatorio de sesión larga todavía ofrece delegar la
+  escritura.
 
 ### La ruta directa
 
@@ -419,10 +488,13 @@ bootstrap".
 - **El recordatorio de sesión larga** cuenta las llamadas, lecturas y ediciones del conductor desde el
   último `run` o `review` de su sesión. Cuando alguna llega a su umbral del bootstrap, agrega un
   recordatorio como contexto, con los umbrales que se cruzaron y qué hacer, y los contadores vuelven
-  a cero. Nunca bloquea una herramienta. El conteo es aproximado:
-  - un `Bash` es una lectura si es un comando de lectura (`cat`, `sed -n`, `rg`, `grep`, `ls`, `find`,
-    `head`, `tail`, `nl`, `wc`), en los dos CLIs; Claude Code no tiene `Grep` ni `Glob`, y busca por
-    `Bash`;
+  a cero. Nunca bloquea una herramienta. Con la sesión ligada a un flujo SDD (§9), el recordatorio se
+  calla: la ruta directa no aplica a quien conduce un flujo. Los contadores vuelven a cero igual, y el
+  rastro lo registra. El conteo es aproximado:
+  - un `Bash` es una lectura si una de sus tuberías empieza con un comando de lectura (`cat`, `sed -n`,
+    `rg`, `grep`, `ls`, `find`, `head`, `tail`, `nl`, `wc`), en los dos CLIs. Decide el primer comando
+    de cada tubería: `git diff | head` no es una lectura y `cat a | grep b` sí. Claude Code no tiene
+    `Grep` ni `Glob`, y busca por `Bash`;
   - en Claude Code, `Read`, `Grep` y `Glob` son lecturas, y `Edit`, `Write` y `NotebookEdit`,
     ediciones; en Codex, `apply_patch` es una edición;
   - toda edición cuenta, también una mecánica;
@@ -431,8 +503,9 @@ bootstrap".
   - la llamada que crea una corrida no cuenta, y un `run` o un `review` de la sesión reinicia los
     contadores.
 - **El rastro** de cada sesión queda en `.sdd-ai/hooks/route/<sesión>.jsonl`, con su estado en
-  `<sesión>.json`. Registra solo hechos: el inicio (`start`), las corridas que ya existían
-  (`existing`), cada recordatorio emitido (`reminder`) y cada corrida nueva de la sesión (`run`). No
+  `<sesión>.json`, que también guarda la liga. Registra solo hechos: el inicio (`start`), las corridas
+  que ya existían (`existing`), cada recordatorio emitido (`reminder`) o callado por la liga
+  (`reminder_suppressed`) y cada corrida nueva de la sesión (`run`). No
   registra si el conductor leyó el recordatorio ni qué ruta siguió: esa ruta la declara el conductor
   al cerrar.
 
@@ -445,8 +518,6 @@ Límites declarados:
   las distinga de un conductor sin callar a alguno, así que si aparecen, reciben el bootstrap.
 - Si Codex tuviera subagentes internos cuyas herramientas llegaran sin `agent_id`, contarían como del
   conductor. La sonda no vio ninguno.
-- Con `jira_approval` activo siempre hay spec, pero sdd-ai todavía no aplica esa regla: llega con su
-  ruta SDD propia, en la fase 5.
 - Cada cambio de `.codex/hooks.json` exige que el usuario vuelva a aprobar los hooks en `/hooks` de
   Codex.
 
@@ -514,4 +585,18 @@ cambian, `status` devuelve el flujo a ese gate.
   retomaría más adelante de lo que el registro sostiene.
 - **`next` no autoriza avanzar sobre un gate externo pendiente.** La nota `external_gate` dice que el
   handoff espera la aprobación externa de la spec, y ahí `next` es `external_gate` en vez de
-  `implement`: seguir sin esa aprobación lo decide el usuario.
+  `implement`: seguir sin esa aprobación lo decide el usuario. Con `jira_approval` en `on` (§8), vale
+  también cuando el handoff no tiene `gate_status`, y alcanza a `verify` y a `review_and_commit`.
+- **La liga.** `sdd status <id>` o `sdd approve <id> <gate>`, como primer tramo de un comando tuyo,
+  ligan tu sesión a ese flujo, termine como termine el comando. El paso de ese momento queda como
+  referencia de `Stop`.
+  - Otro id mueve la liga, y el mismo renueva la referencia.
+  - Se suelta sola cuando el plan llega a `status: done` o el directorio del flujo ya no está.
+  - No ligan un comando en otro tramo (después de un `cd` o de un `&&`), un subagente, un `status` sin
+    id, un id inválido ni un flujo sin artefactos.
+  - La liga es de tu sesión: otra sesión del mismo repositorio no la ve.
+  - Si no se pudo guardar, el hook te lo dice; vuelve a correr el comando.
+
+  **Corre `sdd status <id>` al empezar o retomar un flujo**, y también al seguir en una sesión que se
+  abrió antes de actualizar los hooks. Sin liga, `Stop` no recuerda su paso, la guarda del commit no
+  lo ve y el recordatorio de sesión larga no se calla (§8).

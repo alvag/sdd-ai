@@ -1,4 +1,5 @@
 import type { Proof } from '../approval/proof.ts'
+import type { JiraMode } from '../config.ts'
 import type { HeaderResult, SectionState, TaskCount } from './markdown.ts'
 
 // El estado de un flujo SDD como función pura de sus hechos: no lee el disco, no mira el reloj y no
@@ -40,6 +41,8 @@ export interface FlowFacts {
   fingerprints: Partial<Record<GateId, string>>
   log: ApprovalLog
   paths: Record<string, string>
+  /** El modo de Jira del flujo, con el override del handoff ya aplicado; sin el campo vale `off`. */
+  jira?: JiraMode
 }
 
 export type GateState = 'pending' | 'approved' | 'approved_unfingerprinted' | 'stale'
@@ -192,6 +195,10 @@ export function resolve(facts: FlowFacts): FlowStatus {
     if (facts.files[name] === 'unreadable') blocked.push({ code: 'artifact_unreadable', detail: `${name}.md existe y no se puede leer` })
   }
   if (facts.log.state === 'invalid') blocked.push({ code: 'approvals_invalid', detail: `el registro de aprobaciones no sirve: ${facts.log.detail}` })
+  const noArtifacts = (['spec', 'plan', 'handoff'] as const).every((a) => facts.files[a] !== 'present')
+  if (facts.jira?.mode === 'invalid' && !noArtifacts) {
+    blocked.push({ code: 'jira_approval_invalid', detail: `${facts.jira.detail}: corrige el valor o quita la clave` })
+  }
 
   if (depth === 'corta') {
     for (const name of ['spec', 'tasks'] as const) {
@@ -223,13 +230,18 @@ export function resolve(facts: FlowFacts): FlowStatus {
 
   const gateStatus = headerData(facts.handoffHeader)?.gate_status
   const external = EXTERNAL_PENDING.includes(gateStatus)
+  // Con Jira en on, la spec necesita la aprobación externa aunque el handoff no tenga gate_status.
+  const held = facts.jira?.mode === 'on' && gateStatus !== 'approved'
   if (external) {
     notes.push({ code: 'external_gate', detail: `el handoff espera la aprobación externa de la spec (gate_status: ${String(gateStatus)}): no se implementa hasta que vuelva` })
+  } else if (held) {
+    const said = gateStatus === undefined ? 'no tiene gate_status' : `dice gate_status: ${String(gateStatus)}`
+    notes.push({ code: 'external_gate', detail: `con jira_approval en on la spec necesita la aprobación externa, y el handoff ${said}: no se implementa ni se commitea hasta que diga approved` })
   }
 
   const next = ((): Next => {
     if (blocked.length > 0) return { step: 'resolve_blockers' }
-    if ((['spec', 'plan', 'handoff'] as const).every((a) => facts.files[a] !== 'present')) return { step: 'no_artifacts' }
+    if (noArtifacts) return { step: 'no_artifacts' }
     if (depth === null) return { step: 'depth' }
     const open = gates.find((g) => !APPROVED.includes(g.state))
     if (open) {
@@ -239,9 +251,9 @@ export function resolve(facts: FlowFacts): FlowStatus {
     }
     if (status === 'pushed') return { step: typeof plan?.pr_url === 'string' && plan.pr_url !== '' ? 'archive' : 'open_pr' }
     const closing = status !== null ? CLOSING[status] : undefined
-    if (closing) return { step: closing }
-    if (pending > 0) return external ? { step: 'external_gate' } : { step: 'implement', task: count.firstPending ?? '' }
-    return { step: 'verify' }
+    if (closing) return held && closing === 'review_and_commit' ? { step: 'external_gate' } : { step: closing }
+    if (pending > 0) return external || held ? { step: 'external_gate' } : { step: 'implement', task: count.firstPending ?? '' }
+    return held ? { step: 'external_gate' } : { step: 'verify' }
   })()
 
   return {

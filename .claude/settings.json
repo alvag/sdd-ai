@@ -48,7 +48,7 @@
     ],
     "PostToolUseFailure": [
       {
-        "matcher": "Agent",
+        "matcher": "Agent|Bash",
         "hooks": [
           {
             "type": "command",

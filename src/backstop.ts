@@ -2,7 +2,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync
 import { join } from 'node:path'
 import { type Crossed, ROUTE, type RouteThresholds, renderReminder } from './route.ts'
 import { readJson, writeJsonAtomic } from './runs.ts'
-import { shellSegments } from './shell.ts'
+import { shellPipelines } from './shell.ts'
 
 /**
  * El recordatorio de sesión larga y el rastro de la ruta. Este módulo lo importa también el lanzador
@@ -22,6 +22,9 @@ export interface ToolPayload { tool_name?: unknown; tool_input?: unknown; agent_
 
 export interface StateIo { writeState: (file: string, value: unknown) => void }
 
+/** El flujo SDD que conduce la sesión, y el paso y el gate que `Stop` ya recordó. */
+export interface FlowBinding { id: string; step: string; gate: string | null; at: string }
+
 interface RouteState {
   calls: number; reads: number; edits: number
   /** Corridas que el rastro ya vio: las que aparezcan después son nuevas. */
@@ -29,6 +32,7 @@ interface RouteState {
   /** Corridas a medio escribir cuando empezó el rastro: al completarse son existentes, no nuevas. */
   snapshot_pending: string[]
   bootstrap_at?: string
+  flow?: FlowBinding
 }
 
 type RunKind = 'worker' | 'native' | 'review'
@@ -37,7 +41,10 @@ interface RunFact { session?: string; kind: RunKind; role?: string }
 interface Files { dir: string; state: string; trail: string; lock: string }
 
 const COUNTERS: Crossed[] = ['calls', 'reads', 'edits']
-/** Comandos de shell que leen sin cambiar nada: un tramo que empieza con uno de ellos es una lectura. */
+/**
+ * Comandos de shell que leen sin cambiar nada: una tubería que empieza con uno de ellos es una lectura.
+ * En `git diff | head`, `head` solo filtra la salida de otro comando.
+ */
 const READ_COMMANDS = ['cat', 'sed -n', 'rg', 'grep', 'ls', 'find', 'head', 'tail', 'nl', 'wc']
 const CLAUDE_READS = new Set(['Read', 'Grep', 'Glob'])
 const CLAUDE_EDITS = new Set(['Edit', 'Write', 'NotebookEdit'])
@@ -188,10 +195,53 @@ export function markBootstrap(root: string, session: string): boolean {
 }
 
 function isShellRead(command: string): boolean {
-  return shellSegments(command).some((segment) => {
-    const s = segment.trim()
+  return shellPipelines(command).some(([first]) => {
+    const s = first.trim()
     return READ_COMMANDS.some((c) => s === c || s.startsWith(`${c} `))
   })
+}
+
+const isBinding = (v: unknown): v is FlowBinding => {
+  if (typeof v !== 'object' || v === null) return false
+  const b = v as Record<string, unknown>
+  return typeof b.id === 'string' && typeof b.step === 'string' && (b.gate === null || typeof b.gate === 'string') && typeof b.at === 'string'
+}
+
+/**
+ * La liga de la sesión. Lee sin lock, porque el estado se publica con un rename. `null` sin estado o
+ * sin liga, y `'unreadable'` si el estado existe y no se puede leer.
+ */
+export function readBinding(root: string, session: string): FlowBinding | null | 'unreadable' {
+  const files = filesFor(root, session)
+  if (!files) return null
+  let state: unknown
+  try {
+    state = readJson<unknown>(files.state)
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? null : 'unreadable'
+  }
+  if (typeof state !== 'object' || state === null) return 'unreadable'
+  const flow = (state as RouteState).flow
+  if (flow === undefined) return null
+  return isBinding(flow) ? flow : 'unreadable'
+}
+
+/** Guarda la liga de la sesión, o la borra con `null`, sin tocar los contadores. Devuelve si la guardó. */
+export function setBinding(root: string, session: string, b: FlowBinding | null): boolean {
+  try {
+    const files = filesFor(root, session)
+    if (!files) return false
+    mkdirSync(files.dir, { recursive: true })
+    return withLock(files.lock, () => {
+      const state = ensureState(root, session, files, 'binding', { writeState: writeJsonAtomic })
+      if (b === null) delete state.flow
+      else state.flow = b
+      writeJsonAtomic(files.state, state)
+      return true
+    }) ?? false
+  } catch {
+    return false
+  }
 }
 
 function classify(p: ToolPayload, cli: 'claude' | 'codex'): 'read' | 'edit' | undefined {
@@ -251,6 +301,11 @@ export function countTool(
       for (const c of COUNTERS) state[c] = 0
       // El estado va primero: si no se guarda, el rastro no afirma un recordatorio que no salió.
       io.writeState(files.state, state)
+      if (state.flow) {
+        // La sesión conduce un flujo SDD: el recordatorio de la ruta directa no le aplica.
+        appendTrail(files.trail, [...lines, { at: now(), event: 'reminder_suppressed', crossed, counts, flow: state.flow.id }])
+        return ''
+      }
       appendTrail(files.trail, [...lines, { at: now(), event: 'reminder', crossed, counts }])
       return renderReminder(crossed, counts, t)
     }) ?? ''

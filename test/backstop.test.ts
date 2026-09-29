@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { countTool, markBootstrap, startTrail } from '../src/backstop.ts'
+import { type FlowBinding, countTool, markBootstrap, readBinding, setBinding, startTrail } from '../src/backstop.ts'
 import { ROUTE, type RouteThresholds } from '../src/route.ts'
 import { createRun, writeJsonAtomic } from '../src/runs.ts'
 import { payload } from './hook-contract.ts'
@@ -347,4 +347,54 @@ test('de dos hooks paralelos que cruzan el umbral sale un solo recordatorio', as
     assert.equal(state(repo).edits, 1, `vuelta ${i}: la segunda cuenta después del reinicio`)
     assert.equal(existsSync(join(routeDir(repo), 's1.lock')), false)
   }
+})
+
+const BINDING: FlowBinding = { id: 'f1', step: 'implement', gate: null, at: '2026-09-28T12:00:00.000Z' }
+
+test('con liga el recordatorio se calla, los contadores vuelven a cero y el rastro registra reminder_suppressed', () => {
+  const repo = sddRepo()
+  assert.equal(setBinding(repo, 's1', BINDING), true)
+  const { edits } = ROUTE.backstop
+  for (let i = 0; i < edits; i++) assert.equal(countTool(tool('claude', 'post-tool-use-edit', repo), repo, 's1', 'claude'), '')
+  assert.deepEqual([state(repo).calls, state(repo).reads, state(repo).edits], [0, 0, 0])
+  assert.deepEqual(state(repo).flow, BINDING)
+  const last = trail(repo).at(-1)
+  assert.deepEqual(last && { ...last, at: undefined }, { at: undefined, event: 'reminder_suppressed', crossed: ['edits'], counts: { calls: edits, reads: 0, edits }, flow: 'f1' })
+  assert.equal(events(repo).includes('reminder'), false)
+})
+
+test('solo el primer comando de cada tubería decide la lectura', () => {
+  const reads = (command: string) => {
+    const repo = sddRepo()
+    countTool(bash('claude', repo, command), repo, 's1', 'claude')
+    return state(repo).reads
+  }
+  assert.equal(reads('git diff | head'), 0)
+  assert.equal(reads('cat a | grep b'), 1)
+  assert.equal(reads('git status && ls'), 1)
+})
+
+test('readBinding da null sin estado o sin liga y unreadable con el JSON roto', () => {
+  const repo = sddRepo()
+  assert.equal(readBinding(repo, 's1'), null)
+  startTrail(repo, 's1', 'SessionStart')
+  assert.equal(readBinding(repo, 's1'), null)
+  setBinding(repo, 's1', BINDING)
+  assert.deepEqual(readBinding(repo, 's1'), BINDING)
+  writeFileSync(join(routeDir(repo), 's1.json'), '{roto')
+  assert.equal(readBinding(repo, 's1'), 'unreadable')
+})
+
+test('setBinding guarda y borra la liga sin tocar los contadores, y devuelve false si no puede escribir', () => {
+  const repo = sddRepo()
+  countTool(tool('claude', 'post-tool-use-read', repo), repo, 's1', 'claude')
+  assert.equal(setBinding(repo, 's1', BINDING), true)
+  assert.deepEqual([state(repo).calls, state(repo).reads, state(repo).flow], [1, 1, BINDING])
+  assert.equal(setBinding(repo, 's1', null), true)
+  assert.equal(state(repo).flow, undefined)
+  assert.equal(state(repo).reads, 1)
+  const blocked = sddRepo()
+  mkdirSync(join(blocked, '.sdd-ai', 'hooks'))
+  writeFileSync(join(blocked, '.sdd-ai', 'hooks', 'route'), 'no es un directorio')
+  assert.equal(setBinding(blocked, 's1', BINDING), false)
 })

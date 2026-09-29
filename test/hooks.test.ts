@@ -1,14 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { readBinding, setBinding } from '../src/backstop.ts'
 import { guardDispatch, runHook } from '../src/hooks.ts'
 import { cancelNative, launchState, release, reserve } from '../src/native-launch.ts'
 import { openRuns, runKey } from '../src/open-runs.ts'
 import { ROUTE, renderBootstrap } from '../src/route.ts'
 import { createRun, readStatus, setStatus, writeJsonAtomic } from '../src/runs.ts'
+import { readFlow } from '../src/sdd/read.ts'
+import { resolve } from '../src/sdd/status.ts'
 import type { Status } from '../src/types.ts'
 import { checkOutput, payload } from './hook-contract.ts'
 import { makeRepo } from './helpers.ts'
@@ -733,7 +736,7 @@ test('dentro de un hijo se niegan run, review, wait y cancel en las formas recon
   }
 })
 
-test('fuera de un hijo nunca se niega un comando de shell', () => {
+test('fuera de un hijo no se niega un comando de corridas', () => {
   for (const cli of CLIS) {
     const repo = makeRepo()
     mkdirSync(join(repo, '.sdd-ai'))
@@ -763,3 +766,450 @@ test('dentro de un hijo se niega sdd approve en sus formas directas y no sdd sta
   }
 })
 
+
+// La liga con un flujo SDD, SessionStart con los flujos, Stop con el flujo ligado y la guarda del commit.
+
+const SPEC_APPROVED = '2026-09-28T12:00:00-05:00'
+type FlowShape = { handoff?: Record<string, unknown> | null; spec?: boolean; plan?: Record<string, unknown>; tasks?: 'pending' | 'done' }
+
+/** Un flujo completo en `.plans/<id>/`: con la spec aprobada salvo que el handoff diga otra cosa. */
+function writeFlow(repo: string, id: string, o: FlowShape = {}): void {
+  const dir = join(repo, '.plans', id)
+  mkdirSync(dir, { recursive: true })
+  const front = (data: Record<string, unknown>, body: string) =>
+    `---\n${Object.entries(data).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n')}\n---\n\n${body}\n`
+  const handoff = o.handoff === undefined ? { profundidad: 'completa', spec_approved_at: SPEC_APPROVED } : o.handoff
+  if (handoff !== null) writeFileSync(join(dir, 'handoff.md'), front(handoff, '# Handoff'))
+  if (o.spec ?? true) writeFileSync(join(dir, 'spec.md'), '# Spec\n\n- **AC-1** — algo.\n')
+  if (o.plan) writeFileSync(join(dir, 'plan.md'), front({ profundidad: 'completa', ...o.plan }, '# Plan'))
+  if (o.tasks) writeFileSync(join(dir, 'tasks.md'), `# Tasks\n\n- [x] **T1 — uno**\n- [${o.tasks === 'done' ? 'x' : ' '}] **T2 — dos**\n`)
+}
+
+function flowRepo(jira?: 'on' | 'off' | 'invalid'): string {
+  const repo = makeRepo()
+  mkdirSync(join(repo, '.sdd-ai'))
+  if (jira) writeFileSync(join(repo, '.sdd-ai', 'config.yml'), `jira_approval:\n  mode: ${jira === 'invalid' ? 'true' : `"${jira}"`}\n`)
+  return repo
+}
+
+const stepOf = (repo: string, id: string) => resolve(readFlow(repo, id).facts).next.step
+
+/** El `PostToolUse` de un `Bash` del conductor que terminó; en Claude, `failed` usa `PostToolUseFailure`. */
+function post(cli: Cli, repo: string, command: string, o: { patch?: Record<string, unknown>; failed?: boolean } = {}): Out | '' {
+  const name = o.failed && cli === 'claude' ? 'post-tool-use-failure-bash' : 'post-tool-use-bash'
+  const base = payload(cli, name, {})
+  const p = { ...base, cwd: repo, session_id: 's1', ...o.patch, tool_input: { ...(base.tool_input as object), command } }
+  const out = runHook(JSON.stringify(p), cli)
+  return out === '' ? '' : JSON.parse(out) as Out
+}
+
+const bound = (repo: string, session = 's1') => {
+  const b = readBinding(repo, session)
+  return b === null || b === 'unreadable' ? b : { id: b.id, step: b.step, gate: b.gate }
+}
+const routeDir = (repo: string) => join(repo, '.sdd-ai', 'hooks', 'route')
+
+/** Corre `fn` con el directorio de la ruta en solo lectura, y lo restaura. */
+function readOnlyRoute<T>(repo: string, fn: () => T): T {
+  mkdirSync(routeDir(repo), { recursive: true })
+  chmodSync(routeDir(repo), 0o555)
+  try {
+    return fn()
+  } finally {
+    chmodSync(routeDir(repo), 0o755)
+  }
+}
+
+test('sdd status o approve en el primer tramo liga la sesión, también con salida distinta de cero', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    assert.equal(post(cli, repo, './bin/sdd-ai sdd status f1 --json | head'), '')
+    assert.deepEqual(bound(repo), { id: 'f1', step: 'plan', gate: null })
+    const failed = flowRepo()
+    writeFlow(failed, 'f1', { handoff: { profundidad: 'completa', spec_approved_at: null } })
+    assert.equal(post(cli, failed, './bin/sdd-ai sdd approve f1 spec --conductor claude', { failed: true }), '')
+    assert.deepEqual(bound(failed), { id: 'f1', step: 'gate', gate: 'spec' })
+  }
+})
+
+test('otro id cambia la liga y el mismo renueva la referencia', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    writeFlow(repo, 'f2', { plan: { status: 'implementing' }, tasks: 'pending' })
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    assert.deepEqual(bound(repo), { id: 'f1', step: 'plan', gate: null })
+    writeFlow(repo, 'f1', { plan: { status: 'planned' } })
+    post(cli, repo, 'sdd-ai sdd status f1')
+    assert.deepEqual(bound(repo), { id: 'f1', step: 'gate', gate: 'plan' })
+    post(cli, repo, 'node /x/bin/sdd-ai sdd status f2')
+    assert.deepEqual(bound(repo), { id: 'f2', step: 'implement', gate: null })
+  }
+})
+
+test('sin id, con id inválido, sin flujo, con no_artifacts, en otro tramo o desde un subagente no liga', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    writeFlow(repo, 'f2')
+    mkdirSync(join(repo, '.plans', 'vacio'))
+    for (const command of ['./bin/sdd-ai sdd status', './bin/sdd-ai sdd status ../x', './bin/sdd-ai sdd status nope', './bin/sdd-ai sdd status vacio']) {
+      post(cli, repo, command)
+      assert.equal(bound(repo), null, command)
+    }
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    for (const command of ['./bin/sdd-ai sdd status nope', './bin/sdd-ai sdd status vacio', 'cd . && ./bin/sdd-ai sdd status f2', 'true; ./bin/sdd-ai sdd status f2']) {
+      post(cli, repo, command)
+      assert.deepEqual(bound(repo), { id: 'f1', step: 'plan', gate: null }, command)
+    }
+    post(cli, repo, './bin/sdd-ai sdd status f2', { patch: { agent_id: 'a1', agent_type: 'general-purpose' } })
+    assert.deepEqual(bound(repo), { id: 'f1', step: 'plan', gate: null }, 'desde un subagente')
+  }
+})
+
+test('la liga de una sesión no la ve otra', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    assert.equal(bound(repo, 's2'), null)
+    const ctx = text(fire(cli, 'session-start', repo, { session_id: 's2', source: 'startup' }))
+    assert.match(ctx, /- f1 \(completa\): plan$/m)
+  }
+})
+
+test('si la liga no se guarda, el conductor recibe el aviso', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    for (const failed of [false, true]) {
+      const out = readOnlyRoute(repo, () => post(cli, repo, './bin/sdd-ai sdd status f1', { failed }))
+      const event = failed && cli === 'claude' ? 'PostToolUseFailure' : 'PostToolUse'
+      assert.deepEqual(checkOutput(cli, event, out), [], `${cli} ${event}: ${JSON.stringify(out)}`)
+      assert.match(text(out), /sdd-ai: no se pudo guardar la liga con el flujo f1/)
+      assert.equal(bound(repo), null)
+    }
+  }
+})
+
+test('SessionStart suma una línea por flujo activo en los cuatro orígenes, sin no_artifacts, con el ligado marcado y el ilegible con su motivo', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    writeFlow(repo, 'f2', { handoff: { profundidad: 'completa', spec_approved_at: null } })
+    writeFlow(repo, 'f3')
+    chmodSync(join(repo, '.plans', 'f3', 'spec.md'), 0o000)
+    mkdirSync(join(repo, '.plans', 'vacio'))
+    const outside = mkdtempSync(join(tmpdir(), 'sdd-ai-flujo-'))
+    symlinkSync(outside, join(repo, '.plans', 'roto'))
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    try {
+      for (const source of ['startup', 'clear', 'resume', 'compact']) {
+        const out = fire(cli, 'session-start', repo, { session_id: 's1', source })
+        assert.deepEqual(checkOutput(cli, 'SessionStart', out), [], `${cli} ${source}`)
+        const [head, f1, f2, f3, roto, ...rest] = text(out).split('\n\n').at(-1)!.split('\n')
+        assert.deepEqual([head, f1, f2], ['Flujos SDD en .plans/:', '- f1 (completa): plan · ligado a esta sesión', '- f2 (completa): gate spec'], source)
+        assert.equal(f3, '- f3: no se pudo leer (spec.md existe y no se puede leer)', source)
+        assert.match(roto, /^- roto: no se pudo leer \(.*enlace simbólico/, source)
+        assert.deepEqual(rest, [], source)
+      }
+    } finally {
+      chmodSync(join(repo, '.plans', 'f3', 'spec.md'), 0o644)
+    }
+    assert.equal(fire(cli, 'session-start', repo, { session_id: 's1', source: 'fork' }), '')
+  }
+})
+
+test('sin flujos SessionStart no suma líneas', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    assert.equal(text(fire(cli, 'session-start', repo, { session_id: 's1', source: 'startup' })), renderBootstrap())
+    mkdirSync(join(repo, '.plans', 'vacio'), { recursive: true })
+    assert.equal(text(fire(cli, 'session-start', repo, { session_id: 's1', source: 'clear' })), renderBootstrap())
+  }
+})
+
+test('SessionStart da el bootstrap del modo de Jira de la config, con el detalle si es inválida', () => {
+  const detail = '.sdd-ai/config.yml: jira_approval.mode tiene que ser "on" u "off", no true'
+  for (const cli of CLIS) {
+    assert.equal(text(fire(cli, 'session-start', flowRepo('on'), { session_id: 's1', source: 'startup' })), renderBootstrap(undefined, undefined, 'on'))
+    assert.equal(text(fire(cli, 'session-start', flowRepo('invalid'), { session_id: 's1', source: 'startup' })), renderBootstrap(undefined, undefined, 'invalid', detail))
+    assert.equal(text(fire(cli, 'session-start', flowRepo('off'), { session_id: 's1', source: 'startup' })), renderBootstrap())
+  }
+})
+
+const FLOW_F1 = (step: string) => `Flujo f1: el paso siguiente es ${step}; corre ./bin/sdd-ai sdd status f1 para ver qué sigue`
+
+test('Stop recuerda el flujo ligado una vez por cambio de paso o gate y no por task, en los dos runners', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFile(repo, 'f1', 'tasks.md', '# Tasks\n\n- [x] **T1 — uno**\n- [ ] **T2 — dos**\n- [ ] **T3 — tres**\n')
+    writeFlow(repo, 'f1', { plan: { status: 'implementing' } })
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    writeFile(repo, 'f1', 'tasks.md', '# Tasks\n\n- [x] **T1 — uno**\n- [x] **T2 — dos**\n- [ ] **T3 — tres**\n')
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1' }), '', 'otra task no es otro paso')
+    writeFile(repo, 'f1', 'tasks.md', '# Tasks\n\n- [x] **T1 — uno**\n- [x] **T2 — dos**\n- [x] **T3 — tres**\n')
+    const out = fire(cli, 'stop', repo, { session_id: 's1' })
+    assert.deepEqual(checkOutput(cli, 'Stop', out), [], `${cli}: ${JSON.stringify(out)}`)
+    if (cli === 'codex') assert.equal((out as Out).decision, 'block')
+    assert.equal(text(out), FLOW_F1('verify'))
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1' }), '', 'una sola vez por cambio')
+
+    const gates = flowRepo()
+    writeFlow(gates, 'f1', { handoff: { profundidad: 'completa', spec_approved_at: null } })
+    post(cli, gates, './bin/sdd-ai sdd status f1')
+    assert.deepEqual(bound(gates), { id: 'f1', step: 'gate', gate: 'spec' })
+    writeFlow(gates, 'f1', { plan: { status: 'planned' } })
+    assert.equal(text(fire(cli, 'stop', gates, { session_id: 's1' })), 'Flujo f1: el paso siguiente es gate (gate plan); corre ./bin/sdd-ai sdd status f1 para ver qué sigue')
+  }
+})
+
+test('el primer Stop tras ligar calla si el paso no cambió', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1' }), '')
+    writeFlow(repo, 'f1', { plan: { status: 'planned' } })
+    assert.match(text(fire(cli, 'stop', repo, { session_id: 's1' })), /^Flujo f1: el paso siguiente es gate \(gate plan\)/)
+  }
+})
+
+test('Stop junta corridas y flujo en una salida', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    makeRun(repo, '20260101-0001-aaaa', { state: 'running' })
+    writeFlow(repo, 'f1', { plan: { status: 'planned' } })
+    const out = fire(cli, 'stop', repo, { session_id: 's1' })
+    assert.deepEqual(checkOutput(cli, 'Stop', out), [], cli)
+    const [runs, flow, ...rest] = text(out).split('\n\n')
+    assert.match(runs, /^Corridas de sdd-ai abiertas en esta sesión:\n- 20260101-0001-aaaa/)
+    assert.match(flow, /^Flujo f1: el paso siguiente es gate \(gate plan\)/)
+    assert.deepEqual(rest, [])
+  }
+})
+
+test('con stop_hook_active o sin liga Stop no recuerda el flujo', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1' }), '', 'sin liga')
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    writeFlow(repo, 'f1', { plan: { status: 'planned' } })
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1', stop_hook_active: true }), '')
+    assert.deepEqual(bound(repo), { id: 'f1', step: 'plan', gate: null }, 'la referencia no cambia')
+    assert.match(text(fire(cli, 'stop', repo, { session_id: 's1' })), /^Flujo f1/)
+  }
+})
+
+test('la liga se suelta con el flujo en done o sin su directorio, y rigen las reglas sin liga', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1', { plan: { status: 'pr-open' }, tasks: 'done' })
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1' }), '')
+    assert.deepEqual(bound(repo), { id: 'f1', step: 'archive', gate: null }, 'pr-open conserva la liga')
+    writeFlow(repo, 'f1', { plan: { status: 'done' }, tasks: 'done' })
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1' }), '')
+    assert.equal(bound(repo), null, 'done la suelta')
+    writeFlow(repo, 'f2')
+    post(cli, repo, './bin/sdd-ai sdd status f2')
+    rmSync(join(repo, '.plans', 'f2'), { recursive: true })
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1' }), '')
+    assert.equal(bound(repo), null, 'sin directorio la suelta')
+    // La guarda también suelta la liga, y después rigen las reglas sin liga.
+    for (const jira of ['on', 'off'] as const) {
+      const done = flowRepo(jira)
+      writeFlow(done, 'f1', { plan: { status: 'implementing' }, tasks: 'pending' })
+      post(cli, done, './bin/sdd-ai sdd status f1')
+      writeFlow(done, 'f1', { plan: { status: 'done' }, tasks: 'done' })
+      const out = shell(cli, done, 'git commit -m x')
+      if (jira === 'on') assert.match(denial(out), /con jira_approval en on todo cambio del proyecto va por un flujo SDD/)
+      else assert.equal(out, '')
+      assert.equal(bound(done), null, jira)
+    }
+  }
+})
+
+test('si Stop no puede guardar la referencia, calla el aviso del flujo', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    makeRun(repo, '20260101-0001-aaaa', { state: 'running' })
+    writeFlow(repo, 'f1', { plan: { status: 'planned' } })
+    const out = readOnlyRoute(repo, () => fire(cli, 'stop', repo, { session_id: 's1' }))
+    assert.match(text(out), /20260101-0001-aaaa/)
+    assert.doesNotMatch(text(out), /Flujo f1/)
+    assert.equal(text(fire(cli, 'stop', repo, { session_id: 's1' })), 'Flujo f1: el paso siguiente es gate (gate plan); corre ./bin/sdd-ai sdd status f1 para ver qué sigue')
+  }
+})
+
+function writeFile(repo: string, id: string, name: string, content: string): void {
+  mkdirSync(join(repo, '.plans', id), { recursive: true })
+  writeFileSync(join(repo, '.plans', id, name), content)
+}
+
+/** Cada paso de AC-5 con un flujo en disco que lo produce, y si el commit pasa. */
+const GUARD_STEPS: Array<[string, FlowShape, boolean]> = [
+  ['depth', { handoff: null }, false],
+  ['specify', { spec: false }, false],
+  ['plan', {}, false],
+  ['tasks', { plan: { status: 'plan-approved' } }, false],
+  ['gate', { handoff: { profundidad: 'completa', spec_approved_at: null } }, false],
+  ['external_gate', { handoff: { profundidad: 'completa', spec_approved_at: SPEC_APPROVED, gate_status: 'awaiting' }, plan: { status: 'implementing' }, tasks: 'pending' }, false],
+  ['implement', { plan: { status: 'implementing' }, tasks: 'pending' }, false],
+  ['verify', { plan: { status: 'implementing' }, tasks: 'done' }, false],
+  ['resolve_blockers', { plan: { status: 'bogus' }, tasks: 'done' }, false],
+  ['review_and_commit', { plan: { status: 'verified' }, tasks: 'done' }, true],
+  ['push', { plan: { status: 'committed' }, tasks: 'done' }, true],
+  ['open_pr', { plan: { status: 'pushed' }, tasks: 'done' }, true],
+  ['archive', { plan: { status: 'pr-open' }, tasks: 'done' }, true],
+]
+
+/** Un repo con el flujo f1 en ese paso y la sesión s1 ligada a él. */
+function boundRepo(cli: Cli, shape: FlowShape = { plan: { status: 'implementing' }, tasks: 'pending' }, jira?: 'on' | 'off' | 'invalid'): string {
+  const repo = flowRepo(jira)
+  writeFlow(repo, 'f1', shape)
+  post(cli, repo, './bin/sdd-ai sdd status f1')
+  assert.notEqual(bound(repo), null, 'quedó ligada')
+  return repo
+}
+
+const USER_COMMITS = /el commit lo hace el usuario/
+
+test('con liga niega el commit antes de review_and_commit y lo deja pasar desde ahí', () => {
+  for (const cli of CLIS) {
+    for (const [step, shape, passes] of GUARD_STEPS) {
+      const repo = boundRepo(cli, shape)
+      assert.equal(stepOf(repo, 'f1'), step)
+      const out = shell(cli, repo, 'git add . && git commit -m x')
+      if (passes) {
+        assert.equal(out, '', step)
+        continue
+      }
+      assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [], step)
+      const reason = denial(out)
+      assert.ok(reason.startsWith('sdd-ai: ') && reason.includes('flujo f1') && reason.includes(step), `${step}: ${reason}`)
+      assert.match(reason, USER_COMMITS, step)
+    }
+  }
+})
+
+test('un commit a otro repositorio, también anidado, pasa', () => {
+  for (const cli of CLIS) {
+    const repo = boundRepo(cli)
+    const other = makeRepo()
+    const nested = join(repo, 'sub', 'anidado')
+    mkdirSync(nested, { recursive: true })
+    spawnSync('git', ['init', '-q'], { cwd: nested })
+    for (const command of [`git -C ${other} commit -m x`, 'git -C sub/anidado commit -m x', `cd /tmp && git -C ${nested} commit -m x`]) {
+      assert.equal(shell(cli, repo, command), '', command)
+    }
+    assert.equal(denial(shell(cli, repo, 'git -C sub commit -m x')).includes('flujo f1'), true, 'sub no es otro repositorio')
+  }
+})
+
+test('con liga un destino desconocido se niega', () => {
+  for (const cli of CLIS) {
+    const repo = boundRepo(cli, { plan: { status: 'verified' }, tasks: 'done' })
+    for (const command of ['cd sub && git commit -m x', 'git -C $X commit -m x', 'git -C /no/existe commit -m x', 'git --git-dir=.git commit -m x']) {
+      const reason = denial(shell(cli, repo, command))
+      assert.ok(reason.includes('flujo f1') && reason.includes('no se puede saber a qué repositorio va'), `${command}: ${reason}`)
+      assert.match(reason, USER_COMMITS, command)
+    }
+  }
+})
+
+test('una cadena que liga y commitea se niega en cualquier sesión', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1', { plan: { status: 'verified' }, tasks: 'done' })
+    const other = makeRepo()
+    for (const session of ['s1', 's9']) {
+      if (session === 's1') post(cli, repo, './bin/sdd-ai sdd status f1')
+      const out = shell(cli, repo, './bin/sdd-ai sdd status f1 && git commit -m x', { session_id: session })
+      assert.match(denial(out), /por separado/, session)
+      assert.equal(shell(cli, repo, `./bin/sdd-ai sdd status f1; git -C ${other} commit -m x`, { session_id: session }), '', `${session}: a otro repositorio`)
+    }
+  }
+})
+
+test('no_artifacts en el flujo ligado niega', () => {
+  for (const cli of CLIS) {
+    const repo = boundRepo(cli, { plan: { status: 'verified' }, tasks: 'done' })
+    for (const name of ['spec.md', 'plan.md', 'handoff.md']) unlinkSync(join(repo, '.plans', 'f1', name))
+    assert.equal(stepOf(repo, 'f1'), 'no_artifacts')
+    const reason = denial(shell(cli, repo, 'git commit -m x'))
+    assert.ok(reason.includes('flujo f1') && reason.includes('no_artifacts'), reason)
+    assert.match(reason, USER_COMMITS)
+  }
+})
+
+test('el subagente de una sesión ligada también queda bajo la guarda', () => {
+  for (const cli of CLIS) {
+    const repo = boundRepo(cli)
+    assert.match(denial(shell(cli, repo, 'git commit -m x', CHILD)), /flujo f1/)
+  }
+})
+
+test('con liga, un flujo ilegible, un estado de sesión ilegible o un error dentro de la guarda niegan el commit', () => {
+  for (const cli of CLIS) {
+    const unreadable = boundRepo(cli, { plan: { status: 'verified' }, tasks: 'done' })
+    chmodSync(join(unreadable, '.plans', 'f1', 'spec.md'), 0o000)
+    try {
+      const reason = denial(shell(cli, unreadable, 'git commit -m x'))
+      assert.ok(reason.includes('flujo f1') && reason.includes('su estado no se puede leer (spec.md existe y no se puede leer)'), reason)
+      assert.match(reason, /el commit lo hace el usuario desde su terminal, o se arregla el flujo/)
+    } finally {
+      chmodSync(join(unreadable, '.plans', 'f1', 'spec.md'), 0o644)
+    }
+    const state = boundRepo(cli, { plan: { status: 'verified' }, tasks: 'done' })
+    writeFileSync(join(routeDir(state), 's1.json'), '{roto')
+    const stateReason = denial(shell(cli, state, 'git commit -m x'))
+    assert.ok(stateReason.includes('el estado de esta sesión no se puede leer'), stateReason)
+    assert.match(stateReason, USER_COMMITS)
+    const link = boundRepo(cli, { plan: { status: 'verified' }, tasks: 'done' })
+    const outside = mkdtempSync(join(tmpdir(), 'sdd-ai-flujo-'))
+    rmSync(join(link, '.plans', 'f1'), { recursive: true })
+    symlinkSync(outside, join(link, '.plans', 'f1'))
+    const linkReason = denial(shell(cli, link, 'git commit -m x'))
+    assert.ok(linkReason.includes('no se pudo leer el estado del flujo ligado f1') && linkReason.includes('enlace simbólico'), linkReason)
+    assert.match(linkReason, /el commit lo hace el usuario desde su terminal, o se arregla el flujo/)
+  }
+})
+
+test('con un session_id inválido y jira on se niega el commit', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo('on')
+    assert.match(denial(shell(cli, repo, 'git commit -m x', { session_id: '../x' })), /con jira_approval en on/)
+    assert.equal(shell(cli, flowRepo(), 'git commit -m x', { session_id: '../x' }), '')
+  }
+})
+
+test('sin liga y con jira inválido se niega el commit', () => {
+  for (const cli of CLIS) {
+    const reason = denial(shell(cli, flowRepo('invalid'), 'git commit -m x'))
+    assert.ok(reason.includes('la config de Jira no se puede leer') && reason.includes('jira_approval.mode'), reason)
+    assert.match(reason, USER_COMMITS)
+  }
+})
+
+test('sin liga y con jira on se niega el commit a este repositorio o de destino desconocido y pasa uno a otro', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo('on')
+    for (const command of ['git commit -m x', 'cd sub && git commit -m x']) {
+      const out = shell(cli, repo, command)
+      assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [], command)
+      const reason = denial(out)
+      assert.ok(reason.includes('con jira_approval en on todo cambio del proyecto va por un flujo SDD'), reason)
+      assert.match(reason, USER_COMMITS, command)
+    }
+    assert.equal(shell(cli, repo, `git -C ${makeRepo()} commit -m x`), '')
+    assert.equal(shell(cli, repo, 'git status'), '')
+    assert.equal(shell(cli, flowRepo('off'), 'git commit -m x'), '')
+  }
+})

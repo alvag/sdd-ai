@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Lanzador de los hooks: Claude Code y Codex lo llaman en cada evento, con el payload por stdin. Vive
-// fuera del binario para poder negar un despacho `sdd-ai-*` aunque el binario no arranque, y para
-// contar las herramientas del conductor sin arrancarlo. Fuera de ese caso nunca falla: cualquier error
-// sale con 0 y sin salida.
+// fuera del binario para poder negar un despacho `sdd-ai-*` o un `git commit` aunque el binario no
+// arranque, y para contar las herramientas del conductor sin arrancarlo. Fuera de esos casos nunca
+// falla: cualquier error sale con 0 y sin salida.
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { enableCompileCache } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -14,6 +14,12 @@ const MAX_PAYLOAD = 1024 * 1024
 const BINARY_TIMEOUT_MS = 5000
 const cli = process.argv[2]
 const DISPATCH_TOOLS = ['Agent', 'spawn_agent', 'collaborationspawn_agent']
+/** La misma regla que el hook: el `session_id` termina en una ruta. */
+const SESSION_ID = /^[A-Za-z0-9._-]{1,128}$/
+/** El filtro barato antes de cargar el parser: sin `git` seguido de `commit` no hay commit posible. */
+const COMMIT_HINT = /\bgit\b[\s\S]*\bcommit\b/
+/** El mismo filtro para un comando que puede ligar la sesión a un flujo. */
+const BINDING_HINT = /sdd-ai[\s\S]*\bsdd\b/
 
 /** La raíz sale del payload y no del proceso, para que el mismo lanzador sirva desde la config global. */
 function rootOf(p) {
@@ -28,12 +34,107 @@ function rootOf(p) {
  * segunda vez.
  */
 async function backstop(root) {
+  compileCache()
+  return import(pathToFileURL(join(root, 'src', 'backstop.ts')).href)
+}
+
+function compileCache() {
   try {
     enableCompileCache()
   } catch {
-    // Sin caché el conteo sale igual, más lento.
+    // Sin caché todo sale igual, más lento.
   }
-  return import(pathToFileURL(join(root, 'src', 'backstop.ts')).href)
+}
+
+/**
+ * Un módulo del paquete de este lanzador, no de la raíz del payload: el parser de comandos y la config
+ * tienen que ser los mismos que usa el binario de este paquete.
+ */
+async function own(file) {
+  compileCache()
+  return import(new URL(`../src/${file}`, import.meta.url).href)
+}
+
+/** Si el comando hace `git commit`; si el parser no carga, se asume que sí y decide el binario. */
+async function mayCommit(p) {
+  const command = p.tool_input?.command
+  if (typeof command !== 'string' || !COMMIT_HINT.test(command)) return false
+  try {
+    return (await own('commands.ts')).commitTargets(command, String(p.cwd)).length > 0
+  } catch {
+    return true
+  }
+}
+
+/** El id que liga el comando, `null` si no liga, o `undefined` si el parser no carga y no se sabe. */
+async function bindingOf(p) {
+  const command = p.tool_input?.command
+  if (typeof command !== 'string' || !BINDING_HINT.test(command)) return null
+  try {
+    return (await own('commands.ts')).bindingCommand(command)?.id ?? null
+  } catch {
+    return undefined
+  }
+}
+
+const denyJson = (reason) => JSON.stringify({
+  hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: `sdd-ai: ${reason}` },
+})
+const contextJson = (event, text) => JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: text } })
+
+/**
+ * Un `git commit` que el binario no pudo comprobar: se niega con liga, con el estado de la sesión
+ * ilegible o con la regla de Jira en la config, y pasa sin ninguno de los tres.
+ */
+async function commitFallback(p, root, why) {
+  const user = 'el commit lo hace el usuario desde su terminal, o se arregla el flujo'
+  if (typeof p.session_id === 'string' && SESSION_ID.test(p.session_id)) {
+    const file = join(root, '.sdd-ai', 'hooks', 'route', `${p.session_id}.json`)
+    if (existsSync(file)) {
+      let state
+      try {
+        state = JSON.parse(readFileSync(file, 'utf8'))
+      } catch {
+        return denyJson(`el hook no pudo comprobar el commit (${why}) y el estado de esta sesión no se puede leer: ${user}`)
+      }
+      // Un JSON que no es un objeto tampoco es un estado: no se sabe si hay liga.
+      if (typeof state !== 'object' || state === null || Array.isArray(state)) {
+        return denyJson(`el hook no pudo comprobar el commit (${why}) y el estado de esta sesión no se puede leer: ${user}`)
+      }
+      if (state.flow !== undefined) {
+        return denyJson(`el hook no pudo comprobar el commit (${why}) y la sesión conduce el flujo ${state.flow?.id}: ${user}`)
+      }
+    }
+  }
+  if (!existsSync(join(root, '.sdd-ai', 'config.yml'))) return ''
+  let mode
+  try {
+    mode = (await own('config.ts')).loadJiraMode(root).mode
+  } catch {
+    mode = 'desconocido'
+  }
+  if (mode === 'off') return ''
+  return denyJson(`el hook no pudo comprobar el commit (${why}) y la config pide jira_approval (${mode}): el commit lo hace el usuario desde su terminal`)
+}
+
+const binaryFailure = (r) => (r.error ? r.error.message : `salió con ${r.status ?? r.signal}`)
+
+function runBinary(root, input) {
+  return spawnSync(process.execPath, [join(root, 'bin', 'sdd-ai'), 'hook', cli], { input, encoding: 'utf8', timeout: BINARY_TIMEOUT_MS })
+}
+
+/**
+ * Un comando del conductor que liga la sesión: la liga la pone el binario. Si falla o vence, el
+ * conductor lo sabe, con el evento que llegó.
+ */
+function bindThroughBinary(p, root, input, id) {
+  const r = runBinary(root, input)
+  if (r.status === 0) return r.stdout
+  const why = binaryFailure(r)
+  const text = id === undefined
+    ? `sdd-ai: no se pudo comprobar si el comando liga un flujo (${why}); si corriste sdd status <id>, córrelo otra vez`
+    : `sdd-ai: no se pudo confirmar la liga con el flujo ${id} (${why}); corre ./bin/sdd-ai sdd status ${id} otra vez`
+  return contextJson(p.hook_event_name, text)
 }
 
 /**
@@ -58,30 +159,41 @@ async function countHere(p) {
 
 async function launch(input) {
   const p = JSON.parse(input)
-  if (p.hook_event_name === 'PreToolUse' && p.tool_name === 'Bash' && !p.agent_id) {
-    // Un comando de shell fuera de un subagente nunca se niega: no vale la pena arrancar el binario.
-    await startTrailIfMissing(p)
-    return ''
+  const bash = p.tool_name === 'Bash'
+  let commit = false
+  if (p.hook_event_name === 'PreToolUse' && bash) {
+    commit = await mayCommit(p)
+    if (!commit && !p.agent_id) {
+      // Un comando del conductor que no hace commit nunca se niega: no vale la pena arrancar el binario.
+      await startTrailIfMissing(p)
+      return ''
+    }
+  }
+  if ((p.hook_event_name === 'PostToolUse' || p.hook_event_name === 'PostToolUseFailure') && bash) {
+    // La herramienta de un subagente no liga ni cuenta. Un fallo no se cuenta: solo puede ligar.
+    if (p.agent_id) return ''
+    const id = await bindingOf(p)
+    if (id !== null) {
+      const root = rootOf(p)
+      return existsSync(join(root, '.sdd-ai')) ? bindThroughBinary(p, root, input, id) : ''
+    }
+    return p.hook_event_name === 'PostToolUse' ? await countHere(p) : ''
   }
   if (p.hook_event_name === 'PostToolUse' && !DISPATCH_TOOLS.includes(p.tool_name)) {
     // La herramienta de un subagente no cuenta; la del conductor se cuenta en este proceso.
     return p.agent_id ? '' : await countHere(p)
   }
   const root = rootOf(p)
-  const r = spawnSync(process.execPath, [join(root, 'bin', 'sdd-ai'), 'hook', cli], { input, encoding: 'utf8', timeout: BINARY_TIMEOUT_MS })
+  const r = runBinary(root, input)
   // Una salida 0 sin nada impreso es un silencio del hook, y se respeta.
   if (r.status === 0) return r.stdout
+  if (!existsSync(join(root, '.sdd-ai'))) return ''
+  if (commit) return commitFallback(p, root, binaryFailure(r))
   const tool = p.tool_input ?? {}
   const type = tool.subagent_type ?? tool.agent_type
   const dispatch = DISPATCH_TOOLS.includes(p.tool_name) && typeof type === 'string' && type.startsWith('sdd-ai-')
-  if (!dispatch || !existsSync(join(root, '.sdd-ai'))) return ''
-  const why = r.error ? r.error.message : `salió con ${r.status ?? r.signal}`
-  return JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse', permissionDecision: 'deny',
-      permissionDecisionReason: `sdd-ai: el hook no pudo comprobar el despacho (${why})`,
-    },
-  })
+  if (!dispatch) return ''
+  return denyJson(`el hook no pudo comprobar el despacho (${binaryFailure(r)})`)
 }
 
 let size = 0

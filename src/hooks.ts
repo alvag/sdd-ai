@@ -1,11 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
-import { countTool, markBootstrap, startTrail } from './backstop.ts'
+import { type FlowBinding, countTool, markBootstrap, readBinding, setBinding, startTrail } from './backstop.ts'
+import { type CommitTarget, bindingCommand, commitTargets, invokesBinding } from './commands.ts'
+import { type JiraMode, loadJiraMode } from './config.ts'
 import { repoRoot } from './git.ts'
 import { confirm, release, reserve } from './native-launch.ts'
 import { type OpenRun, type OpenState, describe, openRuns, runKey } from './open-runs.ts'
 import { renderBootstrap } from './route.ts'
 import { readJson, readStatus, writeJsonAtomic } from './runs.ts'
+import { type ListEntry, listFlows, lstatOrNull, readFlow } from './sdd/read.ts'
+import { type FlowStatus, type Reason, type Step, headerData, resolve } from './sdd/status.ts'
 import { shellSegments } from './shell.ts'
 import type { NativeProfile } from './types.ts'
 
@@ -32,11 +36,14 @@ export function runHook(stdin: string, cli: HookCli): string {
     const payload = JSON.parse(stdin) as unknown
     if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return ''
     const p = payload as Payload
-    if (typeof p.session_id !== 'string' || !SESSION_ID.test(p.session_id)) return ''
+    const validSession = typeof p.session_id === 'string' && SESSION_ID.test(p.session_id)
+    // Sin una sesión válida no hay liga posible, pero la regla de Jira vale igual para un commit.
+    if (!validSession && !(p.hook_event_name === 'PreToolUse' && p.tool_name === 'Bash')) return ''
     if (typeof p.cwd !== 'string') return ''
     const root = repoRoot(p.cwd)
     // `existsSync` y no `runsRoot`, que lo crearía: un repo sin sdd-ai no se toca.
     if (!existsSync(join(root, '.sdd-ai'))) return ''
+    if (typeof p.session_id !== 'string' || !validSession) return guardCommit(p, root, null)
     // El rastro empieza con el primer evento que ve de la sesión, también si abrió antes de los hooks.
     const via = p.hook_event_name === 'SessionStart' ? `SessionStart:${String(p.source)}` : String(p.hook_event_name)
     startTrail(root, p.session_id, via)
@@ -45,7 +52,7 @@ export function runHook(stdin: string, cli: HookCli): string {
       case 'Stop': return stop(p, root, p.session_id, cli)
       case 'PreToolUse': return preToolUse(p, root, p.session_id, cli)
       case 'PostToolUse': return postToolUse(p, root, p.session_id, cli)
-      case 'PostToolUseFailure': return postDispatch(p, root, 'release')
+      case 'PostToolUseFailure': return postToolUseFailure(p, root, p.session_id)
       default: return ''
     }
   } catch {
@@ -68,13 +75,15 @@ function context(event: string, additionalContext: string): string {
 }
 
 /**
- * El bootstrap de la ruta directa, seguido de la lista de corridas, en una sola salida. Una sesión
- * bifurcada hereda el contexto de la original y no recibe nada.
+ * El bootstrap de la ruta directa, seguido de la lista de corridas y la de flujos, en una sola salida.
+ * Una sesión bifurcada hereda el contexto de la original y no recibe nada.
  */
 function sessionStart(p: Payload, root: string, session: string): string {
-  const text = [bootstrap(p, root, session), runList(p, root, session)].filter(Boolean).join('\n\n')
+  const text = [bootstrap(p, root, session), runList(p, root, session), flowList(p, root, session)].filter(Boolean).join('\n\n')
   return text === '' ? '' : context('SessionStart', text)
 }
+
+const bootstrapText = (jira: JiraMode) => renderBootstrap(undefined, undefined, jira.mode, jira.mode === 'invalid' ? jira.detail : undefined)
 
 /**
  * Al empezar, limpiar o compactar, el contexto anterior ya no está y el bootstrap vuelve. Una sesión
@@ -84,10 +93,39 @@ function sessionStart(p: Payload, root: string, session: string): string {
 function bootstrap(p: Payload, root: string, session: string): string {
   if (p.source === 'startup' || p.source === 'clear' || p.source === 'compact') {
     markBootstrap(root, session)
-    return renderBootstrap()
+    return bootstrapText(loadJiraMode(root))
   }
-  if (p.source === 'resume') return markBootstrap(root, session) ? '' : renderBootstrap()
+  if (p.source === 'resume') return markBootstrap(root, session) ? '' : bootstrapText(loadJiraMode(root))
   return ''
+}
+
+const FLOW_SOURCES = ['startup', 'clear', 'resume', 'compact']
+
+/** Los bloqueos que dicen que el estado del flujo no se pudo leer, y no que el flujo esté trabado. */
+const READ_ERRORS = new Set(['artifact_unreadable', 'approvals_invalid', 'header_invalid'])
+const readErrors = (reasons: Reason[]) => reasons.filter((r) => READ_ERRORS.has(r.code))
+
+function flowLine(e: ListEntry, boundId: string | null): string {
+  // Sin profundidad y bloqueado es un flujo que no se pudo leer entero: el nombre o el enlace.
+  const errors = e.depth === null && e.blocked ? e.blocked_reasons : readErrors(e.blocked_reasons)
+  if (errors.length > 0) return `- ${e.id}: no se pudo leer (${errors.map((r) => r.detail).join('; ')})`
+  const gate = e.next.gate ? ` ${e.next.gate}` : ''
+  return `- ${e.id} (${e.depth ?? 'sin profundidad'}): ${e.next.step}${gate}${e.id === boundId ? ' · ligado a esta sesión' : ''}`
+}
+
+/** Una línea por flujo activo de `.plans/`, con el ligado marcado. Los directorios sin artefactos no son flujos. */
+function flowList(p: Payload, root: string, session: string): string {
+  if (!FLOW_SOURCES.includes(String(p.source))) return ''
+  let entries: ListEntry[]
+  try {
+    entries = listFlows(root).filter((e) => e.next.step !== 'no_artifacts')
+  } catch (e) {
+    return `Flujos SDD en .plans/: no se pudieron listar (${errorText(e)})`
+  }
+  if (entries.length === 0) return ''
+  const binding = readBinding(root, session)
+  const boundId = binding !== null && binding !== 'unreadable' ? binding.id : null
+  return ['Flujos SDD en .plans/:', ...entries.map((e) => flowLine(e, boundId))].join('\n')
 }
 
 /**
@@ -119,12 +157,19 @@ function reminded(file: string): Set<string> {
 }
 
 /**
- * Reabre el turno una vez por conjunto de corridas abiertas propias. El recordatorio se guarda antes
- * de imprimirlo: si no se puede guardar, calla, porque recordar dos veces lo mismo es peor que perder
- * un recordatorio.
+ * Reabre el turno con lo que haya que recordar: las corridas abiertas propias y el paso del flujo
+ * ligado, en una sola salida. Cada recordatorio se guarda antes de imprimirlo, y si no se puede guardar
+ * calla, porque recordar dos veces lo mismo es peor que perder un recordatorio.
  */
 function stop(p: Payload, root: string, session: string, cli: HookCli): string {
   if (p.stop_hook_active === true) return ''
+  const reason = [runsReminder(root, session), flowReminder(root, session)].filter(Boolean).join('\n\n')
+  if (reason === '') return ''
+  return cli === 'claude' ? context('Stop', reason) : JSON.stringify({ decision: 'block', reason })
+}
+
+/** Las corridas abiertas propias, una vez por conjunto. */
+function runsReminder(root: string, session: string): string {
   const own = openRuns(root).filter((r) => r.session === session)
   if (own.length === 0) return ''
   const file = join(root, '.sdd-ai', 'hooks', `${session}.json`)
@@ -137,8 +182,44 @@ function stop(p: Payload, root: string, session: string, cli: HookCli): string {
   } catch {
     return ''
   }
-  const reason = ownRuns(own)
-  return cli === 'claude' ? context('Stop', reason) : JSON.stringify({ decision: 'block', reason })
+  return ownRuns(own)
+}
+
+/**
+ * La liga de la sesión con el estado de su flujo. `null` sin liga, o después de soltarla porque el
+ * flujo terminó (`status: done` en el plan) o su directorio ya no está; `'unreadable'` si el estado de
+ * la sesión no se lee. Lanza si el flujo no se puede leer o si no se pudo soltar la liga.
+ */
+function boundFlow(root: string, session: string): { binding: FlowBinding; status: FlowStatus } | null | 'unreadable' {
+  const binding = readBinding(root, session)
+  if (binding === null || binding === 'unreadable') return binding
+  const gone = lstatOrNull(join(root, '.plans', binding.id)) === null
+  const read = gone ? null : readFlow(root, binding.id)
+  if (read === null || headerData(read.facts.planHeader)?.status === 'done') {
+    if (!setBinding(root, session, null)) throw new Error(`no se pudo soltar la liga con el flujo ${binding.id}`)
+    return null
+  }
+  return { binding, status: resolve(read.facts) }
+}
+
+/**
+ * El paso del flujo ligado, una vez por cambio de paso o de gate; otra task no cuenta. La referencia
+ * nueva se guarda antes de recordarla, y si no se puede guardar calla: así Codex no reabre el turno
+ * por el mismo cambio en cada `Stop`.
+ */
+function flowReminder(root: string, session: string): string {
+  try {
+    const flow = boundFlow(root, session)
+    if (flow === null || flow === 'unreadable') return ''
+    const { binding, status } = flow
+    const gate = status.next.gate ?? null
+    if (binding.step === status.next.step && binding.gate === gate) return ''
+    if (!setBinding(root, session, { id: binding.id, step: status.next.step, gate, at: new Date().toISOString() })) return ''
+    return `Flujo ${binding.id}: el paso siguiente es ${status.next.step}${gate ? ` (gate ${gate})` : ''}; ` +
+      `corre ./bin/sdd-ai sdd status ${binding.id} para ver qué sigue`
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -160,7 +241,7 @@ const isRecord = (v: unknown): v is Input => typeof v === 'object' && v !== null
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 function preToolUse(p: Payload, root: string, session: string, cli: HookCli): string {
-  if (p.tool_name === 'Bash') return guardShell(p)
+  if (p.tool_name === 'Bash') return guardCommit(p, root, session) || guardShell(p)
   if (typeof p.tool_name !== 'string' || !DISPATCH_TOOLS.has(p.tool_name) || !isRecord(p.tool_input)) return ''
   const type = p.tool_input.subagent_type ?? p.tool_input.agent_type
   if (typeof type !== 'string' || !type.startsWith(AGENT_PREFIX)) return ''
@@ -299,8 +380,9 @@ function unconfirmedReason(reserved: OpenRun[], cited: string | undefined, type:
 }
 
 /**
- * Primero confirma el despacho, como siempre; después cuenta la herramienta para el recordatorio de
- * sesión larga. Un error de cualquiera de los dos no cambia lo que hizo el otro.
+ * Primero confirma el despacho, como siempre; después liga la sesión si el comando lo pide, y al final
+ * cuenta la herramienta para el recordatorio de sesión larga, que ya ve la liga. Un error de cualquiera
+ * de los tres no cambia lo que hicieron los otros.
  */
 function postToolUse(p: Payload, root: string, session: string, cli: HookCli): string {
   let out = ''
@@ -310,8 +392,44 @@ function postToolUse(p: Payload, root: string, session: string, cli: HookCli): s
     // Un despacho que no se pudo confirmar sigue sin confirmar, igual que antes del contador.
   }
   if (out !== '') return out
-  const reminder = countTool(p, root, session, cli)
-  return reminder === '' ? '' : context('PostToolUse', reminder)
+  const text = [bind(p, root, session), countTool(p, root, session, cli)].filter(Boolean).join('\n\n')
+  return text === '' ? '' : context('PostToolUse', text)
+}
+
+/**
+ * Claude Code avisa por acá un despacho o un comando de shell que falló. El despacho se libera; el
+ * comando liga igual que uno que terminó bien, y no se cuenta, como hasta ahora.
+ */
+function postToolUseFailure(p: Payload, root: string, session: string): string {
+  try {
+    postDispatch(p, root, 'release')
+  } catch {
+    // Un despacho que no se pudo liberar queda reservado sin confirmar, como antes.
+  }
+  const warning = bind(p, root, session)
+  return warning === '' ? '' : context('PostToolUseFailure', warning)
+}
+
+/**
+ * Liga la sesión al flujo de un `sdd status <id>` o `sdd approve <id> <gate>` del conductor en el
+ * primer tramo, con el paso de ese momento como referencia de `Stop`, termine como termine el comando.
+ * Un flujo que no se puede leer o sin artefactos no cambia la liga. Devuelve el aviso si no se pudo
+ * guardar, o `''`.
+ */
+function bind(p: Payload, root: string, session: string): string {
+  try {
+    if (p.tool_name !== 'Bash' || (typeof p.agent_id === 'string' && p.agent_id !== '')) return ''
+    const command = isRecord(p.tool_input) ? p.tool_input.command : undefined
+    const binding = typeof command === 'string' ? bindingCommand(command) : undefined
+    if (!binding) return ''
+    const { next } = resolve(readFlow(root, binding.id).facts)
+    if (next.step === 'no_artifacts') return ''
+    if (setBinding(root, session, { id: binding.id, step: next.step, gate: next.gate ?? null, at: new Date().toISOString() })) return ''
+    return `sdd-ai: no se pudo guardar la liga con el flujo ${binding.id}. Hasta que se guarde, Stop no recuerda su paso y la guarda ` +
+      `del commit no lo tiene en cuenta. Vuelve a correr ./bin/sdd-ai sdd status ${binding.id}.`
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -360,3 +478,85 @@ function guardShell(p: Payload): string {
   return shellSegments(command).some(invokesConductorCommand) ? deny('un worker no delega ni toca las corridas del conductor') : ''
 }
 
+
+/** Desde estos pasos el commit pasa: el flujo está para commitear, o ya commiteó. */
+const COMMIT_STEPS: readonly Step[] = ['review_and_commit', 'push', 'open_pr', 'archive']
+const USER_COMMITS = 'el commit lo hace el usuario desde su terminal'
+
+/** Si el destino es este repositorio: su raíz Git, por ruta real, es la de este árbol. Sin raíz, no se sabe. */
+function isHere(target: CommitTarget, here: string): boolean | 'unknown' {
+  if ('unknown' in target) return 'unknown'
+  try {
+    return realpathSync(repoRoot(target.dir)) === here
+  } catch {
+    return 'unknown'
+  }
+}
+
+function jiraDenial(jira: JiraMode): string {
+  const rule = 'con jira_approval en on todo cambio del proyecto va por un flujo SDD'
+  if (jira.mode === 'invalid') {
+    return deny(`la config de Jira no se puede leer (${jira.detail}), y hasta corregirla rige lo mismo que con jira_approval en on: ` +
+      `todo cambio del proyecto va por un flujo SDD; ${USER_COMMITS}`)
+  }
+  return deny(`${rule}: liga la sesión con ./bin/sdd-ai sdd status <id> del flujo, o ${USER_COMMITS}`)
+}
+
+/**
+ * La guarda de `git commit` en el shell del runner, del conductor o de un subagente. Solo mira un
+ * commit a este repositorio o de destino desconocido. Una cadena que también liga se niega. Con liga,
+ * el commit pasa desde `review_and_commit`; sin liga, lo decide la regla de Jira. Tiene su propio
+ * `try`, porque el de `runHook` calla y dejaría pasar el commit: con liga, o con Jira activo o
+ * ilegible, un error niega.
+ */
+export function guardCommit(p: Payload, root: string, session: string | null): string {
+  const command = isRecord(p.tool_input) ? p.tool_input.command : undefined
+  if (typeof command !== 'string' || typeof p.cwd !== 'string') return ''
+  const targets = commitTargets(command, p.cwd)
+  if (targets.length === 0) return ''
+  try {
+    const here = realpathSync(root)
+    const places = targets.map((t) => isHere(t, here))
+    if (!places.some((h) => h !== false)) return ''
+    if (invokesBinding(command)) {
+      return deny('este comando liga un flujo y hace git commit en la misma cadena: corre sdd status o sdd approve y el commit por separado, ' +
+        'porque el commit no se puede decidir con una liga que todavía no existe')
+    }
+    const flow = session === null ? null : boundFlow(root, session)
+    if (flow === 'unreadable') {
+      return deny(`el estado de esta sesión no se puede leer y no se sabe si conduce un flujo SDD: ${USER_COMMITS}, o se arregla el estado en .sdd-ai/hooks/route/`)
+    }
+    if (flow !== null) {
+      const { binding, status } = flow
+      const where = `la sesión conduce el flujo ${binding.id}, con el paso siguiente en ${status.next.step}`
+      if (status.next.step === 'no_artifacts') {
+        return deny(`${where}: el flujo ya no tiene artefactos y su estado no se puede leer; ${USER_COMMITS}, o se arregla el flujo`)
+      }
+      const errors = readErrors(status.blocked_reasons)
+      if (errors.length > 0) {
+        return deny(`${where}, y su estado no se puede leer (${errors.map((r) => r.detail).join('; ')}): ${USER_COMMITS}, o se arregla el flujo`)
+      }
+      if (places.includes('unknown')) {
+        return deny(`${where}, y no se puede saber a qué repositorio va este git commit (un cd previo, o un -C o --git-dir que no es una ruta literal): ${USER_COMMITS}`)
+      }
+      if (!COMMIT_STEPS.includes(status.next.step)) {
+        return deny(`${where}: el commit va desde review_and_commit, y si hace falta antes, ${USER_COMMITS}`)
+      }
+      return ''
+    }
+    const jira = loadJiraMode(root)
+    return jira.mode === 'off' ? '' : jiraDenial(jira)
+  } catch (e) {
+    const binding = session === null ? null : readBinding(root, session)
+    if (binding !== null) {
+      const which = binding === 'unreadable' ? '' : ` ${binding.id}`
+      return deny(`no se pudo leer el estado del flujo ligado${which} (${errorText(e)}): ${USER_COMMITS}, o se arregla el flujo`)
+    }
+    try {
+      const jira = loadJiraMode(root)
+      return jira.mode === 'off' ? '' : jiraDenial(jira)
+    } catch {
+      return deny(`no se pudo comprobar la regla de Jira para este commit (${errorText(e)}): ${USER_COMMITS}`)
+    }
+  }
+}

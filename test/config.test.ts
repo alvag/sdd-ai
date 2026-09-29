@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { effectiveFamilies, loadCrossModel, parseCrossModel, parseFamiliesFlag } from '../src/config.ts'
+import { effectiveFamilies, loadCrossModel, loadJiraMode, parseCrossModel, parseFamiliesFlag } from '../src/config.ts'
 import { SddError } from '../src/types.ts'
 
 const FIXTURE = join(import.meta.dirname, 'fixtures', 'config-ai-workflows.yml')
@@ -81,4 +81,33 @@ test('parseFamiliesFlag valida como families', () => {
 test('effectiveFamilies: el flag reemplaza la lista del config', () => {
   assert.deepEqual(effectiveFamilies(['claude'], ['codex']), ['codex'])
   assert.deepEqual(effectiveFamilies(['claude', 'codex']), ['claude', 'codex'])
+})
+
+test('loadJiraMode: on y off; sin archivo, sin bloque o sin mode es off; booleano, otro valor, bloque que no es mapa o YAML ilegible es invalid', () => {
+  const withConfig = (text: string) => {
+    const root = tmp()
+    mkdirSync(join(root, '.sdd-ai'))
+    writeFileSync(join(root, '.sdd-ai', 'config.yml'), text)
+    return root
+  }
+  const cross = 'cross_model:\n  schema_version: 1\n  families: [claude]\n  selection: full\n'
+  assert.deepEqual(loadJiraMode(withConfig(`${cross}jira_approval:\n  mode: "on"\n`)), { mode: 'on' })
+  assert.deepEqual(loadJiraMode(withConfig('jira_approval:\n  mode: "off"\n')), { mode: 'off' })
+  assert.deepEqual(loadJiraMode(tmp()), { mode: 'off' })
+  assert.deepEqual(loadJiraMode(withConfig(cross)), { mode: 'off' })
+  assert.deepEqual(loadJiraMode(withConfig('jira_approval: null\n')), { mode: 'off' })
+  assert.deepEqual(loadJiraMode(withConfig('jira_approval: {}\n')), { mode: 'off' })
+  const invalid = (text: string, what: string) => {
+    const mode = loadJiraMode(withConfig(text))
+    assert.equal(mode.mode, 'invalid', text)
+    assert.ok(mode.mode === 'invalid' && mode.detail.startsWith('.sdd-ai/config.yml') && mode.detail.includes(what), `${text} → ${JSON.stringify(mode)}`)
+  }
+  invalid('jira_approval:\n  mode: true\n', 'jira_approval.mode tiene que ser "on" u "off"')
+  invalid('jira_approval:\n  mode: "maybe"\n', 'jira_approval.mode tiene que ser "on" u "off"')
+  invalid('jira_approval: "on"\n', 'jira_approval tiene que ser un mapa')
+  invalid('jira_approval: [\n', 'YAML ilegible')
+  const dir = tmp()
+  mkdirSync(join(dir, '.sdd-ai', 'config.yml'), { recursive: true })
+  const unreadable = loadJiraMode(dir)
+  assert.ok(unreadable.mode === 'invalid' && unreadable.detail.includes('no se puede leer'), JSON.stringify(unreadable))
 })

@@ -1,10 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import type { JiraMode } from '../src/config.ts'
 import type { HeaderResult } from '../src/sdd/markdown.ts'
+import { readFlow } from '../src/sdd/read.ts'
 import {
   type Approval, type ApprovalLog, type Depth, type FlowFacts, GATE_ARTIFACTS, GATES, type GateId, type GateResolution, type Reason,
   resolve, resolveGates,
 } from '../src/sdd/status.ts'
+import { makeRepo } from './helpers.ts'
 
 const fp = (c: string) => `sha256:${c.repeat(64)}`
 const FP: Record<GateId, string> = { spec: fp('a'), plan: fp('b'), tasks: fp('c'), 'plan-tasks': fp('d'), single: fp('e') }
@@ -341,4 +346,86 @@ test('una aprobación sin proof cuenta y deja la nota approval_unproven', () => 
 test('la nota de approved_unfingerprinted dice que no tiene prueba del runner', () => {
   const r = resolveGates(flow('completa', 'planned'))
   assert.match(noteFor(r, 'approved_unfingerprinted')[0], /sin una aprobación registrada con sdd approve ni prueba del runner/)
+})
+
+const ON: JiraMode = { mode: 'on' }
+
+test('el override válido pisa la config, también una inválida, y null no pisa nada', () => {
+  const jiraOf = (config: string | null, overrides: string | null) => {
+    const root = makeRepo()
+    if (config !== null) {
+      mkdirSync(join(root, '.sdd-ai'))
+      writeFileSync(join(root, '.sdd-ai', 'config.yml'), config)
+    }
+    mkdirSync(join(root, '.plans', 'f'), { recursive: true })
+    writeFileSync(join(root, '.plans', 'f', 'handoff.md'), `---\nprofundidad: completa\n${overrides ?? ''}---\n\n# Handoff\n`)
+    return readFlow(root, 'f').facts.jira
+  }
+  const on = 'jira_approval:\n  mode: "on"\n'
+  assert.deepEqual(jiraOf(on, 'overrides:\n  jira_approval: "off"\n'), { mode: 'off' })
+  assert.deepEqual(jiraOf('jira_approval:\n  mode: true\n', 'overrides:\n  jira_approval: "on"\n'), { mode: 'on' })
+  assert.deepEqual(jiraOf(on, 'overrides:\n  jira_approval: null\n'), { mode: 'on' })
+  assert.deepEqual(jiraOf(on, null), { mode: 'on' })
+  assert.deepEqual(jiraOf(null, null), { mode: 'off' })
+  for (const bad of ['overrides:\n  jira_approval: "sí"\n', 'overrides: "x"\n']) {
+    const mode = jiraOf(on, bad)
+    assert.ok(mode?.mode === 'invalid' && mode.detail.includes('.plans/f/handoff.md'), `${bad} → ${JSON.stringify(mode)}`)
+  }
+})
+
+test('un jira_approval inválido bloquea con jira_approval_invalid, con un motivo que dice cómo corregirlo', () => {
+  const detail = '.sdd-ai/config.yml: jira_approval.mode tiene que ser "on" u "off", no true'
+  const r = resolve(flow('completa', 'implementing', { jira: { mode: 'invalid', detail } }))
+  assert.deepEqual(r.next, { step: 'resolve_blockers' })
+  const reason = r.blocked_reasons.find((b) => b.code === 'jira_approval_invalid')
+  assert.ok(reason?.detail.includes(detail) && reason.detail.includes('corrige el valor o quita la clave'), JSON.stringify(r.blocked_reasons))
+})
+
+test('un directorio sin artefactos sigue en no_artifacts con la config de Jira inválida', () => {
+  const jira: JiraMode = { mode: 'invalid', detail: 'x' }
+  const bare = { planHeader: null, handoffHeader: null, planSections: null, tasksSection: null, fingerprints: {}, jira }
+  const empty = resolve(flow('completa', 'planned', { ...bare, files: { spec: 'absent', plan: 'absent', tasks: 'absent', handoff: 'absent' }, tasksFile: null }))
+  const onlyTasks = resolve(flow('completa', 'planned', { ...bare, files: { spec: 'absent', plan: 'absent', tasks: 'present', handoff: 'absent' } }))
+  for (const r of [empty, onlyTasks]) {
+    assert.deepEqual(r.next, { step: 'no_artifacts' })
+    assert.deepEqual(r.blocked_reasons, [])
+  }
+})
+
+test('con jira on y sin approved, implement, verify y review_and_commit pasan a external_gate; push y archive no cambian; planificar sigue; con off nada cambia', () => {
+  const at = (gateStatus: string | undefined, status: string, o: Partial<FlowFacts> = {}, jira: JiraMode | null = ON) => {
+    const handoffHeader = hdr({ profundidad: 'completa', spec_approved_at: SPEC_APPROVED_AT, ...(gateStatus === undefined ? {} : { gate_status: gateStatus }) })
+    return resolve(flow('completa', status, { handoffHeader, ...(jira === null ? {} : { jira }), ...o }))
+  }
+  for (const gateStatus of [undefined, 'awaiting']) {
+    assert.deepEqual(at(gateStatus, 'implementing').next, { step: 'external_gate' })
+    assert.deepEqual(at(gateStatus, 'implementing', { tasksFile: DONE }).next, { step: 'external_gate' })
+    assert.deepEqual(at(gateStatus, 'verified', { tasksFile: DONE }).next, { step: 'external_gate' })
+    assert.deepEqual(at(gateStatus, 'committed', { tasksFile: DONE }).next, { step: 'push' })
+    assert.deepEqual(at(gateStatus, 'pushed', { tasksFile: DONE }).next, { step: 'open_pr' })
+    assert.deepEqual(at(gateStatus, 'done', { tasksFile: DONE }).next, { step: 'archive' })
+    const planning = at(gateStatus, 'planned')
+    assert.deepEqual(planning.next, { step: 'gate', gate: 'plan', artifacts: ['plan.md'] })
+    assert.equal(planning.notes.filter((n) => n.code === 'external_gate').length, 1, String(gateStatus))
+  }
+  assert.deepEqual(at('approved', 'implementing').next, { step: 'implement', task: 'T2 — segunda' })
+  assert.deepEqual(at('approved', 'implementing', { tasksFile: DONE }).next, { step: 'verify' })
+  assert.deepEqual(at('approved', 'verified', { tasksFile: DONE }).next, { step: 'review_and_commit' })
+  assert.deepEqual(at('approved', 'planned').notes.filter((n) => n.code === 'external_gate'), [])
+  for (const jira of [null, { mode: 'off' } as JiraMode]) {
+    assert.deepEqual(at(undefined, 'implementing', {}, jira).next, { step: 'implement', task: 'T2 — segunda' })
+    assert.deepEqual(at(undefined, 'verified', { tasksFile: DONE }, jira).next, { step: 'review_and_commit' })
+    assert.deepEqual(at(undefined, 'planned', {}, jira).notes.filter((n) => n.code === 'external_gate'), [])
+  }
+})
+
+test('en corta con jira on vale la sección ## Spec, sin layout_mismatch ni escalada', () => {
+  const planned = resolve(flow('corta', 'planned', { jira: ON }))
+  assert.equal(planned.depth, 'corta')
+  assert.deepEqual(planned.blocked_reasons, [])
+  assert.deepEqual(planned.next, { step: 'gate', gate: 'single', artifacts: ['plan.md'] })
+  const approved = hdr({ profundidad: 'corta', gate_status: 'approved' })
+  const ready = resolve(flow('corta', 'tasks-ready', { jira: ON, handoffHeader: approved }))
+  assert.deepEqual(ready.blocked_reasons, [])
+  assert.deepEqual(ready.next, { step: 'implement', task: 'T2 — segunda' })
 })

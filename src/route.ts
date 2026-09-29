@@ -44,12 +44,54 @@ function writerLine(t: RouteThresholds, writerDispatchable: boolean): string {
     : `- ${files}, la escritura delegada llega con la fase 4b de sdd-ai: hoy se escribe inline o se le propone SDD al usuario.`
 }
 
+/** El modo de Jira como lo necesita el bootstrap. */
+export type JiraBootstrap = 'on' | 'off' | 'invalid'
+
+/** Las líneas de solo lectura: valen con y sin la regla de Jira. */
+function readOnlyLines(t: RouteThresholds): string[] {
+  return [
+    `- Cuando entender el cambio requiere ${t.exploreMinFiles} o más archivos, la exploración se delega, sea cual sea el tamaño ` +
+      `del cambio que venga después: ${delegateExplore()}. El temporal se borra cuando \`run\` confirma que copió el encargo ` +
+      'a la corrida, y se conserva si `run` falla antes.',
+    '- Si el encargo no se puede escribir, porque el usuario prohíbe toda escritura o porque el entorno no deja escribir fuera ' +
+      'del repositorio, la exploración va inline, y es una excepción admitida.',
+  ]
+}
+
+const CLOSING_LINES = [
+  '- Primero se validan las premisas y se corren checks focalizados; después, los completos.',
+  '- Una refutación de solo lectura se pide con `./bin/sdd-ai run --role refute --prompt-file <encargo>`.',
+  '- Al cerrar, el conductor declara la ruta que siguió y los supuestos que tomó.',
+]
+
+/**
+ * Con `jira_approval` en `on` todo cambio va por SDD: la ruta directa queda para el trabajo de solo
+ * lectura y no ofrece escribir. Una config inválida rige igual, y lo dice.
+ */
+function jiraBootstrap(t: RouteThresholds, jira: 'on' | 'invalid', jiraDetail?: string): string {
+  const invalid = jira === 'invalid'
+    ? [`- La config de Jira no se puede leer${jiraDetail ? ` (${jiraDetail})` : ''}: hasta corregirla rige lo mismo que con \`jira_approval\` en \`on\`.`]
+    : []
+  return [
+    'Ruta directa de sdd-ai en este repositorio, con la aprobación de la spec en Jira:',
+    ...invalid,
+    '- Con `jira_approval` en `on`, todo cambio del proyecto va por un flujo SDD, aunque sea `corta`, y la spec se publica en Jira ' +
+      'con dos partes: un resumen para el PO, en lenguaje no técnico, y la definición técnica.',
+    '- Fuera de un flujo SDD el trabajo es de solo lectura. Escribir el encargo de una delegación en un archivo temporal fuera del ' +
+      'repositorio, y el estado que `run` deja en `.sdd-ai/`, no cambian el proyecto.',
+    ...readOnlyLines(t),
+    ...CLOSING_LINES,
+  ].join('\n')
+}
+
 /**
  * La guía de la ruta directa que recibe el conductor al abrir, limpiar, compactar o retomar la sesión.
  * Está escrita como hechos del repositorio: un texto con forma de orden de sistema puede leerse como
  * una inyección.
  */
-export function renderBootstrap(t: RouteThresholds = ROUTE, writerDispatchable = WRITER_DISPATCHABLE): string {
+export function renderBootstrap(t: RouteThresholds = ROUTE, writerDispatchable = WRITER_DISPATCHABLE, jira: JiraBootstrap = 'off',
+  jiraDetail?: string): string {
+  if (jira !== 'off') return jiraBootstrap(t, jira, jiraDetail)
   return [
     'Ruta directa de sdd-ai en este repositorio, para el trabajo que no va por SDD:',
     '- Por defecto el trabajo es de solo lectura. Antes de cambiar el proyecto sin permiso previo, se le hace una sola pregunta al usuario. ' +
@@ -58,19 +100,13 @@ export function renderBootstrap(t: RouteThresholds = ROUTE, writerDispatchable =
     '- Hay tres rutas: inline, delegada y SDD opcional.',
     '- Ni el tamaño ni el riesgo eligen SDD: lo proponen con la pregunta de profundidad (¿se puede decir ahora, sin explorar, ' +
       'qué archivos se van a tocar y cómo se sabrá que funcionó?), y SDD entra solo con un sí del usuario.',
-    `- Cuando entender el cambio requiere ${t.exploreMinFiles} o más archivos, la exploración se delega, sea cual sea el tamaño ` +
-      `del cambio que venga después: ${delegateExplore()}. El temporal se borra cuando \`run\` confirma que copió el encargo ` +
-      'a la corrida, y se conserva si `run` falla antes.',
-    '- Si el encargo no se puede escribir, porque el usuario prohíbe toda escritura o porque el entorno no deja escribir fuera ' +
-      'del repositorio, la exploración va inline, y es una excepción admitida.',
+    ...readOnlyLines(t),
     writerLine(t, writerDispatchable),
     `- La escritura de un cambio de menos de ${t.minDelegateLines} líneas (agregadas más quitadas) no se delega` +
       `${writerDispatchable ? ` aunque toque ${t.writerMinFiles} o más archivos` : ''}; la exploración ` +
       `sí, por la regla de los ${t.exploreMinFiles} archivos. Un cambio mecánico, como renombrar o formatear, no cuenta para ` +
       'elegir la ruta; el recordatorio de sesión larga cuenta igual todas las ediciones.',
-    '- Primero se validan las premisas y se corren checks focalizados; después, los completos.',
-    '- Una refutación de solo lectura se pide con `./bin/sdd-ai run --role refute --prompt-file <encargo>`.',
-    '- Al cerrar, el conductor declara la ruta que siguió y los supuestos que tomó.',
+    ...CLOSING_LINES,
   ].join('\n')
 }
 
