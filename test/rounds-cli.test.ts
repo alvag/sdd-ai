@@ -401,6 +401,24 @@ test('una ronda unavailable no cambia el ledger ni cuenta, y se relanza con el m
     [[1, 'done'], [2, 'unavailable'], [2, 'done']])
 })
 
+test('una ronda cuyo supervisor no arrancó se ve en launch_failed y se relanza con el mismo número', () => {
+  const s = setup([firstRound([grave]), nextRound([{ id: 'F-1', answer: 'resolved' }])])
+  const id = startAndWait(s)
+  cli(s, ['review', 'decide', id, 'accept', 'F-1'])
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 5: 'línea cinco validada' }))
+  const st = runJson(s, id, 'status.json')
+  writeFileSync(runFile(s, id, 'status.json'), JSON.stringify({
+    ...st, state: 'launch_failed', reason: 'supervisor_not_started', detail: 'el sistema no lanzó el proceso supervisor', round: 2, launch: 1,
+  }))
+  const view = cli(s, ['review', 'status', id])
+  assert.deepEqual([view.out.state, view.out.reason], ['launch_failed', 'supervisor_not_started'])
+  assert.match(view.out.next, new RegExp(`review round ${id}`))
+  const again = cli(s, ['review', 'round', id])
+  assert.equal(again.out.round, 2)
+  assert.equal(waitRound(s, id).out.state, 'done')
+  assert.deepEqual(states(s, id), [['F-1', 'resuelto']])
+})
+
 test('round borra un pedido de cancelación viejo y reinicia el estado', () => {
   const s = setup([firstRound([grave]), nextRound([{ id: 'F-1', answer: 'resolved' }])])
   const id = startAndWait(s)

@@ -2,11 +2,12 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { defaultWaitMax } from '../src/cli.ts'
+import { type SupervisorSpawn, defaultWaitMax, launchSupervisor } from '../src/cli.ts'
 import { createRun, isDelivered, markDelivered, readStatus, setStatus, writeJsonAtomic } from '../src/runs.ts'
 import { gitDirs } from '../src/git.ts'
 import { openRuns } from '../src/open-runs.ts'
@@ -15,7 +16,7 @@ import { codexWriterLaunch } from '../src/workers/codex.ts'
 import {
   type WriterControl, reserveWriter, runDirIdentity, runInventory, sensitiveInventory, writeControl,
 } from '../src/writer-store.ts'
-import { READ_ONLY_ROLES, TERMINAL } from '../src/types.ts'
+import { READ_ONLY_ROLES, SddError, TERMINAL } from '../src/types.ts'
 import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
@@ -364,6 +365,50 @@ test('wait detecta un supervisor muerto', () => {
   const r = cli(s, ['wait', 'huerfana', '--max', '2'])
   assert.equal(r.code, 1)
   assert.deepEqual([r.out.state, r.out.reason], ['failed', 'supervisor_lost'])
+})
+
+test('si el supervisor no arranca, el lanzamiento sale con launch_failed y wait lo devuelve sin esperar', () => {
+  const s = setup({ families: '[codex]' })
+  const dir = createRun(s.repo, 'sin-supervisor')
+  // Como un spawn que falla: sin pid, y el error llega en el tick siguiente.
+  const noProcess: SupervisorSpawn = () => {
+    const child = Object.assign(new EventEmitter(), { pid: undefined, unref() {} })
+    setImmediate(() => child.emit('error', new Error('spawn EAGAIN')))
+    return child
+  }
+  assert.throws(
+    () => launchSupervisor(dir, { family: 'codex', deadline_sec: 30 }, {}, { fallback: { family: 'claude' } }, 'argv.json', noProcess),
+    (e: unknown) => e instanceof SddError && e.code === 'launch_failed' && e.next === './bin/sdd-ai wait sin-supervisor',
+  )
+  assert.deepEqual([readStatus(dir).state, readStatus(dir).reason], ['launch_failed', 'supervisor_not_started'])
+  assert.equal(existsSync(join(dir, 'supervisor.pid')), false)
+  const w = cli(s, ['wait', 'sin-supervisor', '--max', '30'])
+  assert.deepEqual([w.code, w.out.state, w.out.reason, w.out.fallback], [1, 'launch_failed', 'supervisor_not_started', undefined])
+  assert.ok(w.ms < 1000, `wait tardó ${w.ms} ms`)
+})
+
+test('un id de corrida que no es un segmento se rechaza en cada comando sin tocar nada fuera del almacén', () => {
+  const s = setup({ families: '[codex]' })
+  const outside = join(s.repo, 'fuera')
+  mkdirSync(outside)
+  writeFileSync(join(outside, 'status.json'), '{"state":"done"}')
+  const commands = (id: string) => [
+    ['wait', id, '--max', '1'], ['cancel', id], ['review', 'status', id], ['review', 'decide', id, 'accept', 'F-1'],
+    ['review', 'round', id], ['run', '--retry', id],
+  ]
+  for (const id of ['../../fuera', 'a/b', '.', '..']) {
+    for (const args of commands(id)) {
+      const r = cli(s, args)
+      assert.notEqual(r.code, 0, args.join(' '))
+      assert.equal(r.out.code, 'usage', args.join(' '))
+      assert.ok(r.out.message.includes(id), args.join(' '))
+    }
+  }
+  assert.deepEqual(readdirSync(outside), ['status.json'])
+  assert.equal(readFileSync(join(outside, 'status.json'), 'utf8'), '{"state":"done"}')
+  const dir = createRun(s.repo, 'valida')
+  setStatus(dir, { state: 'failed', reason: 'x' })
+  assert.deepEqual(pick(cli(s, ['wait', 'valida', '--max', '1'])), { code: 1, state: 'failed', result: undefined })
 })
 
 test('cancel corta una corrida en curso', async () => {

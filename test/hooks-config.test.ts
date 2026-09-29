@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { ROUTE } from '../src/route.ts'
 import { createRun, setStatus, writeJsonAtomic } from '../src/runs.ts'
 import { checkOutput, payload } from './hook-contract.ts'
 import { makeRepo } from './helpers.ts'
@@ -335,4 +336,17 @@ test('si el parser no carga, el evento posterior va al binario y, si también fa
     assert.deepEqual(checkOutput(cli, 'PostToolUse', out), [], cli)
     assert.match(out.hookSpecificOutput.additionalContext, /^sdd-ai: no se pudo comprobar si el comando liga un flujo \(.+\); si corriste sdd status <id>, córrelo otra vez$/)
   }
+})
+
+test('recordatorio con Jira: el lanzador pasa el modo de la config', () => {
+  const repo = testRepo()
+  writeFileSync(join(repo, '.sdd-ai', 'config.yml'), 'jira_approval:\n  mode: "on"\n')
+  // Otra sesión que la de la corrida abierta: una corrida nueva de la sesión reiniciaría los contadores.
+  const edit = JSON.stringify(payload('claude', 'post-tool-use-edit', { cwd: repo, session_id: 's-jira' }))
+  let r = { code: null as number | null, out: '' }
+  for (let i = 0; i < ROUTE.backstop.edits; i++) r = launch('claude', edit)
+  assert.equal(r.code, 0)
+  const context = JSON.parse(r.out).hookSpecificOutput.additionalContext as string
+  assert.ok(context.includes('todo cambio del proyecto va por un flujo SDD'), context)
+  assert.ok(!context.includes('--role implement'), context)
 })

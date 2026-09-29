@@ -135,6 +135,22 @@ export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles)
   return { written, removed }
 }
 
+/** Una copia instalada de la skill, con su ruta relativa a la raíz del repo. */
+export interface SkillCopy { path: string; state: 'ok' | 'stale' | 'missing' }
+
+/**
+ * Cada copia de la skill frente a su fuente, byte a byte: el conductor lee la copia, así que una
+ * fuente editada sin `agents sync` deja al conductor con la versión anterior.
+ */
+export function skillCopies(root: string, pkgDir: string): SkillCopy[] {
+  const source = readFileSync(join(pkgDir, 'skills', 'sdd-ai', 'SKILL.md'))
+  return SKILL_PATHS.map((path): SkillCopy => {
+    const file = join(root, path)
+    if (!existsSync(file)) return { path, state: 'missing' }
+    return { path, state: readFileSync(file).equals(source) ? 'ok' : 'stale' }
+  })
+}
+
 /**
  * Vigente solo si el archivo es exactamente lo que generaría `agents sync` hoy: la marca de hash
  * orienta a quien lo lee, pero una edición a mano puede conservarla.

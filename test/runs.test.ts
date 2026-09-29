@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync } from
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { repoRoot } from '../src/git.ts'
-import { createRun, isAlive, newRunId, readStatus, runDir, setStatus } from '../src/runs.ts'
+import { checkRunId, createRun, isAlive, isRunId, newRunId, readStatus, runDir, setStatus } from '../src/runs.ts'
 import { SddError } from '../src/types.ts'
 import { makeRepo } from './helpers.ts'
 
@@ -41,6 +41,14 @@ test('setStatus mezcla campos y escribe de forma atómica', () => {
 
 test('runDir de una corrida que no existe es run_not_found', () => {
   assert.throws(() => runDir(makeRepo(), 'nope'), isCode('run_not_found'))
+})
+
+test('isRunId acepta un id de corrida de un segmento y rechaza rutas', () => {
+  for (const id of ['20260928-1921-09cd', 'huerfana', 'x', 'a.b_c-d']) assert.equal(isRunId(id), true, id)
+  for (const id of ['../..', 'a/b', '.', '..', '', 'a\\b', 'x'.repeat(129)]) assert.equal(isRunId(id), false, id)
+  assert.equal(checkRunId('huerfana'), 'huerfana')
+  assert.throws(() => checkRunId('../..'), (e: unknown) => isCode('usage')(e) && (e as SddError).message.includes('../..'))
+  assert.throws(() => runDir(makeRepo(), '../..'), isCode('usage'))
 })
 
 test('repoRoot fuera de un repo es not_a_repo', () => {

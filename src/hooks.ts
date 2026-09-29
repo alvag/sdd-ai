@@ -392,7 +392,8 @@ function postToolUse(p: Payload, root: string, session: string, cli: HookCli): s
     // Un despacho que no se pudo confirmar sigue sin confirmar, igual que antes del contador.
   }
   if (out !== '') return out
-  const text = [bind(p, root, session), countTool(p, root, session, cli)].filter(Boolean).join('\n\n')
+  const text = [bind(p, root, session), countTool(p, root, session, cli, undefined, undefined, () => loadJiraMode(root))]
+    .filter(Boolean).join('\n\n')
   return text === '' ? '' : context('PostToolUse', text)
 }
 

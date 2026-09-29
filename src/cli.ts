@@ -1,17 +1,17 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { type SpawnOptions, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
+import { basename, delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
-import { type RoleProfiles, agentName, agentsState, syncAgents } from './agents.ts'
+import { type RoleProfiles, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
 import { type Proof, askNext, prove } from './approval/proof.ts'
 import { DISPUTE_OPTIONS, type Question, disputeQuestion, extraOptions, extraQuestion, gateQuestionFor } from './approval/question.ts'
 import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, parseFamiliesFlag } from './config.ts'
-import { doctor } from './doctor.ts'
+import { type SkillCheck, doctor } from './doctor.ts'
 import { buildIndex, dirtyPaths, gitDirs, headCommit, repoRoot } from './git.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { cancelNative } from './native-launch.ts'
@@ -31,7 +31,7 @@ import {
 import { fits, renderMaterial, renderReviewPrompt } from './review/prompt.ts'
 import { type Risk, type RiskRecord, classify, classifyDelta, readRisk } from './review/risk.ts'
 import {
-  createRun, isAlive, markDelivered, newRunId, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic,
+  checkRunId, createRun, isAlive, markDelivered, newRunId, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic,
 } from './runs.ts'
 import {
   ARTIFACT_NOTE, type ArgvFile, type JobRecord, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, settleGroup, supervise,
@@ -144,6 +144,7 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   if (env.SDD_AI_WORKER === '1') {
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   }
+  if (values.retry !== undefined) checkRunId(values.retry)
   // Un writer se relanza con lo que guardó su almacén, nunca con su corrida visible, que pudo cambiar.
   const retryWriter = values.retry && isWriterRun(repoRoot(cwd), values.retry) ? readControl(repoRoot(cwd), values.retry) : undefined
   if (retryWriter) {
@@ -345,14 +346,33 @@ function runWriter(w: WriterLaunch): Result {
   }
 }
 
-/** Deja la corrida en `launching` y lanza al supervisor desprendido, que sobrevive al shell del conductor. */
-function launchSupervisor(dir: string, argv: ArgvFile, env: Env, status: Partial<Status>, argvName = 'argv.json'): void {
+/** Lo que `launchSupervisor` necesita del proceso lanzado; `spawn` lo cumple. */
+export type SupervisorSpawn = (cmd: string, args: string[], opts: SpawnOptions) => {
+  pid?: number; unref(): void; on(event: 'error', listener: (err: Error) => void): unknown
+}
+
+/**
+ * Deja la corrida en `launching` y lanza al supervisor desprendido, que sobrevive al shell del conductor.
+ * Si el sistema no lanza el proceso, nadie llevaría la corrida a un estado final: queda en
+ * `launch_failed` y el comando que la lanzó falla.
+ */
+export function launchSupervisor(dir: string, argv: ArgvFile, env: Env, status: Partial<Status>, argvName = 'argv.json',
+  start: SupervisorSpawn = spawn): void {
   writeJsonAtomic(join(dir, argvName), argv)
   setStatus(dir, { ...status, state: 'launching' })
-  const supervisor = spawn(process.execPath, [BIN_PATH, '__supervise', dir, argvName], { detached: true, stdio: 'ignore', env: definedEnv(env) })
+  const supervisor = start(process.execPath, [BIN_PATH, '__supervise', dir, argvName], { detached: true, stdio: 'ignore', env: definedEnv(env) })
+  // Un spawn fallido avisa con un evento `error` en el tick siguiente; sin oyente, tumbaría a este proceso.
+  supervisor.on('error', () => {})
+  if (supervisor.pid === undefined) {
+    const id = basename(dir)
+    // Sin caída de familia: el problema es del sistema, no del worker.
+    const s = setStatus(dir, { state: 'launch_failed', reason: 'supervisor_not_started', detail: 'el sistema no lanzó el proceso supervisor', fallback: undefined })
+    markDelivered(dir, s, env)
+    throw new SddError('launch_failed', `el supervisor de la corrida ${id} no arrancó`, { next: `./bin/sdd-ai wait ${id}` })
+  }
   supervisor.unref()
   // En un archivo propio y no en status.json: el supervisor ya puede estar escribiendo ese estado.
-  if (supervisor.pid !== undefined) writeFileSync(join(dir, 'supervisor.pid'), String(supervisor.pid))
+  writeFileSync(join(dir, 'supervisor.pid'), String(supervisor.pid))
 }
 
 interface ReviewRequest {
@@ -945,6 +965,7 @@ function reviewDecide(args: string[], env: Env, cwd: string): Result {
   })
   const [id, action, ...ids] = positionals
   if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review decide <id> accept|reject <F-n>… [--reason <motivo>] [--conductor claude|codex]' })
+  checkRunId(id)
   const conductor = conductorFlag(values.conductor)
   const root = repoRoot(cwd)
   const dir = runDir(root, id)
@@ -1233,6 +1254,7 @@ async function reviewRound(args: string[], env: Env, cwd: string): Promise<Resul
   })
   const id = positionals[0]
   if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review round <id> [--head <ref>] [--extra] [--conductor claude|codex]' })
+  checkRunId(id)
   if (env.SDD_AI_WORKER === '1') {
     // La ronda extra la decide el usuario: desde un worker no hay sesión de la que leer su respuesta.
     if (values.extra) detectRunner(env)
@@ -1389,6 +1411,7 @@ async function review(args: string[], env: Env, cwd: string): Promise<Result> {
     const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: {} })
     const id = positionals[0]
     if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai review status <id>' })
+    checkRunId(id)
     const root = repoRoot(cwd)
     const dir = runDir(root, id)
     const s = readStatus(dir)
@@ -1451,6 +1474,7 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
   const { values, positionals } = parseArgs({ args, strict: true, allowPositionals: true, options: { max: { type: 'string' } } })
   const id = positionals[0]
   if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai wait <id>' })
+  checkRunId(id)
   const root = repoRoot(cwd)
   let max: number
   if (values.max !== undefined) {
@@ -1494,6 +1518,7 @@ async function cancel(args: string[], cwd: string): Promise<Result> {
   const { values, positionals } = parseArgs({ args, strict: true, allowPositionals: true, options: { 'writer-gone': { type: 'boolean', default: false } } })
   const id = positionals[0]
   if (!id) throw new SddError('usage', 'falta el id', { next: './bin/sdd-ai cancel <id>' })
+  checkRunId(id)
   const root = repoRoot(cwd)
   if (isWriterRun(root, id)) return cancelWriter(root, id, values['writer-gone'])
   if (readReservation(root)?.id === id) return releaseOrphan(root, id)
@@ -1770,6 +1795,18 @@ function conductorFlag(v: string | undefined): Family | undefined {
   return v
 }
 
+/** Las copias de la skill del repo donde corre `doctor`; fuera de un repo no hay copias que revisar. */
+function skillCheck(cwd: string): SkillCheck {
+  let root: string
+  try {
+    root = repoRoot(cwd)
+  } catch (e) {
+    if (e instanceof SddError && e.code === 'not_a_repo') return { skipped: 'no es un repositorio Git' }
+    throw e
+  }
+  return { copies: skillCopies(root, PKG_DIR) }
+}
+
 export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {
   const [cmd, ...rest] = argv
   try {
@@ -1781,7 +1818,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'agents': return agents(rest, env, cwd)
       case 'sdd': return sdd(rest, env, cwd)
       case 'doctor': {
-        const report = doctor()
+        const report = doctor(undefined, skillCheck(cwd))
         return { code: report.ok ? 0 : 1, out: report }
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }

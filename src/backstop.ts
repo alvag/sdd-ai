@@ -1,6 +1,7 @@
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { type Crossed, ROUTE, type RouteThresholds, renderReminder } from './route.ts'
+import type { JiraMode } from './config.ts'
+import { type Crossed, type JiraBootstrap, ROUTE, type RouteThresholds, renderReminder } from './route.ts'
 import { readJson, writeJsonAtomic } from './runs.ts'
 import { shellPipelines } from './shell.ts'
 
@@ -256,13 +257,27 @@ function classify(p: ToolPayload, cli: 'claude' | 'codex'): 'read' | 'edit' | un
 }
 
 /**
+ * El modo de Jira, pedido solo si el recordatorio habla de ediciones: leer la config carga `yaml`, y
+ * este contador corre con cada herramienta. Si no se puede leer, rige lo mismo que con `on`.
+ */
+function jiraFor(crossed: Crossed[], jira?: () => JiraMode): [JiraBootstrap, string?] {
+  if (!jira || !crossed.includes('edits')) return ['off']
+  try {
+    const m = jira()
+    return m.mode === 'invalid' ? ['invalid', m.detail] : [m.mode]
+  } catch {
+    return ['invalid', 'no se pudo cargar la config']
+  }
+}
+
+/**
  * Cuenta una herramienta del conductor y devuelve el recordatorio si cruzó algún umbral, o `''`. Una
  * corrida nueva de la sesión reinicia los contadores, y la llamada que la creó no cuenta. Las
  * herramientas de un subagente no cuentan. Sin lock, o ante cualquier error, calla.
  */
 export function countTool(
   p: ToolPayload, root: string, session: string, cli: 'claude' | 'codex', t: RouteThresholds = ROUTE,
-  io: StateIo = { writeState: writeJsonAtomic },
+  io: StateIo = { writeState: writeJsonAtomic }, jira?: () => JiraMode,
 ): string {
   try {
     const files = filesFor(root, session)
@@ -307,7 +322,7 @@ export function countTool(
         return ''
       }
       appendTrail(files.trail, [...lines, { at: now(), event: 'reminder', crossed, counts }])
-      return renderReminder(crossed, counts, t)
+      return renderReminder(crossed, counts, t, undefined, ...jiraFor(crossed, jira))
     }) ?? ''
   } catch {
     return ''

@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import type { SkillCopy } from './agents.ts'
 import type { Family, WorkerTask } from './types.ts'
 import { claudeLaunch, claudeResume, claudeReviewLaunch, claudeWriterLaunch } from './workers/claude.ts'
 import { codexLaunch, codexResume, codexReviewLaunch, codexWriterLaunch } from './workers/codex.ts'
@@ -11,6 +12,11 @@ export interface CliReport {
   inPath: boolean
   flags: { flag: string; present: boolean }[]
 }
+
+/** Las copias de la skill del repo, o por qué no se revisaron. */
+export type SkillCheck = { copies: SkillCopy[] } | { skipped: string }
+
+type SkillReport = { copies: SkillCopy[]; next?: string } | { skipped: string }
 
 const SAMPLE: WorkerTask = {
   cwd: '/r', promptFile: '/r/p', resultFile: '/r/o', sessionId: 's', model: 'm', effort: 'high',
@@ -58,8 +64,11 @@ const defaultExec: Exec = (cmd, args) => {
   return { status: r.error ? null : r.status, stdout: r.stdout ?? '' }
 }
 
-/** Contrato con los CLIs instalados: están en PATH y aceptan cada flag que emite sdd-ai. */
-export function doctor(exec: Exec = defaultExec): { ok: boolean; clis: CliReport[] } {
+/**
+ * Contrato con los CLIs instalados: están en PATH y aceptan cada flag que emite sdd-ai. Con las copias
+ * de la skill, también que coincidan con su fuente.
+ */
+export function doctor(exec: Exec = defaultExec, skill?: SkillCheck): { ok: boolean; clis: CliReport[]; skill?: SkillReport } {
   const clis = (['claude', 'codex'] as Family[]).map((family): CliReport => {
     const v = exec(family, ['--version'])
     if (v.status === null) return { family, inPath: false, flags: [] }
@@ -73,6 +82,9 @@ export function doctor(exec: Exec = defaultExec): { ok: boolean; clis: CliReport
     if (version) report.version = version
     return report
   })
-  const ok = clis.every((c) => c.inPath && c.flags.every((f) => f.present))
-  return { ok, clis }
+  const cliOk = clis.every((c) => c.inPath && c.flags.every((f) => f.present))
+  if (!skill) return { ok: cliOk, clis }
+  if ('skipped' in skill) return { ok: cliOk, clis, skill }
+  const skillOk = skill.copies.every((c) => c.state === 'ok')
+  return { ok: cliOk && skillOk, clis, skill: skillOk ? skill : { ...skill, next: './bin/sdd-ai agents sync' } }
 }

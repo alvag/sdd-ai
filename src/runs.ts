@@ -39,8 +39,23 @@ export function ownerSession(env: Record<string, string | undefined>, family: Fa
   return id || undefined
 }
 
+const RUN_ID = /^[A-Za-z0-9._-]{1,128}$/
+
+/** Un id de corrida es un solo segmento de ruta, la misma forma que los ids de flujo y de sesión. */
+export const isRunId = (id: string) => RUN_ID.test(id) && id !== '.' && id !== '..'
+
+/** El id tal cual si es válido. Va antes de armar cualquier ruta con él, en `.sdd-ai/` o en `.git/`. */
+export function checkRunId(id: string): string {
+  if (!isRunId(id)) {
+    throw new SddError('usage', `el id de corrida no es válido: ${id}`, {
+      detail: 'un id lleva solo letras, dígitos, ., _ y -, hasta 128 caracteres, y no es . ni ..',
+    })
+  }
+  return id
+}
+
 export function runDir(root: string, id: string): string {
-  const dir = join(root, '.sdd-ai', 'runs', id)
+  const dir = join(root, '.sdd-ai', 'runs', checkRunId(id))
   if (!existsSync(dir)) {
     throw new SddError('run_not_found', `no existe la corrida ${id}`, { next: 'revisa el id que devolvió sdd-ai run' })
   }

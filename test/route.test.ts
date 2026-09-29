@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ROUTE, type RouteThresholds, renderBootstrap, renderReminder } from '../src/route.ts'
+import { type Crossed, ROUTE, type RouteThresholds, renderBootstrap, renderReminder } from '../src/route.ts'
 import { makeRepo } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
@@ -118,6 +118,24 @@ test('el recordatorio de ediciones remite al comando del writer', () => {
   assert.match(r, new RegExp(`${SENTINEL.minDelegateLines} líneas`))
   assert.match(r, /con permiso del usuario/)
   assert.ok(!renderReminder(['edits'], { calls: 0, reads: 0, edits: 3 }, SENTINEL, false).includes('--role implement'))
+})
+
+test('recordatorio con Jira: on e invalid no ofrecen el writer y dicen que todo cambio va por SDD; off es el de hoy', () => {
+  const counts = { calls: 97, reads: 98, edits: 99 }
+  const all: Crossed[] = ['calls', 'reads', 'edits']
+  for (const wd of [true, false]) assert.equal(renderReminder(all, counts, SENTINEL, wd, 'off'), renderReminder(all, counts, SENTINEL, wd))
+  const editsLine = (r: string) => r.split('\n').find((l) => l.startsWith('- 99 ediciones'))
+  const on = renderReminder(all, counts, SENTINEL, true, 'on')
+  assert.equal(editsLine(on), '- 99 ediciones (umbral: 96): con `jira_approval` en `on`, todo cambio del proyecto va por un flujo SDD, ' +
+    'aunque sea `corta`: se le propone al usuario.')
+  assert.ok(!on.includes('--role implement'))
+  const others = (r: string) => r.split('\n').filter((l) => !l.startsWith('- 99 ediciones'))
+  assert.deepEqual(others(on), others(renderReminder(all, counts, SENTINEL, true)))
+  const detail = '.sdd-ai/config.yml: jira_approval.mode tiene que ser "on" u "off", no true'
+  const invalid = renderReminder(['edits'], counts, SENTINEL, true, 'invalid', detail)
+  assert.equal(editsLine(invalid), `- 99 ediciones (umbral: 96): la config de Jira no se puede leer (${detail}) y rige lo mismo que con ` +
+    '`jira_approval` en `on`: todo cambio del proyecto va por un flujo SDD, aunque sea `corta`, y se le propone al usuario.')
+  assert.ok(!invalid.includes('--role implement'))
 })
 
 test('con jira on el bootstrap exige SDD, nombra las dos partes y no ofrece rutas de escritura; con invalid lo dice; con off es el de hoy', () => {

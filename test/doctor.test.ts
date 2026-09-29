@@ -1,7 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { skillCopies } from '../src/agents.ts'
 import { checkFlags, doctor, emittedFlags } from '../src/doctor.ts'
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')
@@ -82,4 +84,37 @@ test('doctor comprueba los flags del writer en exec y resume', () => {
   const codex = report.clis.find((c) => c.family === 'codex')?.flags ?? []
   assert.equal(codex.find((f) => f.flag === 'resume --ignore-rules')?.present, false)
   assert.equal(codex.find((f) => f.flag === '--ignore-rules')?.present, true)
+})
+
+/** Los dos CLIs presentes y con todos los flags, para que el resultado dependa solo de la skill. */
+const passing = (cmd: string, args: string[]) => {
+  if (args.includes('--version')) return { status: 0, stdout: cmd === 'claude' ? '2.1.284 (Claude Code)' : 'codex-cli 0.158.0' }
+  if (cmd === 'claude') return { status: 0, stdout: CLAUDE_HELP }
+  return { status: 0, stdout: args.includes('resume') ? CODEX_RESUME_HELP : CODEX_HELP }
+}
+
+test('doctor informa la copia de la skill vieja o ausente con su ruta y agents sync', () => {
+  const pkg = mkdtempSync(join(tmpdir(), 'sdd-ai-pkg-'))
+  mkdirSync(join(pkg, 'skills', 'sdd-ai'), { recursive: true })
+  writeFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'), 'skill v2\n')
+  const repo = mkdtempSync(join(tmpdir(), 'sdd-ai-repo-'))
+  const claudeCopy = join('.claude', 'skills', 'sdd-ai', 'SKILL.md')
+  const agentsCopy = join('.agents', 'skills', 'sdd-ai', 'SKILL.md')
+  for (const rel of [claudeCopy, agentsCopy]) {
+    mkdirSync(dirname(join(repo, rel)), { recursive: true })
+    writeFileSync(join(repo, rel), 'skill v2\n')
+  }
+  const fine = doctor(passing, { copies: skillCopies(repo, pkg) })
+  assert.equal(fine.ok, true)
+  assert.deepEqual(fine.skill, { copies: [{ path: claudeCopy, state: 'ok' }, { path: agentsCopy, state: 'ok' }] })
+  writeFileSync(join(repo, agentsCopy), 'skill v1\n')
+  const stale = doctor(passing, { copies: skillCopies(repo, pkg) })
+  assert.equal(stale.ok, false)
+  assert.deepEqual(stale.skill, {
+    copies: [{ path: claudeCopy, state: 'ok' }, { path: agentsCopy, state: 'stale' }], next: './bin/sdd-ai agents sync',
+  })
+  rmSync(join(repo, claudeCopy))
+  assert.deepEqual(skillCopies(repo, pkg).map((c) => c.state), ['missing', 'stale'])
+  const skipped = doctor(passing, { skipped: 'no es un repositorio Git' })
+  assert.deepEqual([skipped.ok, skipped.skill], [true, { skipped: 'no es un repositorio Git' }])
 })

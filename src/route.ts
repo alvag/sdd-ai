@@ -116,17 +116,27 @@ const CROSSED_LABEL: Record<Crossed, (n: number) => string> = {
   edits: (n) => `${n} ediciones`,
 }
 
+/** Qué hacer con las ediciones: con Jira, lo mismo que dice su bootstrap; sin Jira, cuándo delegar la escritura. */
+function editsAdvice(t: RouteThresholds, writerDispatchable: boolean, jira: JiraBootstrap, jiraDetail?: string): string {
+  if (jira === 'on') return 'con `jira_approval` en `on`, todo cambio del proyecto va por un flujo SDD, aunque sea `corta`: se le propone al usuario'
+  if (jira === 'invalid') {
+    return `la config de Jira no se puede leer${jiraDetail ? ` (${jiraDetail})` : ''} y rige lo mismo que con \`jira_approval\` en \`on\`: ` +
+      'todo cambio del proyecto va por un flujo SDD, aunque sea `corta`, y se le propone al usuario'
+  }
+  return writerDispatchable
+    ? `si lo que queda por escribir toca ${t.writerMinFiles} o más archivos no triviales y ${t.minDelegateLines} líneas o más, ` +
+      `delegar la escritura con permiso del usuario: ${WRITER_COMMAND}; si el cambio creció, se le propone SDD`
+    : 'la escritura delegada llega con la fase 4b de sdd-ai; si el cambio creció, se le propone SDD al usuario'
+}
+
 /**
  * El recordatorio de sesión larga: nombra cada umbral cruzado, con su conteo, y qué hacer con cada
  * uno. Se entiende sin el bootstrap, que puede haber quedado lejos en la conversación.
  */
 export function renderReminder(crossed: Crossed[], counts: Record<Crossed, number>, t: RouteThresholds = ROUTE,
-  writerDispatchable = WRITER_DISPATCHABLE): string {
+  writerDispatchable = WRITER_DISPATCHABLE, jira: JiraBootstrap = 'off', jiraDetail?: string): string {
   const explore = `revisar cuántos archivos quedan por entender y, si son ${t.exploreMinFiles} o más, delegar la exploración: ${delegateExplore()}`
-  const edits = writerDispatchable
-    ? `si lo que queda por escribir toca ${t.writerMinFiles} o más archivos no triviales y ${t.minDelegateLines} líneas o más, ` +
-      `delegar la escritura con permiso del usuario: ${WRITER_COMMAND}; si el cambio creció, se le propone SDD`
-    : 'la escritura delegada llega con la fase 4b de sdd-ai; si el cambio creció, se le propone SDD al usuario'
+  const edits = editsAdvice(t, writerDispatchable, jira, jiraDetail)
   const todo: Record<Crossed, string> = { calls: explore, reads: explore, edits }
   return [
     'Recordatorio de sdd-ai: esta sesión trabaja inline sin delegar desde su último `run` o `review`, y cruzó estos umbrales:',

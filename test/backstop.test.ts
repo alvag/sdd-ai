@@ -243,6 +243,32 @@ test('el recordatorio se entiende sin el bootstrap', () => {
   assert.ok(byReads.includes('archivo temporal fuera del repositorio'))
 })
 
+test('recordatorio con Jira: countTool pide el modo solo al emitir con ediciones cruzadas', () => {
+  let asked = 0
+  const on = () => {
+    asked++
+    return { mode: 'on' as const }
+  }
+  const quiet = sddRepo()
+  countTool(tool('claude', 'post-tool-use-edit', quiet), quiet, 's1', 'claude', ROUTE, undefined, on)
+  const reads = sddRepo()
+  const byReads = repeat(ROUTE.backstop.reads, () => countTool(tool('claude', 'post-tool-use-read', reads), reads, 's1', 'claude', ROUTE, undefined, on))
+  assert.ok(byReads.includes(EXPLORE))
+  assert.equal(asked, 0)
+  const edits = sddRepo()
+  const byEdits = repeat(ROUTE.backstop.edits, () => countTool(tool('claude', 'post-tool-use-edit', edits), edits, 's1', 'claude', ROUTE, undefined, on))
+  assert.equal(asked, 1)
+  assert.ok(byEdits.includes('todo cambio del proyecto va por un flujo SDD'))
+  assert.ok(!byEdits.includes('--role implement'))
+  const broken = sddRepo()
+  const fails = () => {
+    throw new Error('sin yaml')
+  }
+  const byBroken = repeat(ROUTE.backstop.edits, () => countTool(tool('claude', 'post-tool-use-edit', broken), broken, 's1', 'claude', ROUTE, undefined, fails))
+  assert.ok(byBroken.includes('la config de Jira no se puede leer (no se pudo cargar la config)'))
+  assert.ok(!byBroken.includes('--role implement'))
+})
+
 test('el contador cruza los umbrales de la constante que recibe', () => {
   const t: RouteThresholds = { ...ROUTE, backstop: { calls: 3, reads: 7, edits: 9 } }
   const repo = sddRepo()
