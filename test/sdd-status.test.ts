@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { JiraMode } from '../src/config.ts'
@@ -41,6 +42,7 @@ function flow(depth: Depth, status: string, o: Partial<FlowFacts> = {}): FlowFac
     fingerprints: corta ? { plan: FP.plan, single: FP.single } : { spec: FP.spec, plan: FP.plan, tasks: FP.tasks, 'plan-tasks': FP['plan-tasks'] },
     log: { state: 'absent' },
     paths: { dir: '.plans/f' },
+    hasRemote: true,
     ...o,
   }
 }
@@ -224,18 +226,35 @@ test('con los gates aprobados next es implement con la primera pendiente o verif
 })
 
 test('desde verified, committed, pushed y pr-open next sigue la tabla de retomado', () => {
-  const closing = (status: string, extra: Record<string, unknown> = {}) =>
-    resolve(flow('completa', status, { tasksFile: DONE, planHeader: hdr({ profundidad: 'completa', status, ...extra }) })).next
+  const closing = (status: string, extra: Record<string, unknown> = {}, facts: Partial<FlowFacts> = {}) =>
+    resolve(flow('completa', status, { tasksFile: DONE, planHeader: hdr({ profundidad: 'completa', status, ...extra }), ...facts })).next
   assert.deepEqual(closing('verified'), { step: 'review_and_commit' })
   assert.deepEqual(closing('committed'), { step: 'push' })
   assert.deepEqual(closing('pushed'), { step: 'open_pr' })
   assert.deepEqual(closing('pushed', { pr_url: 'https://example.test/pr/1' }), { step: 'archive' })
   assert.deepEqual(closing('pr-open', { pr_url: 'https://example.test/pr/1' }), { step: 'archive' })
   assert.deepEqual(closing('done'), { step: 'archive' })
+  assert.deepEqual(closing('committed', {}, { hasRemote: false }), { step: 'archive' })
+  assert.deepEqual(closing('pushed', {}, { hasRemote: false }), { step: 'archive' })
+  assert.deepEqual(closing('pushed', { pr_url: 'https://example.test/pr/1' }, { hasRemote: false }), { step: 'archive' })
+})
+
+test('readFlow informa si el repositorio tiene remoto', () => {
+  const root = makeRepo()
+  mkdirSync(join(root, '.plans', 'f'), { recursive: true })
+  assert.equal(readFlow(root, 'f').facts.hasRemote, false)
+  execFileSync('git', ['remote', 'add', 'origin', 'https://example.test/repo.git'], { cwd: root })
+  assert.equal(readFlow(root, 'f').facts.hasRemote, true)
 })
 
 test('un gate vencido gana a los estados de cierre del header', () => {
   const r = resolve(flow('completa', 'verified', { tasksFile: DONE, log: log(approval('spec', 'completa', fp('9'))) }))
+  assert.equal(states(r).spec, 'stale')
+  assert.deepEqual(r.next, { step: 'gate', gate: 'spec', artifacts: ['spec.md'] })
+})
+
+test('un gate pendiente conserva prioridad sobre archive sin remoto', () => {
+  const r = resolve(flow('completa', 'committed', { hasRemote: false, tasksFile: DONE, log: log(approval('spec', 'completa', fp('9'))) }))
   assert.equal(states(r).spec, 'stale')
   assert.deepEqual(r.next, { step: 'gate', gate: 'spec', artifacts: ['spec.md'] })
 })

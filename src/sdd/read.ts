@@ -1,6 +1,7 @@
 import { type Stats, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { type JiraMode, loadJiraMode } from '../config.ts'
+import { hasRemote } from '../git.ts'
 import { sha256 } from '../review/candidate.ts'
 import { SddError } from '../types.ts'
 import { isFlowId } from './id.ts'
@@ -239,6 +240,7 @@ export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode
       fingerprints,
       log: toLog(approvals),
       paths,
+      hasRemote: hasRemote(root),
       jira: flowJira(id, handoffHeader, jira),
     },
     digests: {

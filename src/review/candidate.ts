@@ -145,8 +145,11 @@ const outside = (rel: string) => rel === '' || rel.startsWith('..') || isAbsolut
 export function readContextFile(root: string, p: string, what = 'el contexto'): { path: string; bytes: Buffer } {
   const abs = isAbsolute(p) ? p : resolve(root, p)
   const rel = relative(root, abs)
+  // La forma de una ruta externa se rechaza antes de consultar el sistema de archivos.
+  if (outside(rel)) throw new SddError('usage', `${what} tiene que estar dentro del repo: ${p}`)
+  if (!existsSync(abs)) throw new SddError('usage', `${what} no existe: ${p}`)
   // Un symlink dentro del repo puede apuntar afuera: la ruta real también tiene que caer adentro.
-  if (outside(rel) || outside(relative(realpathSync(root), realpathSync(abs)))) {
+  if (outside(relative(realpathSync(root), realpathSync(abs)))) {
     throw new SddError('usage', `${what} tiene que estar dentro del repo: ${p}`)
   }
   const bytes = readFileSync(abs)

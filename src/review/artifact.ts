@@ -59,7 +59,8 @@ const UTF8 = new TextDecoder('utf-8', { fatal: true })
 /** Lee un archivo del material y lo valida: existe, está en el repo, es texto UTF-8 y, si hace falta, no está vacío. */
 export function readMaterial(root: string, p: string, what: string, requireContent: boolean): { path: string; bytes: Buffer; real: string } {
   const abs = isAbsolute(p) ? p : resolve(root, p)
-  // Se comprueba antes que readContextFile: su realpath sobre una ruta inexistente no da un error de uso.
+  // readContextFile no comprueba que sea un archivo regular, y statSync necesita una ruta que exista: el
+  // material lo comprueba antes, así que acá una ruta externa inexistente da "no existe".
   if (!existsSync(abs)) throw new SddError('usage', `${what} no existe: ${p}`)
   if (!statSync(abs).isFile()) throw new SddError('usage', `${what} no es un archivo: ${p}`)
   const { path, bytes } = readContextFile(root, abs, what)

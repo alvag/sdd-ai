@@ -23,6 +23,11 @@ function git(root: string, args: string[]): string {
   })
 }
 
+/** Si el repositorio tiene al menos un remoto configurado. */
+export function hasRemote(root: string): boolean {
+  return git(root, ['remote']).trim() !== ''
+}
+
 /** El commit de `HEAD`, o nada si todavía no hay ninguno. */
 export function headCommit(root: string): string | undefined {
   try {

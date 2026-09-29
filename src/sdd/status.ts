@@ -41,6 +41,8 @@ export interface FlowFacts {
   fingerprints: Partial<Record<GateId, string>>
   log: ApprovalLog
   paths: Record<string, string>
+  /** Si el repositorio tiene al menos un remoto configurado. */
+  hasRemote: boolean
   /** El modo de Jira del flujo, con el override del handoff ya aplicado; sin el campo vale `off`. */
   jira?: JiraMode
 }
@@ -250,6 +252,8 @@ export function resolve(facts: FlowFacts): FlowStatus {
       if (missing.length > 0) return { step: missing[0].step, artifacts: missing.map((p) => p.name) }
       return { step: 'gate', gate: open.gate, artifacts: open.artifacts }
     }
+    // Sin remoto no hay push ni PR posibles: `committed` y `pushed` pasan a archivar.
+    if (!facts.hasRemote && (status === 'committed' || status === 'pushed')) return { step: 'archive' }
     if (status === 'pushed') return { step: typeof plan?.pr_url === 'string' && plan.pr_url !== '' ? 'archive' : 'open_pr' }
     const closing = status !== null ? CLOSING[status] : undefined
     if (closing) return held && closing === 'review_and_commit' ? { step: 'external_gate' } : { step: closing }

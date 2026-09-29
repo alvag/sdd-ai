@@ -630,6 +630,33 @@ test('sdd status trae next.question en el paso gate', () => {
   assert.equal('question' in sdd(other, 'status', 'f').out.next, false)
 })
 
+test('sdd status omite publicación sin remoto y conserva los pasos con remoto', () => {
+  const doneTasks = TASKS.replace('- [ ] **T2', '- [x] **T2')
+  const local = makeRepo()
+  for (const [id, status, prUrl] of [
+    ['committed', 'committed', ''], ['pushed-no-pr', 'pushed', ''], ['pushed-pr', 'pushed', 'pr_url: https://example.test/pr/1\n'],
+  ] as const) {
+    const dir = completa(local, id, status)
+    writeFileSync(join(dir, 'tasks.md'), doneTasks)
+    if (prUrl) {
+      const withPr = plan(status).replace('---\n\n# Plan', `${prUrl}---\n\n# Plan`)
+      assert.notEqual(withPr, plan(status), 'el plan lleva pr_url')
+      writeFileSync(join(dir, 'plan.md'), withPr)
+    }
+    assert.deepEqual(sdd(local, 'status', id).out.next, { step: 'archive' }, id)
+  }
+  const flows = Object.fromEntries(sdd(local, 'status').out.flows.map((f: { id: string; next: unknown }) => [f.id, f.next]))
+  assert.deepEqual(flows.committed, { step: 'archive' })
+
+  const remote = makeRepo()
+  execFileSync('git', ['remote', 'add', 'origin', 'https://example.test/repo.git'], { cwd: remote })
+  for (const [id, status, step] of [['committed', 'committed', 'push'], ['pushed', 'pushed', 'open_pr']] as const) {
+    const dir = completa(remote, id, status)
+    writeFileSync(join(dir, 'tasks.md'), doneTasks)
+    assert.deepEqual(sdd(remote, 'status', id).out.next, { step }, id)
+  }
+})
+
 test('una respuesta posterior a la lectura, también una que llega antes de la escritura, no revoca la decisión', () => {
   const repo = makeRepo()
   const dir = completa(repo, 'f', 'planned')

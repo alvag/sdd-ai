@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -976,6 +976,17 @@ test('el primer Stop tras ligar calla si el paso no cambió', () => {
   }
 })
 
+test('Stop recuerda archive al pasar de verified a committed sin remoto', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1', { plan: { status: 'verified' }, tasks: 'done' })
+    post(cli, repo, './bin/sdd-ai sdd status f1')
+    writeFlow(repo, 'f1', { plan: { status: 'committed' }, tasks: 'done' })
+    assert.equal(text(fire(cli, 'stop', repo, { session_id: 's1' })), FLOW_F1('archive'))
+    assert.equal(fire(cli, 'stop', repo, { session_id: 's1' }), '')
+  }
+})
+
 test('Stop junta corridas y flujo en una salida', () => {
   for (const cli of CLIS) {
     const repo = flowRepo()
@@ -1070,9 +1081,10 @@ const GUARD_STEPS: Array<[string, FlowShape, boolean]> = [
   ['archive', { plan: { status: 'pr-open' }, tasks: 'done' }, true],
 ]
 
-/** Un repo con el flujo f1 en ese paso y la sesión s1 ligada a él. */
+/** Un repo con remoto, el flujo f1 en ese paso y la sesión s1 ligada a él; el remoto conserva `push` y `open_pr` como pasos de cierre. */
 function boundRepo(cli: Cli, shape: FlowShape = { plan: { status: 'implementing' }, tasks: 'pending' }, jira?: 'on' | 'off' | 'invalid'): string {
   const repo = flowRepo(jira)
+  execFileSync('git', ['remote', 'add', 'origin', 'https://example.test/repo.git'], { cwd: repo })
   writeFlow(repo, 'f1', shape)
   post(cli, repo, './bin/sdd-ai sdd status f1')
   assert.notEqual(bound(repo), null, 'quedó ligada')

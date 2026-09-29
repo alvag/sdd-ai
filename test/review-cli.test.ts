@@ -169,6 +169,28 @@ test('sin --base es un error de uso', () => {
   assert.deepEqual([r.code, r.out.code], [2, 'usage'])
 })
 
+test('un contexto inexistente devuelve usage antes de crear la corrida', () => {
+  const s = setup({ families: '[codex, claude]', bins: ['codex'] })
+  writeFileSync(join(s.repo, 'a.txt'), lines(11))
+  for (const path of ['no-existe.md', join(s.repo, 'tampoco-existe.md')]) {
+    const before = runs(s)
+    const r = cli(s, ['review', 'start', '--base', s.base, '--context', path])
+    assert.deepEqual([r.code, r.out.code], [2, 'usage'])
+    assert.match(r.out.message, new RegExp(path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    assert.equal(r.stderr, '')
+    assert.deepEqual(runs(s), before)
+  }
+})
+
+test('un contexto existente se congela al iniciar la revisión de diff', () => {
+  const s = setup({ families: '[codex, claude]', bins: ['codex'] })
+  writeFileSync(join(s.repo, 'a.txt'), lines(11))
+  writeFileSync(join(s.repo, 'contexto.md'), '# Contexto\n')
+  const r = cli(s, ['review', 'start', '--base', s.base, '--context', 'contexto.md'])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual(runJson(s, r.out.id, 'candidate.json').context.map((c: { path: string }) => c.path), ['contexto.md'])
+})
+
 test('review start devuelve y congela el nivel y sus motivos', () => {
   const s = setup({ families: '[codex, claude]', bins: ['codex'] })
   mkdirSync(join(s.repo, 'auth'))

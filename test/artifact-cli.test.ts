@@ -109,6 +109,20 @@ test('artefacto como sujeto: congela un artefacto ignorado y rechaza lo inválid
   assert.deepEqual(runs(t), [])
 })
 
+test('los contextos de artefacto inexistentes fallan antes de crear la corrida y los válidos se congelan', () => {
+  const missing = setup([])
+  const before = runs(missing)
+  const bad = cli(missing, [...specArgs(), '--context', 'no-existe.md'])
+  usage(bad, /no-existe\.md/)
+  assert.deepEqual(runs(missing), before)
+
+  const valid = setup([first([])])
+  writeFileSync(join(valid.repo, 'contexto.md'), '# Contexto\n')
+  const r = cli(valid, [...specArgs(), '--context', 'contexto.md'])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual(r.out.context, ['contexto.md'])
+})
+
 test('el revisor de un artefacto se resuelve con design-review y la familia opuesta al autor', () => {
   const s = setup([first([])])
   const id = start(s)
