@@ -7,16 +7,17 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { type SupervisorSpawn, defaultWaitMax, launchSupervisor } from '../src/cli.ts'
+import { type SupervisorSpawn, defaultWaitMax, launchSupervisor, runWriter } from '../src/cli.ts'
 import { createRun, isDelivered, markDelivered, readStatus, setStatus, writeJsonAtomic } from '../src/runs.ts'
 import { gitDirs } from '../src/git.ts'
 import { openRuns } from '../src/open-runs.ts'
 import { settleGroup, supervise } from '../src/supervisor.ts'
 import { codexWriterLaunch } from '../src/workers/codex.ts'
 import {
-  type WriterControl, reserveWriter, runDirIdentity, runInventory, sensitiveInventory, writeControl,
+  type WriterControl, readReservation, reserveWriter, runDirIdentity, runInventory, sensitiveInventory, writeControl,
 } from '../src/writer-store.ts'
 import { READ_ONLY_ROLES, SddError, TERMINAL } from '../src/types.ts'
+import { readPhaseRecord } from '../src/sdd/phase-state.ts'
 import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
@@ -1184,4 +1185,102 @@ test('un .sdd-ai/runs reemplazado por un enlace sale señalado y la entrega no s
   }
   assert.ok(w.out.flagged.some((f: { path: string; after?: { type: string } }) => f.path === '.sdd-ai/runs' && f.after?.type === 'link'), JSON.stringify(w.out.flagged))
   assert.equal(existsSync(join(outside, id, 'delivered.json')), false)
+})
+
+test('el writer cuyo supervisor no arranca termina en launch_failed, wait lo devuelve y la reserva se libera', async () => {
+  const s = writerSetup()
+  const noProcess: SupervisorSpawn = () => {
+    const child = Object.assign(new EventEmitter(), { pid: undefined, unref() {} })
+    setImmediate(() => child.emit('error', new Error('spawn EAGAIN')))
+    return child
+  }
+  const conductor = { family: 'claude' as const }
+  await assert.rejects(() => runWriter({
+    root: s.repo, env: s.env, conductor, resolution: { family: 'codex', via: 'process', origin: { model: 'heredado', effort: 'heredado' } },
+    prompt: 'Encargo.', deadline: 30, request: { role: 'implement', conductor, deadline_sec: 30 }, source: '--prompt-file p.md', start: noProcess,
+  }), (e: unknown) => e instanceof SddError && e.code === 'launch_failed')
+  const [id] = readdirSync(join(s.repo, '.sdd-ai', 'runs'))
+  assert.deepEqual([readStatus(join(s.repo, '.sdd-ai', 'runs', id)).state, readStatus(join(s.repo, '.sdd-ai', 'runs', id)).reason], ['launch_failed', 'supervisor_not_started'])
+  assert.deepEqual([readStatus(storeOf(s.repo, id)).state, readStatus(storeOf(s.repo, id)).reason], ['launch_failed', 'supervisor_not_started'])
+  const w = cli(s, ['wait', id, '--max', '30'])
+  assert.deepEqual([w.code, w.out.state, w.out.reason], [1, 'launch_failed', 'supervisor_not_started'])
+  assert.ok(w.ms < 5000, `wait tardó ${w.ms} ms`)
+  assert.equal(readReservation(s.repo), undefined)
+})
+
+/** Un flujo en `implement`, ignorado por Git como en un repo real: el árbol queda limpio. */
+function implementFlow(repo: string, tasks = '# Tasks\n\n- [x] **T1 — hecha**  · cubre: AC-1\n- [ ] **T2 — exportar**  · cubre: AC-1\n- [ ] **T3 — encabezado**  · cubre: AC-1\n'): string {
+  writeFileSync(join(repo, '.git', 'info', 'exclude'), '.plans/\n')
+  const dir = join(repo, '.plans', 'f')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'handoff.md'), '---\nprofundidad: completa\nrisk: low\nchange_type: feat\nspec_approved_at: 2026-09-29T08:59:18-05:00\n---\n')
+  writeFileSync(join(dir, 'spec.md'), '# Spec\n\n## Criterios de aceptación\n\n- **AC-1:** exporta. (pedido)\n')
+  writeFileSync(join(dir, 'plan.md'), '---\nid: f\nprofundidad: completa\nstatus: tasks-ready\n---\n\n# Plan\n\n## Enfoque\n\nUno.\n')
+  writeFileSync(join(dir, 'tasks.md'), tasks)
+  return dir
+}
+
+const implementReport = (o: Record<string, unknown> = {}) => `Hice el cambio.\n\n${JSON.stringify({
+  phase: 'implement', missing_context: [],
+  tasks: [
+    { id: 'T2', change_kind: 'behavior_change', changed: 'exporta', deviation: null, check: 'actualizar la expectativa' },
+    { id: 'T3', change_kind: 'refactor', changed: 'encabezado', deviation: null, check: 'confirmar el verde previo' },
+  ],
+  ...o,
+})}\n\nSTATUS: done\n`
+
+test('sdd phase en implement lanza un writer con las tasks congeladas y la cosecha cuenta el contrato', () => {
+  const s = writerSetup({ script: { actions: [{ write: 'nuevo.txt', content: 'x\n' }], report: implementReport() } })
+  implementFlow(s.repo)
+  const prompts = join(mkdtempSync(join(tmpdir(), 'sdd-ai-prompts-')), 'p.jsonl')
+  const r = cli(s, ['sdd', 'phase', 'f'], { FAKE_PROMPTS_FILE: prompts })
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual([r.out.via, r.out.flow, r.out.step, r.out.pending], ['process', 'f', 'implement', ['T2', 'T3']])
+  const control = readJsonFile(join(storeOf(s.repo, r.out.id), 'control.json'))
+  assert.deepEqual([control.phase.flow, control.phase.pending], ['f', ['T2', 'T3']])
+  const w = cli(s, ['wait', r.out.id, '--max', '30'])
+  assert.equal(w.code, 0, JSON.stringify(w.out))
+  assert.deepEqual(w.out.contract, { admitted: true, missing_context: [] })
+  assert.match(w.out.next, /review start --harvest/)
+  assert.deepEqual(w.out.flow_next, cli(s, ['sdd', 'status', 'f']).out.next)
+  const prompt = JSON.parse(readFileSync(prompts, 'utf8').trim().split('\n')[0]) as string
+  assert.match(prompt, /T2, T3/)
+  assert.match(prompt, /<<<INSUMO tasks/)
+  assert.deepEqual(readPhaseRecord(s.repo, 'f').last_run, { id: r.out.id, step: 'implement' })
+  // El cambio del writer sigue en el árbol: otra fase se niega igual que run --role implement.
+  const again = cli(s, ['sdd', 'phase', 'f'])
+  assert.deepEqual([again.code, again.out.code], [2, 'tree_dirty'])
+
+  const failures: Array<[string, object, RegExp]> = [
+    ['contrato no admitido', { actions: [{ write: 'n.txt', content: 'x\n' }], report: 'Hice el cambio.\nSTATUS: done\n' }, /contrato/],
+    ['contexto faltante', { actions: [{ write: 'n.txt', content: 'x\n' }], report: implementReport({ missing_context: ['el esquema'] }) }, /el esquema/],
+    ['tasks cambiadas', { actions: [{ write: 'n.txt', content: 'x\n' }, { append: '.plans/f/tasks.md', content: '- [ ] **T4 — otra**  · cubre: AC-1\n' }], report: implementReport() }, /insumos/],
+  ]
+  for (const [name, script, cause] of failures) {
+    const x = writerSetup({ script })
+    implementFlow(x.repo)
+    const run = cli(x, ['sdd', 'phase', 'f'])
+    assert.equal(run.code, 0, `${name}: ${JSON.stringify(run.out)}`)
+    const h = cli(x, ['wait', run.out.id, '--max', '30'])
+    assert.ok(h.out.failed.some((f: string) => cause.test(f)), `${name}: ${JSON.stringify(h.out.failed)}`)
+    assert.doesNotMatch(h.out.next, /review start/, name)
+  }
+
+  // Un writer de fase que no dejó ningún cambio se relanza con el verbo de la fase y su misma familia.
+  const empty = writerSetup({ script: { report: implementReport() } })
+  implementFlow(empty.repo)
+  const e = cli(empty, ['wait', cli(empty, ['sdd', 'phase', 'f']).out.id, '--max', '30'])
+  assert.match(e.out.next, /pregunta al usuario si relanza: \.\/bin\/sdd-ai sdd phase f --families codex --conductor claude$/)
+
+  const grammar = writerSetup()
+  implementFlow(grammar.repo, '# Tasks\n\n- [ ] hacer algo sin id\n')
+  const g = cli(grammar, ['sdd', 'phase', 'f'])
+  assert.deepEqual([g.code, g.out.code], [2, 'phase_inline'])
+  assert.match(g.out.message, /gramática/)
+
+  const missing = writerSetup({ families: '[codex, claude]', bins: [] })
+  implementFlow(missing.repo)
+  const m = cli(missing, ['sdd', 'phase', 'f'])
+  assert.deepEqual([m.code, m.out.code], [2, 'cli_missing'])
+  assert.equal(m.out.next, 'pregunta al usuario si cae a claude; solo con un sí: ./bin/sdd-ai sdd phase f --families claude --conductor claude')
 })

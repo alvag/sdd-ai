@@ -8,6 +8,7 @@ import { confirm, release, reserve } from './native-launch.ts'
 import { type OpenRun, type OpenState, describe, openRuns, runKey } from './open-runs.ts'
 import { renderBootstrap } from './route.ts'
 import { readJson, readStatus, writeJsonAtomic } from './runs.ts'
+import { withPhaseNext } from './sdd/phase-state.ts'
 import { type ListEntry, listFlows, lstatOrNull, readFlow } from './sdd/read.ts'
 import { type FlowStatus, type Reason, type Step, headerData, resolve } from './sdd/status.ts'
 import { shellSegments } from './shell.ts'
@@ -110,7 +111,8 @@ function flowLine(e: ListEntry, boundId: string | null): string {
   const errors = e.depth === null && e.blocked ? e.blocked_reasons : readErrors(e.blocked_reasons)
   if (errors.length > 0) return `- ${e.id}: no se pudo leer (${errors.map((r) => r.detail).join('; ')})`
   const gate = e.next.gate ? ` ${e.next.gate}` : ''
-  return `- ${e.id} (${e.depth ?? 'sin profundidad'}): ${e.next.step}${gate}${e.id === boundId ? ' · ligado a esta sesión' : ''}`
+  const phase = e.next.command ?? e.next.detail
+  return `- ${e.id} (${e.depth ?? 'sin profundidad'}): ${e.next.step}${gate}${phase ? ` · ${phase}` : ''}${e.id === boundId ? ' · ligado a esta sesión' : ''}`
 }
 
 /** Una línea por flujo activo de `.plans/`, con el ligado marcado. Los directorios sin artefactos no son flujos. */
@@ -118,7 +120,7 @@ function flowList(p: Payload, root: string, session: string): string {
   if (!FLOW_SOURCES.includes(String(p.source))) return ''
   let entries: ListEntry[]
   try {
-    entries = listFlows(root).filter((e) => e.next.step !== 'no_artifacts')
+    entries = listFlows(root).filter((e) => e.next.step !== 'no_artifacts').map((e) => ({ ...e, next: withPhaseNext(root, e.id, e) }))
   } catch (e) {
     return `Flujos SDD en .plans/: no se pudieron listar (${errorText(e)})`
   }
@@ -412,8 +414,8 @@ function postToolUseFailure(p: Payload, root: string, session: string): string {
 }
 
 /**
- * Liga la sesión al flujo de un `sdd status <id>` o `sdd approve <id> <gate>` del conductor en el
- * primer tramo, con el paso de ese momento como referencia de `Stop`, termine como termine el comando.
+ * Liga la sesión al flujo de un `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` del
+ * conductor en el primer tramo, con el paso de ese momento como referencia de `Stop`, termine como termine el comando.
  * Un flujo que no se puede leer o sin artefactos no cambia la liga. Devuelve el aviso si no se pudo
  * guardar, o `''`.
  */
@@ -452,24 +454,28 @@ function postDispatch(p: Payload, root: string, action: 'confirm' | 'release'): 
   return ''
 }
 
-/** Los comandos de corridas; `sdd approve` se suma aparte, porque `sdd status` sí lo puede correr un worker. */
+/**
+ * Los comandos de corridas; `sdd approve` y `sdd phase` se suman aparte, porque `sdd status` sí lo puede
+ * correr un worker.
+ */
 const RUN_COMMANDS = new Set(['run', 'review', 'wait', 'cancel'])
+const CONDUCTOR_SDD = new Set(['approve', 'phase'])
 
 /**
  * Si el tramo invoca `sdd-ai`, una ruta que termina en `bin/sdd-ai` o `node <ruta>/bin/sdd-ai`, con uno
- * de los comandos de corridas o con `sdd approve`.
+ * de los comandos de corridas, con `sdd approve` o con `sdd phase`.
  */
 function invokesConductorCommand(segment: string): boolean {
   const tokens = segment.trim().split(/\s+/)
   if (tokens[0] === 'node') tokens.shift()
   const [bin, command, sub] = tokens
   if (bin !== 'sdd-ai' && !(bin ?? '').endsWith('bin/sdd-ai')) return false
-  return RUN_COMMANDS.has(command ?? '') || (command === 'sdd' && sub === 'approve')
+  return RUN_COMMANDS.has(command ?? '') || (command === 'sdd' && CONDUCTOR_SDD.has(sub ?? ''))
 }
 
 /**
- * Dentro de un subagente, un comando de shell no lanza ni toca corridas, ni aprueba un gate: las dos
- * cosas son del conductor. Es una guarda para el caso honesto; una variable o un script intermedio la
+ * Dentro de un subagente, un comando de shell no lanza ni toca corridas, ni aprueba un gate, ni lanza
+ * una fase: todo eso es del conductor. Es una guarda para el caso honesto; una variable o un script intermedio la
  * esquivan.
  */
 function guardShell(p: Payload): string {

@@ -32,9 +32,21 @@ export function headCommit(root: string): string | undefined {
   }
 }
 
-/** Las rutas con cambios sin commitear: modificadas, borradas, nuevas y renombradas. Lo ignorado no cuenta. */
+/** La rama de `HEAD`, o `null` con `HEAD` separado. */
+export function currentBranch(root: string): string | null {
+  try {
+    return git(root, ['symbolic-ref', '--short', '-q', 'HEAD']).trim() || null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Las rutas con cambios sin commitear: modificadas, borradas, nuevas y renombradas. Lo ignorado no cuenta.
+ * Sin los locks opcionales, `git status` no reescribe el índice: consultarlo no escribe nada en `.git`.
+ */
 export function dirtyPaths(root: string): string[] {
-  const parts = git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']).split('\0')
+  const parts = git(root, ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=all']).split('\0')
   const out: string[] = []
   for (let i = 0; i < parts.length; i++) {
     const entry = parts[i]

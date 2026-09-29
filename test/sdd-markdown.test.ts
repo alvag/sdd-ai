@@ -1,8 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { currentBranch } from '../src/git.ts'
 import {
-  combinedFingerprint, countTasks, planFingerprint, readHeader, section, singleFingerprint, specFingerprint, tasksFingerprint,
+  combinedFingerprint, countTasks, criteriaIds, parseTaskLine, planFingerprint, proseProblems, readHeader, section, singleFingerprint,
+  specFingerprint, tasksFingerprint,
 } from '../src/sdd/markdown.ts'
+import { readFlow } from '../src/sdd/read.ts'
+import { makeRepo } from './helpers.ts'
 
 const FP = /^sha256:[0-9a-f]{64}$/
 
@@ -117,3 +124,66 @@ function readHeaderBody(text: string): string {
   assert.ok(h.ok)
   return h.body
 }
+
+test('una línea de task tiene el checkbox, el id T<n> con o sin negrita, el separador y la cobertura', () => {
+  assert.deepEqual(parseTaskLine('- [ ] **T1 — Roles de fase**  · cubre: AC-13'), { done: false, id: 'T1', title: 'Roles de fase', covers: ['AC-13'] })
+  assert.deepEqual(parseTaskLine('- [x] T12 — sin negrita · cubre: AC-1, AC-2'), { done: true, id: 'T12', title: 'sin negrita', covers: ['AC-1', 'AC-2'] })
+  assert.deepEqual(parseTaskLine('- [X] **T2 — `run` con código**'), { done: true, id: 'T2', title: '`run` con código', covers: [] })
+  assert.deepEqual(parseTaskLine('- [ ] T3 — hacerlo'), { done: false, id: 'T3', title: 'hacerlo', covers: [] })
+  for (const bad of ['- [ ] **Tx — letra**', '- [ ] **T1 - guion corto**', '- [ ] **T1 — sin cierre', '- [ ] hacer algo', '- [ ] T1—pegado']) {
+    assert.equal(parseTaskLine(bad), null, bad)
+  }
+  // Lo que no es una task de primer nivel tampoco es una línea de task.
+  for (const other of ['  - [ ] **T1 — anidada**', 'prosa', '- item sin checkbox']) assert.equal(parseTaskLine(other), null, other)
+  // El cuerpo de una task va sangrado: sus checkboxes no suman tasks.
+  const body = ['- [ ] **T1 — una**  · cubre: AC-1', '  - Pasos:', '    - [ ] x', ''].join('\n')
+  assert.equal(countTasks(body).total, 1)
+})
+
+test('los ids de criterio salen de los ítems de primer nivel de Criterios de aceptación', () => {
+  const spec = [
+    '# Spec', '', '## Alcance', '', '- **AC-9:** fuera de la sección', '', '## Criterios de aceptación', '',
+    '- **AC-1:** Given algo, Then otra cosa. (pedido)', '  - **AC-7:** anidado', '- **AC-2:** segundo', '```', '- **AC-8:** en una cerca', '```',
+    '- **AC-10:** décimo', '', '## Clarifications', '', '- **AC-11:** tampoco',
+  ].join('\n')
+  assert.deepEqual(criteriaIds(spec), ['AC-1', 'AC-2', 'AC-10'])
+  assert.deepEqual(criteriaIds('# Spec\n\n- **AC-1:** sin la sección\n'), [])
+})
+
+test('la prosa no puede traer un título reservado ni una cerca sin cerrar', () => {
+  const reserved = ['Tasks', 'Spec']
+  assert.equal(proseProblems('## Tasks\n\n- [ ] T1 — x', reserved).length, 1)
+  assert.equal(proseProblems('texto\n### Tasks\n', reserved).length, 1)
+  assert.equal(proseProblems('# Spec ##\n', reserved).length, 1)
+  assert.deepEqual(proseProblems('## Otra cosa\n\nbien', reserved), [])
+  assert.deepEqual(proseProblems('```md\n## Tasks\n```\n', reserved), [])
+  const open = proseProblems('antes\n```ts\nconst a = 1\n', reserved)
+  assert.equal(open.length, 1)
+  assert.match(open[0], /cerca/)
+})
+
+test('readFlow con un candidato lee ese artefacto del texto dado y lo demás del disco', () => {
+  const repo = makeRepo()
+  const dir = join(repo, '.plans', 'f')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'tasks.md'), '# Tasks\n\n- [ ] **T1 — una**\n')
+  writeFileSync(join(dir, 'spec.md'), '# Spec\n')
+  const disk = readFlow(repo, 'f')
+  assert.equal(disk.facts.tasksFile?.total, 1)
+  const cand = readFlow(repo, 'f', { mode: 'off' }, { artifact: 'tasks', text: '# Tasks\n\n- [ ] **T1 — una**\n- [ ] **T2 — dos**\n' })
+  assert.equal(cand.facts.tasksFile?.total, 2)
+  assert.notEqual(cand.digests.tasks, disk.digests.tasks)
+  assert.equal(cand.digests.spec, disk.digests.spec)
+  const plan = readFlow(repo, 'f', { mode: 'off' }, { artifact: 'plan', text: '---\nprofundidad: completa\nstatus: planned\n---\n\n# Plan\n' })
+  assert.equal(plan.facts.files.plan, 'present')
+  assert.equal(disk.facts.files.plan, 'absent')
+})
+
+test('currentBranch da la rama de HEAD y null con HEAD separado', () => {
+  const repo = makeRepo()
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'a'], { cwd: repo })
+  execFileSync('git', ['checkout', '-q', '-b', 'feature/x'], { cwd: repo })
+  assert.equal(currentBranch(repo), 'feature/x')
+  execFileSync('git', ['checkout', '-q', '--detach'], { cwd: repo })
+  assert.equal(currentBranch(repo), null)
+})

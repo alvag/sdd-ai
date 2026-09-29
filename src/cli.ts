@@ -10,16 +10,16 @@ import { type Proof, askNext, prove } from './approval/proof.ts'
 import { DISPUTE_OPTIONS, type Question, disputeQuestion, extraOptions, extraQuestion, gateQuestionFor } from './approval/question.ts'
 import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
 import { detectConductor } from './conductor.ts'
-import { effectiveFamilies, loadCrossModel, parseFamiliesFlag } from './config.ts'
+import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
 import { type SkillCheck, doctor } from './doctor.ts'
-import { buildIndex, dirtyPaths, gitDirs, headCommit, repoRoot } from './git.ts'
+import { buildIndex, currentBranch, dirtyPaths, gitDirs, headCommit, repoRoot } from './git.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { nativeProfile, resolve } from './resolve.ts'
 import { renderArtifactMaterial, renderArtifactPrompt, renderArtifactRoundPrompt } from './review/artifact-prompt.ts'
 import {
-  type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, validateArtifactArgs,
+  type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, readMaterial, validateArtifactArgs,
 } from './review/artifact.ts'
 import {
   type Candidate, type Selection, baseOf, changedRanges, freeze, freezeStable, freezeStableWith, readContext, snapshot,
@@ -34,21 +34,25 @@ import {
   checkRunId, createRun, isAlive, markDelivered, newRunId, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic,
 } from './runs.ts'
 import {
-  ARTIFACT_NOTE, type ArgvFile, type JobRecord, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, settleGroup, supervise,
+  ARTIFACT_NOTE, type ArgvFile, type JobRecord, type PhaseResult, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, settleGroup, supervise,
   writeReceipt,
 } from './supervisor.ts'
 import {
   type Conductor, DISPATCHABLE_ROLES, type Family, type NativeProfile, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
-  type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isDispatchableRole, isFamily, opposite, toNativeEffort,
+  type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isDispatchableRole, isFamily, isPhaseRole, opposite, toNativeEffort,
 } from './types.ts'
 import { approve } from './sdd/approve.ts'
-import { listFlows, readFlow } from './sdd/read.ts'
-import { resolve as resolveFlow } from './sdd/status.ts'
+import { criteriaIds, taskLines } from './sdd/markdown.ts'
+import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitImplement, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
+import { type PhaseRecord, activeRun, readPhaseRecord, withFlowLock, withPhaseNext, writePhaseRecord } from './sdd/phase-state.ts'
+import { freezeLaunch } from './sdd/publish.ts'
+import { FILE_NAMES, type FlowRead, artifactHash, bytesHash, flowDir, headerHash, listFlows, readFlow } from './sdd/read.ts'
+import { type FlowStatus, headerData, resolve as resolveFlow } from './sdd/status.ts'
 import { claudeLaunch, claudeWriterLaunch } from './workers/claude.ts'
 import { codexLaunch, codexWriterLaunch } from './workers/codex.ts'
 import { writerPrompt } from './writer.ts'
 import {
-  type HarvestRecord, type WriterControl, canWriteStore, captureTreeAtBase, freezeHarvest, groupState, isWriterRun, leaderMatches,
+  type HarvestRecord, type WriterControl, canWriteStore, captureTreeAtBase, freezeHarvest, groupState, harvestTreeHolds, isWriterRun, leaderMatches,
   readControl, readHarvest, readProcess, readReservation, releaseWriter, reserveWriter, runDirIdentity, runInventory, sensitiveInventory,
   storeDir, writeControl,
 } from './writer-store.ts'
@@ -157,6 +161,9 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   const roleArg = values.role ?? 'explore'
   const renamed = RETIRED_ROLES.get(roleArg)
   if (renamed) throw new SddError('usage', `el rol \`${roleArg}\` ahora se llama \`${renamed}\``, { next: `usa --role ${renamed}` })
+  if (isPhaseRole(roleArg)) {
+    throw new SddError('usage', `el rol ${roleArg} lo despacha sdd phase`, { next: './bin/sdd-ai sdd status <id> dice el comando de la fase' })
+  }
   if (!isDispatchableRole(roleArg)) throw new SddError('usage', `rol desconocido: ${roleArg}`, { next: `usa uno de: ${DISPATCHABLE_ROLES.join(', ')}` })
   const role = roleArg
   const deadlineArg = values.deadline ?? '600'
@@ -197,24 +204,20 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   }
 
   if (role === 'implement') {
-    return runWriter({
+    return await runWriter({
       root, env, conductor, session, resolution, prompt, deadline, retryOf: values.retry,
       request: { role, families: values.families, model: values.model, effort: values.effort, conductor, deadline_sec: deadline },
       source: values.retry ? `--retry ${values.retry}` : `--prompt-file ${shellArg(values['prompt-file'] ?? '')}`,
     })
   }
 
-  const id = newRunId()
-  const dir = createRun(root, id)
-  const promptFile = join(dir, 'prompt.md')
-  writeFileSync(promptFile, prompt)
-  writeJsonAtomic(join(dir, 'request.json'), {
+  const request = {
     role, conductor, session, retry_of: values.retry,
     overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline },
-  })
-  writeJsonAtomic(join(dir, 'resolved.json'), resolution)
-
+  }
   if (resolution.via === 'native') {
+    const { id, dir } = prepareRun(root, prompt, request, resolution)
+    const promptFile = join(dir, 'prompt.md')
     const profiles = nativeProfiles(root, env)
     const state = agentsState(root, PKG_DIR, resolution.family, role, profiles)
     if (state !== 'ok') {
@@ -244,26 +247,60 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
     return { code: 0, out }
   }
 
-  if (!inPath(resolution.family, env)) {
+  const started = startProcessRun({ root, env, resolution, prompt, request, deadline, conductor, web: WEB_ROLES.has(role) })
+  if (!started.launched) {
     const detail = `${resolution.family} no está en PATH`
-    markDelivered(dir, setStatus(dir, { state: 'launch_failed', reason: 'cli_missing', detail, fallback: conductor }), env)
-    return { code: 1, out: { id, state: 'launch_failed', reason: 'cli_missing', detail, fallback: conductor, next: fallbackNext(id, conductor) } }
+    return { code: 1, out: { id: started.id, state: 'launch_failed', reason: 'cli_missing', detail, fallback: conductor, next: fallbackNext(started.id, conductor) } }
   }
-
-  const task: WorkerTask = { cwd: root, promptFile, resultFile: join(dir, 'result.md'), sessionId: randomUUID() }
-  if (resolution.model) task.model = resolution.model
-  if (resolution.effort) task.effort = resolution.effort
-  if (WEB_ROLES.has(role)) task.web = true
-  const launch = resolution.family === 'claude' ? claudeLaunch(task) : codexLaunch(task)
-  launchSupervisor(dir, { family: resolution.family, launch, deadline_sec: deadline }, env, { fallback: conductor })
-  return { code: 0, out: { id, via: 'process', family: resolution.family } }
+  return { code: 0, out: { id: started.id, via: 'process', family: resolution.family } }
 }
 
-interface WriterLaunch {
+/** Crea la corrida con su encargo, su pedido y su resolución, y los archivos congelados que traiga. */
+function prepareRun(root: string, prompt: string, request: Record<string, unknown>, resolution: Resolution,
+  files: Record<string, string | Buffer> = {}): { id: string; dir: string } {
+  const id = newRunId()
+  const dir = createRun(root, id)
+  writeFileSync(join(dir, 'prompt.md'), prompt)
+  for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content)
+  writeJsonAtomic(join(dir, 'request.json'), request)
+  writeJsonAtomic(join(dir, 'resolved.json'), resolution)
+  return { id, dir }
+}
+
+interface ProcessRun {
+  root: string; env: Env; resolution: Resolution; prompt: string; request: Record<string, unknown>; deadline: number
+  conductor: Conductor; web?: boolean; argvExtra?: Partial<ArgvFile>; files?: Record<string, string | Buffer>
+}
+
+/**
+ * Una corrida por proceso de un worker de solo lectura: la crea y lanza su supervisor. Sin el CLI de la
+ * familia resuelta, queda en `launch_failed` con la caída al conductor, que decide el usuario.
+ */
+function startProcessRun(o: ProcessRun): { id: string; dir: string; launched: boolean } {
+  const { id, dir } = prepareRun(o.root, o.prompt, o.request, o.resolution, o.files)
+  if (!inPath(o.resolution.family, o.env)) {
+    const detail = `${o.resolution.family} no está en PATH`
+    markDelivered(dir, setStatus(dir, { state: 'launch_failed', reason: 'cli_missing', detail, fallback: o.conductor }), o.env)
+    return { id, dir, launched: false }
+  }
+  const task: WorkerTask = { cwd: o.root, promptFile: join(dir, 'prompt.md'), resultFile: join(dir, 'result.md'), sessionId: randomUUID() }
+  if (o.resolution.model) task.model = o.resolution.model
+  if (o.resolution.effort) task.effort = o.resolution.effort
+  if (o.web) task.web = true
+  const launch = o.resolution.family === 'claude' ? claudeLaunch(task) : codexLaunch(task)
+  launchSupervisor(dir, { family: o.resolution.family, launch, deadline_sec: o.deadline, ...o.argvExtra }, o.env, { fallback: o.conductor })
+  return { id, dir, launched: true }
+}
+
+export interface WriterLaunch {
   root: string; env: Env; conductor: Conductor; session?: string; resolution: Resolution; prompt: string; deadline: number
   retryOf?: string; request: WriterControl['request']
   /** Cómo nombrar el encargo en un `next`: el archivo o el `--retry`. */
   source: string
+  /** Lo que lanza al supervisor; las pruebas lo reemplazan. */
+  start?: SupervisorSpawn
+  /** Un writer de fase: el contrato de su reporte se valida en la cosecha contra esto. */
+  phase?: WriterControl['phase']
 }
 
 /** Lo que dice el rechazo de un árbol sucio: el usuario decide, sdd-ai no toca nada. */
@@ -274,12 +311,14 @@ const DIRTY_NEXT = 'pregunta al usuario si conserva el cambio o lo revierte. Si 
  * writer abierto prevalece sobre el árbol sucio), un commit en `HEAD` y el árbol limpio. Todo lo que
  * decide queda en el almacén antes de lanzar; en la corrida visible, solo lo previo al lanzamiento.
  */
-function runWriter(w: WriterLaunch): Result {
+export async function runWriter(w: WriterLaunch): Promise<Result> {
   const { root, env, conductor, resolution } = w
   if (!inPath(resolution.family, env)) {
     const c = conductor
     throw new SddError('cli_missing', `${resolution.family} no está en PATH`, {
-      next: `pregunta al usuario si cae a ${c.family}; solo con un sí: ./bin/sdd-ai run --role implement ${w.source} --families ${c.family} --conductor ${c.family}`,
+      next: w.phase
+        ? phaseFallbackNext({ flow: w.phase.flow }, c)
+        : `pregunta al usuario si cae a ${c.family}; solo con un sí: ./bin/sdd-ai run --role implement ${w.source} --families ${c.family} --conductor ${c.family}`,
     })
   }
   if (!canWriteStore(root)) {
@@ -331,14 +370,18 @@ function runWriter(w: WriterLaunch): Result {
     const control: WriterControl = {
       id, base, family: resolution.family, prompt: w.prompt, checkout: { root, ...gitDirs(root) }, request: w.request,
       preLaunch: runInventory(root, id), inventory: sensitiveInventory(root), runDir: identity,
-      ...(w.session ? { session: w.session } : {}),
+      ...(w.session ? { session: w.session } : {}), ...(w.phase ? { phase: w.phase } : {}),
     }
     writeControl(root, control)
-    writeJsonAtomic(join(store, 'argv.json'), argv)
-    setStatus(store, { state: 'launching' })
-    const supervisor = spawn(process.execPath, [BIN_PATH, '__supervise', store, 'argv.json'], { detached: true, stdio: 'ignore', env: definedEnv(env) })
-    supervisor.unref()
-    if (supervisor.pid !== undefined) writeFileSync(join(store, 'supervisor.pid'), String(supervisor.pid))
+    try {
+      launchSupervisor(store, argv, env, {}, 'argv.json', w.start)
+    } catch (e) {
+      // Sin supervisor nadie llevaría la corrida a un terminal: se congela la cosecha, que libera la reserva.
+      const detail = 'el sistema no lanzó el proceso supervisor'
+      setStatus(dir, { state: 'launch_failed', reason: 'supervisor_not_started', detail })
+      await freezeHarvest(root, id, { state: 'launch_failed', reason: 'supervisor_not_started', detail })
+      throw e
+    }
     launched = true
     return { code: 0, out: { id, via: 'process', family: resolution.family, base, next: `./bin/sdd-ai wait ${id}` } }
   } finally {
@@ -411,23 +454,6 @@ function diffSelection(req: ReviewRequest): Selection {
 /** Lo que una selección arrastra entre rondas y reinicios: los archivos nuevos y la cosecha. */
 const untrackedOf = (sel: Selection): Pick<Selection, 'untracked' | 'harvest'> =>
   ({ ...(sel.untracked ? { untracked: true } : {}), ...(sel.harvest ? { harvest: sel.harvest } : {}) })
-
-/** Si el árbol de trabajo sigue siendo el que congeló la cosecha de ese writer. */
-function harvestTreeHolds(root: string, id: string): boolean {
-  try {
-    const h = readHarvest(root, id)
-    if (!h) return false
-    const { checkout, base } = readControl(root, id)
-    const scratch = mkdtempSync(join(tmpdir(), 'sdd-ai-index-'))
-    try {
-      return buildIndex({ root: checkout.root, gitDir: checkout.gitDir }, base, join(scratch, 'index')) === h.tree
-    } finally {
-      rmSync(scratch, { recursive: true, force: true })
-    }
-  } catch {
-    return false
-  }
-}
 
 /** Un delta con riesgo alto: la ronda no corre y se propone reiniciar con lentes, con el mismo head. */
 function riskHigh(root: string, req: ReviewRequest, delta: Risk, head: string | undefined): SddError {
@@ -1451,9 +1477,39 @@ function report(root: string, id: string, dir: string, s: Status, env: Env): Res
   return result
 }
 
+/**
+ * Lo que `wait` devuelve de una corrida de fase terminada: el estado, el artefacto, los supuestos para el
+ * gate y, si no se escribió, las preguntas, lo que falta o la causa. Ni el documento ni el contrato
+ * viajan: quedan en la corrida. El `next` es el de `sdd status` sobre el disco de ahora.
+ */
+function phaseView(root: string, id: string, dir: string, s: Status, req: PhaseRequest): Result {
+  const out: Record<string, unknown> = { id, state: s.state }
+  if (s.reason) out.reason = s.reason
+  if (s.detail) out.detail = s.detail
+  const file = join(dir, 'phase.json')
+  if (existsSync(file)) {
+    const p = readJson<PhaseResult>(file)
+    out.outcome = p.outcome
+    if (p.artifact) out.artifact = p.artifact
+    out.assumptions = p.assumptions
+    if (p.outcome !== 'published') Object.assign(out, { blocking_questions: p.blocking_questions, missing_context: p.missing_context })
+    if (p.cause) out.cause = p.cause
+  }
+  const warnings = profileWarnings(s)
+  if (warnings.length > 0) out.warnings = warnings
+  if (s.state === 'launch_failed' && s.fallback) {
+    out.fallback = s.fallback
+    out.next = phaseFallbackNext(req, s.fallback)
+  } else {
+    out.next = flowNext(root, req.flow)
+  }
+  return { code: s.state === 'done' ? 0 : 1, out }
+}
+
 function reportOf(root: string, id: string, dir: string, s: Status, env: Env): Result {
   const request = existsSync(join(dir, 'request.json')) ? readJson<{ kind?: string }>(join(dir, 'request.json')) : {}
   if (request.kind === 'review' && TERMINAL.has(s.state)) return reviewView(root, id, dir, s, env)
+  if (request.kind === 'phase' && TERMINAL.has(s.state)) return phaseView(root, id, dir, s, request as PhaseRequest)
   const out: Record<string, unknown> = { id, state: s.state }
   if (s.reason) out.reason = s.reason
   if (s.detail) out.detail = s.detail
@@ -1538,9 +1594,22 @@ async function cancel(args: string[], cwd: string): Promise<Result> {
   return { code: 0, out: { id, state: 'cancel_requested', next: `./bin/sdd-ai wait ${id}` } }
 }
 
+/** Lo que la cosecha de un writer de fase dice de su contrato. */
+interface PhaseContract { admitted: boolean; cause?: string; missing_context: string[] }
+
+/** El contrato del reporte de un writer de fase, contra las tasks que congeló al lanzar. Sin corrección. */
+function phaseContract(h: HarvestRecord, phase: NonNullable<WriterControl['phase']>): PhaseContract {
+  const a = admitImplement(h.report ?? '', phase.pending)
+  if (a.kind === 'admitted') return { admitted: true, missing_context: a.review.missing_context }
+  return { admitted: false, cause: a.kind === 'inadmissible' ? a.error : a.reason, missing_context: [] }
+}
+
 /** Lo que falta para proponer la revisión de una cosecha: cada condición que falló, con palabras. */
-function harvestFailures(h: HarvestRecord): string[] {
+function harvestFailures(h: HarvestRecord, contract?: PhaseContract): string[] {
   const failed: string[] = []
+  if (contract && !contract.admitted) failed.push(`el contrato de la fase no se admitió: ${contract.cause ?? ''}`)
+  if (contract && contract.missing_context.length > 0) failed.push(`al writer le faltó contexto: ${contract.missing_context.join('; ')}`)
+  if (h.phase_inputs === 'changed') failed.push('cambiaron los insumos de la fase (spec, plan, tasks o el header del handoff) desde que se lanzó')
   if (h.state !== 'done') failed.push(`el writer terminó en ${h.state}${h.reason ? `/${h.reason}` : ''}`)
   if (!h.endMark) failed.push('el reporte no cierra con la marca de fin')
   if (h.files.length === 0) failed.push('el cambio está vacío')
@@ -1550,14 +1619,19 @@ function harvestFailures(h: HarvestRecord): string[] {
   return failed
 }
 
-function harvestNext(id: string, h: HarvestRecord, family: Family): string {
-  const failed = harvestFailures(h)
+function harvestNext(id: string, h: HarvestRecord, c: WriterControl, failed: string[]): string {
+  const family = c.family
   if (failed.length === 0) {
     return `mira el diff completo (${h.patchFile}) y lanza la revisión antes de correr nada que cambie el árbol: ./bin/sdd-ai review start --harvest ${id} --base ${h.base} --author ${family}`
   }
   if (h.files.length === 0 && h.flagged.length === 0 && h.runAltered.length === 0 && !h.headMoved) {
     const why = h.state === 'done' ? 'el writer terminó sin cambios' : failed[0]
-    return `no hay nada que conservar ni revertir (${why}); pregunta al usuario si relanza: ./bin/sdd-ai run --retry ${id}`
+    // Un writer de fase se relanza con el verbo de la fase, que vuelve a congelar las tasks pendientes,
+    // con la misma familia: `run --retry` rechaza los roles de fase.
+    const relaunch = c.phase
+      ? `./bin/sdd-ai sdd phase ${c.phase.flow} --families ${family} --conductor ${c.request.conductor.family}`
+      : `./bin/sdd-ai run --retry ${id}`
+    return `no hay nada que conservar ni revertir (${why}); pregunta al usuario si relanza: ${relaunch}`
   }
   return `no se propone revisión: ${failed.join('; ')}. Pregunta al usuario si conserva el cambio o lo revierte; sdd-ai no revierte nada`
 }
@@ -1602,12 +1676,22 @@ function writerReport(root: string, id: string, h: HarvestRecord, env: Env): Res
     base: h.base, files: h.files, diff: h.patchFile, flagged: h.flagged, run_altered: h.runAltered, head_moved: h.headMoved,
     report: h.report ?? null, end_mark: h.endMark,
   })
-  const failed = harvestFailures(h)
+  const contract = c.phase ? phaseContract(h, c.phase) : undefined
+  const failed = harvestFailures(h, contract)
   if (failed.length > 0) out.failed = failed
   if (s.session_id) out.session_id = s.session_id
   const warnings = profileWarnings(s)
   if (warnings.length > 0) out.warnings = warnings
-  out.next = harvestNext(id, h, c.family)
+  out.next = harvestNext(id, h, c, failed)
+  if (c.phase && contract) {
+    out.contract = contract
+    try {
+      out.flow_next = flowNext(root, c.phase.flow)
+    } catch (e) {
+      if (!(e instanceof SddError)) throw e
+      out.flow_next = { step: 'resolve_blockers', detail: e.message }
+    }
+  }
   markWriterDelivered(root, id, h.state, env)
   return { code: h.state === 'done' ? 0 : 1, out }
 }
@@ -1762,30 +1846,258 @@ function agents(args: string[], env: Env, cwd: string): Result {
   return { code: 0, out: { written, removed, next: 'reabre la sesión para que el CLI cargue los agentes y la skill' } }
 }
 
+const PHASE_STEPS: readonly string[] = ['specify', 'plan', 'tasks', 'implement']
+
+/**
+ * El `next` de `sdd status <id>`: en un gate, la pregunta que el conductor le hace al usuario antes de
+ * `sdd approve`; en una fase, el comando que la lanza o por qué no hay comando.
+ */
+function nextOf(root: string, status: FlowStatus, facts: FlowRead['facts']): Record<string, unknown> {
+  if (status.next.step === 'gate' && status.next.gate !== undefined && status.depth !== null) {
+    return { ...status.next, question: gateQuestionFor(status.id, status.depth, status.next.gate, facts.fingerprints) }
+  }
+  return { ...withPhaseNext(root, status.id, status) }
+}
+
+/** El `next` que daría `sdd status <id>` ahora. */
+function flowNext(root: string, flow: string): Record<string, unknown> {
+  const { facts } = readFlow(root, flow)
+  return nextOf(root, resolveFlow(facts), facts)
+}
+
+/** Lo que `sdd phase` deja en `request.json`: el reintento de una caída se arma con esto. */
+interface PhaseRequest {
+  kind: 'phase'; flow: string; step: PhaseStep; amended: boolean; role: string; conductor: Conductor; session?: string
+  request_file?: string; context_file?: string
+  overrides: { families?: string; deadline_sec: number }
+}
+
+/** El reintento de una corrida de fase: el mismo verbo con la familia del conductor, nunca `run --retry`. */
+function phaseFallbackNext(r: Pick<PhaseRequest, 'flow' | 'request_file' | 'context_file'>, c: Conductor): string {
+  const flags = [
+    ...(r.request_file !== undefined ? [`--request ${shellArg(r.request_file)}`] : []),
+    ...(r.context_file !== undefined ? [`--context ${shellArg(r.context_file)}`] : []),
+    `--families ${c.family}`, `--conductor ${c.family}`,
+  ]
+  return `pregunta al usuario si cae a ${c.family}; solo con un sí: ./bin/sdd-ai sdd phase ${r.flow} ${flags.join(' ')}`
+}
+
+interface ImplementPhase { root: string; env: Env; id: string; read: FlowRead; depth: 'normal' | 'completa'; conductor: Conductor; families?: string; deadline: number }
+
+/**
+ * `implement` por fase: un solo writer con todas las tasks pendientes, por el mismo camino que
+ * `run --role implement`, con sus rechazos (el árbol sucio, un writer abierto). Congela las tasks y los
+ * insumos, que la cosecha compara con su contrato. Las tasks las marca el conductor, no el binario.
+ */
+async function phaseImplement(p: ImplementPhase): Promise<Result> {
+  const { root, env, id, read, depth, conductor } = p
+  const bytes = { spec: flowBytes(root, read, 'spec'), plan: flowBytes(root, read, 'plan'), tasks: flowBytes(root, read, 'tasks') }
+  const open = taskLines(bytes.tasks.toString('utf8')).filter((l) => !l.done)
+  const outside = open.filter((l) => l.task === null)
+  if (outside.length > 0) {
+    throw new SddError('phase_inline', 'hay tasks pendientes fuera de la gramática de la plantilla (- [ ] **T<n> — <título>**): la fase implement va inline', {
+      detail: outside.map((l) => l.text).join('\n'), next: 'sigue la fase implement inline, en tu sesión',
+    })
+  }
+  const pending = open.flatMap((l) => (l.task ? [l.task.id] : []))
+  const families = effectiveFamilies(loadCrossModel(root, FAMILIES.filter((f) => inPath(f, env))).families, p.families ? parseFamiliesFlag(p.families) : undefined)
+  const resolution = resolve({ conductor, families, workers: loadWorkers(root), role: 'implement', flags: {}, codexRoot: loadCodexRoot(env) })
+  resolution.via = 'process'
+  const prompt = renderPhasePrompt('implement', { id, depth, step: 'implement', pending },
+    { spec: bytes.spec.toString('utf8'), plan: bytes.plan.toString('utf8'), tasks: bytes.tasks.toString('utf8') })
+  const phase: NonNullable<WriterControl['phase']> = {
+    flow: id, pending, inputs: { spec: bytesHash(bytes.spec), plan: bytesHash(bytes.plan), tasks: bytesHash(bytes.tasks) },
+    handoff_header: headerHash(read.facts.handoffHeader),
+  }
+  const result = await runWriter({
+    root, env, conductor, session: ownerSession(env, conductor.family), resolution, prompt, deadline: p.deadline, phase,
+    request: { role: 'implement', families: p.families, conductor, deadline_sec: p.deadline }, source: `sdd phase ${id}`,
+  })
+  const out = result.out as Record<string, unknown>
+  withFlowLock(root, id, () => {
+    const rec = readPhaseRecord(root, id)
+    writePhaseRecord(root, id, { ...rec, last_run: { id: String(out.id), step: 'implement' } })
+  })
+  return { code: result.code, out: { ...out, flow: id, step: 'implement', pending } }
+}
+
+const phaseUsage = (message: string) => new SddError('usage', message, { next: './bin/sdd-ai sdd status <id> dice el comando de la fase' })
+
+/** Los bytes de un artefacto del flujo, que tienen que ser los mismos que acaba de leer `readFlow`. */
+function flowBytes(root: string, read: FlowRead, name: 'spec' | 'plan' | 'tasks'): Buffer {
+  const bytes = readFileSync(join(flowDir(root, read.facts.id), FILE_NAMES[name]))
+  if (bytesHash(bytes) !== artifactHash(read, name)) {
+    throw new SddError('artifacts_unstable', `${FILE_NAMES[name]} cambió mientras se lanzaba la fase`, { next: 'vuelve a correr el comando cuando nadie esté escribiendo en el flujo' })
+  }
+  return bytes
+}
+
+/**
+ * `sdd phase <id>`: lanza por proceso la fase que dice `sdd status`, con el encargo que escribe el
+ * binario. Todas las negativas van antes de crear nada y en este orden: un worker, `corta`, un paso que
+ * no es fase, el registro de la fase y los flags, el material, el header del plan, los criterios de la
+ * spec y la gramática de las tasks. La comprobación del registro, la corrida y el alta de la corrida en
+ * el registro van juntas bajo el lock del flujo: dos invocaciones a la vez no pueden lanzar las dos.
+ */
+async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> {
+  const { values, positionals } = parseArgs({
+    args, strict: true, allowPositionals: true,
+    options: {
+      request: { type: 'string' }, context: { type: 'string' }, families: { type: 'string' }, conductor: { type: 'string' }, deadline: { type: 'string' },
+    },
+  })
+  if (positionals.length !== 1) throw new SddError('usage', 'sdd phase recibe un solo id', { next: './bin/sdd-ai sdd phase <id> [--request <archivo>] [--context <archivo>]' })
+  if (env.SDD_AI_WORKER === '1') throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
+  const id = positionals[0]
+  const deadlineArg = values.deadline ?? '600'
+  const deadline = Number(deadlineArg)
+  if (!Number.isFinite(deadline) || deadline <= 0) throw new SddError('usage', `--deadline inválido: ${deadlineArg}`)
+
+  const root = repoRoot(cwd)
+  const read = readFlow(root, id, loadJiraMode(root))
+  const status = resolveFlow(read.facts)
+  if (status.depth === 'corta') {
+    throw new SddError('phase_inline', 'en profundidad corta las fases van inline', { next: 'sigue la fase inline, en tu sesión' })
+  }
+  const step = status.next.step
+  if (status.depth === null || !PHASE_STEPS.includes(step)) {
+    throw new SddError('not_a_phase', `el paso actual del flujo ${id} es ${step}: sdd phase solo lanza specify, plan, tasks o implement`, {
+      next: `./bin/sdd-ai sdd status ${id}`,
+    })
+  }
+  const depth = status.depth
+  const record = readPhaseRecord(root, id)
+  const running = activeRun(root, record)
+  if (running) throw new SddError('phase_running', `el flujo ${id} tiene una corrida de fase activa: ${running}`, { next: `./bin/sdd-ai wait ${running}` })
+  const conductor = detectConductor(env, { conductor: values.conductor })
+  if (step === 'implement') {
+    if (values.request !== undefined || values.context !== undefined) throw phaseUsage('--request y --context no se usan en implement')
+    return phaseImplement({ root, env, id, read, depth, conductor, families: values.families, deadline })
+  }
+
+  const doc = step as DocumentStep
+  const entry = record.phases[doc]
+  if (entry?.inline) {
+    throw new SddError('phase_inline', `la fase ${doc} del flujo ${id} la sigue el conductor inline: la ampliación volvió a devolver preguntas o faltantes`, {
+      next: 'sigue la fase inline, en tu sesión',
+    })
+  }
+  const awaiting = entry?.awaiting
+  if (awaiting && values.context === undefined) {
+    throw new SddError('context_required', `la fase ${doc} del flujo ${id} espera ampliación`, {
+      detail: [...awaiting.blocking_questions.map((q) => `pregunta: ${q}`), ...awaiting.missing_context.map((m) => `falta: ${m}`)].join('\n'),
+      next: `el usuario contesta las preguntas bloqueantes y el contexto faltante sale del repositorio; con eso en un archivo: ./bin/sdd-ai sdd phase ${id} --context <archivo>. Si no, sigue la fase inline`,
+    })
+  }
+  if (!awaiting && values.context !== undefined) throw phaseUsage(`--context solo se usa cuando la fase espera ampliación, y la fase ${doc} no la espera`)
+  if (values.request !== undefined && (doc !== 'specify' || awaiting)) throw phaseUsage('--request solo se usa en la primera corrida de specify')
+  if (doc === 'specify' && !awaiting && values.request === undefined) {
+    throw new SddError('request_required', 'falta el pedido de la fase specify', { next: `./bin/sdd-ai sdd phase ${id} --request <archivo>` })
+  }
+
+  const request = values.request !== undefined ? readMaterial(root, values.request, 'el pedido', true) : undefined
+  const context = values.context !== undefined ? readMaterial(root, values.context, 'el contexto', true) : undefined
+  // En una ampliación de specify, el pedido es la copia que guardó la primera corrida.
+  let requestFile: { path: string; bytes: Buffer } | undefined = request && { path: join(root, request.path), bytes: request.bytes }
+  if (doc === 'specify' && awaiting) {
+    const copy = join(root, '.sdd-ai', 'runs', awaiting.run, 'request.md')
+    if (!existsSync(copy)) {
+      throw new SddError('request_lost', `no está la copia del pedido que guardó la corrida ${awaiting.run}`, { next: 'sigue la fase specify inline' })
+    }
+    requestFile = { path: copy, bytes: readFileSync(copy) }
+  }
+
+  let plan_header: Parameters<typeof freezeLaunch>[1]['plan_header']
+  if (doc === 'plan') {
+    const h = planHeaderFrom(id, headerData(read.facts.handoffHeader), currentBranch(root), headCommit(root) ?? null, new Date())
+    if ('missing' in h) {
+      throw new SddError('plan_header_incomplete', `faltan datos para el header de plan.md: ${h.missing.join(', ')}`, {
+        next: 'completa change_type, profundidad y risk en el header de handoff.md, y lanza la fase desde una rama con un commit',
+      })
+    }
+    const { created_at: _created, ...frozen } = h.header
+    plan_header = frozen
+  }
+
+  const inputs: FrozenInputs = {}
+  for (const name of PHASE_INPUTS[doc]) {
+    if (name === 'request') inputs.request = requestFile?.bytes.toString('utf8')
+    else if (name === 'spec' || name === 'plan' || name === 'tasks') inputs[name] = flowBytes(root, read, name).toString('utf8')
+  }
+  const criteria = doc === 'tasks' ? criteriaIds(inputs.spec ?? '') : undefined
+  if (criteria && criteria.length === 0) {
+    throw new SddError('phase_inline', 'la spec no tiene criterios reconocibles (ítems - **AC-<n>:** en ## Criterios de aceptación): la fase tasks va inline', {
+      next: 'sigue la fase tasks inline, en tu sesión',
+    })
+  }
+  if (context) inputs.context = context.bytes.toString('utf8')
+
+  const families = effectiveFamilies(loadCrossModel(root, FAMILIES.filter((f) => inPath(f, env))).families, values.families ? parseFamiliesFlag(values.families) : undefined)
+  const resolution = resolve({ conductor, families, workers: loadWorkers(root), role: doc, flags: {}, codexRoot: loadCodexRoot(env) })
+  // Las fases van siempre por proceso: la vía nativa no le devuelve al binario la respuesta del hijo.
+  resolution.via = 'process'
+  const launch = freezeLaunch(read, { step: doc, depth, amended: awaiting !== undefined, request: requestFile, context: context && { path: join(root, context.path), bytes: context.bytes }, plan_header })
+  const phaseRequest: PhaseRequest = {
+    kind: 'phase', flow: id, step: doc, amended: awaiting !== undefined, role: doc, conductor, session: ownerSession(env, conductor.family),
+    ...(values.request !== undefined ? { request_file: values.request } : {}), ...(values.context !== undefined ? { context_file: values.context } : {}),
+    overrides: { families: values.families, deadline_sec: deadline },
+  }
+  const files: Record<string, string | Buffer> = { 'inputs.json': `${JSON.stringify(launch, null, 2)}\n` }
+  if (requestFile) files['request.md'] = requestFile.bytes
+  if (context) files['context.md'] = context.bytes
+  const prompt = renderPhasePrompt(doc, { id, depth, step: doc }, inputs)
+
+  const started = withFlowLock(root, id, () => {
+    // Con el lock tomado, el flujo tiene que ser el que se leyó: si no, la fase ya no es la vigente.
+    if (JSON.stringify(readFlow(root, id, loadJiraMode(root)).digests) !== JSON.stringify(read.digests)) {
+      throw new SddError('artifacts_unstable', `el flujo ${id} cambió mientras se lanzaba la fase`, { next: `./bin/sdd-ai sdd status ${id}` })
+    }
+    const rec = readPhaseRecord(root, id)
+    const busy = activeRun(root, rec)
+    if (busy) throw new SddError('phase_running', `el flujo ${id} tiene una corrida de fase activa: ${busy}`, { next: `./bin/sdd-ai wait ${busy}` })
+    if (JSON.stringify(rec.phases[doc] ?? null) !== JSON.stringify(entry ?? null)) {
+      throw new SddError('flow_busy', `el registro de la fase ${doc} cambió mientras se lanzaba`, { next: `./bin/sdd-ai sdd status ${id}` })
+    }
+    const s = startProcessRun({
+      root, env, resolution, prompt, request: { ...phaseRequest }, deadline, conductor, files,
+      argvExtra: { kind: 'phase', phase: { ...launch, root, ...(criteria ? { criteria } : {}) } },
+    })
+    const phases: PhaseRecord['phases'] = awaiting ? { ...rec.phases, [doc]: { ...entry, amended: { run: s.id, consumed: false } } } : rec.phases
+    writePhaseRecord(root, id, { ...rec, last_run: { id: s.id, step: doc }, phases })
+    return s
+  })
+  if (!started.launched) {
+    return {
+      code: 1,
+      out: { id: started.id, state: 'launch_failed', reason: 'cli_missing', detail: `${resolution.family} no está en PATH`, fallback: conductor, next: phaseFallbackNext(phaseRequest, conductor) },
+    }
+  }
+  return { code: 0, out: { id: started.id, via: resolution.via, family: resolution.family, flow: id, step: doc, amended: awaiting !== undefined, next: `./bin/sdd-ai wait ${started.id}` } }
+}
+
 /**
  * El estado de los flujos SDD de `.plans/`. `status` solo lee y sale con 0 aunque el flujo esté
- * bloqueado; `approve` registra la aprobación de un gate y responde el estado nuevo.
+ * bloqueado; `approve` registra la aprobación de un gate y responde el estado nuevo; `phase` lanza la
+ * fase del flujo en un worker.
  */
-function sdd(args: string[], env: Env, cwd: string): Result {
+async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
   const [sub, ...rest] = args
+  if (sub === 'phase') return sddPhase(rest, env, cwd)
   if (sub === 'status') {
     const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { json: { type: 'boolean', default: false } } })
     if (positionals.length > 1) throw new SddError('usage', 'sdd status recibe un solo id', { next: './bin/sdd-ai sdd status [<id>]' })
     const root = repoRoot(cwd)
-    if (positionals.length === 0) return { code: 0, out: { flows: listFlows(root) } }
+    if (positionals.length === 0) return { code: 0, out: { flows: listFlows(root).map((e) => ({ ...e, next: withPhaseNext(root, e.id, e) })) } }
     const { facts } = readFlow(root, positionals[0])
     const status = resolveFlow(facts)
-    // En un gate, la pregunta que el conductor le hace al usuario antes de sdd approve.
-    if (status.next.step !== 'gate' || status.next.gate === undefined || status.depth === null) return { code: 0, out: status }
-    const question = gateQuestionFor(positionals[0], status.depth, status.next.gate, facts.fingerprints)
-    return { code: 0, out: { ...status, next: { ...status.next, question } } }
+    return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
   }
   if (sub === 'approve') {
     const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { conductor: { type: 'string' } } })
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
     return { code: 0, out: approve(repoRoot(cwd), positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor)) }
   }
-  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate>' })
+  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id>' })
 }
 
 /** El `--conductor` de un comando protegido: elige de qué sesión se lee la respuesta del usuario. */
@@ -1816,7 +2128,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'wait': return await wait(rest, env, cwd)
       case 'cancel': return await cancel(rest, cwd)
       case 'agents': return agents(rest, env, cwd)
-      case 'sdd': return sdd(rest, env, cwd)
+      case 'sdd': return await sdd(rest, env, cwd)
       case 'doctor': {
         const report = doctor(undefined, skillCheck(cwd))
         return { code: report.ok ? 0 : 1, out: report }

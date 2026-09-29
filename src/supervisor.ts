@@ -27,6 +27,9 @@ import { codexResume, codexRetry, codexReviewLaunch, withResultFile } from './wo
 import {
   type GroupIdentity, captureTreeAtBase, freezeHarvest, groupState, readControl, readProcess, recordGroup, writeControl,
 } from './writer-store.ts'
+import { type DocumentContract, admitPlan, admitSpecify, admitTasks } from './sdd/phase.ts'
+import { readPhaseRecord, withFlowLock, writePhaseRecord } from './sdd/phase-state.ts'
+import { type FrozenLaunch, type PublishOutcome, publishPhase } from './sdd/publish.ts'
 
 /** Un revisor sobre un lote. `prompt` es la ruta de su prompt, ya medido y escrito por la CLI. */
 export interface ReviewJob { key: string; reviewer: Reviewer; batch: number; paths: string[]; prompt: string; targets?: Target[] }
@@ -47,7 +50,9 @@ export interface ArgvFile {
   launch?: LaunchSpec
   /** Tope de la reanudación que sigue a un `timeout`; el de la corrida ya venció a esa altura. */
   resume_sec?: number
-  kind?: 'run' | 'review' | 'writer'
+  kind?: 'run' | 'review' | 'writer' | 'phase'
+  /** Una corrida de fase: lo que congeló al lanzarse, la raíz del repo y, en `tasks`, los criterios de la spec. */
+  phase?: FrozenLaunch & { root: string; criteria?: string[] }
   /** Un writer: la raíz del checkout que lo lanzó y su corrida. El supervisor corre en su almacén. */
   root?: string
   id?: string
@@ -837,6 +842,7 @@ export async function supervise(dir: string, argvName = 'argv.json'): Promise<St
   const resumeSec = argv.resume_sec ?? DEFAULT_RESUME_SEC
   if (argv.kind === 'review') return superviseReview(ctx, resumeSec)
   if (argv.kind === 'writer') return superviseWriter(ctx, resumeSec)
+  if (argv.kind === 'phase') return supervisePhase(ctx, resumeSec)
   // Un cancel que llegó antes de que hubiera worker: no se lanza nada.
   if (existsSync(cancelFile)) return setStatus(dir, { state: 'cancelled', ended_at: new Date().toISOString() })
   if (!argv.launch) throw new Error('la corrida no trae su lanzamiento')
@@ -848,6 +854,84 @@ export async function supervise(dir: string, argvName = 'argv.json'): Promise<St
   if (r.retry) patch.retry = r.retry
   if (r.resume) patch.resume = r.resume
   return setStatus(dir, patch)
+}
+
+/** Lo que una corrida de fase deja en `phase.json`: la salida, el artefacto y lo que el gate necesita. */
+export interface PhaseResult {
+  outcome: 'published' | 'awaiting_context' | 'closed_inline' | 'not_published' | 'not_admitted'
+  artifact?: string; assumptions: string[]; blocking_questions: string[]; missing_context: string[]; cause?: string
+}
+
+/**
+ * Una corrida de fase: el hijo con sus recuperaciones, la admisión del contrato con una sola corrección
+ * y la salida. Con preguntas o faltantes la fase espera ampliación, o se cierra inline si ya se amplió;
+ * sin ellos, se publica el artefacto. La salida y el registro se escriben antes del estado terminal:
+ * mientras no hay terminal, la corrida sigue activa y ninguna otra fase del flujo arranca.
+ */
+async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Status> {
+  const { dir, argv, cancelFile } = ctx
+  const phase = argv.phase
+  if (!phase || !argv.launch) throw new Error('la corrida de fase no trae lo que congeló o su lanzamiento')
+  const run = basename(dir)
+  const finish = (patch: Partial<Status>, result?: PhaseResult) => {
+    if (result) writeJsonAtomic(join(dir, 'phase.json'), result)
+    return setStatus(dir, { ...patch, ended_at: new Date().toISOString() })
+  }
+  if (existsSync(cancelFile)) return finish({ state: 'cancelled' })
+  const r = await runAttempts(ctx, argv.launch, Date.now() + argv.deadline_sec * 1000, resumeSec, 'run')
+  const extras: Partial<Status> = {
+    ...(r.facts.sessionId ? { session_id: r.facts.sessionId } : {}), ...(r.retry ? { retry: r.retry } : {}), ...(r.resume ? { resume: r.resume } : {}),
+  }
+  if (r.outcome.state !== 'done') return finish({ ...outcomeFields(r.outcome), ...extras })
+
+  const admitFn = (text: string): Admission<DocumentContract> => {
+    if (phase.step === 'specify') return admitSpecify(text)
+    if (phase.step === 'plan') return admitPlan(text)
+    return admitTasks(text, phase.criteria ?? [])
+  }
+  const admitted = await admitPhase(ctx, r.current, r.last, resumeSec, admitFn, { name: '-fix', suffix: '-fix', kind: 'correction' })
+  const empty = { assumptions: [], blocking_questions: [], missing_context: [] }
+  if (!admitted.review) {
+    const detail = admitted.outcome.detail ?? admitted.outcome.reason ?? admitted.outcome.state
+    return finish({ ...outcomeFields(admitted.outcome), ...extras }, admitted.outcome.state === 'cancelled' ? undefined : { outcome: 'not_admitted', ...empty, cause: detail })
+  }
+  const c = admitted.review
+  writeJsonAtomic(join(dir, 'contract.json'), c)
+  // Un cancel que llegó mientras se admitía corta antes de escribir nada en el flujo.
+  if (existsSync(cancelFile)) return finish({ state: 'cancelled', ...extras })
+  const lists = { assumptions: c.assumptions, blocking_questions: c.blocking_questions, missing_context: c.missing_context }
+  const step = phase.step
+
+  if (c.blocking_questions.length > 0 || c.missing_context.length > 0) {
+    const closed = withFlowLock(phase.root, phase.flow, () => {
+      const rec = readPhaseRecord(phase.root, phase.flow)
+      const entry = { ...rec.phases[step] }
+      // Una fase que ya se amplió no se amplía otra vez: la sigue el conductor inline.
+      const inline = phase.amended || entry.amended?.consumed === true
+      if (inline) {
+        delete entry.awaiting
+        entry.amended = { run: entry.amended?.run ?? run, consumed: true }
+        entry.inline = { run, at: new Date().toISOString() }
+      } else {
+        entry.awaiting = { run, blocking_questions: c.blocking_questions, missing_context: c.missing_context }
+      }
+      writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry } })
+      return inline
+    })
+    return finish({ state: 'done', ...extras }, { outcome: closed ? 'closed_inline' : 'awaiting_context', ...lists })
+  }
+
+  const out: PublishOutcome = publishPhase(phase.root, phase, c, new Date(), (o) => {
+    if (o.kind !== 'published') return
+    const rec = readPhaseRecord(phase.root, phase.flow)
+    const entry = { ...rec.phases[step] }
+    delete entry.awaiting
+    if (entry.amended) entry.amended = { ...entry.amended, consumed: true }
+    writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry } })
+  })
+  if (out.kind === 'published') return finish({ state: 'done', ...extras }, { outcome: 'published', artifact: out.artifact, ...lists })
+  return finish({ state: 'failed', reason: 'not_published', detail: `${out.cause}: ${out.detail}`, ...extras },
+    { outcome: 'not_published', ...lists, cause: `${out.cause}: ${out.detail}` })
 }
 
 /**

@@ -875,7 +875,7 @@ test('la liga de una sesión no la ve otra', () => {
     post(cli, repo, './bin/sdd-ai sdd status f1')
     assert.equal(bound(repo, 's2'), null)
     const ctx = text(fire(cli, 'session-start', repo, { session_id: 's2', source: 'startup' }))
-    assert.match(ctx, /- f1 \(completa\): plan$/m)
+    assert.match(ctx, /- f1 \(completa\): plan · \.\/bin\/sdd-ai sdd phase f1$/m)
   }
 })
 
@@ -909,7 +909,7 @@ test('SessionStart suma una línea por flujo activo en los cuatro orígenes, sin
         const out = fire(cli, 'session-start', repo, { session_id: 's1', source })
         assert.deepEqual(checkOutput(cli, 'SessionStart', out), [], `${cli} ${source}`)
         const [head, f1, f2, f3, roto, ...rest] = text(out).split('\n\n').at(-1)!.split('\n')
-        assert.deepEqual([head, f1, f2], ['Flujos SDD en .plans/:', '- f1 (completa): plan · ligado a esta sesión', '- f2 (completa): gate spec'], source)
+        assert.deepEqual([head, f1, f2], ['Flujos SDD en .plans/:', '- f1 (completa): plan · ./bin/sdd-ai sdd phase f1 · ligado a esta sesión', '- f2 (completa): gate spec'], source)
         assert.equal(f3, '- f3: no se pudo leer (spec.md existe y no se puede leer)', source)
         assert.match(roto, /^- roto: no se pudo leer \(.*enlace simbólico/, source)
         assert.deepEqual(rest, [], source)
@@ -1212,4 +1212,26 @@ test('sin liga y con jira on se niega el commit a este repositorio o de destino 
     assert.equal(shell(cli, repo, 'git status'), '')
     assert.equal(shell(cli, flowRepo('off'), 'git commit -m x'), '')
   }
+})
+
+test('sdd phase en subagentes y workers se niega y la sesión del conductor queda ligada', () => {
+  const phases = WORKER_COMMANDS.map((c) => c.replace(/sdd-ai (run|review|wait|cancel)\b.*$/, 'sdd-ai sdd phase f1 --request pedido.md'))
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1')
+    for (const command of phases) {
+      const out = shell(cli, repo, command, CHILD)
+      assert.match(denial(out), /un worker no delega ni toca las corridas del conductor/, command)
+      assert.equal(shell(cli, repo, command), '', `fuera de un hijo: ${command}`)
+    }
+    // La liga se guarda termine como termine el verbo: también cuando se negó.
+    post(cli, repo, './bin/sdd-ai sdd phase f1 --request pedido.md', { failed: true })
+    assert.deepEqual(bound(repo), { id: 'f1', step: 'plan', gate: null }, cli)
+    const other = flowRepo()
+    writeFlow(other, 'f2')
+    post(cli, other, './bin/sdd-ai sdd phase f2 --context c.md --families codex --conductor claude --deadline 900')
+    assert.deepEqual(bound(other), { id: 'f2', step: 'plan', gate: null }, cli)
+  }
+  const worker = spawnSync(BIN, ['sdd', 'phase', 'f1', '--request', 'pedido.md'], { cwd: makeRepo(), encoding: 'utf8', env: { PATH: process.env.PATH, SDD_AI_WORKER: '1' } })
+  assert.equal(JSON.parse(worker.stdout).code, 'recursion')
 })

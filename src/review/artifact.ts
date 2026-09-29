@@ -57,7 +57,7 @@ export function validateArtifactArgs(v: {
 const UTF8 = new TextDecoder('utf-8', { fatal: true })
 
 /** Lee un archivo del material y lo valida: existe, está en el repo, es texto UTF-8 y, si hace falta, no está vacío. */
-function readMaterial(root: string, p: string, what: string, requireContent: boolean): { path: string; bytes: Buffer; real: string } {
+export function readMaterial(root: string, p: string, what: string, requireContent: boolean): { path: string; bytes: Buffer; real: string } {
   const abs = isAbsolute(p) ? p : resolve(root, p)
   // Se comprueba antes que readContextFile: su realpath sobre una ruta inexistente no da un error de uso.
   if (!existsSync(abs)) throw new SddError('usage', `${what} no existe: ${p}`)

@@ -51,7 +51,8 @@ export interface GateView { gate: GateId; artifacts: string[]; state: GateState 
 export interface GateResolution { depth: Depth | null; gates: GateView[]; blocked: Reason[]; notes: Reason[] }
 export type Step = 'no_artifacts' | 'depth' | 'specify' | 'plan' | 'tasks' | 'gate' | 'external_gate'
   | 'implement' | 'verify' | 'review_and_commit' | 'push' | 'open_pr' | 'archive' | 'resolve_blockers'
-export interface Next { step: Step; gate?: GateId; artifacts?: string[]; task?: string }
+/** `command` y `detail` los agrega la CLI en un paso de fase: `resolve` nunca los escribe. */
+export interface Next { step: Step; gate?: GateId; artifacts?: string[]; task?: string; command?: string; detail?: string }
 export interface FlowStatus {
   id: string
   depth: Depth | null

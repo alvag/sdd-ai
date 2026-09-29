@@ -27,24 +27,33 @@ export function normalize(text: string): string {
 
 /**
  * Un bloque cercado abre con tres o más `` ` `` o `~` y cierra con el mismo carácter, al menos la misma
- * cantidad y nada más en la línea. Uno que no cierra llega hasta el final, como en CommonMark.
+ * cantidad y nada más en la línea. Uno que no cierra llega hasta el final, como en CommonMark; `open` es
+ * el índice de la línea que lo abrió, o `null` si todas cerraron.
  */
-function scan(lines: string[]): Line[] {
+function scanFences(lines: string[]): { lines: Line[]; open: number | null } {
   let fence: { char: string; length: number } | null = null
-  return lines.map((text) => {
+  let open: number | null = null
+  const out = lines.map((text, i) => {
     const marks = FENCE.exec(text)?.[1]
     if (fence) {
-      if (marks && marks[0] === fence.char && marks.length >= fence.length && text.trim() === marks) fence = null
+      if (marks && marks[0] === fence.char && marks.length >= fence.length && text.trim() === marks) {
+        fence = null
+        open = null
+      }
       return { text, fenced: true, level: 0, title: '' }
     }
     if (marks) {
       fence = { char: marks[0], length: marks.length }
+      open = i
       return { text, fenced: true, level: 0, title: '' }
     }
     const h = HEADING.exec(text)
     return { text, fenced: false, level: h ? h[1].length : 0, title: h ? h[2] : '' }
   })
+  return { lines: out, open }
 }
+
+const scan = (lines: string[]): Line[] => scanFences(lines).lines
 
 /** `[desde, hasta)` de la sección `## <title>`: su heading y lo que sigue hasta el próximo `##` o `#`. */
 function sectionRange(lines: Line[], title: string, from = 0): [number, number] | null {
@@ -92,6 +101,53 @@ export function countTasks(text: string): TaskCount {
     else done++
   }
   return { total, done, firstPending }
+}
+
+/** Lo que se lee de la línea de una task con la gramática de la plantilla de `sdd-flow`. */
+export interface TaskLine { done: boolean; id: string; title: string; covers: string[] }
+
+const TASK_BODY = /^(\*\*)?(T\d+) — (.+?)\1(?:[ \t]+·[ \t]+cubre:[ \t]*(.*))?$/
+const CRITERION = /^[-*+][ \t]+\*\*(AC-\d+):\*\*/
+
+/**
+ * `- [ ] **T<n> — <título>**  · cubre: AC-1, AC-2`, con o sin negrita y con o sin la cobertura. `null`
+ * si la línea no es un checkbox de primer nivel o si lo es y no cumple la gramática.
+ */
+export function parseTaskLine(line: string): TaskLine | null {
+  const m = TASK.exec(line)
+  const b = m ? TASK_BODY.exec(m[2].trim()) : null
+  if (!m || !b) return null
+  const covers = b[4] === undefined ? [] : b[4].split(',').map((c) => c.trim()).filter((c) => c !== '')
+  return { done: m[1] !== ' ', id: b[2], title: b[3], covers }
+}
+
+/** Las líneas que `countTasks` cuenta, en orden, con su marca y lo que la gramática de task lee de cada una. */
+export function taskLines(text: string): { text: string; done: boolean; task: TaskLine | null }[] {
+  return scan(splitLines(text)).flatMap((l) => {
+    const m = l.fenced ? null : TASK.exec(l.text)
+    return m ? [{ text: l.text, done: m[1] !== ' ', task: parseTaskLine(l.text) }] : []
+  })
+}
+
+/** Los `AC-<n>` de los ítems `- **AC-<n>:**` de primer nivel dentro de `## Criterios de aceptación`, en orden. */
+export function criteriaIds(spec: string): string[] {
+  const lines = scan(splitLines(spec))
+  const r = sectionRange(lines, 'Criterios de aceptación')
+  if (!r) return []
+  return lines.slice(r[0] + 1, r[1]).filter((l) => !l.fenced).map((l) => CRITERION.exec(l.text)?.[1]).filter((id) => id !== undefined)
+}
+
+/**
+ * Lo que impide admitir una prosa: un heading de cualquier nivel, fuera de las cercas, cuyo título es
+ * uno de `reserved`, y una cerca que no cierra, que se tragaría lo que el binario escribe después.
+ */
+export function proseProblems(text: string, reserved: readonly string[]): string[] {
+  const { lines, open } = scanFences(splitLines(text))
+  const problems = lines
+    .filter((l) => !l.fenced && l.level > 0 && reserved.includes(l.title.replace(/(?:^|[ \t]+)#+$/, '').trimEnd()))
+    .map((l) => `la prosa trae el título reservado ${JSON.stringify(l.text.trim())}`)
+  if (open !== null) problems.push(`la prosa deja una cerca sin cerrar en su línea ${open + 1}`)
+  return problems
 }
 
 const unmark = (l: Line): Line => (l.fenced ? l : { ...l, text: l.text.replace(DONE_MARK, '$1 ') })

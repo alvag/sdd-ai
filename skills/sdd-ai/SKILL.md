@@ -1,6 +1,6 @@
 ---
 name: sdd-ai
-description: Delega una tarea de solo lectura (explorar, buscar, resumir código) o una escritura acotada a un worker de Claude o Codex elegido por la config del repo, o revisa un diff congelado con un revisor aislado. Usar cuando el usuario pide "delega esto a un worker", "usa sdd-ai", "que otro agente explore esto" o "revisa este diff".
+description: Delega una tarea de solo lectura (explorar, buscar, resumir código) o una escritura acotada a un worker de Claude o Codex elegido por la config del repo, revisa un diff congelado con un revisor aislado, o lanza en un worker la fase de un flujo SDD. Usar cuando el usuario pide "delega esto a un worker", "usa sdd-ai", "que otro agente explore esto" o "revisa este diff".
 ---
 
 # sdd-ai: despachar un worker
@@ -42,7 +42,8 @@ antes, consérvalo para reintentar.
 **`"via": "native"`**: lánzalo tú, sin heredar esta conversación.
 
 - Claude Code: herramienta `Agent` con `subagent_type` igual al valor de `agent` (hay un agente
-  por rol, como `sdd-ai-explore` o `sdd-ai-code-review`).
+  por rol, como `sdd-ai-explore` o `sdd-ai-code-review`). Los roles de fase (`specify`, `plan` y
+  `tasks`) no tienen agente: los despacha solo `sdd phase`, por proceso (§9).
 - Codex: `spawn_agent` con `agent_type` igual al valor de `agent`, sin heredar el historial.
   El subagente hereda la búsqueda web de tu sesión, porque Codex no aplica `web_search` desde el
   archivo del agente. Por eso `explore` e `investigate` buscan solo si la tienes encendida, y en los
@@ -331,6 +332,9 @@ con sus umbrales; esta sección dice cómo.
   y congela la cosecha. Si no lo acredita, no envía ninguna señal y el `next` trae
   `cancel <id> --writer-gone`: córrelo solo después de que el usuario confirme que el writer ya no
   corre, porque congela y libera la reserva sin señalar a nadie.
+- **`implement` por fase.** En un flujo SDD en `normal` o `completa`, `sdd phase <id>` en el paso
+  `implement` lanza este mismo writer con todas las tasks pendientes y el contrato de `implement` (§9).
+  Todo lo de esta sección rige igual; `wait` suma el contrato y el paso del flujo.
 - **Límites de esta fase:**
   - el writer solo sale por proceso: no hay writer nativo;
   - no hay ciclo de corrección automático;
@@ -390,7 +394,7 @@ reglas de la guarda del commit (abajo).
 - **`SessionStart`**: al retomar o compactar, te devuelve las corridas abiertas de tu sesión, cada
   una con lo que sigue. Al abrir o limpiar, lista en una línea las abiertas de otras sesiones, solo
   como dato. En los cuatro casos suma una línea por flujo SDD activo de `.plans/`, con su
-  profundidad y su paso siguiente. Marca el flujo ligado a tu sesión (§9) y muestra un flujo ilegible
+  profundidad y su paso siguiente y, en una fase, su comando o por qué no lo hay (§9). Marca el flujo ligado a tu sesión (§9) y muestra un flujo ilegible
   con su motivo. Un directorio sin artefactos no es un flujo y no sale.
 - **`Stop`**: si terminas el turno con corridas propias abiertas, lo reabre una vez con qué corrida,
   en qué estado y qué sigue. Una corrida está abierta si:
@@ -409,13 +413,13 @@ reglas de la guarda del commit (abajo).
   preguntarle al usuario si reintenta o la descarta: `cancel` solo cambia el registro local, y
   reintentar puede lanzar otro agente si el primero llegó a arrancar.
 - **`PostToolUse`**, sobre todas las herramientas: confirma la reserva de un despacho, liga tu sesión
-  cuando un `Bash` tuyo corre `sdd status <id>` o `sdd approve <id> <gate>` (§9) y cuenta la
+  cuando un `Bash` tuyo corre `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` (§9) y cuenta la
   herramienta para el recordatorio de sesión larga. En Claude Code, **`PostToolUseFailure`** libera la
   reserva de un despacho que falló y liga igual cuando el comando del `Bash` sale con un código
   distinto de cero: en Claude Code, ese comando llega por este evento.
 - **`PreToolUse` sobre `Bash`**: en cualquier sesión, aplica la guarda del commit (abajo). Dentro de un
-  subagente, además, niega `sdd-ai run`, `review`, `wait`, `cancel` y `sdd approve`. Un worker no
-  delega, no toca las corridas del conductor ni aprueba gates.
+  subagente, además, niega `sdd-ai run`, `review`, `wait`, `cancel`, `sdd approve` y `sdd phase`. Un
+  worker no delega, no toca las corridas del conductor, no aprueba gates ni lanza fases.
 
 Claude Code carga los hooks del repositorio sin pedir nada. Codex los ejecuta solo después de que el
 usuario los aprueba en `/hooks`, y vuelve a pedirlo cada vez que cambian sus definiciones.
@@ -543,6 +547,7 @@ cambian, `status` devuelve el flujo a ese gate.
 ```
 ./bin/sdd-ai sdd status [<id>]
 ./bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]
+./bin/sdd-ai sdd phase <id> [--request <archivo>] [--context <archivo>] [--families <f>] [--conductor claude|codex] [--deadline <s>]
 ```
 
 - **Lo que trae `sdd status <id>`**: `depth`, los `gates` de esa profundidad con su `state`
@@ -596,8 +601,8 @@ cambian, `status` devuelve el flujo a ese gate.
   handoff espera la aprobación externa de la spec, y ahí `next` es `external_gate` en vez de
   `implement`: seguir sin esa aprobación lo decide el usuario. Con `jira_approval` en `on` (§8), vale
   también cuando el handoff no tiene `gate_status`, y alcanza a `verify` y a `review_and_commit`.
-- **La liga.** `sdd status <id>` o `sdd approve <id> <gate>`, como primer tramo de un comando tuyo,
-  ligan tu sesión a ese flujo, termine como termine el comando. El paso de ese momento queda como
+- **La liga.** `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>`, como primer tramo de
+  un comando tuyo, ligan tu sesión a ese flujo, termine como termine el comando. El paso de ese momento queda como
   referencia de `Stop`.
   - Otro id mueve la liga, y el mismo renueva la referencia.
   - Se suelta sola cuando el plan llega a `status: done` o el directorio del flujo ya no está.
@@ -609,3 +614,76 @@ cambian, `status` devuelve el flujo a ese gate.
   **Corre `sdd status <id>` al empezar o retomar un flujo**, y también al seguir en una sesión que se
   abrió antes de actualizar los hooks. Sin liga, `Stop` no recuerda su paso, la guarda del commit no
   lo ve y el recordatorio de sesión larga no se calla (§8).
+
+### Las fases en un worker: `sdd phase`
+
+`sdd phase <id>` lanza la fase que dice `sdd status` (`specify`, `plan`, `tasks` o `implement`) en un
+worker por proceso, con el encargo que escribe el binario. Solo en `normal` y `completa`: en `corta` las
+fases van inline. El hijo devuelve un contrato fijo, el binario lo valida y escribe el artefacto que
+falta; el paso siguiente lo sigue decidiendo `sdd status`, no el hijo.
+
+- **Qué comando corres lo dice `sdd status <id>`** en `next.command`: `sdd phase <id>` (en `specify`,
+  con `--request <archivo>`), `wait <corrida>` si hay una corrida de fase activa, o `--context
+  <archivo>` si la fase espera ampliación. Sin comando, `next.detail` dice por qué: la fase va inline o
+  el árbol tiene cambios que resolver antes de `implement`. La línea del flujo de `SessionStart` dice lo
+  mismo.
+- **El pedido de `specify`** va en un archivo dentro del repositorio, de texto UTF-8 y no vacío, con
+  `--request`, y solo en la primera corrida: la corrida guarda su copia. `--context` sigue las mismas
+  reglas. Los bytes de los dos se congelan al lanzar.
+- **Se niega antes de crear nada** en un worker o un subagente, en `corta`, en un paso que no es una
+  fase (un gate, `verify` o cualquier otro), con una corrida de fase activa del flujo (el `next` trae su
+  `wait`), con la fase esperando ampliación sin `--context`, con la fase cerrada inline, con `--context`
+  sin ampliación o `--request` fuera de la primera corrida de `specify`. En `plan` se niega si falta la
+  rama, `HEAD` o `change_type`, `profundidad` o `risk` en el header de `handoff.md`; en `tasks`, si la
+  spec no tiene criterios `- **AC-<n>:**` en `## Criterios de aceptación`; en `implement`, si alguna task
+  pendiente no sigue la línea `- [ ] **T<n> — <título>**` de la plantilla. En esos tres casos la fase va
+  inline.
+- **Los contratos.** Un único objeto JSON con `phase` igual al paso; un `next` se descarta, cualquier
+  otra clave de más se rechaza y las listas van aunque estén vacías, que es "ninguno":
+  - `specify`: `known_facts` (hecho y puntero al código), `assumptions`, `blocking_questions`,
+    `missing_context`, `acceptance_criteria` (id `AC-<n>`, texto, autoridad y método de verificación) y
+    la prosa de `problem`, `background` y `scope`;
+  - `plan`: las tres listas y `approach`, `decisions` (admite "ninguno"), `files` y `verification`, que
+    va bajo `## Verification`; el header de `plan.md` lo arma el binario con las claves de `sdd-flow`;
+  - `tasks`: las tres listas y cada task con id `T<n>`, título, los criterios que cubre, el patrón del
+    repositorio, la prueba que la discrimina, sus archivos y sus pasos; cada criterio de la spec lo
+    cubre alguna task;
+  - `implement`: `missing_context` y una entrada por task pendiente con su `change_kind` (`defect`,
+    `behavior_change` o `refactor`), qué cambió, la desviación del plan o `null` y la comprobación que
+    te toca correr.
+  En `specify`, `plan` y `tasks` una salida que no se admite tiene una sola corrección; si la segunda
+  tampoco, la corrida falla sin artefacto.
+- **El artefacto.** El binario escribe `spec.md`, `plan.md` o `tasks.md` desde los campos validados, solo
+  si no existe y si nada cambió desde el lanzamiento: el paso, la profundidad, los insumos, el header de
+  `handoff.md` y, en `plan`, la rama y `HEAD`. Nunca pisa ni edita un artefacto: corregirlo sigue siendo
+  tuyo.
+- **Lo que trae `wait`**: el estado, `outcome` (`published`, `awaiting_context`, `closed_inline`,
+  `not_published` o `not_admitted`), el `artifact` escrito, los `assumptions` del hijo y, si no se
+  escribió, las `blocking_questions` y el `missing_context`, o la `cause`. No trae el documento ni el
+  contrato: quedan en la corrida. Su `next` es el de `sdd status` en ese momento. **Declara los
+  `assumptions` en el gate**, como cualquier supuesto tuyo.
+- **La ampliación, una por fase.** Si el hijo devolvió preguntas o faltantes, el artefacto no se
+  escribe. **Las preguntas bloqueantes las contesta el usuario**: házselas, no las respondas tú. **El
+  contexto faltante sale del repositorio**: búscalo tú. Escribe las respuestas y lo encontrado en un
+  archivo del repositorio y corre `sdd phase <id> --context <archivo>`: relanza la fase con sus insumos
+  y ese archivo. Si esa corrida no llega a publicar ni a cerrar (no arranca, falla o no se admite), la
+  fase sigue esperando y puedes volver a lanzarla con `--context`. Si el hijo vuelve a devolver
+  faltantes, la fase se cierra y **la sigues inline**.
+- **`implement`**: un solo writer con todas las tasks pendientes, por el mismo camino que `run --role
+  implement` (§6), árbol limpio incluido. El `wait` suma `contract` (si se admitió, la causa y el
+  `missing_context`) y `flow_next`, el paso de `sdd status`; su `next` es el de la cosecha. Un contrato
+  no admitido, un `missing_context` o insumos que cambiaron no proponen la revisión, igual que las demás
+  fallas de la cosecha. El binario no marca las tasks: las marcas tú después de revisar el diff y correr
+  las comprobaciones. Con el árbol limpio y tasks pendientes, `sdd phase` lanza otro writer.
+- **Límites:**
+  - las fases van solo por proceso, aunque la familia sea la tuya: la vía nativa no le entrega al
+    binario la respuesta del hijo;
+  - el binario valida la forma, no el mérito: que un criterio tenga método o una task cite un patrón no
+    dice que sirvan, y eso lo juzgan la revisión del artefacto y el gate;
+  - el writer no corre pruebas: las comprobaciones de cada task las corres tú;
+  - el hijo Codex sigue leyendo el `AGENTS.md` del repositorio y el del usuario: el encargo le pide
+    ignorarlos, sin garantía;
+  - con `.plans/` versionado, publicar o marcar tasks ensucia el árbol, y `next.detail` lo dice antes de
+    `implement`;
+  - el registro de las fases vive en `.plans/<id>/sdd-ai-phases.json`, bajo el mismo lock que `sdd
+    approve`: un writer que desobedece sus reglas podría alterarlo.

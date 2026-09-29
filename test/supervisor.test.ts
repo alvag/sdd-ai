@@ -15,6 +15,9 @@ import { ARTIFACT_SYSTEM_PROMPT, REFUTER_SYSTEM_PROMPT } from '../src/workers/cl
 import { renderArtifactMaterial, renderArtifactPrompt } from '../src/review/artifact-prompt.ts'
 import { freezeArtifact } from '../src/review/artifact.ts'
 import { type Family, type Resolution, opposite } from '../src/types.ts'
+import { type PhaseRecord, readPhaseRecord, withFlowLock, writePhaseRecord } from '../src/sdd/phase-state.ts'
+import { freezeLaunch } from '../src/sdd/publish.ts'
+import { readFlow } from '../src/sdd/read.ts'
 import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
 
 const FAKE = join(import.meta.dirname, 'fake-cli.ts')
@@ -1064,4 +1067,93 @@ test('el cierre del writer pide terminar sin archivos a medio escribir', () => {
   assert.match(m, /no empieces cambios nuevos/)
   assert.match(m, /STATUS: done/)
   assert.notEqual(m, closingMessage('run'))
+})
+
+/** Una corrida de fase `specify` sobre un flujo en disco, con las respuestas guionadas del hijo. */
+function preparePhase(answers: string[], o: { amended?: boolean; record?: PhaseRecord } = {}) {
+  const repo = makeRepo()
+  const flow = join(repo, '.plans', 'f')
+  mkdirSync(flow, { recursive: true })
+  writeFileSync(join(flow, 'handoff.md'), '---\nprofundidad: completa\nrisk: low\nchange_type: feat\n---\n\n# Handoff\n')
+  const request = join(mkdtempSync(join(tmpdir(), 'sdd-ai-pedido-')), 'pedido.md')
+  writeFileSync(request, 'Quiero exportar.\n')
+  const dir = createRun(repo, 'p1')
+  writeFileSync(join(dir, 'prompt.md'), 'encargo de fase')
+  writeFileSync(join(dir, 'answers.json'), JSON.stringify(answers))
+  const launch = freezeLaunch(readFlow(repo, 'f'), {
+    step: 'specify', depth: 'completa', amended: o.amended ?? false, request: { path: request, bytes: readFileSync(request) },
+  })
+  const argv: ArgvFile = {
+    family: 'claude', kind: 'phase', deadline_sec: 30, phase: { ...launch, root: repo },
+    launch: { cmd: process.execPath, args: [FAKE], cwd: repo, stdinFile: join(dir, 'prompt.md') },
+  }
+  writeJsonAtomic(join(dir, 'argv.json'), argv)
+  withFlowLock(repo, 'f', () => writePhaseRecord(repo, 'f', o.record ?? { schema_version: 1, last_run: { id: 'p1', step: 'specify' }, phases: {} }))
+  process.env.FAKE_MODE = 'scripted'
+  process.env.FAKE_ANSWERS = join(dir, 'answers.json')
+  process.env.FAKE_CALLS_FILE = join(dir, 'calls')
+  return { repo, flow, dir }
+}
+
+const SPEC_CONTRACT = {
+  phase: 'specify', known_facts: [], assumptions: ['uno'], blocking_questions: [], missing_context: [],
+  acceptance_criteria: [{ id: 'AC-1', text: 'exporta', authority: 'pedido', verification: 'test' }],
+  problem: 'Problema.', background: 'Nada.', scope: 'Todo.',
+}
+const phaseOut = (dir: string) => JSON.parse(readFileSync(join(dir, 'phase.json'), 'utf8'))
+
+test('la fase admite su contrato con una sola corrección y descarta next', async () => {
+  const fixed = preparePhase([JSON.stringify({ ...SPEC_CONTRACT, extra: 1 }), JSON.stringify(SPEC_CONTRACT)])
+  assert.equal((await supervise(fixed.dir)).state, 'done')
+  assert.equal(calls(fixed.dir).length, 2)
+  assert.match(readFileSync(join(fixed.dir, 'prompt-fix.md'), 'utf8'), /extra/)
+  assert.deepEqual([phaseOut(fixed.dir).outcome, phaseOut(fixed.dir).artifact], ['published', '.plans/f/spec.md'])
+  assert.deepEqual(phaseOut(fixed.dir).assumptions, ['uno'])
+  assert.ok(existsSync(join(fixed.flow, 'spec.md')))
+  assert.deepEqual(JSON.parse(readFileSync(join(fixed.dir, 'contract.json'), 'utf8')), SPEC_CONTRACT)
+
+  const missing = Object.fromEntries(Object.entries(SPEC_CONTRACT).filter(([k]) => k !== 'scope'))
+  const twice = preparePhase([JSON.stringify(missing), JSON.stringify(missing)])
+  const s = await supervise(twice.dir)
+  assert.deepEqual([s.state, s.reason], ['unavailable', 'inadmissible_twice'])
+  assert.equal(phaseOut(twice.dir).outcome, 'not_admitted')
+  assert.match(phaseOut(twice.dir).cause, /scope/)
+  assert.equal(existsSync(join(twice.flow, 'spec.md')), false)
+  assert.equal(existsSync(join(twice.dir, 'contract.json')), false)
+
+  const next = preparePhase([JSON.stringify({ ...SPEC_CONTRACT, next: 'plan' })])
+  assert.equal((await supervise(next.dir)).state, 'done')
+  assert.equal(calls(next.dir).length, 1)
+  assert.equal(phaseOut(next.dir).outcome, 'published')
+})
+
+test('la fase con faltantes espera ampliación, la ampliada con faltantes se cierra inline y una sin publicar no consume nada', async () => {
+  const asking = { ...SPEC_CONTRACT, blocking_questions: ['¿CSV o TSV?'], missing_context: ['el esquema'] }
+  const first = preparePhase([JSON.stringify(asking)])
+  assert.equal((await supervise(first.dir)).state, 'done')
+  assert.deepEqual(phaseOut(first.dir), { outcome: 'awaiting_context', assumptions: ['uno'], blocking_questions: ['¿CSV o TSV?'], missing_context: ['el esquema'] })
+  assert.deepEqual(readPhaseRecord(first.repo, 'f').phases.specify, { awaiting: { run: 'p1', blocking_questions: ['¿CSV o TSV?'], missing_context: ['el esquema'] } })
+  assert.equal(existsSync(join(first.flow, 'spec.md')), false)
+
+  const waiting: PhaseRecord = {
+    schema_version: 1, last_run: { id: 'p1', step: 'specify' },
+    phases: { specify: { awaiting: { run: 'p0', blocking_questions: ['¿CSV o TSV?'], missing_context: [] }, amended: { run: 'p1', consumed: false } } },
+  }
+  const again = preparePhase([JSON.stringify(asking)], { amended: true, record: waiting })
+  await supervise(again.dir)
+  assert.equal(phaseOut(again.dir).outcome, 'closed_inline')
+  const closed = readPhaseRecord(again.repo, 'f').phases.specify
+  assert.deepEqual([closed?.awaiting, closed?.amended, closed?.inline?.run], [undefined, { run: 'p1', consumed: true }, 'p1'])
+
+  const published = preparePhase([JSON.stringify(SPEC_CONTRACT)], { amended: true, record: waiting })
+  await supervise(published.dir)
+  assert.equal(phaseOut(published.dir).outcome, 'published')
+  assert.deepEqual(readPhaseRecord(published.repo, 'f').phases.specify, { amended: { run: 'p1', consumed: true } })
+
+  const blocked = preparePhase([JSON.stringify(SPEC_CONTRACT)], { amended: true, record: waiting })
+  writeFileSync(join(blocked.flow, 'spec.md'), 'la escribió otro\n')
+  const b = await supervise(blocked.dir)
+  assert.deepEqual([b.state, b.reason], ['failed', 'not_published'])
+  assert.equal(phaseOut(blocked.dir).outcome, 'not_published')
+  assert.deepEqual(readPhaseRecord(blocked.repo, 'f').phases.specify, waiting.phases.specify)
 })

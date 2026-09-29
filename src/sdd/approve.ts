@@ -1,11 +1,11 @@
 import { join } from 'node:path'
 import { type Proof, prove } from '../approval/proof.ts'
 import { GATE_OPTIONS, gateQuestion } from '../approval/question.ts'
-import { withLock } from '../lock.ts'
 import { freezeStableWith } from '../review/candidate.ts'
 import { writeJsonAtomic } from '../runs.ts'
 import { type Family, SddError } from '../types.ts'
-import { APPROVALS_FILE, FILE_NAMES, type FlowRead, LOCK_FILE, flowDir, lstatOrNull, pathInvalid, readFlow } from './read.ts'
+import { withFlowLock } from './phase-state.ts'
+import { APPROVALS_FILE, FILE_NAMES, type FlowRead, flowDir, lstatOrNull, pathInvalid, readFlow } from './read.ts'
 import { type Approval, type Depth, type FlowStatus, GATE_IDS, GATES, type GateId, missingParts, resolve } from './status.ts'
 
 const APPROVED = new Set(['approved', 'approved_unfingerprinted'])
@@ -57,13 +57,7 @@ export function approve(root: string, id: string, gate: string, now: Date, read:
   const registered = (r: FlowRead) => (r.facts.log.state === 'ok' ? r.facts.log.approvals.filter((a) => a.gate === gate).length : 0)
   const seen = registered(observed)
   const dir = flowDir(root, id)
-  const lock = join(dir, LOCK_FILE)
-  if (lstatOrNull(lock)?.isSymbolicLink()) throw pathInvalid(`.plans/${id}/${LOCK_FILE}`, 'es un enlace simbólico')
-
-  const busy = () => new SddError('approve_in_progress', `otro sdd approve tiene tomado el flujo ${id}`, {
-    next: `si no hay otro sdd approve corriendo, borra .plans/${id}/${LOCK_FILE} y vuelve a correr el comando`,
-  })
-  return withLock(lock, busy, () => {
+  return withFlowLock(root, id, () => {
     let stable: FlowRead
     try {
       stable = freezeStableWith(root, id, read, (r) => JSON.stringify(r.digests))

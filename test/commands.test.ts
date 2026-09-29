@@ -4,7 +4,7 @@ import { bindingCommand, commitTargets, invokesBinding } from '../src/commands.t
 import { shellPipelines } from '../src/shell.ts'
 
 test('bindingCommand reconoce las formas del binario solo en el primer tramo', () => {
-  const binds: [string, 'status' | 'approve'][] = [
+  const binds: [string, 'status' | 'approve' | 'phase'][] = [
     ['sdd-ai sdd status f1', 'status'],
     ['./bin/sdd-ai sdd status --json f1', 'status'],
     ['/x/bin/sdd-ai sdd approve f1 spec --conductor claude', 'approve'],
@@ -12,6 +12,17 @@ test('bindingCommand reconoce las formas del binario solo en el primer tramo', (
     ['node /x/bin/sdd-ai sdd status f1 | head', 'status'],
   ]
   for (const [command, verb] of binds) assert.deepEqual(bindingCommand(command), { verb, id: 'f1' }, command)
+  const phases = [
+    './bin/sdd-ai sdd phase f1',
+    './bin/sdd-ai sdd phase f1 --request pedido.md',
+    './bin/sdd-ai sdd phase --context c.md f1',
+    './bin/sdd-ai sdd phase f1 --families codex --conductor claude --deadline 900',
+    './bin/sdd-ai sdd phase f1 --request=pedido.md',
+  ]
+  for (const command of phases) assert.deepEqual(bindingCommand(command), { verb: 'phase', id: 'f1' }, command)
+  for (const command of ['sdd-ai sdd phase', 'sdd-ai sdd phase f1 f2', 'sdd-ai sdd phase f1 --otra x', 'sdd-ai sdd phase f1 --request']) {
+    assert.equal(bindingCommand(command), undefined, command)
+  }
   const none = [
     'cd x && ./bin/sdd-ai sdd status f1',
     'false && ./bin/sdd-ai sdd status f1',

@@ -1,18 +1,19 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  DISPATCHABLE_ROLES, READ_ONLY_ROLES, RETIRED_ROLES, ROLES, SddError, isDispatchableRole, opposite, toNativeEffort,
+  DISPATCHABLE_ROLES, PHASE_ROLES, READ_ONLY_ROLES, RETIRED_ROLES, ROLES, SddError, isDispatchableRole, opposite, toNativeEffort,
 } from '../src/types.ts'
 
-test('los roles de solo lectura son todos menos implement', () => {
+test('los roles de solo lectura son todos menos implement y los de fase', () => {
   assert.equal(READ_ONLY_ROLES.length, 7)
   assert.equal((READ_ONLY_ROLES as readonly string[]).includes('implement'), false)
-  assert.deepEqual([...READ_ONLY_ROLES, 'implement'].sort(), [...ROLES].sort())
+  assert.deepEqual([...READ_ONLY_ROLES, 'implement', ...PHASE_ROLES].sort(), [...ROLES].sort())
 })
 
 test('run despacha los roles de lectura y implement, y nada más', () => {
-  assert.deepEqual([...DISPATCHABLE_ROLES].sort(), [...ROLES].sort())
+  assert.deepEqual([...DISPATCHABLE_ROLES].sort(), [...READ_ONLY_ROLES, 'implement'].sort())
   assert.equal(isDispatchableRole('implement'), true)
+  for (const r of PHASE_ROLES) assert.equal(isDispatchableRole(r), false, r)
   for (const r of ['pr', 'constructor', '__proto__', '', 7]) assert.equal(isDispatchableRole(r), false, String(r))
 })
 

@@ -43,7 +43,8 @@ const ALL_ANSWERS: readonly string[] = [...ANSWERS.verify, ...ANSWERS.respond]
 const REFUTE_RESULTS: readonly string[] = ['corroborated', 'refuted', 'inconclusive']
 export const GRAVE: ReadonlySet<string> = new Set(['BLOCKER', 'CRITICAL'])
 
-class Rejection extends Error {}
+/** Un motivo para no admitir una respuesta: `admitWith` lo convierte en `inadmissible` con su texto. */
+export class Rejection extends Error {}
 
 function isMap(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -78,19 +79,20 @@ function closingBrace(text: string, start: number): number {
 }
 
 /**
- * Los objetos JSON de la respuesta que traen `candidate_hash`. La prosa alrededor, un bloque de
- * código o una llave suelta en el texto no cuentan: solo lo que parsea y dice a qué candidato responde.
+ * Los objetos JSON de la respuesta que traen la clave `anchor`, con el tramo del texto que ocupa cada
+ * uno. La prosa alrededor, un bloque de código o una llave suelta en el texto no cuentan: solo lo que
+ * parsea y trae el ancla, que en una revisión dice a qué candidato responde.
  */
-function extractCandidates(text: string): Record<string, unknown>[] {
-  const out: Record<string, unknown>[] = []
+export function extractObjects(text: string, anchor: string): { value: Record<string, unknown>; start: number; end: number }[] {
+  const out: { value: Record<string, unknown>; start: number; end: number }[] = []
   let from = 0
   while (from < text.length) {
     const start = text.indexOf('{', from)
     if (start < 0) break
     const end = closingBrace(text, start)
     const parsed = end < 0 ? undefined : parseOrUndefined(text.slice(start, end + 1))
-    if (isMap(parsed) && 'candidate_hash' in parsed) {
-      out.push(parsed)
+    if (isMap(parsed) && anchor in parsed) {
+      out.push({ value: parsed, start, end })
       from = end + 1
     } else {
       from = start + 1
@@ -98,6 +100,8 @@ function extractCandidates(text: string): Record<string, unknown>[] {
   }
   return out
 }
+
+const extractCandidates = (text: string, anchor = 'candidate_hash') => extractObjects(text, anchor).map((o) => o.value)
 
 function onlyKeys(map: Record<string, unknown>, allowed: readonly string[], where: string): void {
   for (const k of Object.keys(map)) {
@@ -279,11 +283,11 @@ function check(raw: Record<string, unknown>, c: Candidate): Admission {
   return { kind: 'admitted', review }
 }
 
-/** Una respuesta solo se admite si trae exactamente un objeto con `candidate_hash` y ese objeto pasa `check`. */
-function admitWith<T>(text: string, validate: (raw: Record<string, unknown>) => Admission<T>): Admission<T> {
-  const found = extractCandidates(text)
+/** Una respuesta solo se admite si trae exactamente un objeto con la clave `anchor` y ese objeto pasa `validate`. */
+export function admitWith<T>(text: string, validate: (raw: Record<string, unknown>) => Admission<T>, anchor = 'candidate_hash'): Admission<T> {
+  const found = extractCandidates(text, anchor)
   if (found.length !== 1) {
-    return { kind: 'inadmissible', error: `se esperaba exactamente un objeto JSON con candidate_hash y hay ${found.length}` }
+    return { kind: 'inadmissible', error: `se esperaba exactamente un objeto JSON con ${anchor} y hay ${found.length}` }
   }
   try {
     return validate(found[0])

@@ -10,6 +10,7 @@ import { type HarvestFile, buildIndex, captureTree, gitDirs, removeIndex } from 
 import type { Outcome } from './outcome.ts'
 import { readJson, writeJsonAtomic } from './runs.ts'
 import { type Conductor, type Family, type RunState, SddError } from './types.ts'
+import { artifactHash, headerHash, readFlow } from './sdd/read.ts'
 import { hasEndMark } from './writer.ts'
 
 /**
@@ -111,6 +112,8 @@ export interface WriterControl {
   inventory: Record<string, InventoryEntry>
   runDir: { dev: number; ino: number }
   group?: GroupIdentity
+  /** Un writer de fase: el flujo, las tasks pendientes y las huellas de sus insumos al lanzar. */
+  phase?: { flow: string; pending: string[]; inputs: Record<string, string>; handoff_header: string }
 }
 
 const controlFile = (root: string, id: string) => join(storeDir(root, id), 'control.json')
@@ -273,6 +276,8 @@ export interface HarvestRecord {
   base: string; tree: string; files: HarvestFile[]; patchFile: string
   flagged: Flagged[]; runAltered: Flagged[]; headMoved: boolean
   report?: string; endMark: boolean
+  /** En un writer de fase, si la spec, el plan, las tasks o el header del handoff siguen como al lanzar. */
+  phase_inputs?: 'unchanged' | 'changed'
 }
 
 /** La corrida visible, `.sdd-ai/runs/<id>/`, con claves relativas a ella. */
@@ -363,6 +368,23 @@ export function captureTreeAtBase(root: string, id: string): boolean {
   }
 }
 
+/** Si el árbol de trabajo sigue siendo el que congeló la cosecha de ese writer. */
+export function harvestTreeHolds(root: string, id: string): boolean {
+  try {
+    const h = readHarvest(root, id)
+    if (!h) return false
+    const { checkout, base } = readControl(root, id)
+    const scratch = mkdtempSync(join(tmpdir(), 'sdd-ai-index-'))
+    try {
+      return buildIndex({ root: checkout.root, gitDir: checkout.gitDir }, base, join(scratch, 'index')) === h.tree
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  } catch {
+    return false
+  }
+}
+
 /** Cuánto espera a que otro publique la cosecha que reclamó antes de darse por vencido. */
 const CLAIM_WAIT_MS = 120_000
 
@@ -418,10 +440,23 @@ export async function freezeHarvest(root: string, id: string, outcome: Outcome, 
     state: outcome.state, ...(outcome.reason ? { reason: outcome.reason } : {}), ...(outcome.detail ? { detail: outcome.detail } : {}),
     base: control.base, tree: cap.tree, files: cap.files, patchFile, flagged, runAltered,
     headMoved: headOf(checkout.gitDir) !== control.base, ...(report !== undefined ? { report } : {}), endMark: hasEndMark(report ?? ''),
+    ...(control.phase ? { phase_inputs: phaseInputs(checkout.root, control.phase) } : {}),
   }
   writeAtomic(harvestFile(dir), `${JSON.stringify(record, null, 2)}\n`)
   release()
   return record
+}
+
+/** Si los insumos de un writer de fase son los que congeló al lanzar; un flujo que ya no se lee cambió. */
+function phaseInputs(root: string, phase: NonNullable<WriterControl['phase']>): 'unchanged' | 'changed' {
+  try {
+    const read = readFlow(root, phase.flow)
+    const now: Record<string, string> = { spec: artifactHash(read, 'spec'), plan: artifactHash(read, 'plan'), tasks: artifactHash(read, 'tasks') }
+    const same = Object.entries(phase.inputs).every(([k, v]) => now[k] === v) && headerHash(read.facts.handoffHeader) === phase.handoff_header
+    return same ? 'unchanged' : 'changed'
+  } catch {
+    return 'changed'
+  }
 }
 
 /** `releaseWriter` con el directorio común registrado, sin volver a resolverlo. */

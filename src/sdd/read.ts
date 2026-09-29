@@ -166,9 +166,41 @@ function flowJira(id: string, handoffHeader: HeaderResult | null, config: JiraMo
   return { mode: 'invalid', detail: `${where}: overrides.jira_approval tiene que ser "on" u "off", o null para no pisar la config, no ${JSON.stringify(v)}` }
 }
 
-export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode(root)): FlowRead {
+export const bytesHash = (b: Buffer | string) => `sha256:${sha256(b)}`
+
+/** La huella de un artefacto leído por `readFlow`: sus bytes si está presente; si no, su estado. */
+export const artifactHash = (read: FlowRead, key: 'spec' | 'plan' | 'tasks') => {
+  const d = read.digests[key]
+  return d.startsWith('present:') ? `sha256:${d.slice('present:'.length)}` : d
+}
+
+/** Un valor con las claves de cada mapa ordenadas, para que la huella no dependa del orden en el archivo. */
+function canonical(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonical)
+  if (typeof v === 'object' && v !== null) return Object.fromEntries(Object.keys(v).sort().map((k) => [k, canonical((v as Record<string, unknown>)[k])]))
+  return v
+}
+
+/** La huella del header del handoff: su cuerpo cambia en cada paso del conductor y no cuenta. */
+export function headerHash(h: HeaderResult | null): string {
+  if (h === null) return 'absent'
+  if (!h.ok) return `invalid:${sha256(h.detail)}`
+  return bytesHash(JSON.stringify(canonical(h.data)))
+}
+
+/** Un artefacto que todavía no está en disco: `readFlow` lo lee de este texto, para evaluar el flujo con él. */
+export interface FlowCandidate { artifact: 'spec' | 'plan' | 'tasks'; text: string }
+
+function candidateRead(text: string): FileRead {
+  const bytes = Buffer.from(text, 'utf8')
+  const state = text.trim() === '' ? 'empty' : 'present'
+  return { state, text, digest: `${state}:${sha256(bytes)}` }
+}
+
+export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode(root), candidate?: FlowCandidate): FlowRead {
   const dir = flowDir(root, id)
   const files = Object.fromEntries(ARTIFACTS.map((a) => [a, readFlowFile(dir, id, a)])) as Record<(typeof ARTIFACTS)[number], FileRead>
+  if (candidate) files[candidate.artifact] = candidateRead(candidate.text)
   const approvals = readFlowFile(dir, id, 'approvals')
   const text = (a: (typeof ARTIFACTS)[number]) => (files[a].state === 'present' ? files[a].text : null)
   const [spec, planText, tasks, handoff] = ARTIFACTS.map(text)

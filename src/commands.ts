@@ -7,7 +7,7 @@ import { isFlowId } from './sdd/id.ts'
 import { shellPipelines } from './shell.ts'
 
 /** Un comando del binario que liga la sesión a un flujo. */
-export interface Binding { verb: 'status' | 'approve'; id: string }
+export interface Binding { verb: 'status' | 'approve' | 'phase'; id: string }
 
 /** Dónde actúa un `git commit`: un directorio, o desconocido si el comando no deja saberlo. */
 export type CommitTarget = { dir: string } | { unknown: true }
@@ -69,16 +69,23 @@ function commandWords(segment: string): Word[] {
   return ws.filter((w) => !w.syntax)
 }
 
+/** Las opciones de cada verbo que liga, como las declara su `parseArgs`: las booleanas y las que llevan valor. */
+const OPTIONS: Record<Binding['verb'], { flags: string[]; values: string[]; count: number }> = {
+  status: { flags: ['--json'], values: [], count: 1 },
+  approve: { flags: [], values: ['--conductor'], count: 2 },
+  phase: { flags: [], values: ['--request', '--context', '--families', '--conductor', '--deadline'], count: 1 },
+}
+
 /** Los posicionales como los separa el `parseArgs` estricto de la CLI; `undefined` si ella los rechazaría. */
-function positionals(args: string[], option: '--json' | '--conductor'): string[] | undefined {
+function positionals(args: string[], o: { flags: string[]; values: string[] }): string[] | undefined {
   const out: string[] = []
   for (let i = 0; i < args.length; i++) {
     const a = args[i]
     if (a === '--') return [...out, ...args.slice(i + 1)]
     if (!a.startsWith('-') || a === '-') out.push(a)
-    else if (option === '--json' && a === '--json') continue
-    else if (option === '--conductor' && a.startsWith('--conductor=')) continue
-    else if (option === '--conductor' && a === '--conductor' && i + 1 < args.length) i++
+    else if (o.flags.includes(a)) continue
+    else if (o.values.some((v) => a.startsWith(`${v}=`))) continue
+    else if (o.values.includes(a) && i + 1 < args.length) i++
     else return undefined
   }
   return out
@@ -90,13 +97,13 @@ function bindingOf(segment: string): Binding | undefined {
   const bin = ws[start]
   if (bin === undefined || (bin !== 'sdd-ai' && !bin.endsWith('bin/sdd-ai')) || ws[start + 1] !== 'sdd') return undefined
   const verb = ws[start + 2]
-  if (verb !== 'status' && verb !== 'approve') return undefined
-  const args = positionals(ws.slice(start + 3), verb === 'status' ? '--json' : '--conductor')
-  if (args === undefined || args.length !== (verb === 'status' ? 1 : 2) || !isFlowId(args[0])) return undefined
+  if (verb !== 'status' && verb !== 'approve' && verb !== 'phase') return undefined
+  const args = positionals(ws.slice(start + 3), OPTIONS[verb])
+  if (args === undefined || args.length !== OPTIONS[verb].count || !isFlowId(args[0])) return undefined
   return { verb, id: args[0] }
 }
 
-/** `sdd status <id>` o `sdd approve <id> <gate>` del binario, solo en el primer tramo de la cadena. */
+/** `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` del binario, solo en el primer tramo de la cadena. */
 export function bindingCommand(command: string): Binding | undefined {
   return bindingOf(shellPipelines(command)[0][0])
 }

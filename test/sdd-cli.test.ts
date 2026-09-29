@@ -92,7 +92,10 @@ test('sdd status lee el flujo sin escribir nada, no crea .sdd-ai y acepta --json
   assert.equal(plain.out.depth, 'completa')
   assert.deepEqual(plain.out.gates.map((g: { state: string }) => g.state), ['approved_unfingerprinted', 'approved_unfingerprinted', 'approved_unfingerprinted'])
   assert.deepEqual(plain.out.tasks, { total: 2, done: 1, pending: 1, first_pending: '**T2 — segunda** · cubre: AC-1' })
-  assert.deepEqual(plain.out.next, { step: 'implement', task: '**T2 — segunda** · cubre: AC-1' })
+  // Con `.plans/` sin ignorar, el árbol está sucio: el writer de la fase no se lanza y el next dice por qué.
+  const { detail, ...next } = plain.out.next
+  assert.deepEqual(next, { step: 'implement', task: '**T2 — segunda** · cubre: AC-1' })
+  assert.match(detail, /cambios sin commitear/)
   assert.equal(plain.out.paths.spec, '.plans/f/spec.md')
   assert.deepEqual(list.out.flows.map((f: { id: string }) => f.id), ['f'])
 
@@ -353,7 +356,7 @@ test('dos approve concurrentes sobre el mismo flujo no pierden entradas: uno reg
     const results = await Promise.all([approveAsync(repo, 'spec'), approveAsync(repo, 'plan')])
     const approved = results.filter((r) => r.code === 0)
     assert.ok(approved.length >= 1, JSON.stringify(results.map((r) => r.out)))
-    for (const r of results.filter((r) => r.code !== 0)) assert.equal(r.out.code, 'approve_in_progress', JSON.stringify(r.out))
+    for (const r of results.filter((r) => r.code !== 0)) assert.equal(r.out.code, 'flow_busy', JSON.stringify(r.out))
     const gates = registry(dir).approvals.map((a: { gate: string }) => a.gate).sort()
     assert.deepEqual(gates, ['spec', 'plan'].filter((_, k) => results[k].code === 0).sort())
     assert.equal(existsSync(join(dir, LOCK)), false)
@@ -366,7 +369,7 @@ test('un lock existente, también de un proceso muerto o que sea un enlace, rech
   writeFileSync(join(dir, LOCK), '999999\n')
   const dead = sdd(repo, 'approve', 'f', 'spec')
   assert.equal(dead.code, 2)
-  assert.equal(dead.out.code, 'approve_in_progress')
+  assert.equal(dead.out.code, 'flow_busy')
   assert.match(dead.out.next, new RegExp(LOCK.replaceAll('.', '\\.')))
   assert.equal(readFileSync(join(dir, LOCK), 'utf8'), '999999\n')
   assert.equal(existsSync(join(dir, REGISTRY)), false)
@@ -417,7 +420,7 @@ test('un lock de un proceso muerto o reciclado, o sin lstart como los de 5a, rec
     const r = sdd(repo, 'approve', 'f', 'spec')
     assert.ok(Date.now() - started < 4000, content)
     assert.equal(r.code, 2, content)
-    assert.equal(r.out.code, 'approve_in_progress', `${content}: ${JSON.stringify(r.out)}`)
+    assert.equal(r.out.code, 'flow_busy', `${content}: ${JSON.stringify(r.out)}`)
     assert.equal(readFileSync(join(dir, LOCK), 'utf8'), content)
     assert.equal(existsSync(join(dir, REGISTRY)), false)
   }

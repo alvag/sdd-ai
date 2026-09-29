@@ -5,14 +5,21 @@ export type Via = 'native' | 'process'
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type Origin = 'flag' | 'workers' | 'heredado'
 
+/** Los roles de las fases SDD: tienen perfil en `workers.yml`, pero solo los despacha `sdd phase`. */
+export const PHASE_ROLES = ['specify', 'plan', 'tasks'] as const
+export type PhaseRole = typeof PHASE_ROLES[number]
 export const ROLES = ['explore', 'counter-plan', 'investigate', 'debate',
-  'design-review', 'implement', 'refute', 'code-review'] as const
+  'design-review', 'implement', 'refute', 'code-review', ...PHASE_ROLES] as const
 export type Role = typeof ROLES[number]
-/** Los roles que solo leen: tienen agente nativo y perfil propio. `implement` escribe y no tiene agente. */
-export type ReadOnlyRole = Exclude<Role, 'implement'>
-export const READ_ONLY_ROLES: readonly ReadOnlyRole[] = ROLES.filter((r): r is ReadOnlyRole => r !== 'implement')
+/**
+ * Los roles que solo leen: tienen agente nativo y perfil propio. `implement` escribe y no tiene agente;
+ * los de fase van siempre por proceso y tampoco lo tienen.
+ */
+export type ReadOnlyRole = Exclude<Role, 'implement' | PhaseRole>
+export const READ_ONLY_ROLES: readonly ReadOnlyRole[] = ROLES.filter((r): r is ReadOnlyRole => r !== 'implement' && !isPhaseRole(r))
 /** Lo que `run` despacha: los roles de lectura y el writer, que sale siempre por proceso. */
-export const DISPATCHABLE_ROLES: readonly Role[] = [...READ_ONLY_ROLES, 'implement']
+export type DispatchableRole = ReadOnlyRole | 'implement'
+export const DISPATCHABLE_ROLES: readonly DispatchableRole[] = [...READ_ONLY_ROLES, 'implement']
 /**
  * Roles que pueden buscar en la web: explorar e investigar a veces necesitan documentación de afuera.
  * Los demás responden solo con el encargo y el repositorio, porque lo que traen de la web no se puede
@@ -108,7 +115,11 @@ export function isReadOnlyRole(v: unknown): v is ReadOnlyRole {
   return typeof v === 'string' && (READ_ONLY_ROLES as readonly string[]).includes(v)
 }
 
-export function isDispatchableRole(v: unknown): v is Role {
+export function isPhaseRole(v: unknown): v is PhaseRole {
+  return typeof v === 'string' && (PHASE_ROLES as readonly string[]).includes(v)
+}
+
+export function isDispatchableRole(v: unknown): v is DispatchableRole {
   return typeof v === 'string' && (DISPATCHABLE_ROLES as readonly string[]).includes(v)
 }
 
