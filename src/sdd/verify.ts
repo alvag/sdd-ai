@@ -398,7 +398,9 @@ interface LoadFailure { importer: string; module: string; exportName?: string }
 
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g
 const MISSING_EXPORT = /^SyntaxError: The requested module '([^']+)' does not provide an export named '([^']+)'/
-const MISSING_MODULE = /^Error \[ERR_MODULE_NOT_FOUND\]: Cannot find module '([^']+)' imported from ([^\s'"]+)/
+// El importador va hasta el final de la línea, porque su ruta puede tener espacios, sin la comilla con
+// que el reporte TAP puede cerrar el error.
+const MISSING_MODULE = /^Error \[ERR_MODULE_NOT_FOUND\]: Cannot find module '([^']+)' imported from (.+?)['"]?\s*$/
 const FILE_LINE = /^file:\/\/\S+?:\d+$/
 
 /** La ruta relativa al repositorio, o `null` si `abs` cae fuera de él. */

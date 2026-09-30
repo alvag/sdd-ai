@@ -22,8 +22,8 @@ export function warmFakeBin(dir: string, name: 'claude' | 'codex'): void {
 }
 
 /** Repo Git vacío en un directorio temporal (ruta real, sin el symlink de /var en macOS). */
-export function makeRepo(): string {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-repo-')))
+export function makeRepo(prefix = 'sdd-ai-repo-'): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)))
   execFileSync('git', ['init', '-q'], { cwd: dir })
   return dir
 }

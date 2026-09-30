@@ -256,6 +256,8 @@ export interface ReceiptFacts {
   /** Si su candidato es el árbol de ahora y su plan el aprobado vigente. */
   current: boolean
   red: string[]; unattested: string[]
+  /** Las filas manuales del recibo con una acreditación vigente. */
+  attested: string[]
   /** Un recibo rojo sin filas rojas: por qué. */
   cause?: 'no_end_mark' | 'tree_mutated' | 'other'
 }
@@ -410,6 +412,7 @@ function onCandidate(receipt: ReceiptFacts | null, imp: ImplementRecord, afterFi
   if (receipt.green) return { kind: 'review' }
   if (receipt.red.length === 0) {
     if (receipt.unattested.length > 0) return { kind: 'attest', rows: receipt.unattested }
+    if (receipt.attested.length > 0) return { kind: 'verify' }
     if (receipt.cause === 'tree_mutated') return { kind: 'amend_contract', rows: [] }
     return { kind: 'conductor', why: 'el recibo es rojo sin filas rojas' }
   }

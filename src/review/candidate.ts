@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { buildIndex, gitDirs, indexEnv } from '../git.ts'
@@ -152,6 +152,7 @@ export function readContextFile(root: string, p: string, what = 'el contexto'): 
   if (outside(relative(realpathSync(root), realpathSync(abs)))) {
     throw new SddError('usage', `${what} tiene que estar dentro del repo: ${p}`)
   }
+  if (!statSync(abs).isFile()) throw new SddError('usage', `${what} no es un archivo: ${p}`)
   const bytes = readFileSync(abs)
   if (bytes.includes(0)) throw new SddError('usage', `${what} no puede ser binario: ${rel}`)
   return { path: rel, bytes }

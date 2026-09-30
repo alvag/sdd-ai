@@ -734,7 +734,13 @@ sdd-ai ahí es la instalación global.
    preguntan:
    - un `workers.yml` nuevo lleva los defaults de cada rol;
    - uno existente conserva sus perfiles, suma los que faltan y pierde los inexistentes, que son los
-     roles retirados o desconocidos y los modelos de Codex que no están en su catálogo local;
+     roles retirados o desconocidos y los modelos de Codex que no están en su catálogo local. El
+     catálogo lo reescribe cualquier cliente de Codex de la máquina: si lo bajó una versión más vieja que
+     el `codex` instalado, `init` no valida los modelos y lo avisa con `codex_catalog_outdated`. Si no se
+     puede leer alguna de las dos versiones, valida igual;
+   - `codex_model_older_generation` avisa de cada perfil de Codex cuyo modelo el catálogo describe como
+     de una generación anterior, con el default del rol. No lo cambia: se edita a mano en `workers.yml`.
+     El aviso solo sale con un catálogo válido;
    - `differs` lista, como dato, los perfiles propios que difieren del default.
 4. **Aplica** solo si el usuario confirma, con el comando que trae `next`:
    `init --apply --digest <digest>` con los mismos flags. Escribe exactamente lo que mostró el

@@ -1,6 +1,6 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { candidateFingerprint } from '../git.ts'
+import { type CandidateFingerprint, candidateFingerprint } from '../git.ts'
 import { type HarvestRecord, type WriterControl, flowWriterRuns, isWriterRun, readControl, readHarvest, readTakeoverMap, runEntries } from '../writer-store.ts'
 import { type ChainInput, type ChainState, type ReceiptFacts, type RunFacts, chainState, lastLink, proposeClass, redRows, unattestedRows } from './chain.ts'
 import { criteriaIds, taskLines } from './markdown.ts'
@@ -10,7 +10,7 @@ import { type FlowRead, flowDir } from './read.ts'
 import { headerData, isDepth } from './status.ts'
 import { type VerificationRow, readVerification } from './verification-contract.ts'
 import { PLAN_GATE } from './verify-state.ts'
-import { type VerifyReceipt, type VerifyReceiptRef, readVerifyReceipt, receiptDir } from './verify-receipt.ts'
+import { type AttestationRef, type VerifyReceipt, type VerifyReceiptRef, currentAttestation, readVerifyReceipt, receiptDir } from './verify-receipt.ts'
 
 // Los hechos de disco que necesita `chainState`: el registro, el control y la cosecha de cada corrida,
 // el último recibo final, las aprobaciones y las tasks abiertas. Solo lee.
@@ -81,19 +81,29 @@ function legacyChain(root: string, id: string, imp: ImplementRecord): { chain: C
  * Los hechos del último recibo final del flujo: si sigue vigente para el árbol y el plan de ahora, y sus filas
  * rojas. Después de una toma, solo un recibo posterior a ella está vigente, aunque el árbol sea el mismo.
  */
-function receiptFacts(root: string, id: string, r: VerifyReceipt, ref: VerifyReceiptRef, planFingerprint: string | undefined, imp: ImplementRecord): ReceiptFacts {
+function receiptFacts(root: string, id: string, r: VerifyReceipt, ref: VerifyReceiptRef, planFingerprint: string | undefined, imp: ImplementRecord, refs: readonly AttestationRef[]): ReceiptFacts {
   let current = false
+  let now: CandidateFingerprint | null = null
   try {
-    const now = candidateFingerprint(root, id, r.after.base_commit)
+    now = candidateFingerprint(root, id, r.after.base_commit)
     current = r.plan_fingerprint === planFingerprint && r.after.tree === now.tree && r.after.base_commit === now.base_commit
       && receiptAfterTakeover(r, imp)
   } catch {
     current = false
   }
+  const manual = unattestedRows(r)
+  // Una acreditación que no se puede leer deja su fila pendiente, sin cambiar la vigencia del recibo.
+  const attested = now === null || !planFingerprint ? [] : manual.filter((row) => {
+    try {
+      return currentAttestation(root, refs, id, row, now, planFingerprint).ref !== null
+    } catch {
+      return false
+    }
+  })
   const red = redRows(r)
   const cause = r.green || red.length > 0 ? undefined
     : r.writer && !r.writer.end_mark ? 'no_end_mark' : r.after.tree !== r.before.tree ? 'tree_mutated' : 'other'
-  return { id: ref.id, digest: ref.digest, green: r.green, current, red, unattested: unattestedRows(r), ...(cause ? { cause } : {}) }
+  return { id: ref.id, digest: ref.digest, green: r.green, current, red, attested, unattested: manual.filter((row) => !attested.includes(row)), ...(cause ? { cause } : {}) }
 }
 
 /** El estado de la cadena del flujo con los hechos de disco de ahora. */
@@ -123,7 +133,7 @@ export function chainView(root: string, id: string, read: FlowRead): ChainView {
   const tasksFile = join(flowDir(root, id), 'tasks.md')
   const open = existsSync(tasksFile) ? taskLines(readFileSync(tasksFile, 'utf8')).filter((l) => !l.done && l.task).map((l) => l.task!.id) : []
   const input: ChainInput = {
-    imp, runs, receipt: receipt && ref ? receiptFacts(root, id, receipt, ref, planFingerprint, imp) : null,
+    imp, runs, receipt: receipt && ref ? receiptFacts(root, id, receipt, ref, planFingerprint, imp, record.verify?.attestations ?? []) : null,
     approvals: read.facts.log.state === 'ok' ? read.facts.log.approvals : [], open,
     failed: new Set([
       ...imp.events.filter((e) => e.kind === 'launch_failed' && e.run).map((e) => e.run!),

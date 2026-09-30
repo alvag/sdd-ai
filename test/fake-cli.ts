@@ -8,6 +8,10 @@ import { dirname, join } from 'node:path'
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')
 const args = process.argv.slice(2)
+if (args.length === 1 && args[0] === '--version' && process.env.FAKE_VERSION) {
+  process.stdout.write(`${process.env.FAKE_VERSION}\n`)
+  process.exit(0)
+}
 // Cada invocación queda anotada para que los tests cuenten los intentos y vean sus argumentos y su cwd.
 if (process.env.FAKE_CALLS_FILE) {
   appendFileSync(process.env.FAKE_CALLS_FILE, `${JSON.stringify(args)}\n`)

@@ -49,6 +49,8 @@ export interface FlowFacts {
   contract?: 'structured' | 'prose'
   /** Con un contrato estructurado y el header en `verified`: si el último recibo final sigue valiendo. */
   receipt?: 'valid' | 'stale'
+  /** Filas que piden reversión sobre rutas ausentes en la base del plan. */
+  revertPathsNotInBase?: Array<{ row: string; paths: string[] }>
 }
 
 export type GateState = 'pending' | 'approved' | 'approved_unfingerprinted' | 'stale'
@@ -134,6 +136,9 @@ function isFresh(a: Approval, fingerprints: FlowFacts['fingerprints']): boolean 
 export function resolveGates(facts: FlowFacts): GateResolution {
   const blocked: Reason[] = []
   const notes: Reason[] = []
+  for (const { row, paths } of facts.revertPathsNotInBase ?? []) {
+    blocked.push({ code: 'revert_path_not_in_base', detail: `la fila ${row} revierte ${paths.join(', ')}, que no existe en base_commit: verify no puede confirmarla; pon en implementation_paths un archivo de la base que conecte lo nuevo` })
+  }
   const headers: Array<[string, HeaderResult | null]> = [['plan.md', facts.planHeader], ['handoff.md', facts.handoffHeader]]
   for (const [name, h] of headers) {
     if (h && !h.ok) blocked.push({ code: 'header_invalid', detail: `${name}: ${h.detail}` })

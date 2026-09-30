@@ -59,7 +59,7 @@ export function checkFlags(help: string, flags: string[]): { flag: string; prese
   })
 }
 
-const defaultExec: Exec = (cmd, args) => {
+export const defaultExec: Exec = (cmd, args) => {
   const r = spawnSync(cmd, args, { encoding: 'utf8' })
   return { status: r.error ? null : r.status, stdout: r.stdout ?? '' }
 }
@@ -67,6 +67,27 @@ const defaultExec: Exec = (cmd, args) => {
 /** Familias cuya CLI responde en PATH. */
 export function detectClis(exec: Exec = defaultExec): Family[] {
   return (['claude', 'codex'] as Family[]).filter((family) => exec(family, ['--version']).status !== null)
+}
+
+const versionOf = (text: string): string | null => /\d+\.\d+\.\d+/.exec(text)?.[0] ?? null
+
+/**
+ * Si la versión `a` es anterior a `b`, comparando el primer `mayor.menor.parche` de cada una: un sufijo de
+ * prerelease no cuenta. Sin un triplete en alguna de las dos, no se comparan.
+ */
+export function olderVersion(a: string, b: string): boolean {
+  const left = versionOf(a)?.split('.').map(Number)
+  const right = versionOf(b)?.split('.').map(Number)
+  if (!left || !right) return false
+  for (let i = 0; i < 3; i++) {
+    if (left[i] !== right[i]) return left[i] < right[i]
+  }
+  return false
+}
+
+/** La versión `mayor.menor.parche` que informa `<family> --version`, o `null` si no informa ninguna. */
+export function cliVersion(exec: Exec, family: Family): string | null {
+  return versionOf(exec(family, ['--version']).stdout)
 }
 
 /**
@@ -83,7 +104,7 @@ export function doctor(exec: Exec = defaultExec, skill?: SkillCheck): { ok: bool
       flags.push(...resume.map((r) => ({ flag: `resume ${r.flag}`, present: r.present })))
     }
     const report: CliReport = { family, inPath: true, flags }
-    const version = /\d+\.\d+\.\d+/.exec(v.stdout)?.[0]
+    const version = versionOf(v.stdout)
     if (version) report.version = version
     return report
   })

@@ -31,16 +31,17 @@ const DEFAULTS = {
 const TWO_FAMILIES = 'cross_model:\n  schema_version: 1\n  families: [codex, claude]\n  selection: full\n'
 
 interface Checkout { repo: string; env: Record<string, string> }
-interface Options { bins?: Array<'claude' | 'codex'>; catalog?: string[] | null; config?: string; workers?: string; sources?: boolean }
+type Catalog = string[] | { client_version?: string; models: Array<{ slug: string; description?: string }> }
+interface Options { bins?: Array<'claude' | 'codex'>; catalog?: Catalog | null; version?: string; config?: string; workers?: string; sources?: boolean }
 
-function environment(bins: Array<'claude' | 'codex'>, catalog: string[] | null): Record<string, string> {
+function environment(bins: Array<'claude' | 'codex'>, catalog: Catalog | null, version?: string): Record<string, string> {
   // PATH controlado: node para el shebang y solo los CLIs falsos pedidos, nunca los reales.
   const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
   symlinkSync(process.execPath, join(bin, 'node'))
   for (const b of bins) makeFakeBin(bin, b)
   const codexHome = mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-'))
-  if (catalog !== null) writeFileSync(join(codexHome, 'models_cache.json'), JSON.stringify({ models: catalog.map((slug) => ({ slug })) }))
-  return { PATH: `${bin}:/usr/bin:/bin`, HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-home-')), CODEX_HOME: codexHome }
+  if (catalog !== null) writeFileSync(join(codexHome, 'models_cache.json'), JSON.stringify(Array.isArray(catalog) ? { models: catalog.map((slug) => ({ slug })) } : catalog))
+  return { PATH: `${bin}:/usr/bin:/bin`, HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-home-')), CODEX_HOME: codexHome, ...(version ? { FAKE_VERSION: version } : {}) }
 }
 
 /** Un checkout de sdd-ai con commit, sin `.sdd-ai/` salvo lo que se pida. */
@@ -62,7 +63,7 @@ function checkout(o: Options = {}): Checkout {
   if (o.config !== undefined || o.workers !== undefined) mkdirSync(join(repo, '.sdd-ai'), { recursive: true })
   if (o.config !== undefined) writeFileSync(join(repo, '.sdd-ai', 'config.yml'), o.config)
   if (o.workers !== undefined) writeFileSync(join(repo, '.sdd-ai', 'workers.yml'), o.workers)
-  return { repo, env: environment(o.bins ?? ['claude', 'codex'], o.catalog === undefined ? CATALOG : o.catalog) }
+  return { repo, env: environment(o.bins ?? ['claude', 'codex'], o.catalog === undefined ? CATALOG : o.catalog, o.version) }
 }
 
 /** La salida del binario es JSON sin un tipo fijo: cada prueba mira los campos que le importan. */
@@ -258,6 +259,67 @@ test('sin workers.yml, init lo crea con los perfiles por defecto', () => {
   const { applied } = initAndApply(c)
   assert.equal(applied.code, 0, JSON.stringify(applied.out))
   assert.deepEqual(parse(read(c, '.sdd-ai/workers.yml')), { schema_version: 1, roles: DEFAULTS })
+})
+
+test('con un catálogo de Codex de un cliente más viejo, init no valida los modelos y avisa con las dos versiones', () => {
+  const catalog = { client_version: '0.156.1', models: [{ slug: 'gpt-6-luna' }] }
+  const workers = 'schema_version: 1\nroles:\n  implement:\n    codex: { model: gpt-6.1-sol, effort: medio }\n'
+  const c = checkout({ config: TWO_FAMILIES, workers, catalog, version: '0.159.0' })
+  const dry = cli(c, ['init']).out
+  assert.deepEqual(dry.workers.removed, [])
+  const result = parse(fileOf(dry, '.sdd-ai/workers.yml').content) as Out
+  assert.equal(result.roles.implement.codex.model, 'gpt-6.1-sol')
+  const note = dry.notes.find((n: Out) => n.code === 'codex_catalog_outdated')
+  assert.ok(note)
+  assert.match(note.detail, /0\.156\.1/)
+  assert.match(note.detail, /0\.159\.0/)
+  assert.equal(codes(dry).includes('codex_default_not_in_catalog'), false)
+  assert.equal(codes(dry).includes('codex_catalog_missing'), false)
+
+  const fresh = checkout({ catalog, version: '0.159.0' })
+  const freshDry = cli(fresh, ['init']).out
+  assert.deepEqual((parse(fileOf(freshDry, '.sdd-ai/workers.yml').content) as Out).roles, DEFAULTS)
+
+  // Un sufijo de prerelease no impide comparar: el triplete 0.156.0 es anterior al instalado.
+  const prerelease = checkout({ config: TWO_FAMILIES, workers, catalog: { ...catalog, client_version: '0.156.0-alpha.1' }, version: '0.159.0' })
+  assert.ok(codes(cli(prerelease, ['init']).out).includes('codex_catalog_outdated'))
+
+  for (const client_version of ['0.159.0', '0.159.2']) {
+    const valid = checkout({ config: TWO_FAMILIES, workers, catalog: { ...catalog, client_version }, version: '0.159.0' })
+    const validated = cli(valid, ['init']).out
+    assert.ok(validated.workers.removed.some((r: Out) => r.path === 'roles.implement.codex'))
+    assert.ok(codes(validated).includes('codex_default_not_in_catalog'))
+    assert.equal(codes(validated).includes('codex_catalog_outdated'), false)
+  }
+
+  c.env.FAKE_VERSION = '0.160.0'
+  const refused = cli(c, ['init', '--apply', '--digest', dry.digest])
+  assert.equal(refused.code, 2)
+  assert.equal(refused.out.code, 'digest_mismatch')
+  c.env.FAKE_VERSION = '0.159.0'
+  writeFileSync(join(c.env.CODEX_HOME, 'models_cache.json'), JSON.stringify({ ...catalog, client_version: '0.156.2' }))
+  assert.equal(cli(c, ['init', '--apply', '--digest', dry.digest]).out.code, 'digest_mismatch')
+})
+
+test('init avisa de los perfiles de Codex con un modelo de una generación anterior sin cambiarlos', () => {
+  const catalog = { client_version: '0.159.0', models: [
+    { slug: 'gpt-6.1-sol', description: 'Latest workhorse model for coding and everyday work.' },
+    { slug: 'gpt-6-luna', description: 'Fast and affordable model for easier tasks.' },
+    { slug: 'gpt-5.6-terra', description: 'Older balanced model for straightforward work.' },
+  ] }
+  const workers = 'schema_version: 1\nroles:\n  implement:\n    codex: { model: gpt-5.6-terra, effort: medio }\n'
+  const c = checkout({ config: TWO_FAMILIES, workers, catalog, version: '0.159.0' })
+  const { dry, applied } = initAndApply(c)
+  const notes = dry.notes.filter((n: Out) => n.code === 'codex_model_older_generation')
+  assert.equal(notes.length, 1)
+  for (const text of ['implement', 'gpt-5.6-terra', 'gpt-6.1-sol', catalog.models[2].description]) assert.ok(notes[0].detail.includes(text), text)
+  assert.equal(applied.code, 0, JSON.stringify(applied.out))
+  assert.equal((parse(read(c, '.sdd-ai/workers.yml')) as Out).roles.implement.codex.model, 'gpt-5.6-terra')
+
+  const outdated = checkout({ config: TWO_FAMILIES, workers, catalog: { ...catalog, client_version: '0.156.1' }, version: '0.159.0' })
+  assert.equal(codes(cli(outdated, ['init']).out).includes('codex_model_older_generation'), false)
+  const absent = checkout({ config: TWO_FAMILIES, workers, catalog: null, version: '0.159.0' })
+  assert.equal(codes(cli(absent, ['init']).out).includes('codex_model_older_generation'), false)
 })
 
 test('con un workers.yml existente, init agrega lo que falta y quita los perfiles inexistentes', () => {

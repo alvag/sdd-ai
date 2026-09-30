@@ -170,7 +170,7 @@ function input(entries: ChainEntry[], facts: RunFacts[], o: Partial<ChainInput> 
 const classified = (receipt: string, rows: Array<[string, ChainClass]>, epoch = 'p1'): Classification => ({
   receipt: { id: receipt, digest: DIG }, epoch, at: AT, rows: rows.map(([row, c]) => ({ row, class: c, proposed: null, reason: 'r' })),
 })
-const red = (id: string, rows = ['V1']): ReceiptFacts => ({ id, digest: DIG, green: false, current: true, red: rows, unattested: [] })
+const red = (id: string, rows = ['V1']): ReceiptFacts => ({ id, digest: DIG, green: false, current: true, red: rows, attested: [], unattested: [] })
 
 test('estado de cadena: cobertura acumulada, continuación con progreso y salida sin progreso', () => {
   const none = chainState({ imp: { schema: 1, chains: [], classifications: [], events: [] }, runs: new Map(), receipt: null, approvals: [], open: ['T1'], failed: new Set() })

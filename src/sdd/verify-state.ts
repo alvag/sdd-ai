@@ -1,12 +1,14 @@
+import { execFileSync } from 'node:child_process'
 import { candidateFingerprint } from '../git.ts'
 import { type HeaderResult, criteriaIds } from './markdown.ts'
 import { implementOf, latestFinalReceipt, readPhaseRecord, receiptAfterTakeover } from './phase-state.ts'
 import { type Depth, type FlowFacts, type GateId, headerData, isDepth } from './status.ts'
-import { readVerification } from './verification-contract.ts'
+import { type TestRow, readVerification } from './verification-contract.ts'
 import { readVerifyReceipt } from './verify-receipt.ts'
 
 // Lo que `readFlow` agrega a los hechos de un flujo sobre su verificación: si el contrato del plan es
-// estructurado y, solo con el header en `verified`, si el último recibo final sigue valiendo.
+// estructurado, sus rutas de reversión ausentes en la base y, solo con el header en `verified`, si el último
+// recibo final sigue valiendo.
 
 /** El gate que cubre el plan en cada profundidad. */
 export const PLAN_GATE: Record<Depth, GateId> = { corta: 'single', normal: 'plan-tasks', completa: 'plan' }
@@ -18,16 +20,34 @@ export const PLAN_GATE: Record<Depth, GateId> = { corta: 'single', normal: 'plan
  * el árbol de ahora. Sin esas dos condiciones no se calcula la huella del árbol, que lee todos los archivos.
  */
 export function verifyFacts(root: string, id: string, planText: string, planHeader: HeaderResult | null,
-  fingerprints: FlowFacts['fingerprints'], specText: string): Pick<FlowFacts, 'contract' | 'receipt'> {
+  fingerprints: FlowFacts['fingerprints'], specText: string): Pick<FlowFacts, 'contract' | 'receipt' | 'revertPathsNotInBase'> {
   let contract: 'structured' | 'prose'
+  const header = headerData(planHeader)
+  let revertPathsNotInBase: FlowFacts['revertPathsNotInBase']
   try {
-    contract = readVerification(planText, criteriaIds(specText)).kind
+    const read = readVerification(planText, criteriaIds(specText))
+    contract = read.kind
+    if (read.kind === 'structured' && typeof header?.base_commit === 'string') {
+      const rows = read.contract.rows.filter((r): r is TestRow => r.kind === 'test' && (r.obligation === 'red_on_revert' || r.obligation === 'green_on_base'))
+      const paths = [...new Set(rows.flatMap((r) => r.implementation_paths))]
+      if (paths.length > 0) {
+        try {
+          const present = new Set(execFileSync('git', ['ls-tree', '-z', '--name-only', header.base_commit, '--', ...paths], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).split('\0').filter(Boolean))
+          revertPathsNotInBase = rows.flatMap((r) => {
+            const absent = r.implementation_paths.filter((p) => !present.has(p))
+            return absent.length > 0 ? [{ row: r.id, paths: absent }] : []
+          })
+        } catch {
+          // Una base que no resuelve no permite decidir si la ruta es nueva.
+        }
+      }
+    }
   } catch {
     contract = 'structured'
   }
-  const header = headerData(planHeader)
-  if (contract === 'prose' || header?.status !== 'verified') return { contract }
-  return { contract, receipt: receiptHolds(root, id, header, fingerprints) ? 'valid' : 'stale' }
+  const facts = { contract, ...(revertPathsNotInBase ? { revertPathsNotInBase } : {}) }
+  if (contract === 'prose' || header?.status !== 'verified') return facts
+  return { ...facts, receipt: receiptHolds(root, id, header, fingerprints) ? 'valid' : 'stale' }
 }
 
 function receiptHolds(root: string, id: string, header: Record<string, unknown>, fingerprints: FlowFacts['fingerprints']): boolean {

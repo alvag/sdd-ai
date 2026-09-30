@@ -265,7 +265,9 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
   const spec = sdd(repo, 'approve', 'f', 'spec')
   assert.equal(spec.code, 0, JSON.stringify(spec.out))
   assert.deepEqual(gateStates(spec.out), { spec: 'approved', plan: 'pending', tasks: 'pending' })
-  assert.deepEqual(spec.out.next, { step: 'gate', gate: 'plan', artifacts: ['plan.md'] })
+  const { question: specQuestion, ...specNext } = spec.out.next
+  assert.deepEqual(specNext, { step: 'gate', gate: 'plan', artifacts: ['plan.md'] })
+  assert.equal(typeof specQuestion?.question, 'string')
   const [first] = registry(dir).approvals
   assert.equal(registry(dir).schema_version, 1)
   assert.deepEqual(Object.keys(first), ['gate', 'depth', 'fingerprint', 'previous', 'at', 'proof'])
@@ -283,10 +285,9 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
   const second = registry(dir).approvals[1]
   assert.equal(second.gate, 'plan')
   assert.deepEqual(second.previous, { spec: first.fingerprint })
-  // Solo `status` trae la pregunta del gate siguiente.
-  const { question, ...next } = sdd(repo, 'status', 'f').out.next
-  assert.equal(typeof question?.question, 'string')
-  assert.deepEqual({ ...sdd(repo, 'status', 'f').out, next }, plan.out)
+  // `approve` responde lo mismo que `status`, con la pregunta del gate siguiente.
+  assert.equal(typeof plan.out.next.question?.question, 'string')
+  assert.deepEqual(sdd(repo, 'status', 'f').out, plan.out)
 
   assert.deepEqual(artifacts.map((n) => `${readFileSync(join(dir, n), 'utf8')} ${lstatSync(join(dir, n)).mtimeMs}`), before)
   assert.equal(existsSync(join(dir, LOCK)), false)

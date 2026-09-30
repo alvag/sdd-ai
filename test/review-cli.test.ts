@@ -87,6 +87,33 @@ test('wait sobre una revisión devuelve la vista de review status con los ejes',
   assert.equal(typeof w.out.next, 'string')
 })
 
+test('review status sin recibo todavía, durante la refutación, sale con 0 y espera la corrida', () => {
+  const s = setup({ families: '[codex, claude]', bins: ['codex'] })
+  writeFileSync(join(s.repo, 'a.txt'), lines(11))
+  const r = cli(s, ['review', 'start', '--base', s.base])
+  const w = cli(s, ['wait', r.out.id, '--max', '20'])
+  assert.equal(w.code, 0, JSON.stringify(w.out))
+  const dir = join(s.repo, '.sdd-ai', 'runs', r.out.id)
+  rmSync(join(dir, 'receipt.json'))
+  writeFileSync(join(dir, 'status.json'), JSON.stringify({
+    ...runJson(s, r.out.id, 'status.json'), state: 'running',
+    job: { phase: 'refutation', key: 'refute-1', index: 1, total: 1 },
+  }))
+  const status = cli(s, ['review', 'status', r.out.id])
+  assert.equal(status.code, 0, JSON.stringify(status.out))
+  assert.equal(status.stderr, '')
+  assert.equal(status.out.state, 'running')
+  assert.equal(status.out.next, `./bin/sdd-ai wait ${r.out.id}`)
+  assert.equal(status.out.reviewer.model_effective, undefined)
+  assert.deepEqual(status.out.degradations, runJson(s, r.out.id, 'request.json').degradations)
+  assert.deepEqual(status.out.tool_events, w.out.tool_events)
+  writeFileSync(join(dir, 'rounds.json'), JSON.stringify({ rounds: [] }))
+  const withoutRounds = cli(s, ['review', 'status', r.out.id])
+  assert.equal(withoutRounds.code, 0, JSON.stringify(withoutRounds.out))
+  assert.equal(withoutRounds.stderr, '')
+  assert.equal(Object.hasOwn(withoutRounds.out, 'tool_events'), false)
+})
+
 test('review status marca stale si el diff cambió o si la base ya no resuelve', () => {
   const s = setup({ families: '[codex, claude]', bins: ['codex'] })
   git(s.repo, 'branch', 'base-temp', s.base)
@@ -180,6 +207,18 @@ test('un contexto inexistente devuelve usage antes de crear la corrida', () => {
     assert.equal(r.stderr, '')
     assert.deepEqual(runs(s), before)
   }
+})
+
+test('un contexto que es un directorio devuelve usage antes de crear la corrida', () => {
+  const s = setup({ families: '[codex, claude]', bins: ['codex'] })
+  writeFileSync(join(s.repo, 'a.txt'), lines(11))
+  mkdirSync(join(s.repo, 'context'))
+  const before = runs(s)
+  const r = cli(s, ['review', 'start', '--base', s.base, '--context', 'context'])
+  assert.deepEqual([r.code, r.out.code], [2, 'usage'])
+  assert.match(r.out.message, /no es un archivo/)
+  assert.equal(r.stderr, '')
+  assert.deepEqual(runs(s), before)
 })
 
 test('un contexto existente se congela al iniciar la revisión de diff', () => {

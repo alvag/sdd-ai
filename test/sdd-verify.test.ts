@@ -371,8 +371,8 @@ function approveAll(repo: string): void {
  * Un flujo `f` en completa con los tres gates aprobados. La base tiene `f = () => 1`; el candidato, `f = () => 2`
  * y la prueba que lo exige. `.plans/` está excluido de Git, como en un repositorio real.
  */
-function verifyFlow(o: { rows?: unknown[]; status?: string; done?: boolean; implement?: boolean; base?: Record<string, string>; candidate?: Record<string, string> } = {}): { repo: string; base: string } {
-  const repo = makeRepo()
+function verifyFlow(o: { prefix?: string; rows?: unknown[]; status?: string; done?: boolean; implement?: boolean; base?: Record<string, string>; candidate?: Record<string, string> } = {}): { repo: string; base: string } {
+  const repo = makeRepo(o.prefix)
   writeFileSync(join(repo, '.git', 'info', 'exclude'), '.plans/\n.sdd-ai/\n')
   mkdirSync(join(repo, 'src'))
   mkdirSync(join(repo, 'test'))
@@ -459,12 +459,29 @@ test('una fila que escribe en el repo, un timeout o una ruta nueva impiden el ve
 
   const fresh = verifyFlow({ rows: [{ ...RED_ROW, implementation_paths: ['src/nueva.ts'] }, BUILD_ROW] })
   writeFileSync(join(fresh.repo, 'src', 'nueva.ts'), 'export const g = 1\n')
-  const n = await final(fresh.repo)
-  assert.equal(n.receipt.rows[0].confirmation?.state, 'not_confirmable')
-  assert.match(n.receipt.rows[0].confirmation?.reason ?? '', /es nueva en el cambio/)
-  // La fila pasó su ejecución, pero sin la confirmación que le exige su obligación no es passed.
-  assert.equal(n.receipt.rows[0].outcome, 'failed')
-  assert.equal(n.receipt.green, false)
+  // Una ruta nueva no tiene una base que revertir: el flujo se bloquea antes de ejecutar la fila.
+  assert.equal(codeOf(() => prepareVerify(fresh.repo, 'f', 'final')), 'flow_blocked')
+})
+
+test('una fila que revierte un archivo nuevo en el cambio bloquea el flujo y approve se niega', () => {
+  const rows = [{ ...RED_ROW, implementation_paths: ['src/nueva.ts'] }, BUILD_ROW]
+  const { repo, base } = verifyFlow({ rows })
+  const status = cli(repo, {}, 'sdd', 'status', 'f')
+  assert.equal(status.code, 0)
+  const reason = status.out.blocked_reasons.find((r: { code: string }) => r.code === 'revert_path_not_in_base')
+  assert.ok(reason)
+  assert.match(reason.detail, /V1/)
+  assert.match(reason.detail, /src\/nueva\.ts/)
+  const refused = cli(repo, {}, 'sdd', 'approve', 'f', 'plan')
+  assert.notEqual(refused.code, 0)
+  assert.equal(refused.out.code, 'approve_rejected')
+  assert.match(refused.out.detail, /revert_path_not_in_base/)
+
+  const noRevert = verifyFlow({ rows: [{ ...rows[0], obligation: 'none', obligation_reason: 'sin seam' }, BUILD_ROW] })
+  assert.equal(cli(noRevert.repo, {}, 'sdd', 'status', 'f').out.blocked_reasons.some((r: { code: string }) => r.code === 'revert_path_not_in_base'), false)
+
+  writeFileSync(join(repo, '.plans', 'f', 'plan.md'), planMd(base, 'implementing', [{ ...RED_ROW, implementation_paths: ['src/a.ts'] }, BUILD_ROW]))
+  assert.equal(cli(repo, {}, 'sdd', 'status', 'f').out.blocked_reasons.some((r: { code: string }) => r.code === 'revert_path_not_in_base'), false)
 })
 
 test('dos corridas vuelven a ejecutar todas las filas y ven una regresión', async () => {
@@ -583,6 +600,21 @@ function answered(q: Question, label: string, env = { CLAUDECODE: '1', CLAUDE_CO
   writeClaudeTranscript(env.CLAUDE_CONFIG_DIR, env.CLAUDE_CODE_SESSION_ID, askPair(env.CLAUDE_CODE_SESSION_ID, `tu-${randomUUID()}`, q, label))
   return env
 }
+
+test('el next de --attest y el de status saltan las filas ya acreditadas', async () => {
+  const { repo, base } = verifyFlow({ rows: [RED_ROW, MANUAL_ROW, { ...MANUAL_ROW, id: 'V3' }] })
+  fakeHarvest(repo, base, { endMark: true })
+  const { receipt } = await final(repo)
+  assert.equal(receipt.green, false)
+  for (const [row, next] of [['V2', './bin/sdd-ai sdd verify f --attest V3'], ['V3', './bin/sdd-ai sdd verify f']]) {
+    const q = attestQuestion('f', row, MANUAL_ROW.observation, candidateFingerprint(repo, 'f', base), receipt.plan_fingerprint)
+    const env = { ...answered(q, 'Acreditar'), CODEX_SESSION_ID: '', CODEX_THREAD_ID: '' }
+    const attested = cli(repo, env, 'sdd', 'verify', 'f', '--attest', row)
+    assert.equal(attested.code, 0, JSON.stringify(attested.out))
+    assert.equal(attested.out.next.command, next)
+    assert.equal(cli(repo, env, 'sdd', 'status', 'f').out.next.command, next)
+  }
+})
 
 test('una fila manual queda pendiente hasta acreditarla, y la acreditación vence con el árbol o el plan', async () => {
   const { repo } = verifyFlow({ rows: [RED_ROW, MANUAL_ROW] })
@@ -984,6 +1016,21 @@ test('una confirmación con el contrato incoherente propone la clase contract', 
   })
   assert.equal(proposeClass(TROW, result('contract_incoherent'), tap), 'contract')
   assert.equal(proposeClass(TROW, result('not_confirmable'), tap), null)
+})
+
+test('el diagnóstico de un módulo que no existe nombra el importador aunque la ruta del repositorio tenga espacios', async () => {
+  const { repo } = verifyFlow({
+    prefix: 'sdd ai repo-', rows: [B_ROW, BUILD_ROW],
+    base: { 'src/b.ts': "import { c } from './c.ts'\nexport const h = () => c\n", 'src/c.ts': 'export const c = 0\n' },
+    candidate: {
+      'src/b.ts': 'export const g = () => 2\n',
+      'test/a.test.ts': "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\nimport { g } from '../src/b.ts'\ntest('f da 2', () => { assert.equal(g(), 2) })\n",
+    },
+  })
+  rmSync(join(repo, 'src', 'c.ts'))
+  const confirmation = (await final(repo)).receipt.rows[0].confirmation
+  assert.equal(confirmation?.state, 'contract_incoherent')
+  assert.match(confirmation?.reason ?? '', /src\/b\.ts importa src\/c\.ts, que no existe/)
 })
 
 test('el diagnóstico de carga nombra la ruta solo si la evidencia la identifica y no atribuye una aserción opaca', async () => {

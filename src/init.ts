@@ -5,7 +5,7 @@ import { dirname, join, relative } from 'node:path'
 import { Scalar, isMap, parse, parseDocument } from 'yaml'
 import { agentName, agentsState, leftoverAgents, skillCopies, syncAgents } from './agents.ts'
 import { parseCrossModel, parseJiraMode } from './config.ts'
-import { type Exec, detectClis, doctor } from './doctor.ts'
+import { type Exec, cliVersion, defaultExec, detectClis, doctor, olderVersion } from './doctor.ts'
 import { gitDirs } from './git.ts'
 import { DEFAULT_PROFILES, type WorkersFile, loadCodexCatalog, loadCodexRoot, parseWorkers } from './profiles.ts'
 import { roleProfiles } from './resolve.ts'
@@ -401,6 +401,13 @@ function agentChanges(root: string, workers: WorkersFile, env: Env): AgentChange
   return out
 }
 
+/**
+ * Cómo describe el catálogo de Codex un modelo de una generación anterior. El catálogo no trae un campo de
+ * generación, así que se lee el comienzo de la descripción, sin distinguir mayúsculas: si cambia la
+ * redacción, el aviso deja de salir, pero nunca sale de más.
+ */
+const OLDER_GENERATION = /^(?:Older|Previous generation|Legacy)\b/i
+
 function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): Planned {
   assertCheckout(root)
   const configText = readText(join(root, CONFIG_PATH))
@@ -428,19 +435,23 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
 
   const workersText = readText(join(root, WORKERS_PATH))
   const sourceWorkers = workersText === null && source !== null ? readText(join(source, WORKERS_PATH)) : null
-  const catalog = loadCodexCatalog(env)
+  const loaded = loadCodexCatalog(env)
+  const codexVersion = detected.includes('codex') ? cliVersion(o.exec ?? defaultExec, 'codex') : null
+  const outdated = loaded !== null && loaded.clientVersion !== null && codexVersion !== null && olderVersion(loaded.clientVersion, codexVersion)
+  // Solo un catálogo de un cliente igual o más nuevo que el instalado sirve para validar los modelos.
+  const validationSlugs = loaded === null || outdated ? null : loaded.slugs
   let report: WorkersReport = { removed: [], added: [], differs: [] }
   let workers: WorkersFile | null = null
   const baseWorkers = workersText ?? sourceWorkers
   if (baseWorkers === null) {
-    const content = freshWorkers(catalog)
+    const content = freshWorkers(validationSlugs)
     workers = parseWorkers(content, join(root, WORKERS_PATH))
-    const added = ROLES.flatMap((r) => FAMILIES.filter((f) => writableDefault(r, f, catalog)).map((f) => `roles.${r}.${f}`))
+    const added = ROLES.flatMap((r) => FAMILIES.filter((f) => writableDefault(r, f, validationSlugs)).map((f) => `roles.${r}.${f}`))
     report = { removed: [], added, differs: [] }
     files.push({ path: WORKERS_PATH, action: 'create', content })
   } else {
     const where = join(workersText === null && source !== null ? source : root, WORKERS_PATH)
-    const merged = mergeWorkers(baseWorkers, where, catalog)
+    const merged = mergeWorkers(baseWorkers, where, validationSlugs)
     if ('invalid' in merged) {
       files.push({ path: WORKERS_PATH, action: 'invalid', error: merged.invalid })
     } else {
@@ -465,9 +476,20 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
   if (plansIgnored(root) === false) {
     notes.push({ code: 'plans_not_ignored', detail: '.plans/ no está ignorado: sus artefactos aparecerían como cambios', next: 'agrega .plans/ a .git/info/exclude; init no edita archivos de ignore' })
   }
-  if (catalog === null) notes.push({ code: 'codex_catalog_missing', detail: 'no se encontró el catálogo local de Codex (models_cache.json): no se validaron los modelos de Codex' })
+  if (loaded === null) notes.push({ code: 'codex_catalog_missing', detail: 'no se encontró el catálogo local de Codex (models_cache.json): no se validaron los modelos de Codex' })
+  if (outdated) notes.push({ code: 'codex_catalog_outdated', detail: `el catálogo local de Codex lo bajó la versión ${loaded?.clientVersion} y el codex instalado es la ${codexVersion}: no se validaron los modelos de Codex`, next: 'corre codex una vez para que baje su catálogo y vuelve a ensayar' })
+  if (loaded !== null && !outdated && workers !== null) {
+    for (const role of ROLES) {
+      const model = workers.roles[role]?.codex?.model
+      if (!model || model === 'heredado') continue
+      const description = loaded.descriptions.get(model)
+      if (description && OLDER_GENERATION.test(description)) {
+        notes.push({ code: 'codex_model_older_generation', detail: `el perfil de ${role} usa ${model}, que el catálogo describe como «${description}»; el default del rol es ${DEFAULT_PROFILES[role].codex.model}`, next: 'si quieres el default, cámbialo a mano en .sdd-ai/workers.yml' })
+      }
+    }
+  }
   // Un default que falta en el catálogo no se escribe (ver `writableDefault`), y se avisa.
-  const skipped = workers === null ? [] : ROLES.filter((r) => !writableDefault(r, 'codex', catalog) && workers?.roles[r]?.codex === undefined)
+  const skipped = workers === null ? [] : ROLES.filter((r) => !writableDefault(r, 'codex', validationSlugs) && workers?.roles[r]?.codex === undefined)
   if (skipped.length > 0) {
     const models = [...new Set(skipped.map((r) => DEFAULT_PROFILES[r].codex.model))]
     notes.push({
@@ -489,7 +511,7 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
     inputs: {
       config: sha(configText), workers: sha(workersText), ignore: sha(ignoreText),
       source_config: sha(sourceConfig), source_workers: sha(sourceWorkers),
-      catalog: catalog === null ? null : [...catalog].sort(), detected,
+      catalog: loaded === null ? null : [...loaded.slugs].sort(), catalog_client: loaded?.clientVersion ?? null, codex_version: codexVersion, detected,
       agent_sources: AGENT_SOURCES.map((rel) => sha(readText(join(root, rel)))), codex_root: loadCodexRoot(env),
       hooks: FAMILIES.map((f) => sha(readQuiet(join(root, HOOK_FILES[f])))),
     },

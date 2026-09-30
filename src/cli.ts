@@ -1007,21 +1007,21 @@ function reviewView(root: string, id: string, dir: string, s: Status, env: Env):
 
   const ledger = readJson<Ledger>(ledgerFile)
   const c = readJson<Candidate>(join(dir, `candidate${tagOf(ledger.completed)}.json`))
-  const receipt = readJson<Receipt>(join(dir, 'receipt.json'))
+  const receipt = existsSync(join(dir, 'receipt.json')) ? readJson<Receipt>(join(dir, 'receipt.json')) : null
   const rounds = existsSync(join(dir, 'rounds.json')) ? readJson<{ rounds: RoundRecord[] }>(join(dir, 'rounds.json')).rounds : []
   const fresh = freshness(root, dir, req, c, headOf(dir, req, ledger.completed))
   const disputes = ledger.entries.filter((e) => e.state === 'en-disputa').map((e) => e.id)
   const out: Record<string, unknown> = {
     id, state: s.state, round, completed: ledger.completed, candidate_hash: c.hash,
-    reviewer: { ...reviewer, model_effective: receipt.reviewer.model_effective },
-    degradations: receipt.degradations, risk: riskView(req), ...roundShape(dir, s, round), ...fresh,
+    reviewer: { ...reviewer, ...(receipt ? { model_effective: receipt.reviewer.model_effective } : {}) },
+    degradations: receipt?.degradations ?? req.degradations, risk: riskView(req), ...roundShape(dir, s, round), ...fresh,
     axes: axesOf(ledger),
     ledger: ledger.entries.map(withProvenance),
     pending: undecided(ledger).filter((x) => !disputes.includes(x)), disputes,
     refuted: ledger.entries.filter((e) => e.state === 'refutado').map((e) => e.id),
     inconclusive: ledger.entries.flatMap((e) => (e.state !== 'refutado' && e.refutation?.result === 'inconclusive'
       ? [{ id: e.id, reason: e.refutation.reason ?? 'refuter_inconclusive' }] : [])),
-    tool_events: rounds.filter((r) => r.state === 'done').at(-1)?.tool_events ?? receipt.tool_events,
+    tool_events: rounds.filter((r) => r.state === 'done').at(-1)?.tool_events ?? receipt?.tool_events,
     ...(ledger.artifact ? artifactView(ledger, rounds) : {}),
     ...common,
     questions: questionsOf(id, dir, s, ledger, fresh),
@@ -2694,7 +2694,8 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
     const root = repoRoot(cwd)
     const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor))
-    return { code: 0, out: { ...status, next: withPhaseNext(root, status.id, status) } }
+    const { facts } = readFlow(root, status.id)
+    return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
   }
   if (sub === 'verify') return sddVerify(rest, env, cwd)
   throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id>' })

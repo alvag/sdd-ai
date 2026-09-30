@@ -141,14 +141,25 @@ export function loadCodexRoot(env: Record<string, string | undefined>): Profile 
   }
 }
 
-/** Catálogo local de Codex, incluidos los modelos ocultos; su ausencia no es un error. */
-export function loadCodexCatalog(env: Record<string, string | undefined>): Set<string> | null {
+export interface CodexCatalog { slugs: Set<string>; clientVersion: string | null; descriptions: Map<string, string> }
+
+/** Catálogo local de Codex, incluidos los modelos ocultos, con descripciones y versión del cliente; su ausencia no es un error. */
+export function loadCodexCatalog(env: Record<string, string | undefined>): CodexCatalog | null {
   const home = env.CODEX_HOME || join(homedir(), '.codex')
   try {
     const value: unknown = JSON.parse(readFileSync(join(home, 'models_cache.json'), 'utf8'))
     if (typeof value !== 'object' || value === null || !Array.isArray((value as { models?: unknown }).models)) return null
-    return new Set((value as { models: unknown[] }).models.flatMap((m) =>
-      typeof m === 'object' && m !== null && typeof (m as { slug?: unknown }).slug === 'string' ? [(m as { slug: string }).slug] : []))
+    const data = value as { models: unknown[]; client_version?: unknown }
+    const slugs = new Set<string>()
+    const descriptions = new Map<string, string>()
+    for (const m of data.models) {
+      if (typeof m !== 'object' || m === null) continue
+      const model = m as { slug?: unknown; description?: unknown }
+      if (typeof model.slug !== 'string') continue
+      slugs.add(model.slug)
+      if (typeof model.description === 'string') descriptions.set(model.slug, model.description)
+    }
+    return { slugs, clientVersion: typeof data.client_version === 'string' ? data.client_version : null, descriptions }
   } catch {
     return null
   }
