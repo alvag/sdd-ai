@@ -1,7 +1,8 @@
 import { parse } from 'yaml'
 import { sha256 } from '../review/candidate.ts'
 
-export interface TaskCount { total: number; done: number; firstPending: string | null }
+/** `firstPending` es el texto de la primera task pendiente tras su checkbox; `firstPendingId`, su `T<n>`, o `null` si no cumple la gramática. */
+export interface TaskCount { total: number; done: number; firstPending: string | null; firstPendingId: string | null }
 export type HeaderResult = { ok: true; data: Record<string, unknown>; body: string } | { ok: false; detail: string }
 export type SectionState = 'absent' | 'empty' | 'present'
 
@@ -123,7 +124,7 @@ export function countTasks(text: string): TaskCount {
     if (m[1] === ' ') firstPending ??= m[2].trim()
     else done++
   }
-  return { total, done, firstPending }
+  return { total, done, firstPending, firstPendingId: firstPending === null ? null : (TASK_BODY.exec(firstPending)?.[2] ?? null) }
 }
 
 /** Lo que se lee de la línea de una task con la gramática de la plantilla de `sdd-flow`. */

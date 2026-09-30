@@ -94,7 +94,7 @@ test('sdd status lee el flujo sin escribir nada, no crea .sdd-ai y acepta --json
   assert.deepEqual(plain.out.tasks, { total: 2, done: 1, pending: 1, first_pending: '**T2 — segunda** · cubre: AC-1' })
   // Con `.plans/` sin ignorar, el árbol está sucio: el writer de la fase no se lanza y el next dice por qué.
   const { detail, ...next } = plain.out.next
-  assert.deepEqual(next, { step: 'implement', task: '**T2 — segunda** · cubre: AC-1' })
+  assert.deepEqual(next, { step: 'implement', task: 'T2' })
   assert.match(detail, /cambios sin commitear/)
   assert.equal(plain.out.paths.spec, '.plans/f/spec.md')
   assert.deepEqual(list.out.flows.map((f: { id: string }) => f.id), ['f'])
@@ -290,6 +290,17 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
 
   assert.deepEqual(artifacts.map((n) => `${readFileSync(join(dir, n), 'utf8')} ${lstatSync(join(dir, n)).mtimeMs}`), before)
   assert.equal(existsSync(join(dir, LOCK)), false)
+})
+
+test('approve trae en next el comando de la fase', () => {
+  const repo = makeRepo()
+  specOnly(repo)
+
+  answer(repo, 'f', 'spec')
+  const spec = sdd(repo, 'approve', 'f', 'spec')
+  assert.equal(spec.code, 0, JSON.stringify(spec.out))
+  assert.deepEqual(spec.out.next, { step: 'plan', artifacts: ['plan.md'], command: './bin/sdd-ai sdd phase f' })
+  assert.deepEqual(sdd(repo, 'status', 'f').out, spec.out)
 })
 
 test('approve rechaza sin escribir un gate inexistente, un artefacto faltante, tasks vacías, un gate anterior pendiente o un flujo bloqueado', () => {

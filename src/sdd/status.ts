@@ -222,7 +222,7 @@ export function resolve(facts: FlowFacts): FlowStatus {
     blocked.push({ code: 'status_invalid', detail: `plan.md tiene un status que no sirve para ${depth ?? 'esta profundidad'}: ${JSON.stringify(plan.status ?? null)}` })
   }
 
-  const count = (depth === 'corta' ? facts.tasksSection : facts.tasksFile) ?? { total: 0, done: 0, firstPending: null }
+  const count = (depth === 'corta' ? facts.tasksSection : facts.tasksFile) ?? { total: 0, done: 0, firstPending: null, firstPendingId: null }
   const pending = count.total - count.done
   if (status !== null && AFTER_IMPLEMENTING.includes(status) && pending > 0) {
     blocked.push({ code: 'status_ahead', detail: `plan.md dice ${status} y quedan ${pending} tasks pendientes` })
@@ -269,7 +269,7 @@ export function resolve(facts: FlowFacts): FlowStatus {
     }
     const closing = status !== null ? CLOSING[status] : undefined
     if (closing) return held && closing === 'review_and_commit' ? { step: 'external_gate' } : { step: closing }
-    if (pending > 0) return external || held ? { step: 'external_gate' } : { step: 'implement', task: count.firstPending ?? '' }
+    if (pending > 0) return external || held ? { step: 'external_gate' } : { step: 'implement', ...(count.firstPendingId === null ? {} : { task: count.firstPendingId }) }
     return held ? { step: 'external_gate' } : { step: 'verify' }
   })()
 

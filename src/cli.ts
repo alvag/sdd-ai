@@ -2665,7 +2665,9 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
   if (sub === 'approve') {
     const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { conductor: { type: 'string' } } })
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
-    return { code: 0, out: approve(repoRoot(cwd), positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor)) }
+    const root = repoRoot(cwd)
+    const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor))
+    return { code: 0, out: { ...status, next: withPhaseNext(root, status.id, status) } }
   }
   if (sub === 'verify') return sddVerify(rest, env, cwd)
   throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id>' })

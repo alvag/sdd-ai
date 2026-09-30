@@ -113,10 +113,10 @@ test('cuenta los checkboxes de primer nivel fuera de las cercas, no los anidados
     '# Tasks', '', '- [ ] a', '* [x] b', '+ [ ] c', '1. [X] d', '2) [ ] e', '  - [ ] anidado', '- [~] marca', '-[ ] pegado',
     '```', '- [ ] en la cerca', '```', '~~~~', '- [x] en otra', '~~~~', '- [ ]', '',
   ].join('\n')
-  assert.deepEqual(countTasks(text), { total: 6, done: 2, firstPending: 'a' })
+  assert.deepEqual(countTasks(text), { total: 6, done: 2, firstPending: 'a', firstPendingId: null })
   assert.deepEqual(countTasks('- [x] **T1 — hecha** · cubre: AC-1\n- [ ] **T2 — pendiente** · cubre: AC-2\n'),
-    { total: 2, done: 1, firstPending: '**T2 — pendiente** · cubre: AC-2' })
-  assert.deepEqual(countTasks('prosa sin tasks\n'), { total: 0, done: 0, firstPending: null })
+    { total: 2, done: 1, firstPending: '**T2 — pendiente** · cubre: AC-2', firstPendingId: 'T2' })
+  assert.deepEqual(countTasks('prosa sin tasks\n'), { total: 0, done: 0, firstPending: null, firstPendingId: null })
 })
 
 function readHeaderBody(text: string): string {

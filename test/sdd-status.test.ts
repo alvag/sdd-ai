@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { JiraMode } from '../src/config.ts'
-import type { HeaderResult } from '../src/sdd/markdown.ts'
+import { type HeaderResult, countTasks } from '../src/sdd/markdown.ts'
 import { readFlow } from '../src/sdd/read.ts'
 import {
   type Approval, type ApprovalLog, type Depth, type FlowFacts, GATE_ARTIFACTS, GATES, type GateId, type GateResolution, type Reason,
@@ -30,7 +30,7 @@ const noteFor = (r: GateResolution, code: string) => r.notes.filter((n) => n.cod
  */
 function flow(depth: Depth, status: string, o: Partial<FlowFacts> = {}): FlowFacts {
   const corta = depth === 'corta'
-  const tasks = { total: 2, done: 1, firstPending: 'T2 — segunda' }
+  const tasks = { total: 2, done: 1, firstPending: 'T2 — segunda', firstPendingId: 'T2' }
   return {
     id: 'f',
     files: { spec: corta ? 'absent' : 'present', plan: 'present', tasks: corta ? 'absent' : 'present', handoff: 'present' },
@@ -155,7 +155,7 @@ test('cambiar la huella de un gate anterior vence los posteriores aunque se reap
   assert.deepEqual(states(r), { spec: 'approved', plan: 'stale', tasks: 'stale' })
 })
 
-const DONE = { total: 2, done: 2, firstPending: null }
+const DONE = { total: 2, done: 2, firstPending: null, firstPendingId: null }
 const noPlan: Partial<FlowFacts> = {
   files: { spec: 'present', plan: 'absent', tasks: 'absent', handoff: 'present' }, planHeader: null, planSections: null, tasksFile: null,
 }
@@ -171,11 +171,25 @@ test('la respuesta trae profundidad, gates, tasks, next, bloqueos, notas y rutas
     { gate: 'tasks', artifacts: ['tasks.md'], state: 'approved_unfingerprinted' },
   ])
   assert.deepEqual(r.tasks, { total: 2, done: 1, pending: 1, first_pending: 'T2 — segunda' })
-  assert.deepEqual(r.next, { step: 'implement', task: 'T2 — segunda' })
+  assert.deepEqual(r.next, { step: 'implement', task: 'T2' })
   assert.deepEqual(r.blocked_reasons, [])
   assert.deepEqual(codes(r.notes), ['approved_unfingerprinted', 'approved_unfingerprinted', 'approved_unfingerprinted'])
   for (const n of r.notes) assert.deepEqual(Object.keys(n), ['code', 'detail'])
   assert.deepEqual(r.paths, { dir: '.plans/f', spec: '.plans/f/spec.md' })
+})
+
+test('next.task trae el id de la task y first_pending la línea como está escrita', () => {
+  const tasksFile = countTasks('- [x] **T1 — primera** · cubre: AC-1\n- [ ] **T2 — segunda** · cubre: AC-1\n')
+  const r = resolve(flow('completa', 'implementing', { tasksFile }))
+  assert.deepEqual(r.next, { step: 'implement', task: 'T2' })
+  assert.equal(r.tasks.first_pending, '**T2 — segunda** · cubre: AC-1')
+})
+
+test('next.task se omite con una task fuera de la gramática', () => {
+  const tasksFile = countTasks('- [x] **T1 — primera** · cubre: AC-1\n- [ ] revisar el log\n')
+  const r = resolve(flow('completa', 'implementing', { tasksFile }))
+  assert.deepEqual(r.next, { step: 'implement' })
+  assert.equal(r.tasks.first_pending, 'revisar el log')
 })
 
 test('sin profundidad next es depth y sin artefactos es no_artifacts, sin bloquear', () => {
@@ -218,8 +232,8 @@ test('next recorre los gates en orden y un artefacto posterior no hace avanzar',
 })
 
 test('con los gates aprobados next es implement con la primera pendiente o verify', () => {
-  assert.deepEqual(resolve(flow('completa', 'tasks-ready')).next, { step: 'implement', task: 'T2 — segunda' })
-  assert.deepEqual(resolve(flow('corta', 'implementing')).next, { step: 'implement', task: 'T2 — segunda' })
+  assert.deepEqual(resolve(flow('completa', 'tasks-ready')).next, { step: 'implement', task: 'T2' })
+  assert.deepEqual(resolve(flow('corta', 'implementing')).next, { step: 'implement', task: 'T2' })
   const done = resolve(flow('completa', 'implementing', { tasksFile: DONE }))
   assert.deepEqual(done.next, { step: 'verify' })
   assert.deepEqual(done.tasks, { total: 2, done: 2, pending: 0, first_pending: null })
@@ -287,7 +301,7 @@ test('cada contradicción va a blocked_reasons con su código y next es resolve_
     ['status_invalid', flow('normal', 'plan-approved')],
     ['status_ahead', flow('completa', 'verified')],
     // Un tasks.md con prosa y sin tasks bloquea aunque su gate no haya llegado.
-    ['tasks_empty', flow('completa', 'planned', { tasksFile: { total: 0, done: 0, firstPending: null } })],
+    ['tasks_empty', flow('completa', 'planned', { tasksFile: { total: 0, done: 0, firstPending: null, firstPendingId: null } })],
     // Un gate de tasks que cuenta como aprobado sin ninguna task, con el artefacto vacío.
     ['tasks_empty', flow('completa', 'tasks-ready', { files: { spec: 'present', plan: 'present', tasks: 'empty', handoff: 'present' }, tasksFile: null })],
     ['artifact_unreadable', flow('completa', 'planned', { files: { spec: 'unreadable', plan: 'present', tasks: 'present', handoff: 'present' } })],
@@ -302,7 +316,7 @@ test('cada contradicción va a blocked_reasons con su código y next es resolve_
 })
 
 test('en corta, una sección Spec o Tasks vacía pide escribirla antes del gate single', () => {
-  const noTasks = { total: 0, done: 0, firstPending: null }
+  const noTasks = { total: 0, done: 0, firstPending: null, firstPendingId: null }
   const specEmpty = resolve(flow('corta', 'planned', { planSections: { spec: 'empty', tasks: 'present' } }))
   assert.deepEqual(states(specEmpty), { single: 'pending' })
   assert.deepEqual(specEmpty.next, { step: 'specify', artifacts: ['plan.md#Spec'] })
@@ -340,7 +354,7 @@ test('un gate externo pendiente deja planificar y cambia implement por external_
     assert.deepEqual(resolve(flow('completa', 'implementing', { handoffHeader, tasksFile: DONE })).next, { step: 'verify' })
   }
   const approved = hdr({ profundidad: 'completa', spec_approved_at: SPEC_APPROVED_AT, gate_status: 'approved' })
-  assert.deepEqual(resolve(flow('completa', 'implementing', { handoffHeader: approved })).next, { step: 'implement', task: 'T2 — segunda' })
+  assert.deepEqual(resolve(flow('completa', 'implementing', { handoffHeader: approved })).next, { step: 'implement', task: 'T2' })
 })
 
 test('resolve da la misma respuesta con los mismos hechos, armados en memoria', () => {
@@ -427,12 +441,12 @@ test('con jira on y sin approved, implement, verify y review_and_commit pasan a 
     assert.deepEqual(planning.next, { step: 'gate', gate: 'plan', artifacts: ['plan.md'] })
     assert.equal(planning.notes.filter((n) => n.code === 'external_gate').length, 1, String(gateStatus))
   }
-  assert.deepEqual(at('approved', 'implementing').next, { step: 'implement', task: 'T2 — segunda' })
+  assert.deepEqual(at('approved', 'implementing').next, { step: 'implement', task: 'T2' })
   assert.deepEqual(at('approved', 'implementing', { tasksFile: DONE }).next, { step: 'verify' })
   assert.deepEqual(at('approved', 'verified', { tasksFile: DONE }).next, { step: 'review_and_commit' })
   assert.deepEqual(at('approved', 'planned').notes.filter((n) => n.code === 'external_gate'), [])
   for (const jira of [null, { mode: 'off' } as JiraMode]) {
-    assert.deepEqual(at(undefined, 'implementing', {}, jira).next, { step: 'implement', task: 'T2 — segunda' })
+    assert.deepEqual(at(undefined, 'implementing', {}, jira).next, { step: 'implement', task: 'T2' })
     assert.deepEqual(at(undefined, 'verified', { tasksFile: DONE }, jira).next, { step: 'review_and_commit' })
     assert.deepEqual(at(undefined, 'planned', {}, jira).notes.filter((n) => n.code === 'external_gate'), [])
   }
@@ -446,11 +460,11 @@ test('en corta con jira on vale la sección ## Spec, sin layout_mismatch ni esca
   const approved = hdr({ profundidad: 'corta', gate_status: 'approved' })
   const ready = resolve(flow('corta', 'tasks-ready', { jira: ON, handoffHeader: approved }))
   assert.deepEqual(ready.blocked_reasons, [])
-  assert.deepEqual(ready.next, { step: 'implement', task: 'T2 — segunda' })
+  assert.deepEqual(ready.next, { step: 'implement', task: 'T2' })
 })
 
 test('con contrato estructurado, verified pide un recibo vigente; en prosa rige el header con una nota', () => {
-  const done = { total: 2, done: 2, firstPending: null }
+  const done = { total: 2, done: 2, firstPending: null, firstPendingId: null }
   const verified = (o: Partial<FlowFacts>) => resolve(flow('completa', 'verified', { tasksFile: done, ...o }))
   assert.equal(verified({}).next.step, 'review_and_commit')
   assert.equal(verified({ contract: 'structured', receipt: 'valid' }).next.step, 'review_and_commit')
