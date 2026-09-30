@@ -3,7 +3,7 @@ import { parseLocation } from './admit.ts'
 import type { Candidate, CandidateFile } from './candidate.ts'
 import { numbered, sections } from './diff.ts'
 import type { LedgerEntry, Reviewer, RoundPlan, Target } from './ledger.ts'
-import { REVIEW_PROMPT_BUDGET, measure, renderMaterial, renderRoundPrompt } from './prompt.ts'
+import { REVIEW_PROMPT_BUDGET, measure, renderLensRoundPrompt, renderMaterial, renderRoundPrompt } from './prompt.ts'
 
 /**
  * La vista de un lote: sus archivos y sus secciones del diff, con el mismo hash y el mismo contexto.
@@ -122,20 +122,37 @@ function pendingBlock(where: string, bytes: number): SddError {
  * Los trabajos de una ronda N, que es una pasada dirigida de la base: uno solo si el prompt entero
  * entra; si no, uno por lote, cada uno con los pendientes de su lote. Si el reparto falla, se vuelve a
  * medir sin pendientes para decir si lo que no entra es un archivo, el contexto o un bloque de
- * pendientes.
+ * pendientes. Con lentes, el reparto se mide con el prompt más grande entre la base con sus pendientes y
+ * cada lente; los pendientes quedan en la base y las lentes van con `targets: []`, solo en los lotes
+ * que tienen rutas.
  */
 export function planRoundJobs(c: Candidate, contextTexts: Map<string, string>, plan: RoundPlan, entries: LedgerEntry[],
-  cap: number): { batches: string[][]; jobs: PlannedJob[] } {
+  cap: number, reviewers: readonly Reviewer[] = ['base']): { reviewers: readonly Reviewer[]; batches: string[][]; jobs: PlannedJob[] } {
   const all = c.files.map((f) => f.path)
+  const lenses = all.length === 0 ? [] : reviewers.filter((r): r is Exclude<Reviewer, 'base'> => r !== 'base')
+  const plannedReviewers: readonly Reviewer[] = ['base', ...lenses]
   const whole = renderRoundPrompt(c, renderMaterial(c, contextTexts), plan, entries, cap)
-  if (measure(whole) <= REVIEW_PROMPT_BUDGET) {
-    return { batches: [all], jobs: [{ key: 'base-b1', reviewer: 'base', batch: 1, paths: all, text: whole }] }
+  const wholeMaterial = lenses.length > 0 ? renderMaterial(c, contextTexts) : ''
+  const wholeLens = lenses.map((lens) => renderLensRoundPrompt(c, wholeMaterial, plan, lens, cap))
+  if (Math.max(measure(whole), ...wholeLens.map(measure)) <= REVIEW_PROMPT_BUDGET) {
+    return {
+      reviewers: plannedReviewers, batches: [all],
+      jobs: [
+        { key: 'base-b1', reviewer: 'base', batch: 1, paths: all, text: whole },
+        ...lenses.map((lens, i): PlannedJob => ({ key: `${lens}-b1`, reviewer: lens, batch: 1, paths: all, targets: [], text: wholeLens[i] as string })),
+      ],
+    }
   }
   const lotPlan = (paths: string[], goals: Target[]): RoundPlan =>
     ({ ...plan, targets: goals, changed: Object.fromEntries(Object.entries(plan.changed).filter(([p]) => paths.includes(p))) })
   const render = (paths: string[], goals: Target[]) =>
     renderRoundPrompt(c, renderMaterial(c, contextTexts, sliceCandidate(c, paths)), lotPlan(paths, goals), entries, cap, paths)
-  const withPending = (paths: string[], first: boolean) => measure(render(paths, lotTargets(plan.targets, entries, c, paths, first)))
+  const renderLens = (lens: Exclude<Reviewer, 'base'>, paths: string[]) =>
+    renderLensRoundPrompt(c, renderMaterial(c, contextTexts, sliceCandidate(c, paths)), lotPlan(paths, []), lens, cap, paths)
+  const withPending = (paths: string[], first: boolean) => Math.max(
+    measure(render(paths, lotTargets(plan.targets, entries, c, paths, first))),
+    ...lenses.map((lens) => measure(renderLens(lens, paths))),
+  )
   let batches: string[][]
   try {
     batches = planBatches(c.files, withPending, REVIEW_PROMPT_BUDGET, sectionSizes(c))
@@ -149,11 +166,11 @@ export function planRoundJobs(c: Candidate, contextTexts: Map<string, string>, p
     if (file && bare([file]) <= REVIEW_PROMPT_BUDGET) throw pendingBlock(`de ${file}`, withPending([file], false))
     throw e
   }
-  return {
-    batches,
-    jobs: batches.map((paths, i) => {
-      const goals = lotTargets(plan.targets, entries, c, paths, i === 0)
-      return { key: `base-b${i + 1}`, reviewer: 'base', batch: i + 1, paths, targets: goals, text: render(paths, goals) }
-    }),
-  }
+  const baseJobs = batches.map((paths, i): PlannedJob => {
+    const goals = lotTargets(plan.targets, entries, c, paths, i === 0)
+    return { key: `base-b${i + 1}`, reviewer: 'base', batch: i + 1, paths, targets: goals, text: render(paths, goals) }
+  })
+  const lensJobs = lenses.flatMap((lens) => batches.flatMap((paths, i): PlannedJob[] =>
+    paths.length === 0 ? [] : [{ key: `${lens}-b${i + 1}`, reviewer: lens, batch: i + 1, paths, targets: [], text: renderLens(lens, paths) }]))
+  return { reviewers: plannedReviewers, batches, jobs: [...baseJobs, ...lensJobs] }
 }

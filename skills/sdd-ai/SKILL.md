@@ -119,7 +119,8 @@ trae `risk`: el nivel, los motivos (cada uno con la señal y la ruta que la disp
 dice si el nivel se subió a mano. Es `high` si el candidato tiene una ruta con un segmento `auth`,
 `security`, `update`, `webhook` o `payments`, un script de shell agregado o cambiado, un archivo
 que pasa a ejecutable, o una línea agregada que lanza procesos (`exec(`, `spawn`, `child_process`,
-un shebang…). El tamaño del diff no cuenta.
+un shebang…). El tamaño del diff no cuenta. En las rondas siguientes, la señal de procesos cuenta solo
+los identificadores nuevos de cada bloque reemplazado: editar una línea que ya los tenía no la dispara.
 
 - **`--risk high`** sube el nivel a mano. Úsalo cuando el cambio toca algo sensible que las señales
   no ven, como una regla de permisos en un archivo con otro nombre. Solo sube: no hay forma de bajar
@@ -175,15 +176,20 @@ sin decidir, si hay aceptados y no corregiste nada, o si no hay nada que verific
   ronda; no lances un `review start` nuevo.
 - Un aceptado que la ronda ve sin resolver vuelve a esperar: corrígelo otra vez (`accept`), o
   recházalo con motivo si la evidencia del revisor no te convence.
-- La ronda siguiente no corre lentes: es una pasada de la base, en lotes si el material no entra,
-  con cada pendiente en el lote de su archivo.
-- **`risk_high`**: la corrección trajo riesgo alto (`detail` nombra la señal y la ruta), así que la
-  ronda no corre: nada nuevo de riesgo alto queda aprobado sin las lentes. Pregúntale al usuario si
-  reinicia la revisión con lentes; si dice que sí, corre el `review start … --risk high` que trae
-  `next`.
+- La ronda siguiente es una pasada de la base, en lotes si el material no entra, con cada pendiente
+  en el lote de su archivo. En una revisión con lentes, un delta de riesgo alto corre además las
+  cuatro lentes sobre lo que cambió: conserva el ledger y las respuestas a los pendientes, y la salida
+  trae `reviewers` y `delta_risk`. Sin señal alta nueva, corre solo la base.
+- **`risk_high`**: en una revisión sin lentes, la corrección trajo riesgo alto (`detail` nombra la
+  señal y la ruta), así que la ronda no corre: nada nuevo de riesgo alto queda aprobado sin las
+  lentes. Pregúntale al usuario si reinicia la revisión con lentes; si dice que sí, corre el
+  `review start … --risk high` que trae `next`.
 - **Relanzar una ronda que no terminó**, también la 1: `review round <id>`, como diga `next`. Corre
   solo los trabajos que faltan; lo ya admitido se conserva mientras su encargo sea el mismo. Si el
-  candidato cambió, corre todos, y antes se frena con `risk_high` si el cambio trajo riesgo alto.
+  candidato cambió, corre todos, y en una revisión sin lentes antes se frena con `risk_high` si el
+  cambio trajo riesgo alto. Con lentes no se frena: en la ronda 1 corre la base y las lentes sobre el
+  candidato vigente; en una ronda posterior corre la base y suma las lentes solo si el delta trae
+  riesgo alto, sobre CAMBIOS.
 
 ### Si algo no entra en el presupuesto
 
@@ -237,6 +243,10 @@ que intenta desmentirlo con el mismo material:
   usuario y pregunta si relanza la ronda con `review round <id>`, como diga `next`.
 - **`stale: true` sin nada pendiente**: el diff cambió desde la última ronda y el veredicto ya no
   vale para lo que hay. Propón la revisión nueva que trae `next`.
+- **La proyección de `sdd verify`**: si el único cambio del contexto es lo que `sdd verify` escribió en
+  el plan (solo `## Verify` y el `status` del header, respaldados por un recibo), la revisión no queda
+  en `stale` y la vista trae `verify_projection` con el plan y el recibo. Cualquier otro cambio, de
+  código o de contexto, sí la vence.
 - El recibo informa: no autoriza el commit ni el push. Un eje en `fail` se resuelve o se declara,
   como en cualquier revisión.
 
@@ -676,7 +686,10 @@ falta; el paso siguiente lo sigue decidiendo `sdd status`, no el hijo.
   que dejó, y su `next` dice cuál es el paso. El orden es verify antes de la revisión: con la cosecha
   completa marcas las tasks acreditadas, corres `sdd verify` y, recién con el verde vigente, lanzas la
   revisión que propone `sdd status`. Si editas a mano, verify se niega hasta que declares la toma
-  (`sdd verify <id> --takeover`). El binario no marca las tasks.
+  (`sdd verify <id> --takeover`). El binario no marca las tasks. Una confirmación `contract_incoherent`
+  es un defecto del contrato: la salida del revert expone un fallo de carga atribuible al conjunto
+  incoherente de rutas. El motivo nombra el módulo y la ruta que falta, o la limitación si no se puede
+  determinar, y se propone la clase `contract`.
 - **Límites:**
   - las fases van solo por proceso, aunque la familia sea la tuya: la vía nativa no le entrega al
     binario la respuesta del hijo;

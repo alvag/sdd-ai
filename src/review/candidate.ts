@@ -213,13 +213,18 @@ function freezeRange(root: string, sel: Selection, baseSha: string, headSha: str
     ? []
     : git(root, ['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter((p) => p !== '')
 
+  return { base_sha: baseSha, head_sha: headSha, files, context, left_out: leftOut, diff, hash: candidateHash({ base_sha: baseSha, head_sha: headSha, files, context }) }
+}
+
+/** El hash del manifiesto normalizado de un candidato: sus archivos y su contexto, ordenados por ruta. */
+export function candidateHash(c: Pick<Candidate, 'base_sha' | 'head_sha' | 'files' | 'context'>): string {
   const manifest = {
-    base_sha: baseSha,
-    head_sha: headSha,
-    files: files.map((f) => ({ path: f.path, status: f.status, from: f.from ?? null, mode: f.mode, sha256: f.sha256 })).sort((a, b) => a.path.localeCompare(b.path)),
-    context: context.map((c) => ({ path: c.path, sha256: c.sha256 })).sort((a, b) => a.path.localeCompare(b.path)),
+    base_sha: c.base_sha,
+    head_sha: c.head_sha,
+    files: c.files.map((f) => ({ path: f.path, status: f.status, from: f.from ?? null, mode: f.mode, sha256: f.sha256 })).sort((a, b) => a.path.localeCompare(b.path)),
+    context: c.context.map((x) => ({ path: x.path, sha256: x.sha256 })).sort((a, b) => a.path.localeCompare(b.path)),
   }
-  return { base_sha: baseSha, head_sha: headSha, files, context, left_out: leftOut, diff, hash: `sha256:${sha256(JSON.stringify(manifest))}` }
+  return `sha256:${sha256(JSON.stringify(manifest))}`
 }
 
 /** Congela dos veces seguidas: si el árbol cambió en el medio, el resultado no representa nada estable. */
@@ -301,12 +306,53 @@ export function changedRanges(prev: Candidate, next: Candidate, dir: string): Ch
     } else if (!before || before.sha256 === null) {
       if (f.lines > 0) out[f.path] = [[1, f.lines]]
     } else {
-      const r = spawnSync('git', ['diff', '--no-index', '--no-color', '--no-ext-diff', '--no-textconv', '-U0',
-        join(dir, 'blobs', before.sha256), join(dir, 'blobs', f.sha256)], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
-      if (r.status !== 0 && r.status !== 1) throw new Error(`git diff --no-index falló sobre ${f.path}: ${r.stderr}`)
-      const ranges = changedSide(r.stdout)
+      const ranges = changedSide(blobDiff(dir, before.sha256, f.sha256, f.path))
       if (ranges.length > 0) out[f.path] = ranges
     }
+  }
+  return out
+}
+
+/** El diff sin contexto entre dos blobs de la corrida. */
+function blobDiff(dir: string, beforeSha: string, afterSha: string, path: string): string {
+  const r = spawnSync('git', ['diff', '--no-index', '--no-color', '--no-ext-diff', '--no-textconv', '-U0',
+    join(dir, 'blobs', beforeSha), join(dir, 'blobs', afterSha)], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
+  if (r.status !== 0 && r.status !== 1) throw new Error(`git diff --no-index falló sobre ${path}: ${r.stderr}`)
+  return r.stdout
+}
+
+/** Un bloque reemplazado: el rango nuevo que ocupa (null si solo borra) y el texto de las líneas quitadas. */
+export interface ReplacedHunk { added: [number, number] | null; removed: string[] }
+
+/**
+ * Los bloques que cambiaron de un candidato al siguiente, por ruta y con el texto que reemplazaron.
+ * Un archivo sin versión anterior es un solo bloque con todas sus líneas y nada quitado; los binarios
+ * no aparecen.
+ */
+export function replacedHunks(prev: Candidate, next: Candidate, dir: string): Record<string, ReplacedHunk[]> {
+  const out: Record<string, ReplacedHunk[]> = {}
+  for (const f of next.files) {
+    if (f.status === 'D' || f.sha256 === null || f.binary) continue
+    const before = prev.files.find((p) => p.path === f.path && p.status !== 'D')
+    if (before?.sha256 === f.sha256) continue
+    if (!before || before.sha256 === null) {
+      if (f.lines > 0) out[f.path] = [{ added: [1, f.lines], removed: [] }]
+      continue
+    }
+    const hunks: ReplacedHunk[] = []
+    let current: ReplacedHunk | null = null
+    for (const line of blobDiff(dir, before.sha256, f.sha256, f.path).split('\n')) {
+      const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line)
+      if (m) {
+        const start = Number(m[1])
+        const count = m[2] === undefined ? 1 : Number(m[2])
+        current = { added: count > 0 ? [start, start + count - 1] : null, removed: [] }
+        hunks.push(current)
+      } else if (current && line.startsWith('-')) {
+        current.removed.push(line.slice(1))
+      }
+    }
+    if (hunks.length > 0) out[f.path] = hunks
   }
   return out
 }

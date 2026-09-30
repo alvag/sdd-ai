@@ -19,7 +19,7 @@ export interface RowExecution {
 }
 /** `execution` es la corrida con las rutas de implementación en la base; sus salidas llevan el prefijo `confirm-`. */
 export interface RowConfirmation {
-  row: string; obligation: Obligation; state: 'confirmed' | 'refuted' | 'not_confirmable' | 'not_required'
+  row: string; obligation: Obligation; state: 'confirmed' | 'refuted' | 'not_confirmable' | 'not_required' | 'contract_incoherent'
   reason?: string; restored: boolean; execution?: RowExecution
 }
 export interface RowResult {

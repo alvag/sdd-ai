@@ -132,12 +132,12 @@ test('el delta evalúa ruta y script de todo archivo cambiado', () => {
     write(repo, 'src/auth/x.ts', lines(5).replace('línea 1\n', 'uno\n').replace('línea 4\n', 'cuatro\n'))
     write(repo, 'tools/run.sh', lines(5).replace('línea 1\n', 'uno\n').replace('línea 4\n', 'cuatro\n'))
   })
-  assert.deepEqual(classifyDelta(prev, next, changedRanges(prev, next, dir)).reasons, [
+  assert.deepEqual(classifyDelta(prev, next, changedRanges(prev, next, dir), dir).reasons, [
     { signal: 'path', path: 'src/auth/x.ts', detail: 'segmento auth' },
     { signal: 'shell', path: 'tools/run.sh', detail: 'script .sh' },
   ])
   const same = rounds(repo, base, () => {})
-  assert.deepEqual(classifyDelta(same.prev, same.next, changedRanges(same.prev, same.next, same.dir)), { level: 'normal', reasons: [] })
+  assert.deepEqual(classifyDelta(same.prev, same.next, changedRanges(same.prev, same.next, same.dir), same.dir), { level: 'normal', reasons: [] })
 })
 
 test('el delta cuenta modos y líneas agregadas', () => {
@@ -150,7 +150,7 @@ test('el delta cuenta modos y líneas agregadas', () => {
     chmodSync(join(repo, 'tool.txt'), 0o755)
     write(repo, 'bin.txt', 'y2\n')
   })
-  const r = classifyDelta(prev, next, changedRanges(prev, next, dir))
+  const r = classifyDelta(prev, next, changedRanges(prev, next, dir), dir)
   assert.equal(r.level, 'high')
   assert.deepEqual(r.reasons, [
     { signal: 'process', path: 'lib.js', detail: 'línea 18: spawn' },
@@ -171,5 +171,49 @@ test('el delta no cuenta las líneas de un archivo que solo se movió', () => {
     git(repo, 'add', '-N', 'movido.js')
   })
   assert.deepEqual(next.files.map((f) => f.path), ['movido.js'])
-  assert.deepEqual(classifyDelta(prev, next, changedRanges(prev, next, dir)), { level: 'normal', reasons: [] })
+  assert.deepEqual(classifyDelta(prev, next, changedRanges(prev, next, dir), dir), { level: 'normal', reasons: [] })
+})
+
+test('el delta cuenta solo los identificadores de proceso nuevos de cada bloque reemplazado', () => {
+  const IMPORT = "import { execFileSync } from 'node:child_process'\n"
+  const body = lines(6, 'cuerpo')
+  const delta = (before: string, after: string) => {
+    const { repo, base } = repoWith({ 'lib.ts': 'base\n' })
+    write(repo, 'lib.ts', before)
+    const { prev, next, dir } = rounds(repo, base, () => write(repo, 'lib.ts', after))
+    return { risk: classifyDelta(prev, next, changedRanges(prev, next, dir), dir), next }
+  }
+
+  // Un import que suma mkdirSync no agrega un identificador de proceso.
+  const mkdir = delta(`${IMPORT}${body}`, `import { execFileSync, mkdirSync } from 'node:child_process'\n${body}`)
+  assert.deepEqual(mkdir.risk, { level: 'normal', reasons: [] })
+  assert.equal(classify(mkdir.next).level, 'high', 'la clasificación inicial contra la base no cambia')
+
+  // Un import que suma spawn sí, y el detalle nombra el nuevo.
+  const spawnImport = delta(`${IMPORT}${body}`, `import { execFileSync, spawn } from 'node:child_process'\n${body}`)
+  assert.deepEqual(spawnImport.risk.reasons, [{ signal: 'process', path: 'lib.ts', detail: 'línea 1: spawn' }])
+
+  // Una línea nueva con spawn cuenta.
+  const fresh = delta(`${IMPORT}${body}`, `${IMPORT}${body}spawn(x)\n`)
+  assert.deepEqual(fresh.risk.reasons, [{ signal: 'process', path: 'lib.ts', detail: 'línea 8: spawn' }])
+
+  // Editar solo los argumentos de una llamada existente no suma identificadores.
+  const args = delta(`${IMPORT}${body}execFileSync(a)\n`, `${IMPORT}${body}execFileSync(b, c)\n`)
+  assert.deepEqual(args.risk, { level: 'normal', reasons: [] })
+
+  // Un aumento de multiplicidad del mismo identificador cuenta.
+  const twice = delta(`${IMPORT}${body}`, `import { execFileSync } from 'node:child_process'; execFileSync(z)\n${body}`)
+  assert.deepEqual(twice.risk.reasons, [{ signal: 'process', path: 'lib.ts', detail: 'línea 1: execFileSync' }])
+
+  // Varias coincidencias en una línea: se informa la primera sin descuento.
+  const several = delta(`${IMPORT}${body}`, `import { execFileSync, spawn, exec } from 'node:child_process'\n${body}`)
+  assert.deepEqual(several.risk.reasons, [{ signal: 'process', path: 'lib.ts', detail: 'línea 1: spawn' }])
+
+  // Un bloque que solo borra no suma nada.
+  const removed = delta(`${IMPORT}${body}exec(a)\n`, `${IMPORT}${body}`)
+  assert.deepEqual(removed.risk, { level: 'normal', reasons: [] })
+
+  // Quitar un identificador en un bloque y agregarlo lejos, en otro, no se compensa.
+  const far = delta(`exec(a)\n${lines(10, 'medio')}${body}`, `${lines(10, 'medio')}${body}exec(b)\n`)
+  assert.deepEqual(far.risk.reasons, [{ signal: 'process', path: 'lib.ts', detail: 'línea 17: exec' }])
 })

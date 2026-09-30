@@ -114,6 +114,41 @@ test('agents sync no genera sdd-ai-implement', () => {
   assert.deepEqual(codex.sort(), READ_ONLY_ROLES.map((role) => `sdd-ai-${role}.toml`).sort())
 })
 
+test('agents sync rechaza un flag desconocido o un posicional sobrante sin tocar las copias', () => {
+  const repo = makeRepo()
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')) }
+  const sync = (...extra: string[]) => {
+    const r = spawnSync(join(import.meta.dirname, '..', 'bin', 'sdd-ai'), ['agents', 'sync', ...extra], { cwd: repo, encoding: 'utf8', env })
+    return { code: r.status, out: JSON.parse(r.stdout) }
+  }
+  assert.equal(sync().code, 0)
+  // Las copias de la skill y un agente quedan desactualizados, y hay un archivo generado que sobraría.
+  const skill = join(repo, '.claude', 'skills', 'sdd-ai', 'SKILL.md')
+  const agent = join(repo, '.claude', 'agents', 'sdd-ai-explore.md')
+  writeFileSync(skill, 'copia vieja\n')
+  writeFileSync(join(repo, '.agents', 'skills', 'sdd-ai', 'SKILL.md'), 'otra copia vieja\n')
+  writeFileSync(agent, `${readFileSync(agent, 'utf8')}\nedición a mano\n`)
+  /** Cada archivo de las tres carpetas con sus bytes: una lista distinta o un byte distinto se nota. */
+  const state = () => readdirSync(repo, { recursive: true, withFileTypes: true })
+    .filter((e) => e.isFile() && /(^|[\\/])\.(claude|codex|agents)([\\/]|$)/.test(join(e.parentPath, e.name).slice(repo.length)))
+    .map((e) => [join(e.parentPath, e.name), readFileSync(join(e.parentPath, e.name), 'utf8')])
+    .sort(([a], [b]) => a.localeCompare(b))
+  const before = state()
+  assert.ok(before.length > 3)
+
+  for (const extra of [['--foo'], ['sobra']]) {
+    const r = sync(...extra)
+    assert.deepEqual([r.code, r.out.code], [2, 'usage'], extra.join(' '))
+    assert.deepEqual(state(), before, extra.join(' '))
+  }
+  assert.equal(readFileSync(skill, 'utf8'), 'copia vieja\n')
+
+  const ok = sync()
+  assert.equal(ok.code, 0)
+  const source = readFileSync(join(import.meta.dirname, '..', 'skills', 'sdd-ai', 'SKILL.md'))
+  for (const copy of ['.claude', '.agents']) assert.ok(readFileSync(join(repo, copy, 'skills', 'sdd-ai', 'SKILL.md')).equals(source), copy)
+})
+
 test('sync borra lo generado que sobra y no toca un archivo sin marca', () => {
   const root = mkdtempSync(join(tmpdir(), 'sdd-ai-root-'))
   mkdirSync(join(root, '.claude', 'agents'), { recursive: true })

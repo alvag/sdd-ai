@@ -1,9 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { freeze } from '../src/review/candidate.ts'
 import { candidateFingerprint, harvestTreeWithout } from '../src/git.ts'
 import { PHASES_FILE, appendAttestationRef, appendReceiptRef, latestFinalReceipt, readPhaseRecord, withFlowLock, withPhaseNext } from '../src/sdd/phase-state.ts'
 import {
@@ -11,6 +12,7 @@ import {
   writeAttestation, writeVerifyReceipt,
 } from '../src/sdd/verify-receipt.ts'
 import { closeRestoreIntent, prepareIntent, restoreIntentOpen, revertPaths, writeRestoreIntent } from '../src/sdd/restore.ts'
+import { proposeClass } from '../src/sdd/chain.ts'
 import { attestRow, confirmationOutcome, evaluateRow, excerpt, executeRows, parseTap, patternMatches, prepareVerify, runBaseline, runFinal } from '../src/sdd/verify.ts'
 import { type Question, attestQuestion } from '../src/approval/question.ts'
 import { prove } from '../src/approval/proof.ts'
@@ -22,7 +24,7 @@ import { resolve } from '../src/sdd/status.ts'
 import { flowWriterRuns, readReservation, releaseWriter, reserveWriter } from '../src/writer-store.ts'
 import { createHash } from 'node:crypto'
 import { SddError } from '../src/types.ts'
-import { askPair, makeRepo, writeClaudeTranscript } from './helpers.ts'
+import { askPair, makeFakeBin, makeRepo, warmFakeBin, writeClaudeTranscript } from './helpers.ts'
 import { realpathSync } from 'node:fs'
 
 const realpathTmp = () => realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-verify-')))
@@ -369,12 +371,13 @@ function approveAll(repo: string): void {
  * Un flujo `f` en completa con los tres gates aprobados. La base tiene `f = () => 1`; el candidato, `f = () => 2`
  * y la prueba que lo exige. `.plans/` está excluido de Git, como en un repositorio real.
  */
-function verifyFlow(o: { rows?: unknown[]; status?: string; done?: boolean; implement?: boolean } = {}): { repo: string; base: string } {
+function verifyFlow(o: { rows?: unknown[]; status?: string; done?: boolean; implement?: boolean; base?: Record<string, string>; candidate?: Record<string, string> } = {}): { repo: string; base: string } {
   const repo = makeRepo()
   writeFileSync(join(repo, '.git', 'info', 'exclude'), '.plans/\n.sdd-ai/\n')
   mkdirSync(join(repo, 'src'))
   mkdirSync(join(repo, 'test'))
   writeFileSync(join(repo, 'src', 'a.ts'), 'export const f = () => 1\n')
+  for (const [path, text] of Object.entries(o.base ?? {})) writeFileSync(join(repo, path), text)
   gitIn(repo, 'add', '-A')
   gitIn(repo, 'commit', '-q', '-m', 'base')
   const base = gitIn(repo, 'rev-parse', 'HEAD')
@@ -388,6 +391,7 @@ function verifyFlow(o: { rows?: unknown[]; status?: string; done?: boolean; impl
   if (o.implement ?? true) {
     writeFileSync(join(repo, 'src', 'a.ts'), 'export const f = () => 2\n')
     writeFileSync(join(repo, 'test', 'a.test.ts'), "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\nimport { f } from '../src/a.ts'\ntest('f da 2', () => { assert.equal(f(), 2) })\n")
+    for (const [path, text] of Object.entries(o.candidate ?? {})) writeFileSync(join(repo, path), text)
   }
   return { repo, base }
 }
@@ -799,7 +803,8 @@ function cli(repo: string, env: Record<string, string>, ...args: string[]): { co
 
 test('sdd verify por la CLI: la corrida final, el error de uso y la acreditación que pide su pregunta', () => {
   const { repo } = verifyFlow({ rows: [RED_ROW, BUILD_ROW] })
-  const env = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: realpathTmp() }
+  // Las cadenas vacías quitan del hijo la sesión Codex heredada: el fixture simula solo a Claude.
+  const env = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: realpathTmp(), CODEX_SESSION_ID: '', CODEX_THREAD_ID: '' }
   assert.equal(cli(repo, env, 'sdd', 'status', 'f').out.next.command, './bin/sdd-ai sdd verify f')
   const usage = cli(repo, env, 'sdd', 'verify', 'f', '--baseline', '--attest', 'V1')
   assert.deepEqual([usage.code, usage.out.code], [2, 'usage'])
@@ -819,6 +824,276 @@ test('sdd verify por la CLI: la corrida final, el error de uso y la acreditació
   const attest = cli(manual.repo, env, 'sdd', 'verify', 'f', '--attest', 'V2')
   assert.equal(attest.out.code, 'approval_missing')
   assert.ok(attest.out.next.includes(pending.out.questions[0].question.question))
+})
+
+/** La respuesta del revisor falso a una ronda 1 sin hallazgos. */
+const CLEAN_ROUND = '{"candidate_hash":"$HASH","inspection":{"status":"completed","paths":$PATHS},"findings":[]}'
+
+/**
+ * Un flujo verificable con una revisión de diff ya convergida sobre su código, con `plan.md` (y, si se pide,
+ * `spec.md`) como contexto. Devuelve el repositorio, el entorno de un conductor Claude y el id de la revisión.
+ */
+function reviewedFlow(contexts: string[], planAsDiff = false, frozenHead = false): { repo: string; env: Record<string, string>; id: string; base: string } {
+  const { repo, base } = verifyFlow()
+  if (planAsDiff) writeFileSync(join(repo, '.git/info/exclude'), '.plans/*\n!.plans/f/\n.plans/f/*\n!.plans/f/plan.md\n.sdd-ai/\n')
+  mkdirSync(join(repo, '.sdd-ai'), { recursive: true })
+  writeFileSync(join(repo, '.sdd-ai', 'config.yml'), 'cross_model:\n  schema_version: 1\n  families: [codex, claude]\n  selection: full\n')
+  writeFileSync(join(repo, '.sdd-ai', 'workers.yml'), [
+    'schema_version: 1', 'roles:',
+    '  code-review:', '    claude:', '      model: opus', '      effort: alto',
+    '  refute:', '    claude:', '      model: sonnet', '      effort: medio', '',
+  ].join('\n'))
+  const bin = realpathTmp()
+  symlinkSync(process.execPath, join(bin, 'node'))
+  makeFakeBin(bin, 'claude')
+  warmFakeBin(bin, 'claude')
+  const work = realpathTmp()
+  writeFileSync(join(work, 'answers.json'), JSON.stringify([CLEAN_ROUND]))
+  const env: Record<string, string> = {
+    PATH: `${bin}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: realpathTmp(),
+    CODEX_SESSION_ID: '', CODEX_THREAD_ID: '', FAKE_MODE: 'scripted', FAKE_ANSWERS: join(work, 'answers.json'), FAKE_CALLS_FILE: join(work, 'calls'),
+  }
+  const context = contexts.flatMap((c) => ['--context', c])
+  if (frozenHead) {
+    gitIn(repo, 'add', 'src', 'test')
+    gitIn(repo, 'commit', '-qm', 'candidate')
+  }
+  const started = cli(repo, env, 'review', 'start', '--base', base, '--author', 'codex', ...context,
+    ...(frozenHead ? ['--head', 'HEAD'] : ['--untracked']))
+  assert.equal(started.code, 0, JSON.stringify(started.out))
+  const id = started.out.id as string
+  assert.notEqual(cli(repo, env, 'wait', id, '--max', '20').code, 3, 'la ronda 1 no terminó')
+  const status = cli(repo, env, 'review', 'status', id).out
+  assert.equal(status.stale, false, JSON.stringify(status))
+  return { repo, env, id, base }
+}
+
+const reviewStatus = (r: { repo: string; env: Record<string, string>; id: string }) => cli(r.repo, r.env, 'review', 'status', r.id).out
+const PLAN = '.plans/f/plan.md'
+
+test('una revisión convergida sigue vigente tras la proyección de verify en su plan de contexto', () => {
+  const r = reviewedFlow([PLAN])
+  const run = cli(r.repo, r.env, 'sdd', 'verify', 'f')
+  assert.equal(run.code, 0, JSON.stringify(run.out))
+  assert.equal(run.out.projection, 'written')
+  const receipt = readPhaseRecord(r.repo, 'f').verify?.receipts.at(-1)?.id
+  const status = reviewStatus(r)
+  assert.equal(status.stale, false, JSON.stringify(status))
+  assert.deepEqual(status.verify_projection, [{ path: PLAN, receipt }])
+  assert.match(status.next, /la revisión está vigente/)
+  assert.doesNotMatch(status.next, /review start/)
+})
+
+test('una revisión vence con cambios de código, del plan, de otra clave del header o de otro contexto aunque verify haya proyectado', () => {
+  const SPEC = '.plans/f/spec.md'
+  const cases: Array<[string, (repo: string) => void]> = [
+    ['el código', (repo) => writeFileSync(join(repo, 'src', 'a.ts'), 'export const f = () => 2 // otro\n')],
+    ['otra sección del plan', (repo) => writeFileSync(join(repo, PLAN), planOf(repo).replace('Uno.', 'Dos.'))],
+    ['otra clave del header', (repo) => writeFileSync(join(repo, PLAN), planOf(repo).replace('risk: low', 'risk: high'))],
+    ['otro archivo de contexto', (repo) => writeFileSync(join(repo, SPEC), `${readFileSync(join(repo, SPEC), 'utf8')}\n- AC-3: algo más.\n`)],
+    ['una edición a mano de Verify', (repo) => writeFileSync(join(repo, PLAN), planOf(repo).replace('✅ passed', '✅ passed (a mano)'))],
+    ['un recibo que ya no está', (repo) => rmSync(receiptDir(repo, readPhaseRecord(repo, 'f').verify?.receipts.at(-1)?.id ?? ''), { recursive: true, force: true })],
+    ['la salida del recibo alterada', (repo) => {
+      const ref = readPhaseRecord(repo, 'f').verify!.receipts.at(-1)!
+      const receipt = readVerifyReceipt(repo, ref)
+      writeFileSync(join(receiptDir(repo, ref.id), receipt.rows[0].execution!.stdout_file), 'otra salida\n')
+    }],
+    ['una referencia reciente inválida con un recibo anterior válido', (repo) => {
+      appendReceiptRef(repo, 'f', { id: newReceiptId(), mode: 'final', digest: `sha256:${'f'.repeat(64)}` })
+    }],
+    ['un recibo íntegro de otro flujo', (repo) => {
+      const record = readPhaseRecord(repo, 'f')
+      const receipt = readVerifyReceipt(repo, record.verify!.receipts.at(-1)!)
+      const foreign = writeVerifyReceipt(repo, { ...receipt, flow: 'other' })
+      writeFileSync(join(repo, '.plans/f', PHASES_FILE), JSON.stringify({ ...record, verify: { ...record.verify, receipts: [foreign] } }))
+    }],
+    ['un recibo alterado', (repo) => {
+      const file = join(receiptDir(repo, readPhaseRecord(repo, 'f').verify?.receipts.at(-1)?.id ?? ''), 'receipt.json')
+      writeFileSync(file, `${readFileSync(file, 'utf8')}\n`)
+    }],
+  ]
+  for (const [what, change] of cases) {
+    const r = reviewedFlow([PLAN, SPEC])
+    assert.equal(cli(r.repo, r.env, 'sdd', 'verify', 'f').out.projection, 'written', what)
+    change(r.repo)
+    const status = reviewStatus(r)
+    assert.equal(status.stale, true, what)
+    assert.equal(status.verify_projection, undefined, what)
+    assert.match(status.next, /review start/, what)
+  }
+
+  // Un plan revisado como archivo del diff no recibe la excepción reservada al contexto.
+  const asDiff = reviewedFlow([], true)
+  assert.ok(freeze(asDiff.repo, { base: asDiff.base, context: [], untracked: true }).files.some((f) => f.path === PLAN))
+  assert.equal(cli(asDiff.repo, asDiff.env, 'sdd', 'verify', 'f').out.projection, 'written')
+  const status = reviewStatus(asDiff)
+  assert.equal(status.stale, true)
+  assert.equal(status.verify_projection, undefined)
+  assert.match(status.next, /review start/)
+
+  // El movimiento del ref sigue siendo observable aunque no se pueda leer la proyección del contexto.
+  const atHead = reviewedFlow([PLAN], false, true)
+  const frozen = freeze(atHead.repo, { base: atHead.base, head: 'HEAD', context: [PLAN] })
+  gitIn(atHead.repo, 'commit', '--allow-empty', '-qm', 'move ref')
+  writeFileSync(join(atHead.repo, PLAN), `${planOf(atHead.repo)}\nAnother context section.\n`)
+  rmSync(join(atHead.repo, '.sdd-ai', 'runs', atHead.id, 'blobs', frozen.context[0].sha256))
+  const unreadable = reviewStatus(atHead)
+  assert.equal(unreadable.stale, true)
+  assert.equal(unreadable.ref_moved, true)
+  assert.equal(unreadable.verify_projection, undefined)
+})
+
+/** Una fila `red_on_revert` sobre `src/b.ts`, cuyo candidato agrega `g` y lo usa desde `src/a.ts`. */
+const B_ROW = { ...RED_ROW, implementation_paths: ['src/b.ts'] }
+const B_BASE = { 'src/b.ts': 'export const h = () => 0\n' }
+const B_CANDIDATE = {
+  'src/b.ts': 'export const g = () => 2\nexport const h = () => 0\n',
+  'src/a.ts': "import { g } from './b.ts'\nexport const f = () => g()\n",
+}
+
+test('una confirmación que no carga al revertir es un defecto de contrato con su módulo y la ruta que falta', () => {
+  const { repo } = verifyFlow({ rows: [B_ROW, BUILD_ROW], base: B_BASE, candidate: B_CANDIDATE })
+  const env = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: realpathTmp(), CODEX_SESSION_ID: '', CODEX_THREAD_ID: '' }
+  const run = cli(repo, env, 'sdd', 'verify', 'f')
+  assert.equal(run.out.green, false, JSON.stringify(run.out))
+  const [v1] = run.out.rows
+  assert.equal(v1.outcome, 'failed')
+  assert.equal(v1.confirmation, 'contract_incoherent')
+  for (const text of ['src/a.ts', '«g»', 'src/b.ts', 'contract']) assert.ok(v1.reason.includes(text), `${text}: ${v1.reason}`)
+  assert.match(v1.reason, /falta src\/a\.ts en implementation_paths/)
+
+  const receipt = readVerifyReceipt(repo, readPhaseRecord(repo, 'f').verify!.receipts.at(-1)!)
+  assert.equal(receipt.green, false)
+  assert.equal(receipt.rows[0].confirmation?.state, 'contract_incoherent')
+  assert.match(receipt.rows[0].confirmation?.reason ?? '', /src\/a\.ts/)
+  assert.match(planOf(repo), /revert: contract_incoherent \(/)
+  assert.match(planOf(repo), /\| AC-1 \| V1 \| ❌ failed \|/)
+  assert.equal(readFileSync(join(repo, 'src', 'b.ts'), 'utf8'), B_CANDIDATE['src/b.ts'])
+
+  // Contraste: si el test sigue pasando con las rutas revertidas, es una refutación del comportamiento.
+  const refuted = verifyFlow({ rows: [B_ROW, BUILD_ROW], base: B_BASE, candidate: { 'src/b.ts': 'export const h = () => 0 // cambia\n' } })
+  const other = cli(refuted.repo, env, 'sdd', 'verify', 'f')
+  assert.equal(other.out.rows[0].confirmation, 'refuted')
+})
+
+test('una confirmación con el contrato incoherente propone la clase contract', () => {
+  const tap = 'TAP version 13\nok 1 - pasa\n'
+  const result = (state: 'contract_incoherent' | 'not_confirmable') => ({
+    row: 'V1', outcome: 'failed' as const, execution: { ...EXEC, exit_code: 0 },
+    confirmation: { row: 'V1', obligation: 'red_on_revert' as const, state, restored: true },
+  })
+  assert.equal(proposeClass(TROW, result('contract_incoherent'), tap), 'contract')
+  assert.equal(proposeClass(TROW, result('not_confirmable'), tap), null)
+})
+
+test('el diagnóstico de carga nombra la ruta solo si la evidencia la identifica y no atribuye una aserción opaca', async () => {
+  // La evidencia identifica al importador que no está en implementation_paths.
+  const named = verifyFlow({ rows: [B_ROW, BUILD_ROW], base: B_BASE, candidate: B_CANDIDATE })
+  const a = (await final(named.repo)).receipt.rows[0].confirmation
+  assert.equal(a?.state, 'contract_incoherent')
+  assert.match(a?.reason ?? '', /falta src\/a\.ts en implementation_paths/)
+
+  // Si quien importa es la prueba, la ruta que falta no se puede determinar y no se propone una.
+  const direct = verifyFlow({
+    rows: [B_ROW, BUILD_ROW], base: B_BASE,
+    candidate: {
+      'src/b.ts': 'export const g = () => 2\nexport const h = () => 0\n',
+      'test/a.test.ts': "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\nimport { g } from '../src/b.ts'\ntest('f da 2', () => { assert.equal(g(), 2) })\n",
+    },
+  })
+  const b = (await final(direct.repo)).receipt.rows[0].confirmation
+  assert.equal(b?.state, 'contract_incoherent')
+  assert.match(b?.reason ?? '', /test\/a\.test\.ts es una prueba/)
+  assert.match(b?.reason ?? '', /no se puede determinar la ruta que falta/)
+  assert.doesNotMatch(b?.reason ?? '', /falta \S+ en implementation_paths/)
+
+  // Una aserción que falla sin diagnóstico de carga conserva su tratamiento: confirmada.
+  const opaque = verifyFlow()
+  const c = (await final(opaque.repo)).receipt.rows[0].confirmation
+  assert.equal(c?.state, 'confirmed')
+
+  // Un subprocess con un fallo de enlace propaga el diagnóstico en el error del test nombrado.
+  const subprocessTest = (paths: string[]) => `import { test } from 'node:test'
+import { execFileSync } from 'node:child_process'
+test('f da 2', () => {
+  const errors = []
+  for (const path of ${JSON.stringify(paths)}) {
+    try { execFileSync(process.execPath, [path], { stdio: 'pipe' }) }
+    catch (error) { errors.push(error.message) }
+  }
+  if (errors.length) throw new Error(errors.join('\\n'))
+})\n`
+  const propagated = verifyFlow({ rows: [B_ROW, BUILD_ROW], base: B_BASE, candidate: {
+    ...B_CANDIDATE, 'test/a.test.ts': subprocessTest(['src/a.ts']),
+  } })
+  const d = (await final(propagated.repo)).receipt.rows[0].confirmation
+  assert.equal(d?.state, 'contract_incoherent')
+  assert.match(d?.reason ?? '', /falta src\/a\.ts en implementation_paths/)
+
+  // Un diagnóstico sin marcador propio no hereda el importador de otro fallo de carga.
+  const unlocated = verifyFlow({ rows: [B_ROW, BUILD_ROW], base: {
+    ...B_BASE, 'src/c.ts': 'export const c = 1\n', 'src/d.ts': 'export const d = 1\n',
+    'src/e.ts': 'export const e = 1\n',
+  }, candidate: {
+    ...B_CANDIDATE, 'src/b.ts': 'export const g = () => 2\nexport const h = () => 2\n',
+    'src/c.ts': "import { z } from './d.ts'\nexport const c = z\n",
+    'src/e.ts': "import { g } from './b.ts'\nexport const e = g()\n",
+    'src/unlocated.ts': "import('./e.ts').catch(error => { console.error(error.toString()); process.exitCode = 1 })\n",
+    'test/a.test.ts': "import { h } from '../src/b.ts'\n" + subprocessTest(['src/c.ts', 'src/unlocated.ts'])
+      .replace('  const errors = []', '  if (h() !== 0) return\n  const errors = []'),
+  } })
+  const withoutImporter = (await final(unlocated.repo)).receipt.rows[0].confirmation
+  assert.equal(withoutImporter?.state, 'confirmed', withoutImporter?.reason ?? '')
+
+  // Los helpers bajo el directorio de pruebas tampoco se proponen como implementación.
+  const helper = verifyFlow({ rows: [B_ROW, BUILD_ROW], base: {
+    ...B_BASE, 'test/helpers.ts': 'export const f = () => 1\n',
+  }, candidate: {
+    ...B_CANDIDATE,
+    'test/helpers.ts': "import { g } from '../src/b.ts'\nexport const f = () => g()\n",
+    'test/a.test.ts': "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\nimport { f } from './helpers.ts'\ntest('f da 2', () => { assert.equal(f(), 2) })\n",
+  } })
+  const helperFailure = (await final(helper.repo)).receipt.rows[0].confirmation
+  assert.equal(helperFailure?.state, 'contract_incoherent')
+  assert.match(helperFailure?.reason ?? '', /test\/helpers\.ts es una prueba/)
+  assert.match(helperFailure?.reason ?? '', /no se puede determinar la ruta que falta/)
+  assert.doesNotMatch(helperFailure?.reason ?? '', /falta \S+ en implementation_paths/)
+
+  // Citar un diagnóstico mientras falla una aserción no demuestra que el módulo no cargó.
+  const incidental = verifyFlow({ base: { 'src/b.ts': 'export const b = 1\n' }, candidate: { 'src/b.ts': 'export const b = 2\n' } })
+  writeFileSync(join(incidental.repo, 'test/a.test.ts'), `import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { f } from '../src/a.ts'
+test('f da 2', () => {
+  if (f() === 1) console.error(${JSON.stringify("Error [ERR_MODULE_NOT_FOUND]: Cannot find module '" + join(incidental.repo, 'src/a.ts') + "' imported from " + join(incidental.repo, 'src/b.ts'))})
+  assert.equal(f(), 2)
+})\n`)
+  const e = (await final(incidental.repo)).receipt.rows[0].confirmation
+  assert.equal(e?.state, 'confirmed')
+
+  // Una dependencia externa observable no es una ruta que se pueda agregar al conjunto de revert.
+  const external = join(realpathTmp(), 'outside.mjs')
+  writeFileSync(external, 'export const h = 1\n')
+  const outside = verifyFlow({ rows: [RED_ROW, BUILD_ROW], base: {
+    'src/a.ts': `import { g } from ${JSON.stringify(external)}\nexport const f = () => g\n`,
+  }, candidate: { 'test/a.test.ts': subprocessTest(['src/a.ts']) } })
+  const g = (await final(outside.repo)).receipt.rows[0].confirmation
+  assert.equal(g?.state, 'contract_incoherent')
+  assert.match(g?.reason ?? '', /outside\.mjs/)
+  assert.match(g?.reason ?? '', /no se puede determinar la ruta que falta/)
+  assert.doesNotMatch(g?.reason ?? '', /falta \S+ en implementation_paths/)
+
+  // Dos importadores modificados observables no permiten escoger una única ruta que falta.
+  const multiple = verifyFlow({ rows: [B_ROW, BUILD_ROW], base: {
+    ...B_BASE, 'src/c.ts': 'export const c = 1\n',
+  }, candidate: {
+    ...B_CANDIDATE, 'src/c.ts': "import { g } from './b.ts'\nexport const c = g()\n",
+    'test/a.test.ts': subprocessTest(['src/a.ts', 'src/c.ts']),
+  } })
+  const h = (await final(multiple.repo)).receipt.rows[0].confirmation
+  assert.equal(h?.state, 'contract_incoherent')
+  assert.match(h?.reason ?? '', /no hay una única ruta candidata/)
+  assert.doesNotMatch(h?.reason ?? '', /falta \S+ en implementation_paths/)
 })
 
 test('antes de un verbo se resuelve la restauración que dejó una verificación caída', () => {

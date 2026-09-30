@@ -8,6 +8,10 @@ import { join } from 'node:path'
 import { createHash } from 'node:crypto'
 import { type Question, disputeQuestion, extraQuestion } from '../src/approval/question.ts'
 import { extraReuse } from '../src/cli.ts'
+import { planRoundJobs } from '../src/review/batch.ts'
+import { freeze } from '../src/review/candidate.ts'
+import { REVIEW_PROMPT_BUDGET, measure } from '../src/review/prompt.ts'
+import { type Reviewer, type RoundPlan, type LedgerEntry } from '../src/review/ledger.ts'
 import { decide } from '../src/review/ledger.ts'
 import { REFUTER_SYSTEM_PROMPT } from '../src/workers/claude.ts'
 import { askPair, makeFakeBin, makeRepo, warmFakeBin, writeClaudeTranscript } from './helpers.ts'
@@ -671,21 +675,160 @@ test('ronda N: un bloque de pendientes que no entra da prompt_too_large', () => 
   assert.equal(existsSync(runFile(c, cid, 'argv-r2-l1.json')), false)
 })
 
-test('un delta con señal alta frena la ronda y propone --risk high', () => {
-  for (const extra of [[], ['--risk', 'high']]) {
-    const s = setup(Array.from({ length: 5 }, () => firstRound([grave])))
-    const id = startAndWait(s, extra)
-    const ids = runJson(s, id, 'ledger.json').entries.map((e: { id: string }) => e.id)
-    assert.equal(cli(s, ['review', 'decide', id, 'accept', ...ids]).code, 0)
-    writeFileSync(join(s.repo, 'a.txt'), lines(10, { 5: 'línea cinco validada', 7: 'exec(cmd)' }))
-    const blobs = readdirSync(runFile(s, id, 'blobs')).sort()
-    const r = cli(s, ['review', 'round', id])
-    assert.deepEqual([r.code, r.out.code, r.out.message], [2, 'risk_high', 'la corrección introduce riesgo alto'])
-    assert.equal(r.out.detail, 'process en a.txt: línea 7: exec')
-    assert.match(r.out.next, /^pregunta al usuario si reinicia la revisión con lentes: \.\/bin\/sdd-ai review start --base \S+ --author codex --risk high$/)
-    assert.deepEqual(readdirSync(runFile(s, id, 'blobs')).sort(), blobs)
-    assert.equal(existsSync(runFile(s, id, 'argv-r2-l1.json')), false)
+test('sin lentes un delta con señal alta frena la ronda y propone reiniciar con lentes', () => {
+  const s = setup([firstRound([grave])])
+  const id = startAndWait(s)
+  const ids = runJson(s, id, 'ledger.json').entries.map((e: { id: string }) => e.id)
+  assert.equal(cli(s, ['review', 'decide', id, 'accept', ...ids]).code, 0)
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 5: 'línea cinco validada', 7: 'exec(cmd)' }))
+  const blobs = readdirSync(runFile(s, id, 'blobs')).sort()
+  const r = cli(s, ['review', 'round', id])
+  assert.deepEqual([r.code, r.out.code, r.out.message], [2, 'risk_high', 'la corrección introduce riesgo alto'])
+  assert.equal(r.out.detail, 'process en a.txt: línea 7: exec')
+  assert.match(r.out.next, /^pregunta al usuario si reinicia la revisión con lentes: \.\/bin\/sdd-ai review start --base \S+ --author codex --risk high$/)
+  assert.deepEqual(readdirSync(runFile(s, id, 'blobs')).sort(), blobs)
+  assert.deepEqual(prompts(s, id, 'prompt-r2-'), [])
+  assert.equal(existsSync(runFile(s, id, 'argv-r2-l1.json')), false)
+})
+
+const ROUND_REVIEWERS: readonly Reviewer[] = ['base', 'risk', 'resilience', 'reliability', 'readability']
+const lensPrompts = (keys: readonly string[]) => keys.map((k) => `prompt-r2-l1-${k}-b1.md`).sort()
+
+test('una revisión con lentes corre la base y las lentes sobre un delta con señal alta', () => {
+  const inChanges = { ...warning, location: 'a.txt:7', claim: 'el exec no valida su entrada' }
+  const outside = { ...warning, location: 'a.txt:2', claim: 'una línea que no cambió' }
+  const s = setup([
+    firstRound([grave]), firstRound([{ ...warning, claim: 'lo dice risk' }]), firstRound([]), firstRound([]), firstRound([]),
+    nextRound([{ id: 'F-1', answer: 'resolved' }, { id: 'F-2', answer: 'withdrawn' }]),
+    nextRound([], [inChanges]), nextRound([]), nextRound([]), nextRound([], [outside]), nextRound([]),
+  ])
+  const id = startAndWait(s, ['--risk', 'high'])
+  assert.equal(cli(s, ['review', 'decide', id, 'accept', 'F-1']).code, 0)
+  assert.equal(cli(s, ['review', 'decide', id, 'reject', 'F-2', '--reason', 'es intencional']).code, 0)
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 5: 'línea cinco validada', 7: 'exec(cmd)' }))
+  const r = cli(s, ['review', 'round', id])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual(r.out.reviewers, ROUND_REVIEWERS)
+  assert.deepEqual(r.out.delta_risk.reasons, [{ signal: 'process', path: 'a.txt', detail: 'línea 7: exec' }])
+  waitRound(s, id)
+
+  const files = prompts(s, id, 'prompt-r2-').filter((f) => !f.endsWith('-fix.md'))
+  assert.deepEqual(files, lensPrompts(ROUND_REVIEWERS))
+  for (const lens of ROUND_REVIEWERS.slice(1)) {
+    const text = readFileSync(runFile(s, id, `prompt-r2-l1-${lens}-b1.md`), 'utf8')
+    assert.match(block(text, 'CAMBIOS'), /a\.txt: 5, 7/)
+    assert.equal(text.includes('<<<VERIFICAR sha256:') || text.includes('<<<RESPONDER sha256:'), false)
   }
+  assert.ok(block(readFileSync(runFile(s, id, 'prompt-r2-l1-base-b1.md'), 'utf8'), 'VERIFICAR').includes('"F-1"'))
+
+  // Una lente que cita fuera de CAMBIOS no se admite: su corrección trae el motivo.
+  assert.ok(existsSync(runFile(s, id, 'prompt-r2-l1-readability-b1-fix.md')))
+  const entries = runJson(s, id, 'ledger.json').entries
+  assert.deepEqual(entries.map((e: { id: string }) => e.id), ['F-1', 'F-2', 'F-3'])
+  assert.deepEqual(entries.map((e: { claim: string }) => e.claim).includes('una línea que no cambió'), false)
+  assert.deepEqual([entries[2].reviewer, entries[2].batch, entries[2].claim], ['risk', 1, 'el exec no valida su entrada'])
+  assert.deepEqual(entries.slice(0, 2).map((e: { responses: unknown[] }) => e.responses.length), [1, 1])
+  checkBatchedLenses()
+  checkEmptyLensLots()
+})
+
+function checkBatchedLenses(): void {
+  const none = firstRound([])
+  const empty = nextRound([])
+  const s = setup([
+    firstRound([{ ...grave, location: 'x/uno.txt:5' }]), none, none, none, none, none, none, none, none, none,
+    nextRound([{ id: 'F-1', answer: 'resolved' }]), empty, empty, empty, empty, empty, empty, empty, empty, empty,
+  ])
+  mkdirSync(join(s.repo, 'x'))
+  mkdirSync(join(s.repo, 'y'))
+  writeFileSync(join(s.repo, 'x', 'uno.txt'), bulky())
+  writeFileSync(join(s.repo, 'y', 'dos.txt'), bulky())
+  git(s.repo, 'add', '-N', 'x/uno.txt', 'y/dos.txt')
+  const r = cli(s, ['review', 'start', '--base', s.base, '--author', 'codex', '--risk', 'high'])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  const id = r.out.id
+  waitRound(s, id)
+  assert.equal(cli(s, ['review', 'decide', id, 'accept', 'F-1']).code, 0)
+  writeFileSync(join(s.repo, 'x', 'uno.txt'), bulky('arreglado uno'))
+  writeFileSync(join(s.repo, 'y', 'dos.txt'), bulky('exec(cmd)'))
+  const round = cli(s, ['review', 'round', id])
+  assert.equal(round.code, 0, JSON.stringify(round.out))
+  assert.deepEqual(round.out.batches, [{ n: 1, paths: ['x/uno.txt'] }, { n: 2, paths: ['y/dos.txt'] }])
+  waitRound(s, id)
+  const jobs = runJson(s, id, 'argv-r2-l1.json').jobs.map((j: { key: string }) => j.key)
+  assert.deepEqual(jobs, ROUND_REVIEWERS.flatMap((k) => [`${k}-b1`, `${k}-b2`]))
+  const verify = (key: string) => block(readFileSync(runFile(s, id, `prompt-r2-l1-${key}.md`), 'utf8'), 'VERIFICAR')
+  assert.ok(verify('base-b1').includes('"F-1"') && !verify('base-b2').includes('"F-1"'))
+  for (const key of jobs.filter((k: string) => !k.startsWith('base'))) {
+    assert.equal(readFileSync(runFile(s, id, `prompt-r2-l1-${key}.md`), 'utf8').includes('<<<VERIFICAR sha256:'), false, key)
+  }
+  assert.equal(entryOf(s, id, 'F-1').responses.length, 1)
+
+  const candidate = freeze(s.repo, { base: s.base, context: [] })
+  const plan: RoundPlan = { n: 2, prev_hash: candidate.hash, identical: false, targets: [], changed: { 'x/uno.txt': [[5, 5]], 'y/dos.txt': [[5, 5]] } }
+  const planned = planRoundJobs(candidate, new Map(), plan, [], 4, ROUND_REVIEWERS)
+  assert.equal(planned.batches.length, 2)
+  for (const job of planned.jobs) {
+    assert.ok(measure(job.text) <= REVIEW_PROMPT_BUDGET, job.key)
+    if (job.reviewer !== 'base') assert.deepEqual(job.targets, [])
+  }
+}
+
+function checkEmptyLensLots(): void {
+  const s = setup([])
+  const clean = freeze(s.repo, { base: s.base, context: [] })
+  const plan: RoundPlan = { n: 2, prev_hash: clean.hash, identical: false, targets: [], changed: {} }
+  const empty = planRoundJobs(clean, new Map(), plan, [], 4, ROUND_REVIEWERS)
+  assert.deepEqual(empty.batches, [[]])
+  assert.deepEqual(empty.jobs.map((j) => j.key), ['base-b1'])
+  assert.deepEqual(empty.reviewers, ['base'])
+
+  // Un pendiente huérfano puede ocupar el primer lote sin rutas: las lentes empiezan en el siguiente.
+  writeFileSync(join(s.repo, 'a.txt'), bulky('exec(cmd)'))
+  const candidate = freeze(s.repo, { base: s.base, context: [] })
+  const entry: LedgerEntry = { ...grave, axis: 'quality', severity: 'CRITICAL', causality: 'introduced', evidence: 'deterministic', id: 'F-1', state: 'aceptado' as const, reviewer: 'base' as const, batch: 1,
+    location: 'orphan.txt:1', responses: [], round: 1, claim: 'x'.repeat(115000) }
+  const pending: RoundPlan = { ...plan, targets: [{ id: 'F-1', kind: 'verify' }], changed: { 'a.txt': [[5, 5]] } }
+  const split = planRoundJobs(candidate, new Map(), pending, [entry], 4, ROUND_REVIEWERS)
+  assert.deepEqual(split.batches, [[], ['a.txt']])
+  assert.deepEqual(split.jobs.filter((j) => j.reviewer !== 'base').map((j) => j.key), ROUND_REVIEWERS.slice(1).map((r) => `${r}-b2`))
+  for (const job of split.jobs) {
+    assert.ok(measure(job.text) <= REVIEW_PROMPT_BUDGET, job.key)
+    if (job.reviewer !== 'base') assert.deepEqual(job.targets, [])
+  }
+}
+
+test('con lentes un delta sin señal nueva corre solo la base', () => {
+  const s = setup([firstRound([grave]), firstRound([]), firstRound([]), firstRound([]), firstRound([]), nextRound([{ id: 'F-1', answer: 'resolved' }])])
+  const id = startAndWait(s, ['--risk', 'high'])
+  assert.equal(cli(s, ['review', 'decide', id, 'accept', 'F-1']).code, 0)
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 5: 'línea cinco validada' }))
+  const r = cli(s, ['review', 'round', id])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.equal(r.out.reviewers, undefined)
+  assert.equal(r.out.delta_risk, undefined)
+  waitRound(s, id)
+  assert.deepEqual(prompts(s, id, 'prompt-r2-'), ['prompt-r2-l1-base-b1.md'])
+})
+
+test('una ronda cuyo delta agrega mkdirSync a un import con execFileSync se lanza solo con la base', () => {
+  const s = setup([firstRound([grave]), nextRound([{ id: 'F-1', answer: 'resolved' }])])
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 1: "import { execFileSync } from 'node:child_process'" }))
+  git(s.repo, 'commit', '-qam', 'import')
+  const base = git(s.repo, 'rev-parse', 'HEAD')
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 1: "import { execFileSync } from 'node:child_process'", 5: 'línea cinco' }))
+  const started = cli(s, ['review', 'start', '--base', base, '--author', 'codex'])
+  assert.equal(started.code, 0, JSON.stringify(started.out))
+  const id = started.out.id
+  waitRound(s, id)
+  assert.equal(cli(s, ['review', 'decide', id, 'accept', 'F-1']).code, 0)
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 1: "import { execFileSync, mkdirSync } from 'node:child_process'", 5: 'línea cinco validada' }))
+  const r = cli(s, ['review', 'round', id])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.equal(r.out.reviewers, undefined)
+  assert.equal(r.out.delta_risk, undefined)
+  waitRound(s, id)
+  assert.deepEqual(prompts(s, id, 'prompt-r2-'), ['prompt-r2-l1-base-b1.md'])
 })
 
 const unavailable = '{"candidate_hash":"$HASH","inspection":{"status":"unavailable","paths":[],"reason":"no pude"},"findings":[]}'
@@ -748,6 +891,23 @@ test('relanzar con una señal alta en el delta se frena', () => {
   assert.deepEqual([r.code, r.out.code, r.out.detail], [2, 'risk_high', 'process en a.txt: línea 8: spawn'])
   assert.match(r.out.next, /review start --base \S+ --author codex --risk high$/)
   assert.equal(existsSync(runFile(s, id, 'argv-l2.json')), false)
+})
+
+test('relanzar la ronda 1 de una revisión con lentes con una señal alta nueva corre base y lentes', () => {
+  const none = firstRound([])
+  const s = setup([none, '__fail__', none, none, none, none, none, none, none, none])
+  const id = startAndWait(s, ['--risk', 'high'])
+  assert.deepEqual([runJson(s, id, 'status.json').state, existsSync(runFile(s, id, 'ledger.json'))], ['unavailable', false])
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 5: 'línea cinco', 8: 'spawn(x)' }))
+  const r = cli(s, ['review', 'round', id])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual([r.out.id, r.out.round, r.out.launch, r.out.kept], [id, 1, 2, undefined])
+  assert.deepEqual(r.out.reviewers, ROUND_REVIEWERS)
+  waitRound(s, id)
+  assert.deepEqual(runJson(s, id, 'argv-l2.json').jobs.map((j: { key: string }) => j.key), ROUND_REVIEWERS.map((k) => `${k}-b1`))
+  assert.deepEqual(runJson(s, id, 'rounds.json').rounds.map((x: { n: number; launch: number; state: string }) => [x.n, x.launch, x.state]),
+    [[1, 1, 'unavailable'], [1, 2, 'done']])
+  assert.equal(existsSync(runFile(s, id, 'ledger.json')), true)
 })
 
 test('relanzar la ronda 1 con un archivo que no entra deja la corrida intacta', () => {

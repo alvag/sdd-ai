@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs'
-import { delimiter, isAbsolute, join } from 'node:path'
+import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { delimiter, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
 import { ATTEST_OPTIONS, attestQuestion } from '../approval/question.ts'
 import { type Proof, prove } from '../approval/proof.ts'
@@ -9,6 +10,7 @@ import { Rejection } from '../review/admit.ts'
 import { killGroup } from '../supervisor.ts'
 import { type Family, SddError } from '../types.ts'
 import { canWriteStore, controlUnavailable, flowWriterOpen, latestFlowHarvest, recordVerifyGroup, releaseWriter, reserveWriter } from '../writer-store.ts'
+import { isFlowId } from './id.ts'
 import { criteriaIds, replaceSection, setHeaderStatus } from './markdown.ts'
 import { localIso } from './phase.ts'
 import { appendAttestationRef, appendReceiptRef, implementOf, readPhaseRecord, withFlowLock } from './phase-state.ts'
@@ -391,13 +393,157 @@ const REFUTED: Record<'red_on_revert' | 'green_on_base', string> = {
   green_on_base: 'con las rutas de implementación en la base, el test falló',
 }
 
+/** Un fallo de enlace de Node: quién importa, qué módulo y, si lo dice el error, qué export falta. */
+interface LoadFailure { importer: string; module: string; exportName?: string }
+
+const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g
+const MISSING_EXPORT = /^SyntaxError: The requested module '([^']+)' does not provide an export named '([^']+)'/
+const MISSING_MODULE = /^Error \[ERR_MODULE_NOT_FOUND\]: Cannot find module '([^']+)' imported from ([^\s'"]+)/
+const FILE_LINE = /^file:\/\/\S+?:\d+$/
+
+/** La ruta relativa al repositorio, o `null` si `abs` cae fuera de él. */
+function repoPath(root: string, abs: string): string | null {
+  if (!isAbsolute(abs)) return null
+  let real = root
+  try {
+    real = realpathSync(root)
+  } catch {
+    // Sin ruta real, se compara solo con la ruta dada.
+  }
+  for (const base of new Set([root, real])) {
+    const rel = relative(base, abs)
+    if (rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) return rel.split(sep).join('/')
+  }
+  return null
+}
+
+/**
+ * Los fallos de enlace de Node que trae una salida, con rutas relativas si caen en el repositorio: sin
+ * ANSI ni el prefijo `# ` con que el reporte TAP cita el stderr de un proceso. El importador de un export
+ * ausente es la última línea `file://…:<n>` anterior al mensaje, desde el diagnóstico anterior: sin
+ * un marcador propio, el diagnóstico no cuenta.
+ */
+function loadFailures(root: string, text: string): LoadFailure[] {
+  const out: LoadFailure[] = []
+  let file: string | null = null
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(ANSI, '').replace(/^\s*(?:# )?/, '')
+    if (FILE_LINE.test(line)) {
+      try {
+        file = fileURLToPath(line.replace(/:\d+$/, ''))
+      } catch {
+        file = null
+      }
+      continue
+    }
+    const noExport = MISSING_EXPORT.exec(line)
+    if (noExport) {
+      const importerFile = file
+      file = null
+      if (importerFile === null) continue
+      const importer = repoPath(root, importerFile)
+      const absolute = resolvePath(dirname(importerFile), noExport[1])
+      const module = repoPath(root, absolute) ?? absolute
+      if (importer) out.push({ importer, module, exportName: noExport[2] })
+      continue
+    }
+    const missing = MISSING_MODULE.exec(line)
+    if (missing) {
+      file = null
+      const importer = repoPath(root, missing[2])
+      const module = repoPath(root, missing[1]) ?? missing[1]
+      if (importer) out.push({ importer, module })
+    }
+  }
+  return out
+}
+
+/**
+ * Solo el error propagado de un subproceso del test nombrado, no sus comentarios ni los valores de una
+ * aserción. Node pone ese error en el bloque YAML de la entrada: `Command failed: …` con su stderr.
+ */
+function namedLoadOutput(stdout: string, row: TestRow): string | null {
+  const lines = stdout.replace(ANSI, '').split(/\r?\n/)
+  for (let i = 0; i < lines.length; i++) {
+    const entry = ENTRY.exec(lines[i])
+    if (!entry || entry[2] !== 'not ok' || unescape(entry[3] ?? '') !== row.test_name || entry[4]) continue
+    const indent = entry[1].length + 2
+    for (i++; i < lines.length; i++) {
+      if (lines[i] === `${' '.repeat(indent)}...`) break
+      if (lines[i] !== `${' '.repeat(indent)}error: |-` && lines[i] !== `${' '.repeat(indent)}error: |`) continue
+      const prefix = ' '.repeat(indent + 2)
+      const error: string[] = []
+      for (i++; i < lines.length && lines[i].startsWith(prefix); i++) error.push(lines[i].slice(prefix.length))
+      return error[0]?.startsWith('Command failed:') ? error.join('\n') : null
+    }
+  }
+  return null
+}
+
+const failureKey = (f: LoadFailure) => `${f.importer}\0${f.module}\0${f.exportName ?? ''}`
+
+/**
+ * Si la corrida con las rutas revertidas no cargó por un conjunto incoherente del contrato: el diagnóstico
+ * de enlace involucra una ruta revertida, no aparece en la ejecución del candidato y la fila falló por él
+ * (su archivo de prueba en `not ok` sin el test nombrado, o el test nombrado en `not ok` con el diagnóstico
+ * en el error propagado del subproceso). Devuelve el motivo, o `null` si la salida no lo demuestra.
+ */
+function contractIncoherence(start: VerifyStart, row: TestRow, candidate: RowExecution, execution: RowExecution): string | null {
+  const read = (e: RowExecution) => {
+    const stdout = readForEval(start.runDir, e.stdout_file)
+    const stderr = readForEval(start.runDir, e.stderr_file)
+    return stdout === null || stderr === null ? null : { stdout, stderr }
+  }
+  const reverted = read(execution)
+  const green = read(candidate)
+  if (!reverted || !green) return null
+  const inImpl = (p: string) => row.implementation_paths.includes(p)
+  const inTest = (p: string) => row.test_paths.includes(p)
+    || /(?:^|\/)(?:tests?|__tests__)\//.test(p) || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(p)
+  const seen = new Set([green.stdout, green.stderr].flatMap((text) => loadFailures(start.root, text)).map(failureKey))
+  const entries = parseTap(reverted.stdout)
+  const fileFailed = entries.some((e) => !e.ok && !e.suite && row.test_paths.some((p) => e.name === p || e.name.endsWith(`/${p}`)))
+  const test = named(reverted.stdout, row)
+  const output = test.length === 0 && fileFailed ? [reverted.stdout, reverted.stderr]
+    : test.length === 1 && !test[0].ok ? namedLoadOutput(reverted.stdout, row) : null
+  if (output === null) return null
+  const failures = (Array.isArray(output) ? output : [output]).flatMap((text) => loadFailures(start.root, text))
+    .filter((f) => !seen.has(failureKey(f)) && (inImpl(f.importer) || inImpl(f.module)) && !(inImpl(f.importer) && inImpl(f.module)))
+  if (failures.length === 0) return null
+
+  const [first] = failures
+  const routes = new Set<string>()
+  let limit = ''
+  for (const f of failures) {
+    const candidatePath = inImpl(f.importer) ? f.module : f.importer
+    if (inTest(f.importer)) limit = `el importador ${f.importer} es una prueba`
+    else if (isAbsolute(f.module)) limit = `el módulo ${f.module} está fuera del repositorio`
+    else if (inTest(candidatePath)) limit = `el módulo ${candidatePath} es una prueba`
+    else routes.add(candidatePath)
+  }
+  let route: string | undefined
+  if (routes.size === 1 && limit === '') {
+    const [candidatePath] = routes
+    const admitted = inspectRevertPaths(start.root, start.baseCommit, { ...row, implementation_paths: [candidatePath] })
+    if (admitted.eligible) route = candidatePath
+    else limit = `${candidatePath} no es admisible como ruta de implementación: ${admitted.reason}`
+  } else if (limit === '') {
+    limit = 'no hay una única ruta candidata'
+  }
+  const what = first.exportName === undefined
+    ? `${first.importer} importa ${first.module}, que no existe`
+    : `${first.importer} importa «${first.exportName}» de ${first.module}, que no lo exporta`
+  const fix = route ? `falta ${route} en implementation_paths` : `no se puede determinar la ruta que falta (${limit})`
+  return `con las rutas de implementación en la base el test no carga: ${what}; ${fix}; es un defecto del contrato, clase contract`
+}
+
 /**
  * Confirma una fila con obligación: guarda los dos contenidos de sus rutas de implementación, escribe la
  * intención, las devuelve a la base, corre la fila con el prefijo `confirm-` y las restaura, también si la
  * fila falla o se interrumpe. La intención se cierra solo después de restaurar: si algo corta en el medio,
  * la resuelve el verbo siguiente. Al final la huella tiene que volver a ser `original`.
  */
-export async function confirmRow(start: VerifyStart, row: TestRow, original: CandidateFingerprint, signal: AbortSignal): Promise<RowConfirmation> {
+export async function confirmRow(start: VerifyStart, row: TestRow, original: CandidateFingerprint, signal: AbortSignal, candidate: RowExecution): Promise<RowConfirmation> {
   const head = { row: row.id, obligation: row.obligation }
   if (row.obligation === 'none') return { ...head, state: 'not_required', restored: true }
   const eligible = inspectRevertPaths(start.root, start.baseCommit, row)
@@ -418,6 +564,8 @@ export async function confirmRow(start: VerifyStart, row: TestRow, original: Can
     return { ...head, state: 'not_confirmable', reason: `${changed.join(', ')} cambió después de guardar su contenido, así que no se revirtió`, restored: true }
   }
   const restored = candidateFingerprint(start.root, start.flow, start.baseCommit).tree === original.tree
+  const incoherent = execution.reason === undefined ? contractIncoherence(start, row, candidate, execution) : null
+  if (incoherent !== null) return { ...head, state: 'contract_incoherent', reason: incoherent, restored, execution }
   const state = confirmationOutcome(row, execution, readForEval(start.runDir, execution.stdout_file))
   const reason = state === 'refuted' ? REFUTED[row.obligation]
     : state === 'not_confirmable' ? `el reporte no muestra una única entrada del test «${row.test_name}» con el resultado que confirma (${execution.excerpt})` : undefined
@@ -588,7 +736,7 @@ export async function runFinal(start: VerifyStart, signal: AbortSignal): Promise
       const evaluated = evaluateRow(row, e, outputOf(start.runDir, e))
       const confirmation = row.kind !== 'test' || row.obligation === 'none' ? undefined
         : evaluated !== 'passed' || signal.aborted ? { row: row.id, obligation: row.obligation, state: 'not_confirmable' as const, reason: 'la fila no está en verde', restored: true }
-          : await confirmRow(start, row, before, signal)
+          : await confirmRow(start, row, before, signal, e)
       // Una fila con obligación pasa solo si además se confirmó y se restauró.
       const outcome = confirmation && evaluated === 'passed' && !(confirmation.state === 'confirmed' && confirmation.restored) ? 'failed' : evaluated
       rows.push({ row: row.id, outcome, execution: e, ...(confirmation ? { confirmation } : {}), baseline: observed })
@@ -685,10 +833,35 @@ function project(start: VerifyStart, receipt: VerifyReceipt): Projection {
     const file = join(flowDir(start.root, start.flow), FILE_NAMES.plan)
     if (!lstatSync(file).isFile()) throw new SddError('path_invalid', `${file} no es un archivo regular`)
     const text = readFileSync(file, 'utf8')
-    const next = setHeaderStatus(replaceSection(text, 'Verify', renderVerify(receipt)), receipt.green ? 'verified' : 'implementing')
-    writeTextAtomic(file, next)
+    writeTextAtomic(file, projectVerify(text, receipt))
     return 'written'
   })
+}
+
+/** El plan con la proyección del recibo: solo `## Verify` y el `status` del header cambian. */
+export function projectVerify(text: string, receipt: VerifyReceipt): string {
+  return setHeaderStatus(replaceSection(text, 'Verify', renderVerify(receipt)), receipt.green ? 'verified' : 'implementing')
+}
+
+/**
+ * Si `current` es exactamente lo que la proyección de un recibo final íntegro del flujo hace a `frozen`,
+ * devuelve el id de ese recibo. Solo aplica al plan `.plans/<flujo>/plan.md`; ante cualquier error, `null`.
+ */
+export function verifyProjectionOf(root: string, contextPath: string, frozen: string, current: string): string | null {
+  const m = /^\.plans\/([^/]+)\/plan\.md$/.exec(contextPath)
+  if (!m || !isFlowId(m[1])) return null
+  const flow = m[1]
+  try {
+    const refs = (readPhaseRecord(root, flow).verify?.receipts ?? []).filter((r) => r.mode === 'final')
+    for (const ref of [...refs].reverse()) {
+      const receipt = readVerifyReceipt(root, ref)
+      if (receipt.flow !== flow) continue
+      if (projectVerify(frozen, receipt) === current) return receipt.id
+    }
+  } catch {
+    return null
+  }
+  return null
 }
 
 function writeTextAtomic(file: string, text: string): void {

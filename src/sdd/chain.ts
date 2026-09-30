@@ -23,12 +23,13 @@ export function unattestedRows(receipt: Pick<VerifyReceipt, 'rows'>): string[] {
 
 /**
  * La clase que el binario propone para una fila roja, o `null` si ninguna regla aplica. En orden: una
- * confirmación refutada dice que la prueba no discrimina (contrato); una fila que no se pudo correr es del
+ * confirmación refutada dice que la prueba no discrimina (contrato), y una incoherente, que el conjunto de
+ * rutas de implementación no carga al revertirse (también contrato); una fila que no se pudo correr es del
  * entorno; una fila de test cuyo TAP trae su test en `not ok` es un defecto de implementación. La propuesta
  * no es la clasificación: la confirma o la cambia el conductor.
  */
 export function proposeClass(row: VerificationRow | undefined, result: RowResult, stdout: string | null): ChainClass | null {
-  if (result.confirmation?.state === 'refuted') return 'contract'
+  if (result.confirmation?.state === 'refuted' || result.confirmation?.state === 'contract_incoherent') return 'contract'
   if (result.outcome === 'unavailable') return 'environment'
   if (row?.kind === 'test' && result.outcome === 'failed' && stdout !== null) {
     const entries = parseTap(stdout).filter((e) => e.name === row.test_name && !e.suite)

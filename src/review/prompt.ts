@@ -270,6 +270,43 @@ ${roundSchema(lot)}`
   ].join('\n\n')
 }
 
+/**
+ * La pasada dirigida de una lente, cuando la corrección introdujo riesgo alto: revisa solo CAMBIOS con
+ * el mandato de su lente. No responde a pendientes (los contesta la base) y sus hallazgos nuevos solo
+ * pueden citar CAMBIOS. Con `lot`, el material es el de ese lote y la inspección pide sus rutas.
+ */
+export function renderLensRoundPrompt(c: Candidate, material: string, plan: RoundPlan, lens: Exclude<Reviewer, 'base'>, cap: number, lot?: string[]): string {
+  const h = c.hash
+  const instructions = `Eres un revisor de código aislado. Esta es la ronda ${plan.n} de ${cap} de una revisión: la revisión tiene hasta ${cap} rondas. En una ronda anterior se emitieron hallazgos y el conductor corrigió el candidato. La corrección introdujo riesgo alto: revisas lo que cambió con tu lente.
+
+${access(h)}
+
+${lensReview(lens)}
+
+## Reglas
+- Revisa solo el bloque CAMBIOS: las líneas del candidato actual que cambiaron desde la ronda anterior. Busca regresiones que haya introducido la corrección.
+- No respondes a hallazgos anteriores: \`responses\` es [].
+- Los hallazgos nuevos solo pueden citar líneas del bloque CAMBIOS: son regresiones de la corrección. Un binario de CAMBIOS se cita por su ruta. Una cita fuera de CAMBIOS rechaza la respuesta entera.
+- ${EVIDENCE_ONLY}
+
+${CITING}
+
+${GRAVITY}
+
+${lotPart(lot)}## Respuesta
+- Responde con un único objeto JSON que cumpla el esquema de abajo. No agregues otro objeto ni campos que el esquema no tenga.
+${inspection(h, lot)}
+- Escribe cada \`claim\` y \`note\` en español.
+
+Esquema:
+${roundSchema(lot)}`
+  return [
+    instructions,
+    block('CAMBIOS', h, changes(plan)),
+    `${material}\n`,
+  ].join('\n\n')
+}
+
 const REFUTE_SCHEMA = `{
   "candidate_hash": "<el hash exacto de arriba>",
   "results": [

@@ -24,7 +24,7 @@ import {
   type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, readMaterial, validateArtifactArgs,
 } from './review/artifact.ts'
 import {
-  type Candidate, type Selection, baseOf, changedRanges, freeze, freezeStable, freezeStableWith, readContext, snapshot,
+  type Candidate, type Selection, baseOf, candidateHash, changedRanges, freeze, freezeStable, freezeStableWith, readContext, readContextFile, sha256 as candidateSha256, snapshot,
 } from './review/candidate.ts'
 import { type PlannedJob, planJobs, planRoundJobs, sliceCandidate } from './review/batch.ts'
 import {
@@ -62,7 +62,7 @@ import { FILE_NAMES, type FlowRead, LOCK_FILE, artifactHash, bytesHash, flowDir,
 import { recoverPendingRestore } from './sdd/restore.ts'
 import { type FlowStatus, headerData, resolve as resolveFlow } from './sdd/status.ts'
 import { type ManualRow, type VerificationRow, readVerification } from './sdd/verification-contract.ts'
-import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal } from './sdd/verify.ts'
+import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal, verifyProjectionOf } from './sdd/verify.ts'
 import { type VerifyReceipt, type VerifyReceiptRef, readVerifyReceipt, receiptDir } from './sdd/verify-receipt.ts'
 import { claudeLaunch, claudeResume, claudeWriterLaunch, withSessionId } from './workers/claude.ts'
 import { codexLaunch, codexResume, codexWriterLaunch, withResultFile } from './workers/codex.ts'
@@ -782,21 +782,45 @@ function resolvesTo(root: string, ref: string | undefined, sha: string | null): 
  * se movió; sin `--head`, reconstruye con la misma base y el mismo contexto sobre el árbol. Si la
  * reconstrucción falla, cuenta como `stale`.
  */
-interface Freshness { stale: boolean; ref_moved?: boolean; stale_reason?: 'inputs' | 'artifact' }
+interface Freshness { stale: boolean; ref_moved?: boolean; stale_reason?: 'inputs' | 'artifact'; verify_projection?: Array<{ path: string; receipt: string }> }
 
-function freshness(root: string, req: ReviewRequest, c: Candidate, head: string | undefined): Freshness {
+function freshness(root: string, dir: string, req: ReviewRequest, c: Candidate, head: string | undefined): Freshness {
   if (isArtifact(req.selection)) return artifactFreshness(root, req.selection, c)
   const sel = req.selection
+  let moved: Pick<Freshness, 'ref_moved'> = {}
   try {
-    if (c.head_sha) {
-      const again = freeze(root, { base: baseOf(c), head: c.head_sha, context: sel.context })
-      const moved = !resolvesTo(root, head, c.head_sha) || !resolvesTo(root, sel.base, c.base_sha)
-      return { stale: again.hash !== c.hash, ref_moved: moved }
-    }
-    return { stale: freeze(root, { base: sel.base, context: sel.context, ...untrackedOf(sel) }).hash !== c.hash }
+    const again = c.head_sha
+      ? freeze(root, { base: baseOf(c), head: c.head_sha, context: sel.context })
+      : freeze(root, { base: sel.base, context: sel.context, ...untrackedOf(sel) })
+    moved = c.head_sha ? { ref_moved: !resolvesTo(root, head, c.head_sha) || !resolvesTo(root, sel.base, c.base_sha) } : {}
+    if (again.hash === c.hash) return { stale: false, ...moved }
+    const projection = verifyProjections(root, dir, c, again)
+    return projection ? { stale: false, ...moved, verify_projection: projection } : { stale: true, ...moved }
   } catch {
-    return { stale: true }
+    return { stale: true, ...moved }
   }
+}
+
+/**
+ * Si lo único que cambió del contexto desde que se congeló es la proyección de `sdd verify` en un plan,
+ * respaldada por un recibo íntegro, y con los sha congelados el hash vuelve a ser el de la revisión.
+ * Devuelve cada contexto reconocido con su recibo, o `null` si algo más cambió.
+ */
+function verifyProjections(root: string, dir: string, c: Candidate, again: Candidate): Array<{ path: string; receipt: string }> | null {
+  if (c.context.length !== again.context.length || c.context.some((x, i) => x.path !== again.context[i].path)) return null
+  const found: Array<{ path: string; receipt: string }> = []
+  for (const [i, frozen] of c.context.entries()) {
+    const now = again.context[i]
+    if (frozen.sha256 === now.sha256) continue
+    const current = readContextFile(root, frozen.path).bytes
+    if (candidateSha256(current) !== now.sha256) return null
+    const receipt = verifyProjectionOf(root, frozen.path, readFileSync(join(dir, 'blobs', frozen.sha256), 'utf8'), current.toString('utf8'))
+    if (receipt === null) return null
+    found.push({ path: frozen.path, receipt })
+  }
+  if (found.length === 0) return null
+  const restored = again.context.map((x, i) => (found.some((f) => f.path === x.path) ? c.context[i] : x))
+  return candidateHash({ ...again, context: restored }) === c.hash ? found : null
 }
 
 /**
@@ -973,7 +997,7 @@ function reviewView(root: string, id: string, dir: string, s: Status, env: Env):
   const ledgerFile = join(dir, 'ledger.json')
   if (!existsSync(ledgerFile)) {
     const c = readJson<Candidate>(join(dir, 'candidate.json'))
-    const fresh = freshness(root, req, c, headOf(dir, req, 1))
+    const fresh = freshness(root, dir, req, c, headOf(dir, req, 1))
     const out: Record<string, unknown> = {
       id, state: s.state, round, candidate_hash: c.hash, reviewer, degradations: req.degradations, risk: riskView(req),
       ...roundShape(dir, s, round), ...fresh, ...common, questions: [],
@@ -989,7 +1013,7 @@ function reviewView(root: string, id: string, dir: string, s: Status, env: Env):
   const c = readJson<Candidate>(join(dir, `candidate${tagOf(ledger.completed)}.json`))
   const receipt = readJson<Receipt>(join(dir, 'receipt.json'))
   const rounds = existsSync(join(dir, 'rounds.json')) ? readJson<{ rounds: RoundRecord[] }>(join(dir, 'rounds.json')).rounds : []
-  const fresh = freshness(root, req, c, headOf(dir, req, ledger.completed))
+  const fresh = freshness(root, dir, req, c, headOf(dir, req, ledger.completed))
   const disputes = ledger.entries.filter((e) => e.state === 'en-disputa').map((e) => e.id)
   const out: Record<string, unknown> = {
     id, state: s.state, round, completed: ledger.completed, candidate_hash: c.hash,
@@ -1472,18 +1496,19 @@ async function reviewRoundDiff(o: {
   let plan: RoundPlan | undefined
   let material: string
   let planned: { reviewers?: readonly Reviewer[]; batches: string[][]; jobs: PlannedJob[] }
+  let delta: Risk | undefined
   try {
     const changed = identical ? {} : changedRanges(prev, candidate, dir)
     if (!identical) {
-      const delta = classifyDelta(prev, candidate, changed)
-      if (delta.level === 'high') throw riskHigh(root, req, delta, selection.head)
+      delta = classifyDelta(prev, candidate, changed, dir)
+      if (delta.level === 'high' && readRisk(req).level !== 'high') throw riskHigh(root, req, delta, selection.head)
     }
     const contextTexts = readContext(root, candidate)
     material = renderMaterial(candidate, contextTexts)
     if (ledger) {
       plan = { n, prev_hash: prev.hash, identical, targets: goals, changed }
       if (values.head) plan.head = values.head
-      planned = planRoundJobs(candidate, contextTexts, plan, ledger.entries, ROUND_CAP)
+      planned = planRoundJobs(candidate, contextTexts, plan, ledger.entries, ROUND_CAP, delta?.level === 'high' ? REVIEWERS : ['base'])
     } else {
       planned = planFirstRound(candidate, contextTexts, readRisk(req))
     }
@@ -1526,6 +1551,7 @@ async function reviewRoundDiff(o: {
     out: {
       id, round: n, launch: k, family: resolved.family, candidate_hash: candidate.hash, identical,
       ...(plan ? { targets: goals, changed: Object.keys(plan.changed) } : { reviewers: planned.reviewers }),
+      ...(plan && delta?.level === 'high' ? { reviewers: planned.reviewers, delta_risk: delta } : {}),
       ...(planned.batches.length > 1 ? { batches: planned.batches.map((paths, i) => ({ n: i + 1, paths })) } : {}),
       ...(kept.length > 0 ? { kept: kept.map((j) => j.key) } : {}),
       left_out: candidate.left_out, questions: [], next: `./bin/sdd-ai wait ${id}`,
@@ -2075,6 +2101,7 @@ function releaseOrphan(root: string, id: string): Result {
 
 function agents(args: string[], env: Env, cwd: string): Result {
   if (args[0] !== 'sync') throw new SddError('usage', `subcomando desconocido: agents ${args[0] ?? ''}`, { next: './bin/sdd-ai agents sync' })
+  parseArgs({ args: args.slice(1), strict: true, allowPositionals: false, options: {} })
   const root = repoRoot(cwd)
   const { written, removed } = syncAgents(root, PKG_DIR, nativeProfiles(root, env))
   return { code: 0, out: { written, removed, next: 'reabre la sesión para que el CLI cargue los agentes y la skill' } }

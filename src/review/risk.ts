@@ -1,4 +1,4 @@
-import type { Candidate, CandidateFile } from './candidate.ts'
+import { type Candidate, type CandidateFile, type ReplacedHunk, replacedHunks } from './candidate.ts'
 import { addedLines, sections } from './diff.ts'
 import type { ChangedRanges } from './ledger.ts'
 
@@ -87,9 +87,10 @@ const inRanges = (line: number, ranges: Array<[number, number]>) => ranges.some(
 /**
  * El nivel de lo que cambió de un candidato al siguiente. Toda ruta que cambió pasa por las señales de
  * ruta y de script aunque ya estuviera en el anterior; de los modos y las líneas agregadas cuenta solo
- * lo nuevo.
+ * lo nuevo, y de los identificadores de proceso, solo los que un bloque reemplazado no traía ya.
  */
-export function classifyDelta(prev: Candidate, next: Candidate, changed: ChangedRanges): Risk {
+export function classifyDelta(prev: Candidate, next: Candidate, changed: ChangedRanges, dir: string): Risk {
+  const hunks = replacedHunks(prev, next, dir)
   const before = new Map(prev.files.map((f) => [f.path, f]))
   const after = new Map(next.files.map((f) => [f.path, f]))
   const paths = new Set(Object.keys(changed))
@@ -113,9 +114,30 @@ export function classifyDelta(prev: Candidate, next: Candidate, changed: Changed
     const ranges = changed[f.path]
     // Un archivo que solo cambió de ruta no trae líneas nuevas, aunque en su ruta nueva todas figuren cambiadas.
     const moved = prev.files.some((p) => p.status !== 'D' && p.sha256 === f.sha256)
-    if (Array.isArray(ranges) && !moved) {
-      found.push(processSignal(f.path, addedLines(section(f.path)).filter((a) => inRanges(a.line, ranges))))
-    }
+    if (Array.isArray(ranges) && !moved) found.push(newProcessSignal(f.path, addedLines(section(f.path)), hunks[f.path] ?? []))
   }
   return risk(found)
+}
+
+/**
+ * Primer identificador de proceso que un archivo agrega: en cada bloque reemplazado se descuentan, con
+ * su multiplicidad, los que ya estaban en el texto que quitó.
+ */
+function newProcessSignal(path: string, added: Array<{ line: number; text: string }>, hunks: ReplacedHunk[]): RiskReason | undefined {
+  for (const hunk of hunks) {
+    if (!hunk.added) continue
+    const range = hunk.added
+    const seen = new Map<string, number>()
+    for (const text of hunk.removed) {
+      for (const m of text.matchAll(new RegExp(PROCESS.source, 'gu'))) seen.set(m[0], (seen.get(m[0]) ?? 0) + 1)
+    }
+    for (const { line, text } of added.filter((a) => inRanges(a.line, [range]))) {
+      for (const m of text.matchAll(new RegExp(PROCESS.source, 'gu'))) {
+        const left = seen.get(m[0]) ?? 0
+        if (left > 0) seen.set(m[0], left - 1)
+        else return { signal: 'process', path, detail: `línea ${line}: ${m[0]}` }
+      }
+    }
+  }
+  return undefined
 }
