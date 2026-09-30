@@ -991,3 +991,38 @@ test('con una verificación en curso, un writer concurrente se niega; y doctor t
   assert.equal(readFileSync(join(repo, 'src', 'a.ts'), 'utf8'), 'export const f = () => 2\n')
   assert.equal(restoreIntentOpen(repo), false)
 })
+
+test('recibo posterior a la toma: después de una toma, solo un recibo que corrió sobre ella acredita el árbol', async () => {
+  const { repo, base } = verifyFlow()
+  fakeHarvest(repo, base, { endMark: true })
+  const first = await final(repo)
+  assert.equal(first.receipt.green, true, JSON.stringify(first.receipt.rows))
+  assert.equal(statusOf(repo).next.step, 'review_and_commit')
+  // Una toma posterior al recibo: el verde anterior ya no acredita el árbol.
+  const phases = join(repo, '.plans', 'f', 'sdd-ai-phases.json')
+  const rec = JSON.parse(readFileSync(phases, 'utf8'))
+  const at = new Date().toISOString()
+  rec.implement = {
+    schema: 1, classifications: [], events: [],
+    chains: [{ id: 'c1', terminal: { code: 'takeover', at, detail: 'toma' }, entries: [{ kind: 'takeover', id: 't-uno', parent: null, at, map: { ref: 'takeovers/t-uno.json', digest: `sha256:${'c'.repeat(64)}` } }] }],
+  }
+  writeFileSync(phases, JSON.stringify(rec))
+  assert.equal(statusOf(repo).next.step, 'verify')
+  // La cadena tampoco da por vigente el verde anterior a la toma, aunque el árbol sea el mismo: pide verificar.
+  const chained = withPhaseNext(repo, 'f', statusOf(repo))
+  assert.equal(chained.command, './bin/sdd-ai sdd verify f', JSON.stringify(chained))
+  // Un recibo nuevo lleva la toma y, en verde, vuelve a acreditar el árbol aunque el writer no cierre.
+  const second = await final(repo)
+  assert.equal(second.receipt.writer?.takeover, 't-uno')
+  assert.equal(second.receipt.green, true)
+  assert.equal(statusOf(repo).next.step, 'review_and_commit')
+  // Una toma posterior y otra cadena después de ella: el verde anterior a esa toma tampoco acredita el árbol.
+  const now = JSON.parse(readFileSync(phases, 'utf8'))
+  const later = new Date(Date.now() + 1000).toISOString()
+  now.implement.chains = [
+    { id: 'c1', terminal: { code: 'takeover', at: later, detail: 'toma' }, entries: [{ kind: 'takeover', id: 't-dos', parent: null, at: later, map: { ref: 'takeovers/t-dos.json', digest: `sha256:${'d'.repeat(64)}` } }] },
+    { id: 'c2', terminal: null, entries: [{ kind: 'implement', run: '20260929-2359-beef', parent: 't-dos', at: later, pending: ['T1'] }] },
+  ]
+  writeFileSync(phases, JSON.stringify(now))
+  assert.equal(statusOf(repo).next.step, 'verify')
+})

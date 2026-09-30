@@ -291,9 +291,9 @@ con sus umbrales; esta sección dice cómo.
   preguntes al usuario si los conserva o los revierte; si los conserva, sigues inline hasta que él
   deje el árbol limpio. sdd-ai nunca hace stash, commit ni revert.
 - **El encargo** trae el objetivo, los archivos que se tocan y cómo se comprueba que quedó bien. No
-  hace falta ninguna estructura: el binario lo envuelve en un contrato fijo que le prohíbe commitear,
-  tocar esas rutas, correr pruebas o comandos, y le pide declarar lo que se desvió y cerrar con
-  `STATUS: done`.
+  hace falta ninguna estructura: el binario lo envuelve en un contrato fijo que le deja leer el
+  repositorio, también con el shell, y le prohíbe commitear, tocar esas rutas y ejecutar pruebas, builds
+  o comandos que escriban; le pide declarar lo que se desvió y cerrar con `STATUS: done`.
 - **Mientras corre, no edites el árbol.** Espera con `./bin/sdd-ai wait <id>`. Hay un writer por
   repositorio: otro `run --role implement`, desde cualquier sesión o worktree, se rechaza nombrando
   el que está abierto.
@@ -302,7 +302,8 @@ con sus umbrales; esta sección dice cómo.
   (`flagged`: cambios en el directorio de Git, `.sdd-ai/`, `.claude/`, `.codex/` o `.agents/`), la
   corrida alterada (`run_altered`: archivos de `.sdd-ai/runs/<id>/` que el writer tocó) y si `HEAD` se
   movió. El cambio sale del árbol real contra la base, no del reporte.
-- **Antes de aceptar el cambio, en este orden:**
+- **Antes de aceptar el cambio de un writer suelto, en este orden** (el de un writer de fase va por
+  otro camino: primero `sdd verify` y después la revisión, en §9):
   1. Mira primero `flagged`, `run_altered` y `failed`. Si hay algo, díselo al usuario antes de seguir.
   2. Lee el diff completo.
   3. Lanza el `review start` que trae `next` antes de correr nada que pueda cambiar el árbol. Revisa
@@ -321,7 +322,8 @@ con sus umbrales; esta sección dice cómo.
 - **Un diff parcial o que no quedó bien**, o un `wait` que termina en fallo, plazo vencido o
   cancelación: el `next` te dice que le preguntes al usuario si conserva el cambio o lo revierte.
   Después puedes corregir a mano lo chico, relanzar con un encargo mejor (`--retry` relanza el encargo
-  original) o proponer SDD. Si no quedó ningún cambio, no hay nada que conservar: ofrece relanzar.
+  original de un writer suelto; un writer de fase se niega con `phase_writer` y lo sigue `sdd phase`) o
+  proponer SDD. Si no quedó ningún cambio, no hay nada que conservar: ofrece relanzar.
 - **`control_unavailable`**: el binario no pudo escribir su almacén de control, que vive en el
   directorio de Git. Pasa cuando lo corres dentro del sandbox de Codex: vuelve a correr el mismo
   comando pidiendo salir del sandbox. Esa escalada la aprueba el usuario o el auto-review; si no se
@@ -669,18 +671,18 @@ falta; el paso siguiente lo sigue decidiendo `sdd status`, no el hijo.
   y ese archivo. Si esa corrida no llega a publicar ni a cerrar (no arranca, falla o no se admite), la
   fase sigue esperando y puedes volver a lanzarla con `--context`. Si el hijo vuelve a devolver
   faltantes, la fase se cierra y **la sigues inline**.
-- **`implement`**: un solo writer con todas las tasks pendientes, por el mismo camino que `run --role
-  implement` (§6), árbol limpio incluido. El `wait` suma `contract` (si se admitió, la causa y el
-  `missing_context`) y `flow_next`, el paso de `sdd status`; su `next` es el de la cosecha. Un contrato
-  no admitido, un `missing_context` o insumos que cambiaron no proponen la revisión, igual que las demás
-  fallas de la cosecha. El binario no marca las tasks: las marcas tú después de revisar el diff y correr
-  las comprobaciones. Con el árbol limpio y tasks pendientes, `sdd phase` lanza otro writer.
+- **`implement`**: el writer va por el mismo camino que `run --role implement` (§6). Una entrega parcial
+  o un rojo de `sdd verify` no se corrigen a mano: `sdd phase` sigue la cadena del writer sobre el árbol
+  que dejó, y su `next` dice cuál es el paso. El orden es verify antes de la revisión: con la cosecha
+  completa marcas las tasks acreditadas, corres `sdd verify` y, recién con el verde vigente, lanzas la
+  revisión que propone `sdd status`. Si editas a mano, verify se niega hasta que declares la toma
+  (`sdd verify <id> --takeover`). El binario no marca las tasks.
 - **Límites:**
   - las fases van solo por proceso, aunque la familia sea la tuya: la vía nativa no le entrega al
     binario la respuesta del hijo;
   - el binario valida la forma, no el mérito: que un criterio tenga método o una task cite un patrón no
     dice que sirvan, y eso lo juzgan la revisión del artefacto y el gate;
-  - el writer no corre pruebas: las comprobaciones de cada task las corres tú;
+  - el writer no corre pruebas: las comprobaciones las corre `sdd verify`;
   - el hijo Codex sigue leyendo el `AGENTS.md` del repositorio y el del usuario: el encargo le pide
     ignorarlos, sin garantía;
   - con `.plans/` versionado, publicar o marcar tasks ensucia el árbol, y `next.detail` lo dice antes de

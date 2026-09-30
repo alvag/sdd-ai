@@ -1157,3 +1157,27 @@ test('la fase con faltantes espera ampliación, la ampliada con faltantes se cie
   assert.equal(phaseOut(blocked.dir).outcome, 'not_published')
   assert.deepEqual(readPhaseRecord(blocked.repo, 'f').phases.specify, waiting.phases.specify)
 })
+
+test('supervisor encadenado: el cierre por timeout de una corrida que reanuda conserva su argv de reanudación', async () => {
+  const { chainFlow, chainSetup, runBin } = await import('./helpers.ts')
+  const done = (ids: string[], pending: string[] = []) => `Hecho.\n\n${JSON.stringify({ phase: 'implement', missing_context: [],
+    tasks: [...ids.map((id) => ({ id, completion: 'done' })), ...pending.map((id) => ({ id, completion: 'pending' }))].map((t) => ({ ...t, change_kind: 'behavior_change', changed: 'x', deviation: null, check: 'V1' })) })}\n\nSTATUS: done\n`
+  const s = chainSetup({ writers: [
+    { actions: [{ write: 'src/t1.ts', content: '1\n' }], report: done(['T1'], ['T2']) },
+    { actions: [{ write: 'src/t2.ts', content: '2\n' }], hang: true },
+    { report: done(['T2']) },
+  ] })
+  chainFlow(s, { tasks: 2 })
+  runBin(s, ['wait', runBin(s, ['sdd', 'phase', 'f']).out.id, '--max', '30'])
+  const cont = runBin(s, ['sdd', 'phase', 'f', '--deadline', '3'])
+  assert.equal(cont.code, 0, JSON.stringify(cont.out))
+  const w = runBin(s, ['wait', cont.out.id, '--max', '60'])
+  assert.equal(w.out.state, 'done', JSON.stringify(w.out))
+  const store = join(s.repo, '.git', 'sdd-ai', 'runs', cont.out.id)
+  const launched = JSON.parse(readFileSync(join(store, 'argv.json'), 'utf8')).launch.args as string[]
+  const resumed = JSON.parse(readFileSync(join(store, 'argv-resume.json'), 'utf8')).launch.args as string[]
+  // El argv ya reanudaba la sesión del writer anterior: el cierre usa el mismo, sin anidar otro resume.
+  assert.deepEqual(resumed, launched)
+  assert.equal(launched.filter((a) => a === 'resume').length, 1)
+  assert.deepEqual(w.out.left, [])
+})

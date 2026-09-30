@@ -1223,8 +1223,8 @@ function implementFlow(repo: string, tasks = '# Tasks\n\n- [x] **T1 — hecha** 
 const implementReport = (o: Record<string, unknown> = {}) => `Hice el cambio.\n\n${JSON.stringify({
   phase: 'implement', missing_context: [],
   tasks: [
-    { id: 'T2', change_kind: 'behavior_change', changed: 'exporta', deviation: null, check: 'actualizar la expectativa' },
-    { id: 'T3', change_kind: 'refactor', changed: 'encabezado', deviation: null, check: 'confirmar el verde previo' },
+    { id: 'T2', completion: 'done', change_kind: 'behavior_change', changed: 'exporta', deviation: null, check: 'V1' },
+    { id: 'T3', completion: 'done', change_kind: 'refactor', changed: 'encabezado', deviation: null, check: 'V1' },
   ],
   ...o,
 })}\n\nSTATUS: done\n`
@@ -1241,15 +1241,17 @@ test('sdd phase en implement lanza un writer con las tasks congeladas y la cosec
   const w = cli(s, ['wait', r.out.id, '--max', '30'])
   assert.equal(w.code, 0, JSON.stringify(w.out))
   assert.deepEqual(w.out.contract, { admitted: true, missing_context: [] })
-  assert.match(w.out.next, /review start --harvest/)
+  // Con todas las tasks hechas, la cadena va a verify: la revisión viene después, con el verde.
+  assert.match(w.out.next, /sdd verify f/)
+  assert.doesNotMatch(w.out.next, /review start/)
   assert.deepEqual(w.out.flow_next, cli(s, ['sdd', 'status', 'f']).out.next)
   const prompt = JSON.parse(readFileSync(prompts, 'utf8').trim().split('\n')[0]) as string
   assert.match(prompt, /T2, T3/)
   assert.match(prompt, /<<<INSUMO tasks/)
   assert.deepEqual(readPhaseRecord(s.repo, 'f').last_run, { id: r.out.id, step: 'implement' })
-  // El cambio del writer sigue en el árbol: otra fase se niega igual que run --role implement.
+  // El último eslabón está completo: no hay otra corrida que lanzar hasta marcar las tasks y verificar.
   const again = cli(s, ['sdd', 'phase', 'f'])
-  assert.deepEqual([again.code, again.out.code], [2, 'tree_dirty'])
+  assert.deepEqual([again.code, again.out.code], [2, 'chain_complete'])
 
   const failures: Array<[string, object, RegExp]> = [
     ['contrato no admitido', { actions: [{ write: 'n.txt', content: 'x\n' }], report: 'Hice el cambio.\nSTATUS: done\n' }, /contrato/],
@@ -1266,11 +1268,11 @@ test('sdd phase en implement lanza un writer con las tasks congeladas y la cosec
     assert.doesNotMatch(h.out.next, /review start/, name)
   }
 
-  // Un writer de fase que no dejó ningún cambio se relanza con el verbo de la fase y su misma familia.
+  // Un writer de fase que no dejó ningún cambio no acredita nada: la cadena sigue con las mismas tasks.
   const empty = writerSetup({ script: { report: implementReport() } })
   implementFlow(empty.repo)
   const e = cli(empty, ['wait', cli(empty, ['sdd', 'phase', 'f']).out.id, '--max', '30'])
-  assert.match(e.out.next, /pregunta al usuario si relanza: \.\/bin\/sdd-ai sdd phase f --families codex --conductor claude$/)
+  assert.match(e.out.next, /sigue con T2, T3: \.\/bin\/sdd-ai sdd phase f$/)
 
   const grammar = writerSetup()
   implementFlow(grammar.repo, '# Tasks\n\n- [ ] hacer algo sin id\n')
@@ -1283,4 +1285,65 @@ test('sdd phase en implement lanza un writer con las tasks congeladas y la cosec
   const m = cli(missing, ['sdd', 'phase', 'f'])
   assert.deepEqual([m.code, m.out.code], [2, 'cli_missing'])
   assert.equal(m.out.next, 'pregunta al usuario si cae a claude; solo con un sí: ./bin/sdd-ai sdd phase f --families claude --conductor claude')
+})
+
+test('lanzamiento encadenado: la continuación reanuda la sesión de la corrida de origen con su familia, y sin sesión se niega', async () => {
+  const { chainFlow, chainSetup, fakeCalls, runBin } = await import('./helpers.ts')
+  const report = (done: string[], pending: string[]) => `Hecho.\n\n${JSON.stringify({ phase: 'implement', missing_context: [],
+    tasks: [...done.map((id) => ({ id, completion: 'done' })), ...pending.map((id) => ({ id, completion: 'pending' }))].map((t) => ({ ...t, change_kind: 'behavior_change', changed: 'x', deviation: null, check: 'V1' })) })}\n\nSTATUS: done\n`
+  const s = chainSetup({ families: '[claude]', bins: ['claude'], writers: [
+    { actions: [{ write: 'src/t1.ts', content: '1\n' }], report: report(['T1'], ['T2']) },
+    { actions: [{ write: 'src/t2.ts', content: '2\n' }], report: report(['T2'], []) },
+  ] })
+  chainFlow(s, { tasks: 2 })
+  const first = runBin(s, ['sdd', 'phase', 'f'])
+  runBin(s, ['wait', first.out.id, '--max', '30'])
+  const second = runBin(s, ['sdd', 'phase', 'f'])
+  assert.deepEqual([second.code, second.out.family, second.out.kind], [0, 'claude', 'continuation'], JSON.stringify(second.out))
+  runBin(s, ['wait', second.out.id, '--max', '30'])
+  const [a, b] = fakeCalls(s)
+  const sid = a[a.indexOf('--session-id') + 1]
+  // El argv del hijo es el del padre con --resume en lugar de --session-id: mismo aislamiento, misma sesión.
+  assert.deepEqual(b, a.map((x) => (x === '--session-id' ? '--resume' : x)))
+  assert.equal(b[b.indexOf('--resume') + 1], sid)
+  const control = JSON.parse(readFileSync(join(storeOf(s.repo, second.out.id), 'control.json'), 'utf8'))
+  assert.deepEqual([control.phase.session_origin, control.phase.launch_from], [first.out.id, { run: first.out.id }])
+
+  // Sin el archivo de la sesión no hay reanudación, ni otra familia ni una sesión nueva en silencio.
+  const t = chainSetup({ families: '[claude]', bins: ['claude'], writers: [
+    { actions: [{ write: 'src/t1.ts', content: '1\n' }], report: report(['T1'], ['T2']) },
+    { actions: [{ write: 'src/t2.ts', content: '2\n' }], report: report(['T2'], []) },
+  ] })
+  chainFlow(t, { tasks: 2 })
+  const r = runBin(t, ['sdd', 'phase', 'f'])
+  runBin(t, ['wait', r.out.id, '--max', '30'])
+  const sid2 = fakeCalls(t)[0][fakeCalls(t)[0].indexOf('--session-id') + 1]
+  execFileSync('rm', ['-f', join(t.env.CLAUDE_CONFIG_DIR!, 'projects', '-repo', `${sid2}.jsonl`)])
+  const refused = runBin(t, ['sdd', 'phase', 'f'])
+  assert.deepEqual([refused.code, refused.out.code], [2, 'resume_unavailable'], JSON.stringify(refused.out))
+  assert.match(refused.out.next, /--blocks/)
+  assert.equal(fakeCalls(t).length, 1)
+  // El bloque que propone abre una sesión nueva con la familia y el perfil del writer: no necesita la sesión perdida.
+  const block = runBin(t, ['sdd', 'phase', 'f', '--blocks'])
+  assert.deepEqual([block.code, block.out.kind, block.out.family], [0, 'block', 'claude'], JSON.stringify(block.out))
+  runBin(t, ['wait', block.out.id, '--max', '30'])
+  const [origin, blockCall] = fakeCalls(t)
+  assert.ok(!blockCall.includes('--resume'))
+  assert.notEqual(blockCall[blockCall.indexOf('--session-id') + 1], origin[origin.indexOf('--session-id') + 1])
+
+  // Sin el id de la sesión de origen (Codex lo guarda en el estado), el bloque se lanza igual con el argv.
+  const u = chainSetup({ writers: [
+    { actions: [{ write: 'src/t1.ts', content: '1\n' }], report: report(['T1'], ['T2']) },
+    { actions: [{ write: 'src/t2.ts', content: '2\n' }], report: report(['T2'], []) },
+  ] })
+  chainFlow(u, { tasks: 2 })
+  const r0 = runBin(u, ['sdd', 'phase', 'f'])
+  runBin(u, ['wait', r0.out.id, '--max', '30'])
+  const statusFile = join(storeOf(u.repo, r0.out.id), 'status.json')
+  const { session_id: _session, ...withoutSession } = JSON.parse(readFileSync(statusFile, 'utf8'))
+  writeFileSync(statusFile, JSON.stringify(withoutSession))
+  const codexBlock = runBin(u, ['sdd', 'phase', 'f', '--blocks'])
+  assert.deepEqual([codexBlock.code, codexBlock.out.kind, codexBlock.out.family], [0, 'block', 'codex'], JSON.stringify(codexBlock.out))
+  runBin(u, ['wait', codexBlock.out.id, '--max', '30'])
+  assert.ok(!fakeCalls(u)[1].includes('resume'))
 })

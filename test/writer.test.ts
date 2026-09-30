@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { WRITER_END_MARK, hasEndMark, writerPrompt } from '../src/writer.ts'
+import { WRITER_END_MARK, hasEndMark, writerEnvelopeBytes, writerPrompt } from '../src/writer.ts'
 
 test('el contrato envuelve el encargo con las reglas fijas y la marca de fin, sin exigir secciones', () => {
   const encargo = 'Agrega un saludo en src/a.ts.\nSin más detalles.'
@@ -9,8 +9,11 @@ test('el contrato envuelve el encargo con las reglas fijas y la marca de fin, si
   for (const rule of [
     /escribe solo lo que el encargo pide/i, /no commitees/i,
     /\.git/, /\.sdd-ai\//, /\.claude\//, /\.codex\//, /\.agents\//, /archivos que Git ignora/,
-    /no corras pruebas ni comandos/i, /declara lo que te desviaste del encargo y por qué/i, /STATUS: done/,
+    /lee el repositorio con libertad, también con el shell/i, /no ejecutes pruebas, builds, instaladores ni ningún comando que escriba/i,
+    /las comprobaciones las corre `sdd verify`/, /declara lo que te desviaste del encargo y por qué/i, /STATUS: done/,
   ]) assert.match(p, rule)
+  // La regla ya no prohíbe los comandos de lectura: esa ambigüedad frenó a un writer que leía con el shell.
+  assert.doesNotMatch(p, /no corras pruebas ni comandos/i)
   // El encargo va intacto entre delimitadores, y un encargo sin secciones se acepta.
   const [open, close] = ['<<<ENCARGO', 'ENCARGO>>>']
   assert.equal(p.slice(p.indexOf(open) + open.length + 1, p.indexOf(close) - 1), encargo)
@@ -23,4 +26,9 @@ test('la marca de fin es la última línea no vacía', () => {
   assert.equal(hasEndMark('STATUS: done\nY una línea más'), false)
   assert.equal(hasEndMark('  STATUS: done  '), true)
   assert.equal(hasEndMark(''), false)
+})
+
+test('el envoltorio del writer mide lo que suma a cualquier encargo', () => {
+  assert.equal(writerEnvelopeBytes(), Buffer.byteLength(writerPrompt(''), 'utf8'))
+  assert.equal(Buffer.byteLength(writerPrompt('ñandú'), 'utf8'), writerEnvelopeBytes() + Buffer.byteLength('ñandú', 'utf8'))
 })

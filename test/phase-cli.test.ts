@@ -476,13 +476,15 @@ test('una segunda sdd phase con la corrida activa se niega nombrándola', () => 
 test('wait de una fase devuelve el next de sdd status también en implement, con la cosecha aparte', () => {
   const s = phaseSetup('implement', { mode: 'writer' })
   writeFileSync(join(s.repo, '.git', 'info', 'exclude'), '.plans/\n.sdd-ai/\npedido.md\n')
-  const report = `Listo.\n${JSON.stringify({ phase: 'implement', missing_context: [], tasks: [{ id: 'T1', change_kind: 'behavior_change', changed: 'x', deviation: null, check: 'actualizar la expectativa' }] })}\nSTATUS: done\n`
+  const report = `Listo.\n${JSON.stringify({ phase: 'implement', missing_context: [], tasks: [{ id: 'T1', completion: 'done', change_kind: 'behavior_change', changed: 'x', deviation: null, check: 'V1' }] })}\nSTATUS: done\n`
   const env = { FAKE_WRITER: JSON.stringify({ actions: [{ write: 'nuevo.txt', content: 'x\n' }], report }) }
   const r = cli(s, ['sdd', 'phase', 'f'], env)
   assert.equal(r.code, 0, JSON.stringify(r.out))
   const w = cli(s, ['wait', r.out.id, '--max', '30'], env)
   assert.equal(w.code, 0, JSON.stringify(w.out))
-  assert.match(w.out.next, /review start --harvest/)
+  // Una cosecha completa de fase va a verify antes que a la revisión.
+  assert.match(w.out.next, /sdd verify f/)
+  assert.doesNotMatch(w.out.next, /review start/)
   assert.deepEqual(w.out.flow_next, cli(s, ['sdd', 'status', 'f']).out.next)
   assert.equal(w.out.flow_next.step, 'implement')
 })

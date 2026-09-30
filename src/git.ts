@@ -263,6 +263,61 @@ export function harvestTreeWithout(root: string, flow: string, base: string, pat
   })
 }
 
+/** De dónde sale el mapa de un árbol: el árbol de trabajo real, o la base con el patch de una cosecha aplicado. */
+export type EntriesSource = { kind: 'current' } | { kind: 'base' } | { kind: 'patch'; patchFile: string }
+
+/**
+ * El mapa ruta → `modo sha` de un árbol contra `base`, armado en un índice propio que se borra al
+ * terminar: son cadenas de texto, así que compararlas después no depende de que los objetos del índice
+ * temporal sigan en el repositorio. `null` si el patch ya no está o no aplica. No toca el índice del usuario.
+ */
+export function indexEntries(root: string, base: string, source: EntriesSource): Map<string, string> | null {
+  const c: Checkout = { root, gitDir: gitDirs(root).gitDir }
+  if (source.kind === 'patch') {
+    try {
+      statSync(source.patchFile)
+    } catch {
+      return null
+    }
+  }
+  return withScratchIndex((indexFile) => {
+    const g = indexedGit(c, indexFile)
+    if (source.kind === 'current') {
+      buildIndex(c, base, indexFile)
+    } else if (source.kind === 'base') {
+      g.text(['read-tree', base])
+    } else {
+      g.text(['read-tree', base])
+      if (statSync(source.patchFile).size > 0) {
+        try {
+          g.text(['apply', '--cached', '--binary', source.patchFile])
+        } catch {
+          return null
+        }
+      }
+    }
+    const out = new Map<string, string>()
+    for (const line of splitZ(g.text(['ls-files', '-z', '-s']))) {
+      const tab = line.indexOf('\t')
+      const [mode, sha] = line.slice(0, tab).split(' ')
+      out.set(line.slice(tab + 1), `${mode} ${sha}`)
+    }
+    return out
+  })
+}
+
+/**
+ * Las rutas que difieren entre dos mapas de `indexEntries`: presentes en uno solo, o con otro modo o
+ * contenido. Ordenadas, y sin `.plans/<flow>/`, que el propio flujo escribe.
+ */
+export function entryDiff(a: ReadonlyMap<string, string>, b: ReadonlyMap<string, string>, flow: string): string[] {
+  const own = `.plans/${flow}/`
+  const out = new Set<string>()
+  for (const [path, v] of a) if (b.get(path) !== v) out.add(path)
+  for (const path of b.keys()) if (!a.has(path)) out.add(path)
+  return [...out].filter((p) => !p.startsWith(own)).sort()
+}
+
 /** Diff del índice armado contra la base, sin diff externo ni textconv, con las rutas de siempre. */
 const CAPTURE_DIFF = ['--no-color', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/', '-M']
 

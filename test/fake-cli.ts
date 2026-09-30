@@ -136,6 +136,11 @@ interface WriterScript {
   /** Deja un hijo vivo en su grupo, que sobrevive al writer. */
   child?: boolean
   exit?: number
+  /** Un dato que la sesión recuerda; una reanudación lo escribe en `recall` para probar la memoria. */
+  remember?: string
+  recall?: string
+  /** Espera a que exista este archivo (ruta absoluta) antes de actuar, hasta 30 s: la corrida sigue activa mientras tanto. Si no aparece, sale con 1 sin actuar. */
+  waitFor?: string
 }
 
 const runDirs = () => {
@@ -160,9 +165,43 @@ function act(a: WriterAction): void {
   else if ('runsSwap' in a) { renameSync(join('.sdd-ai', 'runs'), a.runsSwap); symlinkSync(a.runsSwap, join('.sdd-ai', 'runs')) }
 }
 
+/**
+ * El guion de esta invocación: con FAKE_WRITERS, uno por invocación en orden (y cada uno actúa también
+ * si reanuda); si no, FAKE_WRITER para todas, y una reanudación solo cierra.
+ */
+function writerScript(): { script: WriterScript; perCall: boolean } {
+  if (process.env.FAKE_WRITERS === undefined) return { script: JSON.parse(process.env.FAKE_WRITER ?? '{}') as WriterScript, perCall: false }
+  const list = JSON.parse(process.env.FAKE_WRITERS) as WriterScript[]
+  return { script: list[callCount() - 1] ?? {}, perCall: true }
+}
+
+/**
+ * Con FAKE_SESSION_FILES, la sesión vive en un archivo donde la busca el runner real: Claude en
+ * `CLAUDE_CONFIG_DIR/projects/-repo/<sesión>.jsonl`, Codex en `CODEX_HOME/sessions/.../rollout-*-<hilo>.jsonl`.
+ * Una reanudación sin su archivo falla como el CLI real. Devuelve el id y el dato recordado.
+ */
+function session(codex: boolean, resumed: boolean, remember: string | undefined): { id: string; remembered?: string } | 'missing' {
+  const files = process.env.FAKE_SESSION_FILES === '1'
+  const id = codex
+    ? (resumed ? args[args.length - 2] : files ? `th-${process.pid}-${Date.now()}` : 'T1')
+    : args[args.indexOf(resumed ? '--resume' : '--session-id') + 1]
+  if (!files) return { id }
+  const file = codex
+    ? join(process.env.CODEX_HOME ?? '/nonexistent', 'sessions', '2026', '09', '29', `rollout-2026-09-29T00-00-00-${id}.jsonl`)
+    : join(process.env.CLAUDE_CONFIG_DIR ?? '/nonexistent', 'projects', '-repo', `${id}.jsonl`)
+  if (resumed) {
+    if (!existsSync(file)) return 'missing'
+    const remembered = (JSON.parse(readFileSync(file, 'utf8').split('\n')[0]) as { remember?: string }).remember
+    return { id, remembered }
+  }
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, `${JSON.stringify({ remember })}\n`)
+  return { id }
+}
+
 /** El writer falso: lee su prompt, actúa sobre el árbol y responde en el stream de su familia. */
 function writer(): void {
-  const script = JSON.parse(process.env.FAKE_WRITER ?? '{}') as WriterScript
+  const { script, perCall } = writerScript()
   const prompt = readFileSync(0, 'utf8')
   if (process.env.FAKE_PROMPTS_FILE) appendFileSync(process.env.FAKE_PROMPTS_FILE, `${JSON.stringify(prompt)}\n`)
   if (script.silent) return
@@ -172,8 +211,28 @@ function writer(): void {
     process.exitCode = 1
     return
   }
-  process.stdout.write(`${codex ? codexThread : claudeInit()}\n`)
-  if (!resumed) for (const a of script.actions ?? []) act(a)
+  const s = session(codex, resumed, script.remember)
+  if (s === 'missing') {
+    process.stderr.write('fake-cli: no se encontró la sesión\n')
+    process.exitCode = 1
+    return
+  }
+  const opening = process.env.FAKE_SESSION_FILES === '1'
+    ? JSON.stringify(codex ? { type: 'thread.started', thread_id: s.id } : { type: 'system', subtype: 'init', session_id: s.id, model: 'claude-falso', tools: [] })
+    : codex ? codexThread : claudeInit()
+  process.stdout.write(`${opening}\n`)
+  if (resumed && script.recall && s.remembered !== undefined) writeFileSync(script.recall, s.remembered)
+  if (script.waitFor) {
+    const until = Date.now() + 30_000
+    while (!existsSync(script.waitFor) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+    // Si la señal no llegó, la invocación falla: una prueba que coordina con ella no sigue como si hubiera llegado.
+    if (!existsSync(script.waitFor)) {
+      process.stderr.write(`fake-cli: no apareció ${script.waitFor}\n`)
+      process.exitCode = 1
+      return
+    }
+  }
+  if (!resumed || perCall) for (const a of script.actions ?? []) act(a)
   if (script.rejectModel && (args.includes('-m') || args.includes('--model'))) {
     fail(codex ? 'codex-modelo-rechazado.jsonl' : 'claude-modelo-rechazado.jsonl')
     return

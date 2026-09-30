@@ -6,7 +6,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { type HarvestFile, buildIndex, captureTree, gitDirs, removeIndex } from './git.ts'
+import { type HarvestFile, buildIndex, captureTree, entryDiff, gitDirs, indexEntries, removeIndex } from './git.ts'
 import type { Outcome } from './outcome.ts'
 import { isAlive, readJson, writeJsonAtomic } from './runs.ts'
 import { type Conductor, type Family, type RunState, SddError } from './types.ts'
@@ -184,7 +184,32 @@ export interface WriterControl {
   runDir: { dev: number; ino: number }
   group?: GroupIdentity
   /** Un writer de fase: el flujo, las tasks pendientes y las huellas de sus insumos al lanzar. */
-  phase?: { flow: string; pending: string[]; inputs: Record<string, string>; handoff_header: string }
+  phase?: PhaseControl
+}
+
+/** De dónde parte el árbol de una corrida encadenada: la cosecha de otra corrida o una toma. Sin él, de la base. */
+export type LaunchFrom = { run: string } | { takeover: { ref: string; digest: string } }
+
+/**
+ * El vínculo de un writer con su fase. Un control sin `kind` es de un writer lanzado antes de las cadenas:
+ * se admite con el contrato anterior y no sirve de padre.
+ */
+export interface PhaseControl {
+  flow: string; pending: string[]; inputs: Record<string, string>; handoff_header: string
+  kind?: 'implement' | 'continuation' | 'block' | 'fix'
+  chain?: string
+  /** El eslabón del que parte (una corrida o una toma), o `null` en la primera cadena con el árbol limpio. */
+  parent?: string | null
+  /** Cómo se obtiene el árbol del que parte; sin él, el de la base. */
+  launch_from?: LaunchFrom
+  /** La corrida interrumpida que esta reanuda. */
+  resumes?: string
+  /** La corrida que abrió la sesión que esta usa: la propia si abre una sesión nueva. */
+  session_origin?: string
+  /** El digest del registro de fases al lanzar, después de registrar esta corrida. */
+  registry?: string
+  /** En un `fix`: el recibo de entrada, las filas enviadas y los tramos recortados del encargo. */
+  fix?: { receipt: { id: string; digest: string }; rows: { id: string; test_paths?: string[] }[]; trimmed: string[] }
 }
 
 const controlFile = (root: string, id: string) => join(storeDir(root, id), 'control.json')
@@ -349,6 +374,11 @@ export interface HarvestRecord {
   report?: string; endMark: boolean
   /** En un writer de fase, si la spec, el plan, las tasks o el header del handoff siguen como al lanzar. */
   phase_inputs?: 'unchanged' | 'changed'
+  /** En un writer de cadena: el mapa del árbol cosechado sin el directorio del flujo, y las rutas que cambió frente a su padre. */
+  entries?: Record<string, string>
+  delta?: string[]
+  /** El delta no se pudo medir (sin el árbol cosechado o sin el del padre): va vacío y no acredita tasks. */
+  delta_unmeasured?: true
 }
 
 /** La corrida visible, `.sdd-ai/runs/<id>/`, con claves relativas a ella. */
@@ -490,6 +520,135 @@ export function harvestTreeHolds(root: string, id: string): boolean {
   }
 }
 
+const withoutFlow = (m: Map<string, string>, flow: string) => new Map([...m].filter(([p]) => !p.startsWith(`.plans/${flow}/`)))
+
+/** El mapa del árbol que dejó la cosecha de `run`: el guardado, o reconstruido desde su patch si es anterior. */
+export function runEntries(root: string, run: string): Map<string, string> | null {
+  const h = readHarvest(root, run)
+  if (!h) return null
+  if (h.entries) return new Map(Object.entries(h.entries))
+  const flow = readControl(root, run).phase?.flow
+  const m = indexEntries(root, h.base, { kind: 'patch', patchFile: h.patchFile })
+  return m && flow ? withoutFlow(m, flow) : m
+}
+
+const takeoverFile = (root: string, id: string) => join(gitDirs(root).gitDir, 'sdd-ai', 'takeovers', `${id}.json`)
+const sha = (text: string) => `sha256:${createHash('sha256').update(text).digest('hex')}`
+
+/** Guarda en el almacén el mapa del árbol que declaró una toma, y devuelve su referencia con digest. */
+export function writeTakeoverMap(root: string, id: string, entries: ReadonlyMap<string, string>): { ref: string; digest: string } {
+  const text = `${JSON.stringify(Object.fromEntries(entries))}\n`
+  const file = takeoverFile(root, id)
+  mkdirSync(join(file, '..'), { recursive: true })
+  writeAtomic(file, text)
+  return { ref: `takeovers/${id}.json`, digest: sha(text) }
+}
+
+/** El mapa de una toma, o `null` si falta o su digest no coincide. */
+export function readTakeoverMap(root: string, map: { ref: string; digest: string }): Map<string, string> | null {
+  const file = join(gitDirs(root).gitDir, 'sdd-ai', map.ref)
+  if (!/^takeovers\/[^/]+\.json$/.test(map.ref) || !existsSync(file)) return null
+  const text = readFileSync(file, 'utf8')
+  return sha(text) === map.digest ? new Map(Object.entries(JSON.parse(text) as Record<string, string>)) : null
+}
+
+/** El mapa del árbol del que parte una corrida: el de su padre, o el de la base. */
+export function launchEntries(root: string, c: Pick<WriterControl, 'base'> & { phase?: Pick<PhaseControl, 'flow' | 'launch_from'> }): Map<string, string> | null {
+  const from = c.phase?.launch_from
+  if (from === undefined) {
+    const m = indexEntries(root, c.base, { kind: 'base' })
+    return m && c.phase ? withoutFlow(m, c.phase.flow) : m
+  }
+  return 'run' in from ? runEntries(root, from.run) : readTakeoverMap(root, from.takeover)
+}
+
+/** Las rutas del árbol actual que difieren del árbol del que parte la corrida; `null` si ese árbol no se puede leer. */
+export function launchTreeDiff(root: string, c: Pick<WriterControl, 'base'> & { phase?: Pick<PhaseControl, 'flow' | 'launch_from'> }): string[] | null {
+  const expected = launchEntries(root, c)
+  if (expected === null) return null
+  const now = indexEntries(root, c.base, { kind: 'current' })
+  return now === null ? null : entryDiff(expected, now, c.phase?.flow ?? '')
+}
+
+/**
+ * Si el árbol sigue siendo el de lanzamiento: el del padre en una corrida encadenada, o la base si no
+ * tiene padre (lo mismo que `captureTreeAtBase`).
+ */
+export function launchTreeHolds(root: string, c: WriterControl): boolean {
+  if (c.phase?.launch_from === undefined) return captureTreeAtBase(root, c.id)
+  return launchTreeDiff(root, c)?.length === 0
+}
+
+/**
+ * La sesión que abrió una corrida y el argv con que la abrió: el del reintento por perfil si lo hubo. En
+ * Claude la sesión está en el argv; en Codex, en el estado que dejó el supervisor. `null` si falta algo.
+ */
+export function writerSession(root: string, id: string): { family: Family; session: string; launch: { cmd: string; args: string[]; cwd: string } } | null {
+  const argv = writerLaunchOf(root, id)
+  if (argv === null) return null
+  try {
+    const i = argv.launch.args.indexOf('--session-id')
+    const session = argv.family === 'claude'
+      ? (i >= 0 ? argv.launch.args[i + 1] : undefined)
+      : readJson<{ session_id?: string }>(join(storeDir(root, id), 'status.json')).session_id
+    return session ? { ...argv, session } : null
+  } catch {
+    return null
+  }
+}
+
+/** La familia y el argv con que se lanzó una corrida (el del reintento por perfil si lo hubo), sin su sesión. `null` si falta. */
+export function writerLaunchOf(root: string, id: string): { family: Family; launch: { cmd: string; args: string[]; cwd: string } } | null {
+  try {
+    const store = storeDir(root, id)
+    const file = existsSync(join(store, 'argv-2.json')) ? 'argv-2.json' : 'argv.json'
+    const argv = readJson<{ family: Family; launch?: { cmd: string; args: string[]; cwd: string } }>(join(store, file))
+    return argv.launch ? { family: argv.family, launch: argv.launch } : null
+  } catch {
+    return null
+  }
+}
+
+/** El digest del registro de fases del flujo, o `absent` si todavía no existe. */
+export function registryDigest(root: string, flow: string): string {
+  const file = join(root, '.plans', flow, 'sdd-ai-phases.json')
+  return existsSync(file) ? sha(readFileSync(file, 'utf8')) : 'absent'
+}
+
+/**
+ * El control desde el que se mide el delta: una reanudación se mide con la corrida que reanuda, y así
+ * hacia atrás hasta la primera que no es una reanudación. Un ciclo en `resumes` es un registro roto: lanza.
+ */
+function measuredFrom(root: string, c: WriterControl): WriterControl {
+  let cur = c
+  const seen = new Set<string>([c.id])
+  while (cur.phase?.resumes !== undefined) {
+    if (seen.has(cur.phase.resumes)) throw new Error(`la corrida ${cur.phase.resumes} se reanuda a sí misma en la cadena`)
+    seen.add(cur.phase.resumes)
+    cur = readControl(root, cur.phase.resumes)
+  }
+  return cur
+}
+
+/**
+ * El mapa del árbol cosechado de un writer de cadena, leído del patch que se acaba de publicar para que
+ * los dos digan lo mismo, y su delta contra el árbol del que parte (el de la corrida original, si reanuda).
+ * Sin alguno de los dos árboles, el delta queda sin medir: vacío y marcado, para que no acredite tasks.
+ */
+function chainFacts(root: string, control: WriterControl, patchFile: string): Pick<HarvestRecord, 'entries' | 'delta' | 'delta_unmeasured'> {
+  const flow = control.phase?.flow ?? ''
+  const now = indexEntries(root, control.base, { kind: 'patch', patchFile })
+  const entries = now === null ? null : withoutFlow(now, flow)
+  let from: Map<string, string> | null
+  try {
+    from = launchEntries(root, measuredFrom(root, control))
+  } catch {
+    from = null
+  }
+  const measured = entries !== null && from !== null
+  return { ...(entries ? { entries: Object.fromEntries(entries) } : {}), delta: measured ? entryDiff(from!, entries!, flow) : [], ...(measured ? {} : { delta_unmeasured: true as const }) }
+}
+
 /** Cuánto espera a que otro publique la cosecha que reclamó antes de darse por vencido. */
 const CLAIM_WAIT_MS = 120_000
 
@@ -546,6 +705,7 @@ export async function freezeHarvest(root: string, id: string, outcome: Outcome, 
     base: control.base, tree: cap.tree, files: cap.files, patchFile, flagged, runAltered,
     headMoved: headOf(checkout.gitDir) !== control.base, ...(report !== undefined ? { report } : {}), endMark: hasEndMark(report ?? ''),
     ...(control.phase ? { phase_inputs: phaseInputs(checkout.root, control.phase) } : {}),
+    ...(control.phase?.kind ? chainFacts(checkout.root, control, patchFile) : {}),
   }
   writeAtomic(harvestFile(dir), `${JSON.stringify(record, null, 2)}\n`)
   release()
@@ -553,11 +713,12 @@ export async function freezeHarvest(root: string, id: string, outcome: Outcome, 
 }
 
 /** Si los insumos de un writer de fase son los que congeló al lanzar; un flujo que ya no se lee cambió. */
-function phaseInputs(root: string, phase: NonNullable<WriterControl['phase']>): 'unchanged' | 'changed' {
+function phaseInputs(root: string, phase: PhaseControl): 'unchanged' | 'changed' {
   try {
     const read = readFlow(root, phase.flow)
     const now: Record<string, string> = { spec: artifactHash(read, 'spec'), plan: artifactHash(read, 'plan'), tasks: artifactHash(read, 'tasks') }
     const same = Object.entries(phase.inputs).every(([k, v]) => now[k] === v) && headerHash(read.facts.handoffHeader) === phase.handoff_header
+      && (phase.registry === undefined || registryDigest(root, phase.flow) === phase.registry)
     return same ? 'unchanged' : 'changed'
   } catch {
     return 'changed'

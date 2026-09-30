@@ -5,7 +5,7 @@ const RULES = [
   'Escribe solo lo que el encargo pide: nada de mejoras, refactors ni arreglos que no te pidieron.',
   'No commitees.',
   'No toques `.git`, `.sdd-ai/`, `.claude/`, `.codex/`, `.agents/` ni archivos que Git ignora.',
-  'No corras pruebas ni comandos: los checks los corre el conductor. Si lees archivos con el shell, usa solo comandos de lectura.',
+  'Lee el repositorio con libertad, también con el shell (cat, rg, ls, git diff, git log o git show). No ejecutes pruebas, builds, instaladores ni ningún comando que escriba o cambie estado: las comprobaciones las corre `sdd verify`. Editar los archivos que pide el encargo sí es tu trabajo.',
   'En el reporte, declara lo que te desviaste del encargo y por qué, incluido lo que quedó sin hacer.',
   `Cierra el reporte con la línea \`${WRITER_END_MARK}\` como última línea, y solo cuando terminaste de escribir.`,
 ]
@@ -27,6 +27,11 @@ export function writerPrompt(encargo: string): string {
     'ENCARGO>>>',
     '',
   ].join('\n')
+}
+
+/** Los bytes UTF-8 que el prompt fijo le suma a cualquier encargo: el presupuesto de un encargo los descuenta. */
+export function writerEnvelopeBytes(): number {
+  return Buffer.byteLength(writerPrompt(''), 'utf8')
 }
 
 /** Si la última línea no vacía del reporte es la marca de fin. */

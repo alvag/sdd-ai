@@ -6,12 +6,14 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { captureTree, dirtyPaths, gitDirs, headCommit } from '../src/git.ts'
+import { captureTree, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries } from '../src/git.ts'
 import { SddError } from '../src/types.ts'
 import {
   canWriteStore, diffInventory, groupState, leaderMatches, readControl, readProcess, readReservation, recordGroup, releaseWriter, reserveWriter,
-  sensitiveInventory, storeDir, storeRoot, writeControl,
+  sensitiveInventory, storeDir, storeRoot, writeControl, freezeHarvest, launchTreeDiff, launchTreeHolds, readTakeoverMap, registryDigest,
+  runEntries, writeTakeoverMap, type WriterControl,
 } from '../src/writer-store.ts'
+import { headerHash, readFlow } from '../src/sdd/read.ts'
 import { makeRepo } from './helpers.ts'
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
@@ -102,6 +104,41 @@ test('diff.patch aplicado sobre la base reproduce el árbol cosechado', () => {
   git(clone, 'apply', '--index', '--binary', patch)
   assert.equal(git(clone, 'write-tree'), cap.tree)
   assert.notEqual(cap.tree, git(repo, 'rev-parse', `${base}^{tree}`))
+})
+
+test('mapas del índice: el árbol actual y el reconstruido desde el patch coinciden, sin tocar el índice del usuario', () => {
+  const { repo, base } = committed({ 'a.txt': 'uno\n', 'borrar.txt': 'b\n', 'mover.txt': 'm\n'.repeat(30), 'script.sh': '#!/bin/sh\n' })
+  const clean = indexEntries(repo, base, { kind: 'current' })!
+  assert.deepEqual([...clean.keys()].sort(), ['a.txt', 'borrar.txt', 'mover.txt', 'script.sh'])
+  assert.match(clean.get('a.txt')!, /^100644 [0-9a-f]{40}$/)
+
+  writeFileSync(join(repo, 'a.txt'), 'uno\ndos\n')
+  unlinkSync(join(repo, 'borrar.txt'))
+  renameSync(join(repo, 'mover.txt'), join(repo, 'movido.txt'))
+  chmodSync(join(repo, 'script.sh'), 0o755)
+  writeFileSync(join(repo, 'nuevo.txt'), 'n\n')
+  mkdirSync(join(repo, '.plans', 'f'), { recursive: true })
+  writeFileSync(join(repo, '.plans', 'f', 'plan.md'), '# Plan\n')
+  const indexBefore = readFileSync(join(repo, '.git', 'index'))
+  const now = indexEntries(repo, base, { kind: 'current' })!
+  assert.deepEqual(readFileSync(join(repo, '.git', 'index')), indexBefore)
+  // Borrados, renombres, modos y archivos nuevos cuentan; el directorio del flujo no.
+  assert.deepEqual(entryDiff(clean, now, 'f'), ['a.txt', 'borrar.txt', 'mover.txt', 'movido.txt', 'nuevo.txt', 'script.sh'])
+  assert.ok(now.has('.plans/f/plan.md'))
+  assert.deepEqual(entryDiff(now, now, 'f'), [])
+
+  // El patch de una cosecha, aplicado sobre la base en un índice propio, da el mismo mapa.
+  const cap = captureTree(checkoutOf(repo), base, scratchIndex())
+  const patch = join(mkdtempSync(join(tmpdir(), 'sdd-ai-patch-')), 'diff.patch')
+  writeFileSync(patch, cap.patch)
+  const rebuilt = indexEntries(repo, base, { kind: 'patch', patchFile: patch })!
+  assert.deepEqual(entryDiff(rebuilt, now, 'f'), [])
+  // Un mapa guardado sigue sirviendo después de borrar el índice temporal: son cadenas, no objetos.
+  assert.deepEqual(entryDiff(new Map(JSON.parse(JSON.stringify([...rebuilt]))), now, 'f'), [])
+  // Sin el patch, o con uno que no aplica, no hay mapa.
+  assert.equal(indexEntries(repo, base, { kind: 'patch', patchFile: join(tmpdir(), 'no-existe.patch') }), null)
+  writeFileSync(patch, 'esto no es un patch\n')
+  assert.equal(indexEntries(repo, base, { kind: 'patch', patchFile: patch }), null)
 })
 
 test('un .gitattributes del writer que activa un filtro clean no hace correr ningún comando durante la captura', () => {
@@ -332,4 +369,89 @@ test('la captura no escribe en .git: funciona con los objetos del repositorio en
   assert.deepEqual(cap.files.map((f) => f.path).sort(), ['a.txt', 'enlace', 'nuevo.txt'])
   assert.match(cap.patch.toString('utf8'), /\+nuevo/)
   assert.equal(count(), before)
+})
+
+/** El control mínimo de un writer de fase del flujo `f`, para congelar su cosecha sin lanzarlo. */
+function chainControl(repo: string, base: string, id: string, phase: Partial<NonNullable<WriterControl['phase']>> = {}): WriterControl {
+  mkdirSync(join(repo, '.plans', 'f'), { recursive: true })
+  const c: WriterControl = {
+    id, base, family: 'codex', prompt: 'encargo', checkout: { root: repo, ...gitDirs(repo) },
+    request: { role: 'implement', conductor: { family: 'claude' }, deadline_sec: 600 },
+    preLaunch: {}, inventory: sensitiveInventory(repo, gitDirs(repo)), runDir: { dev: 0, ino: 0 },
+    phase: { flow: 'f', pending: ['T1'], inputs: {}, handoff_header: headerHash(readFlow(repo, 'f').facts.handoffHeader), kind: 'implement', ...phase },
+  }
+  writeControl(repo, c)
+  return c
+}
+
+test('cosecha encadenada: el patch es acumulado, el delta es frente al padre y una reanudación se mide con la corrida que reanuda', async () => {
+  const { repo, base } = committed({ 'a.txt': 'a\n' })
+  writeFileSync(join(repo, '.git', 'info', 'exclude'), '.plans/\n')
+  chainControl(repo, base, '20260929-2100-aaaa')
+  writeFileSync(join(repo, 'a.txt'), 'a2\n')
+  writeFileSync(join(repo, 'b.txt'), 'b\n')
+  const first = await freezeHarvest(repo, '20260929-2100-aaaa', { state: 'done' }, 'ok\nSTATUS: done')
+  assert.deepEqual(first.delta, ['a.txt', 'b.txt'])
+  assert.deepEqual(Object.keys(first.entries ?? {}).sort(), ['a.txt', 'b.txt'])
+
+  chainControl(repo, base, '20260929-2101-bbbb', { kind: 'continuation', parent: '20260929-2100-aaaa', launch_from: { run: '20260929-2100-aaaa' } })
+  writeFileSync(join(repo, 'b.txt'), 'b2\n')
+  const second = await freezeHarvest(repo, '20260929-2101-bbbb', { state: 'done' }, 'ok\nSTATUS: done')
+  assert.deepEqual(second.delta, ['b.txt'])
+  // El patch sigue siendo contra la base de la cadena: trae los cambios de las dos corridas.
+  assert.deepEqual(second.files.map((f) => f.path).sort(), ['a.txt', 'b.txt'])
+
+  // Una reanudación que solo cierra el contrato se mide contra el padre de la corrida que reanuda.
+  chainControl(repo, base, '20260929-2102-cccc', { kind: 'continuation', parent: '20260929-2101-bbbb', resumes: '20260929-2101-bbbb', launch_from: { run: '20260929-2101-bbbb' } })
+  const resumed = await freezeHarvest(repo, '20260929-2102-cccc', { state: 'done' }, 'ok\nSTATUS: done')
+  assert.deepEqual(resumed.delta, ['b.txt'])
+  // Un writer sin kind, anterior a las cadenas, no guarda mapa ni delta.
+  chainControl(repo, base, '20260929-2103-dddd', { kind: undefined })
+  const legacy = await freezeHarvest(repo, '20260929-2103-dddd', { state: 'done' }, 'ok\nSTATUS: done')
+  assert.deepEqual([legacy.entries, legacy.delta], [undefined, undefined])
+  // Su mapa se reconstruye igual desde el patch.
+  assert.deepEqual([...(runEntries(repo, '20260929-2103-dddd') ?? new Map()).keys()].sort(), ['a.txt', 'b.txt'])
+  // Sin el árbol del padre, el delta queda sin medir: vacío y marcado, no la lista acumulada del patch.
+  chainControl(repo, base, '20260929-2104-eeee', { kind: 'continuation', parent: '20260929-2199-ffff', launch_from: { run: '20260929-2199-ffff' } })
+  const orphan = await freezeHarvest(repo, '20260929-2104-eeee', { state: 'done' }, 'ok\nSTATUS: done')
+  assert.deepEqual([orphan.delta, orphan.delta_unmeasured], [[], true])
+  // Un ciclo en las reanudaciones es un registro roto: tampoco se mide.
+  chainControl(repo, base, '20260929-2105-gggg', { kind: 'continuation', parent: '20260929-2106-hhhh', resumes: '20260929-2106-hhhh', launch_from: { run: '20260929-2106-hhhh' } })
+  chainControl(repo, base, '20260929-2106-hhhh', { kind: 'continuation', parent: '20260929-2105-gggg', resumes: '20260929-2105-gggg', launch_from: { run: '20260929-2105-gggg' } })
+  const loop = await freezeHarvest(repo, '20260929-2105-gggg', { state: 'done' }, 'ok\nSTATUS: done')
+  assert.deepEqual([loop.delta, loop.delta_unmeasured], [[], true])
+})
+
+test('árbol de lanzamiento: una corrida con padre exige el árbol de su cosecha o de su toma, sin contar el flujo', async () => {
+  const { repo, base } = committed({ 'a.txt': 'a\n' })
+  writeFileSync(join(repo, '.git', 'info', 'exclude'), '.plans/\n')
+  chainControl(repo, base, '20260929-2200-aaaa')
+  writeFileSync(join(repo, 'a.txt'), 'a2\n')
+  await freezeHarvest(repo, '20260929-2200-aaaa', { state: 'done' }, 'ok\nSTATUS: done')
+  const child = chainControl(repo, base, '20260929-2201-bbbb', { kind: 'fix', parent: '20260929-2200-aaaa', launch_from: { run: '20260929-2200-aaaa' } })
+  assert.equal(launchTreeHolds(repo, child), true)
+  writeFileSync(join(repo, '.plans', 'f', 'plan.md'), '# Plan\n')
+  assert.equal(launchTreeHolds(repo, child), true)
+  writeFileSync(join(repo, 'c.txt'), 'c\n')
+  assert.equal(launchTreeHolds(repo, child), false)
+  assert.deepEqual(launchTreeDiff(repo, child), ['c.txt'])
+
+  // Una toma guarda su mapa con digest; alterado, no se acepta.
+  const map = writeTakeoverMap(repo, 't1', new Map([['a.txt', 'x']]))
+  assert.deepEqual([...(readTakeoverMap(repo, map) ?? new Map())], [['a.txt', 'x']])
+  assert.equal(readTakeoverMap(repo, { ...map, digest: `sha256:${'0'.repeat(64)}` }), null)
+  assert.equal(readTakeoverMap(repo, { ref: '../runs/x.json', digest: map.digest }), null)
+})
+
+test('insumos de cadena: el registro de fases congelado al lanzar invalida la cosecha si cambia durante la corrida', async () => {
+  const { repo, base } = committed({ 'a.txt': 'a\n' })
+  writeFileSync(join(repo, '.git', 'info', 'exclude'), '.plans/\n')
+  mkdirSync(join(repo, '.plans', 'f'), { recursive: true })
+  writeFileSync(join(repo, '.plans', 'f', 'sdd-ai-phases.json'), '{"schema_version":1,"last_run":null,"phases":{}}\n')
+  chainControl(repo, base, '20260929-2300-aaaa', { registry: registryDigest(repo, 'f') })
+  writeFileSync(join(repo, 'a.txt'), 'a2\n')
+  assert.equal((await freezeHarvest(repo, '20260929-2300-aaaa', { state: 'done' }, 'ok\nSTATUS: done')).phase_inputs, 'unchanged')
+  chainControl(repo, base, '20260929-2301-bbbb', { registry: registryDigest(repo, 'f') })
+  writeFileSync(join(repo, '.plans', 'f', 'sdd-ai-phases.json'), '{"schema_version":1,"last_run":null,"phases":{},"x":1}\n')
+  assert.equal((await freezeHarvest(repo, '20260929-2301-bbbb', { state: 'done' }, 'ok\nSTATUS: done')).phase_inputs, 'changed')
 })

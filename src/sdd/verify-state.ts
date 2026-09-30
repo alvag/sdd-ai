@@ -1,6 +1,6 @@
 import { candidateFingerprint } from '../git.ts'
 import { type HeaderResult, criteriaIds } from './markdown.ts'
-import { latestFinalReceipt, readPhaseRecord } from './phase-state.ts'
+import { implementOf, latestFinalReceipt, readPhaseRecord, receiptAfterTakeover } from './phase-state.ts'
 import { type Depth, type FlowFacts, type GateId, headerData, isDepth } from './status.ts'
 import { readVerification } from './verification-contract.ts'
 import { readVerifyReceipt } from './verify-receipt.ts'
@@ -35,10 +35,13 @@ function receiptHolds(root: string, id: string, header: Record<string, unknown>,
   const base = header.base_commit
   if (!isDepth(depth) || typeof base !== 'string') return false
   try {
-    const ref = latestFinalReceipt(readPhaseRecord(root, id))
+    const record = readPhaseRecord(root, id)
+    const ref = latestFinalReceipt(record)
     if (ref === null) return false
     const r = readVerifyReceipt(root, ref)
     if (!r.green || r.plan_fingerprint !== fingerprints[PLAN_GATE[depth]]) return false
+    // Después de una toma, solo un recibo posterior a ella acredita el árbol, aunque haya otra cadena después.
+    if (!receiptAfterTakeover(r, implementOf(record))) return false
     const now = candidateFingerprint(root, id, base)
     return r.after.base_commit === now.base_commit && r.after.tree === now.tree
   } catch {

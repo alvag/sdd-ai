@@ -1,6 +1,8 @@
 import { type SpawnOptions, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -12,7 +14,7 @@ import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
 import { type SkillCheck, doctor } from './doctor.ts'
-import { buildIndex, currentBranch, dirtyPaths, gitDirs, headCommit, repoRoot } from './git.ts'
+import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, repoRoot } from './git.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
@@ -43,22 +45,32 @@ import {
 } from './types.ts'
 import { approve } from './sdd/approve.ts'
 import { criteriaIds, taskLines } from './sdd/markdown.ts'
-import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitImplement, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
-import { type PhaseRecord, activeRun, readPhaseRecord, withFlowLock, withPhaseNext, writePhaseRecord } from './sdd/phase-state.ts'
+import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
+import {
+  type ChainClass, type ChainEntry, type ChainTerminal, type PhaseRecord, type RunEntry, type RunKind, activeRun, appendClassification, appendEntry, appendEvent,
+  closeChain, implementOf, readPhaseRecord, withFlowLock, withPhaseNext, writePhaseRecord,
+} from './sdd/phase-state.ts'
+import {
+  type ChainState, FIX_PROMPT_BUDGET, TAIL_BYTES, checkClassification, classesPath, lastLink, orientation, redRows, renderContinuationPrompt,
+  renderFixPrompt, renderResumePrompt,
+} from './sdd/chain.ts'
+import {
+  type ChainView, type CurrentLink, chainBaseOf, chainView, classificationDetail, contractRows, currentLink, fileTail, persistLegacy, redProposals,
+} from './sdd/chain-facts.ts'
 import { freezeLaunch } from './sdd/publish.ts'
-import { FILE_NAMES, type FlowRead, artifactHash, bytesHash, flowDir, headerHash, listFlows, readFlow } from './sdd/read.ts'
+import { FILE_NAMES, type FlowRead, LOCK_FILE, artifactHash, bytesHash, flowDir, headerHash, listFlows, readFlow } from './sdd/read.ts'
 import { recoverPendingRestore } from './sdd/restore.ts'
 import { type FlowStatus, headerData, resolve as resolveFlow } from './sdd/status.ts'
-import type { ManualRow } from './sdd/verification-contract.ts'
-import { attestRow, prepareVerify, runBaseline, runFinal } from './sdd/verify.ts'
-import type { VerifyReceipt, VerifyReceiptRef } from './sdd/verify-receipt.ts'
-import { claudeLaunch, claudeWriterLaunch } from './workers/claude.ts'
-import { codexLaunch, codexWriterLaunch } from './workers/codex.ts'
-import { writerPrompt } from './writer.ts'
+import { type ManualRow, type VerificationRow, readVerification } from './sdd/verification-contract.ts'
+import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal } from './sdd/verify.ts'
+import { type VerifyReceipt, type VerifyReceiptRef, readVerifyReceipt, receiptDir } from './sdd/verify-receipt.ts'
+import { claudeLaunch, claudeResume, claudeWriterLaunch, withSessionId } from './workers/claude.ts'
+import { codexLaunch, codexResume, codexWriterLaunch, withResultFile } from './workers/codex.ts'
+import { writerEnvelopeBytes, writerPrompt } from './writer.ts'
 import {
-  type HarvestRecord, type WriterControl, canWriteStore, captureTreeAtBase, controlUnavailable, freezeHarvest, groupState, harvestTreeHolds, isWriterRun, leaderMatches,
-  readControl, readHarvest, readProcess, readReservation, releaseWriter, reserveWriter, runDirIdentity, runInventory, sensitiveInventory,
-  storeDir, writeControl,
+  type HarvestRecord, type LaunchFrom, type WriterControl, canWriteStore, captureTreeAtBase, controlUnavailable, freezeHarvest, groupState, harvestTreeHolds, isWriterRun,
+  flowWriterRuns, launchTreeDiff, launchTreeHolds, leaderMatches, readControl, readHarvest, readProcess, readReservation, releaseWriter, reserveWriter, runDirIdentity, runInventory,
+  registryDigest, sensitiveInventory, storeDir, writeControl, writeTakeoverMap, writerLaunchOf, writerSession,
 } from './writer-store.ts'
 
 type Env = Record<string, string | undefined>
@@ -155,6 +167,13 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   if (values.retry !== undefined) checkRunId(values.retry)
   // Un writer se relanza con lo que guardó su almacén, nunca con su corrida visible, que pudo cambiar.
   const retryWriter = values.retry && isWriterRun(repoRoot(cwd), values.retry) ? readControl(repoRoot(cwd), values.retry) : undefined
+  // Un writer de fase se relanza con el verbo de su fase, que congela sus tasks, admite su contrato y lo
+  // registra en el flujo. El vínculo está en el control desde que existen los writers de fase.
+  if (retryWriter?.phase) {
+    throw new SddError('phase_writer', `la corrida ${retryWriter.id} es un writer de la fase implement del flujo ${retryWriter.phase.flow}: no se relanza con run --retry`, {
+      next: `./bin/sdd-ai sdd phase ${retryWriter.phase.flow}`,
+    })
+  }
   if (retryWriter) {
     const r = retryWriter.request
     inheritRetry(values, { role: r.role, conductor: r.conductor, overrides: { families: r.families, model: r.model, effort: r.effort, deadline_sec: r.deadline_sec } })
@@ -305,6 +324,57 @@ export interface WriterLaunch {
   start?: SupervisorSpawn
   /** Un writer de fase: el contrato de su reporte se valida en la cosecha contra esto. */
   phase?: WriterControl['phase']
+  /** El id de la corrida, cuando el llamador lo registró antes de lanzar. */
+  id?: string
+  /**
+   * Una corrida encadenada: `resume` reanuda la sesión de la corrida `origin` con el encargo nuevo;
+   * `fresh` abre una sesión nueva con la familia y el perfil de `origin`; `initial` abre una sesión como
+   * el writer inicial de hoy. Con padre, el árbol tiene que ser el suyo y `HEAD`, la base de la cadena.
+   */
+  chained?: { mode: 'resume' | 'fresh' | 'initial'; origin?: string; base: string }
+}
+
+/**
+ * Si la sesión de la corrida `origin` se puede reanudar: el CLI de su familia en PATH, el id de la sesión
+ * conocido y su archivo donde lo guarda el runner. Un bloque (`fresh`) abre una sesión nueva con el argv de
+ * `origin`: le alcanza con ese argv y el CLI, sin la sesión. Nunca propone otra familia.
+ */
+export function checkResumable(root: string, env: Env, origin: string, mode: 'resume' | 'fresh' = 'resume'): { ok: true } | { ok: false; why: string } {
+  if (mode === 'fresh') {
+    const l = writerLaunchOf(root, origin)
+    if (l === null) return { ok: false, why: `no se conoce el argv de la corrida ${origin}` }
+    return inPath(l.family, env) ? { ok: true } : { ok: false, why: `${l.family} no está en PATH` }
+  }
+  const s = writerSession(root, origin)
+  if (s === null) return { ok: false, why: `no se conoce la sesión de la corrida ${origin}` }
+  if (!inPath(s.family, env)) return { ok: false, why: `${s.family} no está en PATH` }
+  try {
+    sessionFile(env, { runner: s.family, session: s.session })
+  } catch {
+    return { ok: false, why: `no se encuentra el archivo de la sesión ${s.session} de ${s.family}` }
+  }
+  return { ok: true }
+}
+
+/** El lanzamiento de una corrida encadenada que reanuda o copia la sesión de `origin`, con el encargo del almacén. */
+function chainedLaunch(root: string, mode: 'resume' | 'fresh', origin: string, stdinFile: string, resultFile: string) {
+  const unavailable = () => new SddError('resume_unavailable', `no se conoce la sesión de la corrida ${origin}`, { next: 'declara la toma: ./bin/sdd-ai sdd verify <flujo> --takeover' })
+  let s: { family: Family; launch: { cmd: string; args: string[]; cwd: string } }
+  let args: string[] | null
+  if (mode === 'fresh') {
+    // Un bloque abre una sesión nueva: le alcanza con el argv de origen.
+    const l = writerLaunchOf(root, origin)
+    if (l === null) throw unavailable()
+    s = l
+    args = s.family === 'claude' ? withSessionId(s.launch.args, randomUUID()) : withResultFile(s.launch.args, resultFile)
+  } else {
+    const r = writerSession(root, origin)
+    if (r === null) throw unavailable()
+    s = r
+    args = r.family === 'claude' ? claudeResume(r.launch.args) : codexResume(r.launch.args, r.session, resultFile)
+  }
+  if (!args) throw new SddError('resume_unavailable', `el argv de la corrida ${origin} no se puede reanudar`, { next: 'declara la toma: ./bin/sdd-ai sdd verify <flujo> --takeover' })
+  return { family: s.family, launch: { ...s.launch, args, cwd: root, stdinFile } }
 }
 
 /** Lo que dice el rechazo de un árbol sucio: el usuario decide, sdd-ai no toca nada. */
@@ -330,7 +400,7 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
     e.next = `${e.next}. Si el usuario no la aprueba, escribe inline`
     throw e
   }
-  const id = newRunId()
+  const id = w.id ?? newRunId()
   const reserved = reserveWriter(root, id)
   if (!reserved.ok) {
     throw new SddError('writer_open', `ya hay un writer abierto en este repositorio: ${reserved.holder}`, {
@@ -347,8 +417,22 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
         next: 'pregunta al usuario si commitea primero; mientras tanto, escribe inline',
       })
     }
-    const dirty = dirtyPaths(root)
-    if (dirty.length > 0) throw new SddError('tree_dirty', `el árbol tiene cambios sin commitear: ${dirty.join(', ')}`, { detail: dirty.join('\n'), next: DIRTY_NEXT })
+    if (w.chained && base !== w.chained.base) {
+      throw new SddError('head_moved', 'HEAD ya no es la base de la cadena', { next: 'una cadena necesita HEAD en su base: sin eso, la sigue el conductor con la toma' })
+    }
+    if (w.phase?.launch_from !== undefined) {
+      // Una corrida con padre parte del árbol que dejó el padre, no de uno limpio.
+      const diff = launchTreeDiff(root, { base, phase: w.phase })
+      if (diff === null || diff.length > 0) {
+        throw new SddError('tree_not_parent', diff === null ? 'no se puede leer el árbol del eslabón anterior' : `el árbol ya no es el del eslabón anterior: cambió ${diff.join(', ')}`, {
+          detail: (diff ?? []).join('\n'),
+          next: `devuelve el árbol al del eslabón anterior o declara la toma: ./bin/sdd-ai sdd verify ${w.phase.flow} --takeover`,
+        })
+      }
+    } else {
+      const dirty = dirtyPaths(root)
+      if (dirty.length > 0) throw new SddError('tree_dirty', `el árbol tiene cambios sin commitear: ${dirty.join(', ')}`, { detail: dirty.join('\n'), next: DIRTY_NEXT })
+    }
 
     const dir = createRun(root, id)
     const store = storeDir(root, id)
@@ -358,8 +442,12 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
     const task: WorkerTask = { cwd: root, promptFile: storePrompt, resultFile: join(store, 'result.md'), sessionId: randomUUID() }
     if (resolution.model) task.model = resolution.model
     if (resolution.effort) task.effort = resolution.effort
-    const launch = resolution.family === 'claude' ? claudeWriterLaunch(task) : codexWriterLaunch(task)
-    const argv: ArgvFile = { family: resolution.family, deadline_sec: w.deadline, kind: 'writer', root, id, launch }
+    const mode = w.chained?.mode
+    const copied = (mode === 'resume' || mode === 'fresh') && w.chained?.origin
+      ? chainedLaunch(root, mode, w.chained.origin, storePrompt, task.resultFile) : null
+    const family = copied?.family ?? resolution.family
+    const launch = copied?.launch ?? (family === 'claude' ? claudeWriterLaunch(task) : codexWriterLaunch(task))
+    const argv: ArgvFile = { family, deadline_sec: w.deadline, kind: 'writer', root, id, launch }
 
     // La corrida visible: lo que los hooks y el conductor leen. Después de lanzar, sdd-ai no escribe ahí.
     writeFileSync(join(dir, 'prompt.md'), w.prompt)
@@ -373,10 +461,12 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
 
     const identity = runDirIdentity(root, id)
     if (!identity) throw new Error(`la corrida ${id} desapareció antes de lanzar`)
+    // La sesión de una corrida de cadena: la que reanuda, o la propia si abre una nueva.
+    const phase = w.phase?.kind ? { ...w.phase, session_origin: mode === 'resume' && w.chained?.origin ? writerSessionOrigin(root, w.chained.origin) : id } : w.phase
     const control: WriterControl = {
-      id, base, family: resolution.family, prompt: w.prompt, checkout: { root, ...gitDirs(root) }, request: w.request,
+      id, base, family, prompt: w.prompt, checkout: { root, ...gitDirs(root) }, request: w.request,
       preLaunch: runInventory(root, id), inventory: sensitiveInventory(root), runDir: identity,
-      ...(w.session ? { session: w.session } : {}), ...(w.phase ? { phase: w.phase } : {}),
+      ...(w.session ? { session: w.session } : {}), ...(phase ? { phase } : {}),
     }
     writeControl(root, control)
     try {
@@ -389,9 +479,18 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
       throw e
     }
     launched = true
-    return { code: 0, out: { id, via: 'process', family: resolution.family, base, next: `./bin/sdd-ai wait ${id}` } }
+    return { code: 0, out: { id, via: 'process', family, base, next: `./bin/sdd-ai wait ${id}` } }
   } finally {
     if (!launched) releaseWriter(root, id)
+  }
+}
+
+/** La corrida que abrió la sesión de `run`: la suya, o la que ella reanudó. */
+function writerSessionOrigin(root: string, run: string): string {
+  try {
+    return readControl(root, run).phase?.session_origin ?? run
+  } catch {
+    return run
   }
 }
 
@@ -1583,6 +1682,22 @@ async function cancel(args: string[], cwd: string): Promise<Result> {
   checkRunId(id)
   const root = repoRoot(cwd)
   if (isWriterRun(root, id)) return cancelWriter(root, id, values['writer-gone'])
+  const orphan = orphanEntry(root, id)
+  if (orphan) {
+    // El lanzamiento tiene el lock del flujo: al tomarlo, la corrida pudo haber llegado a su control. Una
+    // entrada que ya se marcó como fallida no se vuelve a marcar.
+    const marked = withFlowLock(root, orphan.flow, () => {
+      if (isWriterRun(root, id)) return false
+      const events = implementOf(readPhaseRecord(root, orphan.flow)).events
+      if (!events.some((e) => e.kind === 'launch_failed' && e.run === id)) {
+        appendEvent(root, orphan.flow, { kind: 'launch_failed', at: new Date().toISOString(), chain: orphan.chain, run: id, detail: 'la corrida quedó registrada sin control: nunca se lanzó' })
+      }
+      return true
+    })
+    if (!marked) return cancelWriter(root, id, values['writer-gone'])
+    if (readReservation(root)?.id === id) releaseWriter(root, id)
+    return { code: 0, out: { id, state: 'launch_failed', flow: orphan.flow, next: flowNextOrStatus(root, orphan.flow) } }
+  }
   if (readReservation(root)?.id === id) return releaseOrphan(root, id)
   if (values['writer-gone']) throw new SddError('usage', '--writer-gone solo se usa con la corrida de un writer')
   const dir = runDir(root, id)
@@ -1600,14 +1715,119 @@ async function cancel(args: string[], cwd: string): Promise<Result> {
   return { code: 0, out: { id, state: 'cancel_requested', next: `./bin/sdd-ai wait ${id}` } }
 }
 
+/** La entrada de una cadena registrada sin control: el proceso cayó entre el registro y el control. */
+function orphanEntry(root: string, run: string): { flow: string; chain: string } | null {
+  for (const flow of listFlows(root)) {
+    let chains
+    try {
+      chains = implementOf(readPhaseRecord(root, flow.id)).chains
+    } catch {
+      continue
+    }
+    const chain = chains.find((c) => c.entries.some((e) => e.kind !== 'takeover' && e.run === run))
+    if (chain) return { flow: flow.id, chain: chain.id }
+  }
+  return null
+}
+
+function flowNextOrStatus(root: string, flow: string): unknown {
+  try {
+    return flowNext(root, flow)
+  } catch {
+    return `./bin/sdd-ai sdd status ${flow}`
+  }
+}
+
+/**
+ * Un writer de cadena que nunca llegó a lanzarse queda como evento `launch_failed` en su cadena: no es un
+ * eslabón ni gasta una ronda. Sin el lock del flujo disponible, lo deriva igual la cadena por su cosecha.
+ */
+function chainLaunchFailed(root: string, c: WriterControl, detail: string): void {
+  if (!c.phase?.kind || !c.phase.chain) return
+  const phase = c.phase
+  try {
+    withFlowLock(root, phase.flow, () => appendEvent(root, phase.flow, { kind: 'launch_failed', at: new Date().toISOString(), chain: phase.chain!, run: c.id, detail }))
+  } catch {
+    // La cosecha en launch_failed ya la excluye de la cadena.
+  }
+}
+
+/** Si el árbol sigue siendo el de lanzamiento del writer: el del padre en una corrida encadenada, la base si no. */
+const launchHolds = (root: string, c: WriterControl) => (c.phase?.launch_from ? launchTreeHolds(root, c) : captureTreeAtBase(root, c.id))
+
 /** Lo que la cosecha de un writer de fase dice de su contrato. */
 interface PhaseContract { admitted: boolean; cause?: string; missing_context: string[] }
 
-/** El contrato del reporte de un writer de fase, contra las tasks que congeló al lanzar. Sin corrección. */
+/**
+ * El contrato del reporte de un writer de fase, contra lo que congeló al lanzar. Sin corrección. Un `fix`
+ * responde por sus filas; las demás corridas de la cadena, por sus tasks con `completion`; un writer
+ * anterior a las cadenas, con el contrato de entonces.
+ */
 function phaseContract(h: HarvestRecord, phase: NonNullable<WriterControl['phase']>): PhaseContract {
-  const a = admitImplement(h.report ?? '', phase.pending)
+  const report = h.report ?? ''
+  const a = phase.kind === 'fix'
+    ? admitFix(report, (phase.fix?.rows ?? []).map((r) => r.id))
+    : admitImplement(report, phase.pending, { explicit: phase.kind !== undefined })
   if (a.kind === 'admitted') return { admitted: true, missing_context: a.review.missing_context }
   return { admitted: false, cause: a.kind === 'inadmissible' ? a.error : a.reason, missing_context: [] }
+}
+
+/**
+ * Lo que la cosecha de un writer de cadena agrega: las tasks que siguen, el delta frente a su padre, los
+ * tramos que el encargo de un `fix` recortó y la señal de síntoma forzado, que cruza solo el delta del `fix`
+ * con las pruebas de todas las filas de test rojas de su recibo de entrada. Una consulta: no escribe nada.
+ */
+function chainReport(root: string, c: WriterControl, h: HarvestRecord): { extra: Record<string, unknown>; failed: string[]; view: ChainView | null } {
+  const phase = c.phase!
+  // Un delta que no se pudo medir va como null: la lista de la cosecha es el cambio acumulado de toda la cadena.
+  const extra: Record<string, unknown> = { delta: h.delta_unmeasured ? null : (h.delta ?? h.files.map((f) => f.path)) }
+  const failed: string[] = []
+  let view: ChainView | null = null
+  try {
+    view = chainView(root, phase.flow, readFlow(root, phase.flow))
+  } catch (e) {
+    // Sin la cadena no hay qué seguir: la cosecha lo dice, en vez de caer en el next de un writer suelto.
+    failed.push(`no se pudo leer la cadena del writer: ${(e as Error).message}`)
+  }
+  if (phase.kind !== 'fix' && view) {
+    extra.left = view.state.left
+    if (view.state.left.length > 0) {
+      extra.partial = true
+      failed.push(`cosecha parcial: quedan ${view.state.left.join(', ')}`)
+    }
+  }
+  if (h.delta_unmeasured) failed.push('no se pudo medir el delta frente a su padre: la corrida no acredita tasks')
+  else if ((h.delta ?? []).length === 0) failed.push('sin cambios frente a su padre')
+  if (phase.kind === 'fix' && phase.fix) {
+    if (phase.fix.trimmed.length > 0) extra.trimmed = phase.fix.trimmed
+    const signal = h.delta_unmeasured ? { unknown: 'no se pudo medir el delta frente a su padre' } : forcedSymptom(root, phase.flow, phase.fix.receipt, h.delta ?? [])
+    // Una señal que no se pudo evaluar no se presenta como una corrección que no tocó pruebas rojas.
+    extra.forced_symptom = 'unknown' in signal ? null : signal.pairs
+    if ('unknown' in signal) failed.push(`no se pudo evaluar la señal de síntoma forzado: ${signal.unknown}`)
+  }
+  return { extra, failed, view }
+}
+
+/**
+ * Los pares fila y ruta en que el delta de un `fix` toca la prueba de una fila de test roja del recibo de entrada,
+ * o por qué no se pudieron evaluar: sin el recibo o sin el contrato no hay con qué cruzar el delta.
+ */
+function forcedSymptom(root: string, flow: string, ref: { id: string; digest: string }, delta: string[]): { pairs: { row: string; path: string }[] } | { unknown: string } {
+  let receipt: VerifyReceipt
+  let rows: VerificationRow[]
+  try {
+    receipt = readVerifyReceipt(root, { ...ref, mode: 'final' })
+    rows = contractRows(root, flow)
+  } catch (e) {
+    return { unknown: (e as Error).message }
+  }
+  const red = new Set(redRows(receipt))
+  const pairs: { row: string; path: string }[] = []
+  for (const row of rows) {
+    if (row.kind !== 'test' || !red.has(row.id)) continue
+    for (const path of row.test_paths) if (delta.includes(path)) pairs.push({ row: row.id, path })
+  }
+  return { pairs }
 }
 
 /** Lo que falta para proponer la revisión de una cosecha: cada condición que falló, con palabras. */
@@ -1677,12 +1897,19 @@ function writerReport(root: string, id: string, h: HarvestRecord, env: Env): Res
     report: h.report ?? null, end_mark: h.endMark,
   })
   const contract = c.phase ? phaseContract(h, c.phase) : undefined
-  const failed = harvestFailures(h, contract)
+  const chain = c.phase?.kind ? chainReport(root, c, h) : null
+  const failed = [...harvestFailures(h, contract), ...(chain?.failed ?? [])]
   if (failed.length > 0) out.failed = failed
+  if (chain) Object.assign(out, chain.extra)
   if (s.session_id) out.session_id = s.session_id
   const warnings = profileWarnings(s)
+  if (chain?.extra.trimmed) warnings.push(`el encargo del fix recortó los tramos de salida de ${(chain.extra.trimmed as string[]).join(', ')} para entrar en el tope`)
   if (warnings.length > 0) out.warnings = warnings
-  out.next = harvestNext(id, h, c, failed)
+  // Un writer de cadena sigue lo que dice su cadena, salvo que su cosecha tenga alertas de integridad.
+  const integrity = h.flagged.length === 0 && h.runAltered.length === 0 && !h.headMoved
+  out.next = chain && integrity
+    ? (chain.view ? orientation(c.phase!.flow, chain.view.state.next) : `revisa el registro de fases del flujo: ./bin/sdd-ai sdd status ${c.phase!.flow}`)
+    : harvestNext(id, h, c, failed)
   if (c.phase && contract) {
     out.contract = contract
     try {
@@ -1713,10 +1940,12 @@ async function recoverWriter(root: string, id: string, env: Env): Promise<Result
   if (!canWriteStore(root)) throw controlUnavailable()
   const c = readControl(root, id)
   if (!c.spawning) {
-    const outcome = captureTreeAtBase(root, id)
+    const outcome = launchHolds(root, c)
       ? { state: 'failed' as const, reason: 'supervisor_lost', detail: 'el supervisor terminó antes de lanzar al writer' }
       : { state: 'launch_failed' as const, reason: 'tree_changed', detail: 'el árbol cambió y el writer nunca se lanzó' }
-    return writerReport(root, id, await freezeHarvest(root, id, outcome), env)
+    const record = await freezeHarvest(root, id, outcome)
+    chainLaunchFailed(root, c, outcome.detail)
+    return writerReport(root, id, record, env)
   }
   if (!c.group) return uncertain(root, id, 'no_identity', 'el supervisor terminó mientras lanzaba al writer, antes de registrar su grupo')
   const state = groupState(c.group)
@@ -1799,8 +2028,13 @@ async function cancelWriter(root: string, id: string, writerGone: boolean): Prom
   if (!c.spawning) {
     // El supervisor ve el pedido antes de lanzar; si murió, el writer nunca se lanzó.
     if (supervised) return requested
-    if (captureTreeAtBase(root, id)) return freeze('not_launched', 'el writer nunca se lanzó')
+    if (launchHolds(root, c)) {
+      const r = await freeze('not_launched', 'el writer nunca se lanzó')
+      chainLaunchFailed(root, c, 'el writer nunca se lanzó')
+      return r
+    }
     const r = await freezeHarvest(root, id, { state: 'launch_failed', reason: 'tree_changed', detail: 'el árbol cambió y el writer nunca se lanzó' })
+    chainLaunchFailed(root, c, 'el árbol cambió y el writer nunca se lanzó')
     return { code: 0, out: { id, state: r.state, reason: r.reason, next: `./bin/sdd-ai wait ${id}` } }
   }
   if (!c.group) {
@@ -1882,17 +2116,117 @@ function phaseFallbackNext(r: Pick<PhaseRequest, 'flow' | 'request_file' | 'cont
   return `pregunta al usuario si cae a ${c.family}; solo con un sí: ./bin/sdd-ai sdd phase ${r.flow} ${flags.join(' ')}`
 }
 
-interface ImplementPhase { root: string; env: Env; id: string; read: FlowRead; depth: 'normal' | 'completa'; conductor: Conductor; families?: string; deadline: number }
+interface ImplementPhase {
+  root: string; env: Env; id: string; read: FlowRead; depth: 'normal' | 'completa'; conductor: Conductor; families?: string; deadline: number
+  /** El paso de `sdd status`: `implement` lanza la cadena; `verify` resuelve el último recibo rojo. */
+  step: 'implement' | 'verify'
+  blocks?: boolean
+  /** El archivo de clases del conductor, con ruta absoluta. */
+  classes?: string
+}
+
+/** Una corrida de la cadena lista para registrar y lanzar. */
+interface ChainLaunch {
+  kind: RunKind; chain: string | null; parent: string | null; launchFrom?: LaunchFrom; resumes?: string
+  pending: string[]; prompt: string; mode: 'resume' | 'fresh' | 'initial'; origin?: string; base: string
+  fix?: NonNullable<WriterControl['phase']>['fix']
+}
+
+const refusal = (code: string, message: string, next: string, detail?: string) => new SddError(code, message, { next, ...(detail ? { detail } : {}) })
+const takeoverNext = (id: string) => `sigue a mano y declara la toma antes de verificar: ./bin/sdd-ai sdd verify ${id} --takeover`
+/** Un terminal derivado lleva una fecha de relleno: se escribe con la de ahora. */
+const stamped = (t: ChainTerminal): ChainTerminal => ({ ...t, at: new Date().toISOString() })
 
 /**
- * `implement` por fase: un solo writer con todas las tasks pendientes, por el mismo camino que
- * `run --role implement`, con sus rechazos (el árbol sucio, un writer abierto). Congela las tasks y los
- * insumos, que la cosecha compara con su contrato. Las tasks las marca el conductor, no el binario.
+ * `implement` por fase, como cadena de writers. Bajo el lock del flujo: lee la cadena, persiste un
+ * terminal que su estado ya implica, decide qué corrida sigue (el writer inicial, una continuación, un
+ * bloque, una reanudación o un `fix`) y la registra antes de lanzarla. Las tasks las marca el conductor.
  */
 async function phaseImplement(p: ImplementPhase): Promise<Result> {
-  const { root, env, id, read, depth, conductor } = p
+  const { root, id } = p
+  const busy = () => new SddError('flow_busy', `otro comando de sdd-ai tiene tomado el flujo ${id}`, {
+    next: `si no hay otro sdd approve ni sdd phase corriendo, borra .plans/${id}/${LOCK_FILE} y vuelve a correr el comando`,
+  })
+  return withLockAsync(join(flowDir(root, id), LOCK_FILE), busy, () => chainLaunch(p))
+}
+
+async function chainLaunch(p: ImplementPhase): Promise<Result> {
+  const { root, id, read } = p
+  let view = chainView(root, id, read)
+  // Un writer anterior a las cadenas queda en el registro como una cadena cerrada: su cosecha no es padre.
+  if (view.legacy && view.state.chain?.terminal) {
+    const [entry] = view.state.chain.entries
+    const chain = appendEntry(root, id, null, entry)
+    closeChain(root, id, chain, stamped(view.state.chain.terminal))
+    view = chainView(root, id, read)
+  }
+  if (view.state.derived && view.state.chain) {
+    closeChain(root, id, view.state.chain.id, stamped(view.state.derived))
+    view = chainView(root, id, read)
+  }
+  if (p.step === 'verify') return resolveReceipt(p, view)
+  if (p.classes !== undefined) throw phaseUsage('--classes resuelve un recibo rojo: va en el paso verify')
+  const s = view.state
+  const next = s.next
+  const last = s.last && s.last.kind !== 'takeover' ? s.last : null
+  if (p.families !== undefined && next.kind !== 'start') throw phaseUsage('--families solo elige la familia del writer inicial de una cadena nueva')
+  switch (next.kind) {
+    case 'start':
+      if (p.blocks) throw phaseUsage('--blocks reparte las pendientes de una cadena parcial')
+      return launchLink(p, s, initialLink(p, s, view.input.failed))
+    case 'resume':
+      if (p.blocks) throw refusal('blocks_not_apt', `la corrida ${next.run} se cortó antes de cerrar: no es padre de un bloque`, `reanúdala: ./bin/sdd-ai sdd phase ${id}; o ${takeoverNext(id)}`)
+      return launchLink(p, s, resumeLink(p, s, next.run))
+    case 'continue':
+      return launchLink(p, s, p.blocks ? blockLink(p, s, last!, next.left) : continuationLink(p, s, last!, next.left))
+    case 'blocks_or_takeover':
+      if (!p.blocks) throw refusal('no_progress', next.why, `reparte las pendientes en bloques: ./bin/sdd-ai sdd phase ${id} --blocks; o ${takeoverNext(id)}`)
+      return launchLink(p, s, blockLink(p, s, last!, next.left))
+    case 'wait':
+      throw new SddError('phase_running', `el flujo ${id} tiene una corrida de fase activa: ${next.run}`, { next: `./bin/sdd-ai wait ${next.run}` })
+    case 'orphan':
+      throw refusal('launch_incomplete', `la corrida ${next.run} quedó registrada sin control`, `./bin/sdd-ai cancel ${next.run}`)
+    case 'takeover':
+    case 'conductor':
+      throw refusal('chain_closed', next.why, takeoverNext(id))
+    default:
+      throw refusal('chain_complete', 'el último eslabón de la cadena está completo: no hay otra corrida que lanzar',
+        `marca en tasks.md las tasks acreditadas (${s.covered.join(', ') || 'ninguna'}) y corre ./bin/sdd-ai sdd verify ${id}`)
+  }
+}
+
+/** Los bytes congelados de spec, plan y tasks y sus huellas: cada corrida congela los suyos al lanzarse. */
+function frozenInputs(root: string, read: FlowRead) {
   const bytes = { spec: flowBytes(root, read, 'spec'), plan: flowBytes(root, read, 'plan'), tasks: flowBytes(root, read, 'tasks') }
-  const open = taskLines(bytes.tasks.toString('utf8')).filter((l) => !l.done)
+  return {
+    text: { spec: bytes.spec.toString('utf8'), plan: bytes.plan.toString('utf8'), tasks: bytes.tasks.toString('utf8') },
+    hashes: { spec: bytesHash(bytes.spec), plan: bytesHash(bytes.plan), tasks: bytesHash(bytes.tasks) },
+  }
+}
+
+/** De dónde parte una corrida cuyo padre es `link`: su cosecha o su toma. */
+function launchFromLink(link: ChainEntry): LaunchFrom {
+  return link.kind === 'takeover' ? { takeover: link.map } : { run: link.run }
+}
+
+/**
+ * La base de la cadena: la de su primera corrida lanzada, o la de la cadena anterior más cercana que tenga una;
+ * `HEAD` si el flujo todavía no lanzó ninguna. Un control que existe y no se lee hace fallar la consulta: la base
+ * no se reemplaza en silencio por la de ahora.
+ */
+function chainBase(root: string, id: string, s: ChainState): string {
+  const base = s.chain ? chainBaseOf(root, implementOf(readPhaseRecord(root, id)), s.chain) : null
+  return base ?? headCommit(root) ?? ''
+}
+
+/**
+ * El writer inicial de una cadena nueva: todas las tasks abiertas, con sesión nueva y el árbol del último
+ * eslabón. Si la cadena de ahora no tiene eslabones (todos sus lanzamientos fallaron), se relanza su inicial
+ * dentro de ella, con el mismo padre y la misma base.
+ */
+function initialLink(p: ImplementPhase, s: ChainState, failed: ReadonlySet<string>): ChainLaunch {
+  const { root, id, read, depth } = p
+  const open = taskLines(frozenInputs(root, read).text.tasks).filter((l) => !l.done)
   const outside = open.filter((l) => l.task === null)
   if (outside.length > 0) {
     throw new SddError('phase_inline', 'hay tasks pendientes fuera de la gramática de la plantilla (- [ ] **T<n> — <título>**): la fase implement va inline', {
@@ -1900,26 +2234,223 @@ async function phaseImplement(p: ImplementPhase): Promise<Result> {
     })
   }
   const pending = open.flatMap((l) => (l.task ? [l.task.id] : []))
-  const families = effectiveFamilies(loadCrossModel(root, FAMILIES.filter((f) => inPath(f, env))).families, p.families ? parseFamiliesFlag(p.families) : undefined)
-  const resolution = resolve({ conductor, families, workers: loadWorkers(root), role: 'implement', flags: {}, codexRoot: loadCodexRoot(env) })
-  resolution.via = 'process'
-  const prompt = renderPhasePrompt('implement', { id, depth, step: 'implement', pending },
-    { spec: bytes.spec.toString('utf8'), plan: bytes.plan.toString('utf8'), tasks: bytes.tasks.toString('utf8') })
-  const phase: NonNullable<WriterControl['phase']> = {
-    flow: id, pending, inputs: { spec: bytesHash(bytes.spec), plan: bytesHash(bytes.plan), tasks: bytesHash(bytes.tasks) },
-    handoff_header: headerHash(read.facts.handoffHeader),
+  const inputs = frozenInputs(root, read).text
+  const prompt = renderPhasePrompt('implement', { id, depth, step: 'implement', pending }, inputs)
+  if (s.chain && lastLink(s.chain, failed) === null) {
+    const first = s.chain.entries[0] as RunEntry
+    const from = first.parent === null ? undefined : launchFromId(root, id, first.parent)
+    return {
+      kind: 'implement', chain: s.chain.id, parent: first.parent, ...(from ? { launchFrom: from } : {}), pending, mode: 'initial',
+      base: chainBase(root, id, s), prompt,
+    }
   }
-  const result = await runWriter({
-    root, env, conductor, session: ownerSession(env, conductor.family), resolution, prompt, deadline: p.deadline, phase,
-    request: { role: 'implement', families: p.families, conductor, deadline_sec: p.deadline }, source: `sdd phase ${id}`,
-  })
-  const out = result.out as Record<string, unknown>
-  withFlowLock(root, id, () => {
-    const rec = readPhaseRecord(root, id)
-    writePhaseRecord(root, id, { ...rec, last_run: { id: String(out.id), step: 'implement' } })
-  })
-  return { code: result.code, out: { ...out, flow: id, step: 'implement', pending } }
+  const prev = s.chain ? lastLink(s.chain, failed) : null
+  return {
+    kind: 'implement', chain: null, parent: prev === null ? null : prev.kind === 'takeover' ? prev.id : prev.run,
+    ...(prev ? { launchFrom: launchFromLink(prev) } : {}), pending, mode: 'initial', base: prev ? chainBase(root, id, s) : headCommit(root) ?? '', prompt,
+  }
 }
+
+/** De dónde parte un eslabón nombrado por su id, buscándolo en todas las cadenas del flujo. */
+function launchFromId(root: string, flow: string, link: string): LaunchFrom | undefined {
+  for (const c of implementOf(readPhaseRecord(root, flow)).chains) {
+    const e = c.entries.find((x) => (x.kind === 'takeover' ? x.id : x.run) === link)
+    if (e) return launchFromLink(e)
+  }
+  return undefined
+}
+
+function continuationLink(p: ImplementPhase, s: ChainState, last: RunEntry, left: string[]): ChainLaunch {
+  return {
+    kind: 'continuation', chain: s.chain!.id, parent: last.run, launchFrom: { run: last.run }, pending: left, mode: 'resume',
+    origin: writerSessionOrigin(p.root, last.run), base: chainBase(p.root, p.id, s), prompt: renderContinuationPrompt(p.id, left),
+  }
+}
+
+const BLOCK_SIZE = 3
+
+/** Un bloque: las primeras pendientes en el orden congelado, con una sesión nueva de la misma familia y el encargo completo. */
+function blockLink(p: ImplementPhase, s: ChainState, last: RunEntry, left: string[]): ChainLaunch {
+  const pending = left.slice(0, BLOCK_SIZE)
+  return {
+    kind: 'block', chain: s.chain!.id, parent: last.run, launchFrom: { run: last.run }, pending, mode: 'fresh',
+    origin: writerSessionOrigin(p.root, last.run), base: chainBase(p.root, p.id, s),
+    prompt: renderPhasePrompt('implement', { id: p.id, depth: p.depth, step: 'implement', pending }, frozenInputs(p.root, p.read).text),
+  }
+}
+
+/** La reanudación de una corrida que se cortó: el mismo tipo, las mismas tasks o filas y el mismo contrato. */
+function resumeLink(p: ImplementPhase, s: ChainState, run: string): ChainLaunch {
+  const c = readControl(p.root, run)
+  const kind = c.phase?.kind ?? 'implement'
+  const ids = kind === 'fix' ? (c.phase?.fix?.rows ?? []).map((r) => r.id) : c.phase?.pending ?? []
+  return {
+    kind, chain: s.chain!.id, parent: run, launchFrom: { run }, resumes: run, pending: c.phase?.pending ?? [], mode: 'resume',
+    origin: writerSessionOrigin(p.root, run), base: chainBase(p.root, p.id, s), ...(c.phase?.fix ? { fix: c.phase.fix } : {}),
+    prompt: renderResumePrompt(p.id, run, kind === 'fix' ? 'fix' : 'implement', ids),
+  }
+}
+
+/**
+ * Registra la corrida en la cadena y la lanza, bajo el lock del flujo. Antes de registrar nada comprueba la
+ * sesión que reanuda, `HEAD` y el árbol del padre; el registro queda antes del control, y su digest entra en
+ * los insumos que la cosecha compara. Un lanzamiento que falla deja el evento `launch_failed`.
+ */
+async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Promise<Result> {
+  const { root, env, id, read, conductor } = p
+  if (l.mode !== 'initial' && l.origin) {
+    const ok = checkResumable(root, env, l.origin, l.mode)
+    if (!ok.ok) {
+      const at = new Date().toISOString()
+      // Sin la sesión, una corrida cortada o un fix solo se cierran con la toma; una continuación todavía puede ir en bloques.
+      if (l.mode === 'resume' && (l.resumes !== undefined || l.kind === 'fix')) {
+        closeChain(root, id, l.chain!, { code: 'resume_unavailable', at, detail: ok.why })
+        throw refusal('resume_unavailable', `no se puede reanudar la sesión del writer: ${ok.why}`, takeoverNext(id))
+      }
+      if (l.mode === 'resume') {
+        appendEvent(root, id, { kind: 'refused', at, chain: l.chain!, detail: `continuación sin sesión: ${ok.why}` })
+        throw refusal('resume_unavailable', `no se puede reanudar la sesión del writer: ${ok.why}`, `reparte las pendientes en bloques: ./bin/sdd-ai sdd phase ${id} --blocks; o ${takeoverNext(id)}`)
+      }
+      throw refusal('resume_unavailable', `no se puede abrir un bloque con la familia del writer: ${ok.why}`, takeoverNext(id))
+    }
+  }
+  if (headCommit(root) !== l.base) throw refusal('head_moved', 'HEAD ya no es la base de la cadena', takeoverNext(id))
+  if (l.launchFrom) {
+    const diff = launchTreeDiff(root, { base: l.base, phase: { flow: id, launch_from: l.launchFrom } })
+    if (diff === null || diff.length > 0) {
+      throw refusal('tree_not_parent', diff === null ? 'no se puede leer el árbol del eslabón anterior' : `el árbol ya no es el del eslabón anterior: cambió ${diff.join(', ')}`,
+        `devuelve el árbol al del eslabón anterior o ${takeoverNext(id)}`, (diff ?? []).join('\n'))
+    }
+  }
+  // La familia y el perfil se resuelven antes de registrar: si fallan, no queda una entrada sin control.
+  let resolution: Resolution
+  if (l.mode === 'initial') {
+    const families = effectiveFamilies(loadCrossModel(root, FAMILIES.filter((f) => inPath(f, env))).families, p.families ? parseFamiliesFlag(p.families) : undefined)
+    resolution = resolve({ conductor, families, workers: loadWorkers(root), role: 'implement', flags: {}, codexRoot: loadCodexRoot(env) })
+    resolution.via = 'process'
+  } else {
+    const launched = writerLaunchOf(root, l.origin!)
+    resolution = { family: launched?.family ?? readControl(root, l.origin!).family, via: 'process', origin: { model: 'heredado', effort: 'heredado' } }
+  }
+  const frozen = frozenInputs(root, read)
+  const run = newRunId()
+  const at = new Date().toISOString()
+  const chain = appendEntry(root, id, l.chain, {
+    kind: l.kind, run, parent: l.parent, base: l.base, at, pending: l.pending, ...(l.resumes ? { resumes: l.resumes } : {}),
+    ...(l.fix ? { receipt: l.fix.receipt } : {}),
+  })
+  const phase: NonNullable<WriterControl['phase']> = {
+    flow: id, pending: l.pending, inputs: frozen.hashes, handoff_header: headerHash(read.facts.handoffHeader),
+    kind: l.kind, chain, parent: l.parent, ...(l.launchFrom ? { launch_from: l.launchFrom } : {}), ...(l.resumes ? { resumes: l.resumes } : {}),
+    ...(l.fix ? { fix: l.fix } : {}), registry: registryDigest(root, id),
+  }
+  let result: Result
+  try {
+    result = await runWriter({
+      root, env, conductor, session: ownerSession(env, conductor.family), resolution, prompt: l.prompt, deadline: p.deadline, phase, id: run,
+      chained: { mode: l.mode, ...(l.origin ? { origin: l.origin } : {}), base: l.base },
+      request: { role: 'implement', families: p.families, conductor, deadline_sec: p.deadline }, source: `sdd phase ${id}`,
+    })
+  } catch (e) {
+    appendEvent(root, id, { kind: 'launch_failed', at: new Date().toISOString(), chain, run, detail: (e as Error).message })
+    throw e
+  }
+  const out = result.out as Record<string, unknown>
+  return { code: result.code, out: { ...out, flow: id, step: 'implement', kind: l.kind, chain, pending: l.pending } }
+}
+
+/**
+ * `sdd phase` en el paso `verify`: reanuda un `fix` cortado o resuelve el último recibo final rojo. Sin una
+ * clasificación registrada, pide la del conductor con las propuestas; con ella, deriva y lanza el `fix` si
+ * corresponde. Una clasificación se registra una sola vez por recibo.
+ */
+async function resolveReceipt(p: ImplementPhase, view: ChainView): Promise<Result> {
+  const { root, id, read } = p
+  if (p.blocks || p.families !== undefined) throw phaseUsage('--blocks y --families no van en el paso verify')
+  const s = view.state
+  const last = s.last && s.last.kind !== 'takeover' ? s.last : null
+  if (s.chain === null) throw refusal('not_a_phase', `el flujo ${id} no tiene una cadena de writers: el paso es verify`, `./bin/sdd-ai sdd verify ${id}`)
+  if (s.next.kind === 'resume' && last?.kind === 'fix') return launchLink(p, s, resumeLink(p, s, s.next.run))
+  const receipt = view.receipt
+  const ref = view.receiptRef
+  if (!receipt || !ref || !view.input.receipt?.current || receipt.green || redRows(receipt).length === 0) {
+    throw refusal('receipt_not_red', 'no hay un recibo final rojo vigente con filas rojas para este candidato', orientation(id, s.next))
+  }
+  const contract = contractRows(root, id)
+  const registered = implementOf(readPhaseRecord(root, id)).classifications.find((c) => c.receipt.id === ref.id)
+  const proposed = redProposals(root, id, receipt)
+  if (p.classes !== undefined) {
+    let file: unknown
+    try {
+      file = JSON.parse(readFileSync(p.classes, 'utf8'))
+    } catch (e) {
+      throw refusal('classification_invalid', `no se puede leer el archivo de clases: ${(e as Error).message}`, `revisa ${p.classes}`)
+    }
+    const rows = checkClassification(receipt, file)
+    if (registered) {
+      const key = (r: { row: string; class: string; reason: string }) => `${r.row}|${r.class}|${r.reason}`
+      if (rows.map(key).sort().join('\n') !== registered.rows.map(key).sort().join('\n')) {
+        throw refusal('classification_exists', `el recibo ${ref.id} ya tiene una clasificación registrada distinta`, `corre ./bin/sdd-ai sdd phase ${id} sin --classes para usar la registrada, o verifica de nuevo para tener otro recibo`)
+      }
+    } else {
+      appendClassification(root, id, {
+        receipt: { id: ref.id, digest: ref.digest }, epoch: s.epoch, at: new Date().toISOString(),
+        rows: rows.map((r) => ({ ...r, proposed: proposed.get(r.row) ?? null })),
+      })
+    }
+  } else if (!registered) {
+    const file = classesPath(id, ref.id)
+    throw new SddError('classification_required', `el recibo ${ref.id} tiene filas rojas sin clasificar`, {
+      detail: classificationDetail(receipt, proposed),
+      next: `confirma o cambia cada clase con su razón en ${file} (fuera de .plans/${id}/, un archivo del repositorio cambia el árbol) y corre ./bin/sdd-ai sdd phase ${id} --classes ${file}`,
+    })
+  }
+  const fresh = chainView(root, id, read)
+  if (fresh.state.derived && fresh.state.chain) closeChain(root, id, fresh.state.chain.id, stamped(fresh.state.derived))
+  const next = fresh.state.next
+  if (next.kind === 'back_to_plan') {
+    closeChain(root, id, fresh.state.chain!.id, { code: 'back_to_plan', at: new Date().toISOString(), detail: `hueco de diseño en ${next.rows.join(', ')}` })
+    throw refusal('back_to_plan', `las filas ${next.rows.join(', ')} son un hueco de diseño: la cadena vuelve al plan o a la spec`, `corrige el plan o la spec y reaprueba el gate; con la aprobación nueva, una cadena nueva toma las tasks que falten`)
+  }
+  if (next.kind !== 'fix') throw refusal('no_fix', `el recibo ${ref.id} no lleva a un fix`, orientation(id, next))
+  return launchLink(p, fresh.state, fixLink(p, fresh.state, receipt, ref, next.rows, contract))
+}
+
+/** El `fix` de las filas de implementación del recibo: una sola corrida con todas, que reanuda la sesión. */
+function fixLink(p: ImplementPhase, s: ChainState, receipt: VerifyReceipt, ref: VerifyReceiptRef, rows: string[], contract: VerificationRow[]): ChainLaunch {
+  const { root, id } = p
+  const last = s.last as RunEntry
+  const registered = implementOf(readPhaseRecord(root, id)).classifications.find((c) => c.receipt.id === ref.id)
+  const dir = receiptDir(root, receipt.id)
+  const tail = (name: string | undefined) => (name && existsSync(join(dir, name)) ? fileTail(join(dir, name), TAIL_BYTES * 4) : '')
+  const input = {
+    flow: id, receipt: ref.id, paths: { spec: `.plans/${id}/spec.md`, plan: `.plans/${id}/plan.md`, tasks: `.plans/${id}/tasks.md` },
+    rows: rows.map((row) => {
+      const r = receipt.rows.find((x) => x.row === row)!
+      const e = r.execution
+      const c = registered?.rows.find((x) => x.row === row)
+      return {
+        id: row, argv: e?.argv ?? [], exit_code: e?.exit_code ?? null, ...(e?.reason ? { no_exit: e.reason } : {}), excerpt: e?.excerpt ?? '',
+        class: c?.class ?? 'implementation', reason: c?.reason ?? '', stdout: tail(e?.stdout_file), stderr: tail(e?.stderr_file),
+        ...(r.confirmation ? { confirmation: `${r.confirmation.state}${r.confirmation.reason ? `: ${r.confirmation.reason}` : ''}` } : {}),
+      }
+    }),
+  }
+  const rendered = renderFixPrompt(input, FIX_PROMPT_BUDGET - writerEnvelopeBytes())
+  if ('over_budget' in rendered) {
+    throw refusal('fix_over_budget', `el encargo del fix no entra en ${FIX_PROMPT_BUDGET} bytes ni sin los tramos de salida`, takeoverNext(id))
+  }
+  const testPaths = (row: string) => {
+    const c = contract.find((x) => x.id === row)
+    return c && c.kind === 'test' ? { test_paths: c.test_paths } : {}
+  }
+  return {
+    kind: 'fix', chain: s.chain!.id, parent: last.run, launchFrom: { run: last.run }, pending: [], mode: 'resume',
+    origin: writerSessionOrigin(root, last.run), base: chainBase(root, id, s), prompt: rendered.prompt,
+    fix: { receipt: { id: ref.id, digest: ref.digest }, rows: rows.map((id) => ({ id, ...testPaths(id) })), trimmed: rendered.trimmed },
+  }
+}
+
 
 const phaseUsage = (message: string) => new SddError('usage', message, { next: './bin/sdd-ai sdd status <id> dice el comando de la fase' })
 
@@ -1944,9 +2475,12 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     args, strict: true, allowPositionals: true,
     options: {
       request: { type: 'string' }, context: { type: 'string' }, families: { type: 'string' }, conductor: { type: 'string' }, deadline: { type: 'string' },
+      classes: { type: 'string' }, blocks: { type: 'boolean' },
     },
   })
-  if (positionals.length !== 1) throw new SddError('usage', 'sdd phase recibe un solo id', { next: './bin/sdd-ai sdd phase <id> [--request <archivo>] [--context <archivo>]' })
+  if (positionals.length !== 1) {
+    throw new SddError('usage', 'sdd phase recibe un solo id', { next: './bin/sdd-ai sdd phase <id> [--request <archivo>] [--context <archivo>] [--classes <archivo>] [--blocks]' })
+  }
   if (env.SDD_AI_WORKER === '1') throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   const id = positionals[0]
   const deadlineArg = values.deadline ?? '600'
@@ -1960,7 +2494,11 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     throw new SddError('phase_inline', 'en profundidad corta las fases van inline', { next: 'sigue la fase inline, en tu sesión' })
   }
   const step = status.next.step
-  if (status.depth === null || !PHASE_STEPS.includes(step)) {
+  // En verify, sdd phase resuelve el último recibo rojo de una cadena de writers: la clasificación y el fix.
+  // Sin writers de fase en el flujo no hay cadena, y verify no es una fase.
+  const chainStep = step === 'verify' && status.depth !== null
+    && (implementOf(readPhaseRecord(root, id)).chains.length > 0 || flowWriterRuns(root, id).length > 0)
+  if (status.depth === null || (!PHASE_STEPS.includes(step) && !chainStep)) {
     throw new SddError('not_a_phase', `el paso actual del flujo ${id} es ${step}: sdd phase solo lanza specify, plan, tasks o implement`, {
       next: `./bin/sdd-ai sdd status ${id}`,
     })
@@ -1970,10 +2508,15 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   const running = activeRun(root, record)
   if (running) throw new SddError('phase_running', `el flujo ${id} tiene una corrida de fase activa: ${running}`, { next: `./bin/sdd-ai wait ${running}` })
   const conductor = detectConductor(env, { conductor: values.conductor })
-  if (step === 'implement') {
+  if (step === 'implement' || chainStep) {
     if (values.request !== undefined || values.context !== undefined) throw phaseUsage('--request y --context no se usan en implement')
-    return phaseImplement({ root, env, id, read, depth, conductor, families: values.families, deadline })
+    const classes = values.classes === undefined ? undefined : isAbsolute(values.classes) ? values.classes : resolvePath(cwd, values.classes)
+    return phaseImplement({
+      root, env, id, read, depth, conductor, families: values.families, deadline, step: chainStep ? 'verify' : 'implement',
+      ...(values.blocks ? { blocks: true } : {}), ...(classes !== undefined ? { classes } : {}),
+    })
   }
+  if (values.classes !== undefined || values.blocks) throw phaseUsage('--classes y --blocks van en implement o en verify')
 
   const doc = step as DocumentStep
   const entry = record.phases[doc]
@@ -2101,7 +2644,7 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
   throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id>' })
 }
 
-const VERIFY_USAGE = './bin/sdd-ai sdd verify <id> [--baseline | --attest V<n>] [--conductor claude|codex]'
+const VERIFY_USAGE = './bin/sdd-ai sdd verify <id> [--baseline | --attest V<n> | --takeover [--reason <texto>]] [--conductor claude|codex]'
 
 /** Lo que devuelve una corrida de verify: el recibo resumido, por fila, sin las salidas completas. */
 function receiptSummary(receipt: VerifyReceipt, ref: VerifyReceiptRef | null): Record<string, unknown> {
@@ -2126,17 +2669,23 @@ function receiptSummary(receipt: VerifyReceipt, ref: VerifyReceiptRef | null): R
 async function sddVerify(args: string[], env: Env, cwd: string): Promise<Result> {
   const { values, positionals } = parseArgs({
     args, strict: true, allowPositionals: true,
-    options: { baseline: { type: 'boolean', default: false }, attest: { type: 'string' }, conductor: { type: 'string' } },
+    options: {
+      baseline: { type: 'boolean', default: false }, attest: { type: 'string' }, conductor: { type: 'string' },
+      takeover: { type: 'boolean', default: false }, reason: { type: 'string' },
+    },
   })
   if (positionals.length !== 1) throw new SddError('usage', 'sdd verify recibe un solo id', { next: VERIFY_USAGE })
   if (values.baseline && values.attest !== undefined) throw new SddError('usage', '--baseline y --attest no van juntos', { next: VERIFY_USAGE })
+  if (values.takeover && (values.baseline || values.attest !== undefined)) throw new SddError('usage', '--takeover va en la corrida final', { next: VERIFY_USAGE })
+  if (values.reason !== undefined && !values.takeover) throw new SddError('usage', '--reason acompaña a --takeover', { next: VERIFY_USAGE })
   const root = repoRoot(cwd)
   const [id] = positionals
   if (values.attest !== undefined) {
     const ref = attestRow(root, id, values.attest, env, conductorFlag(values.conductor))
     return { code: 0, out: { flow: id, row: ref.row, attestation: ref.id, next: flowNext(root, id) } }
   }
-  const start = prepareVerify(root, id, values.baseline ? 'baseline' : 'final')
+  const guard = values.baseline ? undefined : treeGuard(root, id, values.takeover ? { reason: values.reason } : undefined)
+  const start = prepareVerify(root, id, values.baseline ? 'baseline' : 'final', guard ? { guard } : {})
   const controller = new AbortController()
   const stop = () => controller.abort()
   process.once('SIGINT', stop)
@@ -2153,12 +2702,78 @@ async function sddVerify(args: string[], env: Env, cwd: string): Promise<Result>
       }
     }
     const { receipt, ref, projection } = await runFinal(start, controller.signal)
+    if (ref) persistReceiptTerminal(root, id)
     const pending = start.contract.rows.filter((r): r is ManualRow => r.kind === 'manual' && receipt.rows.find((x) => x.row === r.id)?.outcome !== 'passed')
     const questions = pending.map((r) => ({ row: r.id, question: attestQuestion(id, r.id, r.observation, receipt.after, receipt.plan_fingerprint) }))
     return { code: 0, out: { ...receiptSummary(receipt, ref), projection, ...(questions.length > 0 ? { questions } : {}), next: flowNext(root, id) } }
   } finally {
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
+  }
+}
+
+/**
+ * La guarda del árbol de `sdd verify` en un flujo con writers de fase. Sin toma, el árbol tiene que ser el del
+ * último eslabón de la cadena (cosecha o toma), sin contar el flujo: si no, se niega y nombra las rutas. Con
+ * `--takeover`, registra la toma del árbol de ahora con autoría mezclada y cierra la cadena del writer; un
+ * terminal que la cadena ya implicaba se escribe antes y no se reemplaza. Un flujo sin writer de fase no tiene guarda.
+ */
+function treeGuard(root: string, flow: string, takeover?: { reason?: string }): TreeGuard | undefined {
+  let registered = false
+  return (when, base) => {
+    const cur = currentLink(root, flow)
+    if (cur === null) {
+      if (takeover) throw new SddError('usage', `el flujo ${flow} no tiene un writer de fase: no hay cadena que tomar`, { next: `./bin/sdd-ai sdd verify ${flow}` })
+      return
+    }
+    const now = indexEntries(root, base, { kind: 'current' })
+    if (takeover && when === 'locked') {
+      if (now === null) throw new SddError('tree_unreadable', 'no se puede leer el árbol de ahora para declarar la toma')
+      registerTakeover(root, flow, cur, now, takeover.reason)
+      registered = true
+      return
+    }
+    if (registered) {
+      const again = currentLink(root, flow)
+      const diff = again?.map && now ? entryDiff(again.map, now, flow) : null
+      if (diff === null || diff.length > 0) throw treeNotHarvest(flow, diff)
+      return
+    }
+    const diff = cur.map && now ? entryDiff(cur.map, now, flow) : null
+    if (diff === null || diff.length > 0) throw treeNotHarvest(flow, diff)
+  }
+}
+
+const treeNotHarvest = (flow: string, diff: string[] | null) => new SddError('tree_not_harvest',
+  diff === null ? 'no se puede comparar el árbol con el del último eslabón de la cadena' : `el árbol no es el del último eslabón de la cadena: cambió ${diff.join(', ')}`, {
+    detail: (diff ?? []).join('\n'),
+    next: `si esas ediciones son tuyas, declara la toma: ./bin/sdd-ai sdd verify ${flow} --takeover [--reason <texto>]; si no, devuelve el árbol al de la cosecha. La revisión no se propone hasta verificar`,
+  })
+
+/** Registra la toma bajo el lock del flujo (lo toma `prepareVerify`): su mapa en el almacén y la entrada en la cadena. */
+function registerTakeover(root: string, flow: string, cur: CurrentLink, now: Map<string, string>, reason?: string): void {
+  const chain = persistLegacy(root, flow, cur)
+  const view = chainView(root, flow, readFlow(root, flow))
+  if (view.state.derived && view.state.chain?.id === chain) closeChain(root, flow, chain, { ...view.state.derived, at: new Date().toISOString() })
+  const id = `t-${newRunId()}`
+  const own = `.plans/${flow}/`
+  const map = writeTakeoverMap(root, id, new Map([...now].filter(([path]) => !path.startsWith(own))))
+  const parent = cur.link.kind === 'takeover' ? cur.link.id : cur.link.run
+  appendEntry(root, flow, chain, { kind: 'takeover', id, parent, at: new Date().toISOString(), map, ...(reason ? { reason } : {}) })
+  closeChain(root, flow, chain, { code: 'takeover', at: new Date().toISOString(), detail: reason ?? 'toma del conductor' })
+}
+
+/** Después de publicar un recibo, el terminal que la cadena ya implica (fix_cap tras el rojo de la segunda corrección) queda escrito. */
+function persistReceiptTerminal(root: string, flow: string): void {
+  try {
+    withFlowLock(root, flow, () => {
+      const view = chainView(root, flow, readFlow(root, flow))
+      if (view.state.derived?.code === 'fix_cap' && view.state.chain && view.state.chain.terminal === null) {
+        closeChain(root, flow, view.state.chain.id, { ...view.state.derived, at: new Date().toISOString() })
+      }
+    })
+  } catch {
+    // El terminal lo vuelve a derivar el próximo verbo que escriba: no impide devolver el recibo.
   }
 }
 

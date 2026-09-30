@@ -26,10 +26,19 @@ export interface TasksContract {
   phase: 'tasks'; assumptions: string[]; blocking_questions: string[]; missing_context: string[]
   tasks: { id: string; title: string; covers: string[]; pattern: string; test: string; files: string[]; steps: string[] }[]
 }
+/** Si la task quedó hecha entera o sin terminar, según el writer. La prosa del reporte no cuenta. */
+export type Completion = 'done' | 'pending'
 export interface ImplementContract {
   phase: 'implement'; missing_context: string[]
   tasks: { id: string; change_kind: 'defect' | 'behavior_change' | 'refactor'; changed: string
-    deviation: { what: string; why: string } | null; check: string }[]
+    deviation: { what: string; why: string } | null; check: string
+    /** Solo en el contrato con completitud explícita; el anterior no la trae. */
+    completion?: Completion }[]
+}
+/** El contrato de una corrida de corrección: una entrada por fila roja enviada, y solo esas. */
+export interface FixContract {
+  phase: 'fix'; missing_context: string[]
+  rows: { id: string; changed: string; deviation: { what: string; why: string } | null }[]
 }
 export type DocumentContract = SpecifyContract | PlanContract | TasksContract
 
@@ -64,7 +73,7 @@ const TASK_OF: Record<PhaseStep, (f: FlowData) => string> = {
   specify: (f) => `Escribe la spec del flujo ${f.id}: el QUÉ y el por qué del INSUMO request, con criterios de aceptación verificables y sin detalles de implementación. Lee el código que haga falta para separar lo que se sabe de lo que supones.`,
   plan: (f) => `Escribe el plan técnico del flujo ${f.id}: el CÓMO que cumple la spec del INSUMO spec. El enfoque es la solución más simple que cumple sus criterios; lo que vaya por encima se nombra en decisiones y trade-offs.`,
   tasks: (f) => `Descompón en tasks el plan del flujo ${f.id} (INSUMOS spec y plan): tareas atómicas, ordenadas y autosuficientes, que alguien sin esta conversación pueda ejecutar.`,
-  implement: (f) => `Implementa las tasks pendientes del flujo ${f.id}, todas en esta corrida: ${(f.pending ?? []).join(', ')}. Sigue el plan y las tasks de los INSUMOS; no marques las tasks, eso lo hace el conductor.`,
+  implement: (f) => `Implementa las tasks pendientes del flujo ${f.id} en esta corrida: ${(f.pending ?? []).join(', ')}. Sigue el plan y las tasks de los INSUMOS. Una task que no termines va con \`completion: pending\`; no marques las tasks, eso lo hace el conductor.`,
 }
 
 const SCHEMA: Record<PhaseStep, string> = {
@@ -116,15 +125,21 @@ const SCHEMA: Record<PhaseStep, string> = {
   implement: `{
   "phase": "implement",
   "missing_context": ["<lo que faltó para terminar>"],
-  "tasks": [{ "id": "T<n>", "change_kind": "defect" | "behavior_change" | "refactor", "changed": "<qué cambió>", "deviation": { "what": "<en qué te desviaste del plan>", "why": "<por qué>" } | null, "check": "<la comprobación que le toca correr al conductor>" }]
+  "tasks": [{ "id": "T<n>", "completion": "done" | "pending", "change_kind": "defect" | "behavior_change" | "refactor", "changed": "<qué cambió; en una task pending, qué quedó hecho y qué no>", "deviation": { "what": "<en qué te desviaste del plan>", "why": "<por qué>" } | null, "check": "<la fila de ## Verification que la demuestra>" }]
 }
-- Una entrada por cada task pendiente, y solo esas.
-- \`check\` depende del tipo: en \`defect\`, reproducir el fallo que se arregló; en \`behavior_change\`, actualizar la expectativa que cambió; en \`refactor\`, confirmar el verde que había antes.
+- Una entrada por cada task pendiente de esta corrida, y solo esas.
+- \`completion\` es \`done\` si la task quedó hecha entera y \`pending\` si no la terminaste. Es lo único que cuenta: una task pending no pasa a hecha porque la prosa o \`STATUS: done\` digan otra cosa.
+- \`check\` nombra la fila de \`## Verification\` que demuestra la task (por ejemplo \`V3\`), o dice por qué ninguna la cubre. Esa fila la corre \`sdd verify\`, no tú.
 - \`missing_context\` es obligatorio aunque vaya vacío; vacío significa "ninguno".`,
 }
 
 const IMPLEMENT_OUTPUT = `## Formato del reporte
 Tu reporte trae un único objeto JSON con la clave \`"phase": "implement"\` y exactamente las claves del esquema, antes de la línea \`${WRITER_END_MARK}\`. No incluyas \`next\`: el paso siguiente lo decide sdd-ai.`
+
+/** El formato del reporte de `implement`, para el encargo de una continuación o un bloque que reanuda la sesión. */
+export function implementReportFormat(): string {
+  return `${IMPLEMENT_OUTPUT}\n\n## Esquema\n${SCHEMA.implement}`
+}
 
 function mandates(step: DocumentStep): string {
   const m = ARTIFACT_MANDATES[step === 'specify' ? 'spec' : step]
@@ -427,7 +442,9 @@ export function renderTasks(c: TasksContract): string {
   return doc
 }
 
-function checkImplement(raw: Record<string, unknown>, pending: readonly string[]): ImplementContract {
+const COMPLETIONS: readonly string[] = ['done', 'pending']
+
+function checkImplement(raw: Record<string, unknown>, pending: readonly string[], explicit: boolean): ImplementContract {
   const c = contract(raw, 'implement', ['phase', 'missing_context', 'tasks'])
   if (!Array.isArray(c.tasks)) throw new Rejection('tasks tiene que ser una lista')
   const ids = taskIds(c.tasks, 'tasks')
@@ -436,37 +453,75 @@ function checkImplement(raw: Record<string, unknown>, pending: readonly string[]
   const tasks = c.tasks.map((t, i) => {
     const where = `tasks[${i}]`
     if (!isMap(t)) throw new Rejection(`${where} tiene que ser un objeto`)
-    keysOf(t, ['id', 'change_kind', 'changed', 'deviation', 'check'], where)
+    keysOf(t, explicit ? ['id', 'completion', 'change_kind', 'changed', 'deviation', 'check'] : ['id', 'change_kind', 'changed', 'deviation', 'check'], where)
+    let completion: Completion | undefined
+    if (explicit) {
+      const value = text(t.completion, `${where}.completion`)
+      if (!COMPLETIONS.includes(value)) throw new Rejection(`${where}.completion tiene que ser done | pending y es ${JSON.stringify(value)}`)
+      completion = value as Completion
+    }
     const kind = text(t.change_kind, `${where}.change_kind`)
     if (!CHANGE_KINDS.includes(kind)) throw new Rejection(`${where}.change_kind tiene que ser ${CHANGE_KINDS.join(' | ')} y es ${JSON.stringify(kind)}`)
-    let deviation: ImplementContract['tasks'][number]['deviation'] = null
-    if (t.deviation !== null) {
-      if (!isMap(t.deviation)) throw new Rejection(`${where}.deviation tiene que ser null o un objeto con what y why`)
-      keysOf(t.deviation, ['what', 'why'], `${where}.deviation`)
-      deviation = { what: text(t.deviation.what, `${where}.deviation.what`), why: text(t.deviation.why, `${where}.deviation.why`) }
-    }
     return {
       id: ids[i], change_kind: kind as ImplementContract['tasks'][number]['change_kind'], changed: text(t.changed, `${where}.changed`),
-      deviation, check: text(t.check, `${where}.check`),
+      deviation: deviationOf(t.deviation, where), check: text(t.check, `${where}.check`), ...(completion === undefined ? {} : { completion }),
     }
   })
   return { phase: 'implement', missing_context: texts(c.missing_context, 'missing_context'), tasks }
 }
 
+function deviationOf(v: unknown, where: string): { what: string; why: string } | null {
+  if (v === null) return null
+  if (!isMap(v)) throw new Rejection(`${where}.deviation tiene que ser null o un objeto con what y why`)
+  keysOf(v, ['what', 'why'], `${where}.deviation`)
+  return { what: text(v.what, `${where}.deviation.what`), why: text(v.why, `${where}.deviation.why`) }
+}
+
 /**
- * El contrato de `implement` del reporte del writer: un único objeto JSON anclado en `phase`, antes de
- * la marca de fin, con una entrada por task pendiente y solo esas. Sin corrección: el cambio ya está en el árbol.
+ * El único objeto JSON anclado en `phase` del reporte de un writer, antes de su marca de fin, pasado por
+ * `check`. Sin corrección: el cambio ya está en el árbol.
  */
-export function admitImplement(report: string, pending: readonly string[]): Admission<ImplementContract> {
+function admitReport<T>(report: string, check: (raw: Record<string, unknown>) => T): Admission<T> {
   const found = extractObjects(report, 'phase')
   if (found.length !== 1) return { kind: 'inadmissible', error: `se esperaba exactamente un objeto JSON con phase y hay ${found.length}` }
   if (!hasEndMark(report) || found[0].end > report.lastIndexOf(WRITER_END_MARK)) {
     return { kind: 'inadmissible', error: `el contrato tiene que ir antes de la línea final ${WRITER_END_MARK}` }
   }
   try {
-    return admitted(checkImplement(found[0].value, pending))
+    return admitted(check(found[0].value))
   } catch (e) {
     if (e instanceof Rejection) return { kind: 'inadmissible', error: e.message }
     throw e
   }
+}
+
+/**
+ * El contrato de `implement` del reporte del writer, con una entrada por task pendiente y solo esas. Con
+ * `explicit`, cada entrada declara su `completion`; sin él, se admite el contrato anterior, que no la trae.
+ */
+export function admitImplement(report: string, pending: readonly string[], o: { explicit?: boolean } = {}): Admission<ImplementContract> {
+  return admitReport(report, (raw) => checkImplement(raw, pending, o.explicit ?? false))
+}
+
+/** El contrato de un `fix`: una entrada por cada fila enviada al writer, y solo esas. */
+export function admitFix(report: string, rows: readonly string[]): Admission<FixContract> {
+  return admitReport(report, (raw) => {
+    const { next: _next, ...c } = raw
+    if (c.phase !== 'fix') throw new Rejection(`phase tiene que ser "fix" y es ${JSON.stringify(c.phase)}`)
+    keysOf(c, ['phase', 'missing_context', 'rows'], 'el contrato')
+    if (!Array.isArray(c.rows)) throw new Rejection('rows tiene que ser una lista')
+    const seen = new Set<string>()
+    const out = c.rows.map((r, i) => {
+      const where = `rows[${i}]`
+      if (!isMap(r)) throw new Rejection(`${where} tiene que ser un objeto`)
+      keysOf(r, ['id', 'changed', 'deviation'], where)
+      const id = text(r.id, `${where}.id`)
+      if (!rows.includes(id)) throw new Rejection(`la entrada ${id} no es una fila enviada en esta corrección`)
+      if (seen.has(id)) throw new Rejection(`la fila ${id} tiene dos entradas`)
+      seen.add(id)
+      return { id, changed: text(r.changed, `${where}.changed`), deviation: deviationOf(r.deviation, where) }
+    })
+    for (const id of rows) if (!seen.has(id)) throw new Rejection(`la fila enviada ${id} no tiene entrada`)
+    return { phase: 'fix', missing_context: texts(c.missing_context, 'missing_context'), rows: out } satisfies FixContract
+  })
 }

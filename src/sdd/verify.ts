@@ -11,7 +11,7 @@ import { type Family, SddError } from '../types.ts'
 import { canWriteStore, controlUnavailable, flowWriterOpen, latestFlowHarvest, recordVerifyGroup, releaseWriter, reserveWriter } from '../writer-store.ts'
 import { criteriaIds, replaceSection, setHeaderStatus } from './markdown.ts'
 import { localIso } from './phase.ts'
-import { appendAttestationRef, appendReceiptRef, readPhaseRecord, withFlowLock } from './phase-state.ts'
+import { appendAttestationRef, appendReceiptRef, implementOf, readPhaseRecord, withFlowLock } from './phase-state.ts'
 import { APPROVALS_FILE, FILE_NAMES, flowDir, readFlow } from './read.ts'
 import { headerData, resolve } from './status.ts'
 import { type ExecutableRow, type ManualRow, type TestRow, type VerificationContract, readVerification } from './verification-contract.ts'
@@ -302,19 +302,35 @@ const STEPS: Record<VerifyStart['mode'], readonly string[]> = { final: ['verify'
  * contrato es estructurado y se admite contra los criterios de la spec. Recién entonces genera el id del
  * recibo y toma la reserva de writer con él.
  */
-export function prepareVerify(root: string, flow: string, mode: VerifyStart['mode']): VerifyStart {
+export function prepareVerify(root: string, flow: string, mode: VerifyStart['mode'], o: { guard?: TreeGuard } = {}): VerifyStart {
   if (!canWriteStore(root) || !canWriteVerifyStore(root)) throw controlUnavailable()
-  const read = withFlowLock(root, flow, () => verifyPreconditions(root, flow, mode))
+  const read = withFlowLock(root, flow, () => verifyPreconditions(root, flow, mode, o.guard))
   const receiptId = newReceiptId()
   const reserved = reserveWriter(root, receiptId, 'verify')
   if (!reserved.ok) throw new SddError('writer_open', `ya hay un writer abierto en este repositorio: ${reserved.holder}`, { next: 'espera a que termine y vuelve a correr sdd verify' })
+  // Entre la comprobación del árbol y la reserva nadie más lanza un writer, pero el conductor puede editar.
+  if (mode === 'final' && o.guard) {
+    try {
+      o.guard('reserved', read.baseCommit)
+    } catch (e) {
+      releaseWriter(root, receiptId)
+      throw e
+    }
+  }
   return { root, flow, mode, receiptId, runDir: receiptDir(root, receiptId), ...read }
 }
+
+/**
+ * La guarda del árbol de una corrida final con writers de fase: bajo el lock, antes de ejecutar nada,
+ * exige que el árbol sea el del último eslabón de la cadena o registra la toma; con la reserva tomada,
+ * vuelve a comparar. Lanza para negarse.
+ */
+export type TreeGuard = (when: 'locked' | 'reserved', base: string) => void
 
 /** Lo que `prepareVerify` comprueba y lee del flujo. Va dentro de `withFlowLock`. */
 type Preconditions = Omit<VerifyStart, 'root' | 'flow' | 'mode' | 'receiptId' | 'runDir'>
 
-function verifyPreconditions(root: string, flow: string, mode: VerifyStart['mode']): Preconditions {
+function verifyPreconditions(root: string, flow: string, mode: VerifyStart['mode'], guard?: TreeGuard): Preconditions {
   const { facts } = readFlow(root, flow)
   const status = resolve(facts)
   if (status.blocked_reasons.length > 0) {
@@ -356,6 +372,7 @@ function verifyPreconditions(root: string, flow: string, mode: VerifyStart['mode
   }
   const baseCommit = headerData(facts.planHeader)?.base_commit
   if (typeof baseCommit !== 'string' || baseCommit === '') throw new SddError('plan_invalid', 'plan.md no declara base_commit')
+  if (mode === 'final' && guard) guard('locked', baseCommit)
   const rec = readPhaseRecord(root, flow)
   return { baseCommit, planFingerprint: fingerprint, contract, specAcs, refs: rec.verify ?? { receipts: [], attestations: [] } }
 }
@@ -578,9 +595,12 @@ export async function runFinal(start: VerifyStart, signal: AbortSignal): Promise
     }
     const harvest = latestFlowHarvest(start.root, start.flow)
     const after = candidateFingerprint(start.root, start.flow, start.baseCommit)
-    const writer = harvest ? writerObservation(start, harvest, after) : undefined
+    const takeover = lastTakeover(start.root, start.flow)
+    const observed = harvest ? writerObservation(start, harvest, after) : undefined
+    const writer = observed && takeover ? { ...observed, takeover } : observed
+    // Después de una toma el candidato es del conductor: la marca final del último writer ya no cuenta.
     const green = rows.every((r) => r.outcome === 'passed')
-      && after.tree === before.tree && after.base_commit === before.base_commit && (writer === undefined || writer.end_mark)
+      && after.tree === before.tree && after.base_commit === before.base_commit && (writer === undefined || writer.end_mark || writer.takeover !== undefined)
     const receipt: VerifyReceipt = {
       id: start.receiptId, flow: start.flow, mode: 'final', started_at, ended_at: new Date().toISOString(), before, after,
       plan_fingerprint: start.planFingerprint, coverage: coverageOf(start.contract, start.specAcs), rows, ...(writer ? { writer } : {}), green,
@@ -607,6 +627,13 @@ function latestBaseline(start: VerifyStart): Map<string, NonNullable<RowResult['
     }
   }
   return null
+}
+
+/** La toma que cierra la última cadena del flujo, si su último eslabón es una. */
+function lastTakeover(root: string, flow: string): string | undefined {
+  const chain = implementOf(readPhaseRecord(root, flow)).chains.at(-1)
+  const last = chain?.entries.at(-1)
+  return last?.kind === 'takeover' ? last.id : undefined
 }
 
 /** Si la última cosecha cerró completa y si su árbol, sin el flujo, es el del candidato de ahora. */

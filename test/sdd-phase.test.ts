@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { countTasks, criteriaIds, readHeader, section, taskLines } from '../src/sdd/markdown.ts'
 import { renderVerification } from '../src/sdd/verification-contract.ts'
 import {
-  type FlowData, type FrozenInputs, PHASE_INPUTS, PLAN_TITLES, type PhaseStep, SPEC_TITLES, STATUS_TITLES, admitImplement, admitPlan, admitSpecify,
+  type FlowData, type FrozenInputs, PHASE_INPUTS, PLAN_TITLES, type PhaseStep, SPEC_TITLES, STATUS_TITLES, admitFix, admitImplement, admitPlan, admitSpecify,
   admitTasks, planHeaderFrom, renderPhasePrompt, renderPlan, renderSpec, renderTasks,
 } from '../src/sdd/phase.ts'
 
@@ -247,6 +247,48 @@ test('la admisión de implement exige una entrada por task pendiente antes de la
     ['sin missing_context', report({ phase: 'implement', tasks: IMPL.tasks }), /missing_context/],
   ]
   for (const [name, text, cause] of cases) assert.match(errorOf(admitImplement(text, ['T1', 'T3'])), cause, name)
+})
+
+test('la admisión de implement con completitud explícita exige completion por task y no la deduce de la prosa', () => {
+  const done = (id: string, completion: string) => ({ ...IMPL.tasks.find((x) => x.id === id)!, completion })
+  const explicit = { explicit: true }
+  const all = admitImplement(report({ ...IMPL, tasks: [done('T1', 'done'), done('T3', 'done')] }), ['T1', 'T3'], explicit)
+  assert.equal(all.kind, 'admitted')
+  const mixed = admitImplement(report({ ...IMPL, tasks: [done('T1', 'done'), done('T3', 'pending')] }), ['T1', 'T3'], explicit)
+  assert.equal(mixed.kind, 'admitted')
+  assert.deepEqual(mixed.kind === 'admitted' && mixed.review.tasks.map((x) => x.completion), ['done', 'pending'])
+  // La prosa y la marca final no la reemplazan: una task pending sigue pending aunque el reporte diga que terminó.
+  const prose = `Terminé todo, las dos tasks quedaron hechas.\n\n${JSON.stringify({ ...IMPL, tasks: [done('T1', 'done'), done('T3', 'pending')] })}\n\nSTATUS: done\n`
+  const p = admitImplement(prose, ['T1', 'T3'], explicit)
+  assert.deepEqual(p.kind === 'admitted' && p.review.tasks.map((x) => x.completion), ['done', 'pending'])
+  const cases: Array<[string, string, RegExp]> = [
+    ['sin completion', report(IMPL), /completion/],
+    ['completion inválido', report({ ...IMPL, tasks: [done('T1', 'hecha'), done('T3', 'done')] }), /completion tiene que ser done \| pending/],
+    ['task omitida', report({ ...IMPL, tasks: [done('T1', 'done')] }), /T3/],
+    ['id de más', report({ ...IMPL, tasks: [done('T1', 'done'), { ...done('T3', 'done'), id: 'T4' }] }), /T4/],
+    ['id duplicado', report({ ...IMPL, tasks: [done('T1', 'done'), done('T1', 'done')] }), /T1/],
+  ]
+  for (const [name, text, cause] of cases) assert.match(errorOf(admitImplement(text, ['T1', 'T3'], explicit)), cause, name)
+  // Sin el modo explícito se admite el contrato anterior, que no trae completion.
+  assert.equal(admitImplement(report(IMPL), ['T1', 'T3']).kind, 'admitted')
+})
+
+test('la admisión de fix exige exactamente las filas enviadas antes de la marca de fin', () => {
+  const FIX = { phase: 'fix', missing_context: [], rows: [{ id: 'V1', changed: 'corregí la suma', deviation: null }, { id: 'V3', changed: 'el separador', deviation: { what: 'otro archivo', why: 'estaba ahí' } }] }
+  const ok = admitFix(report(FIX), ['V1', 'V3'])
+  assert.equal(ok.kind, 'admitted')
+  assert.deepEqual(ok.kind === 'admitted' && ok.review.rows.map((r) => r.id), ['V1', 'V3'])
+  assert.equal(admitFix(report({ ...FIX, next: 'verify' }), ['V1', 'V3']).kind, 'admitted')
+  const cases: Array<[string, string, RegExp]> = [
+    ['fila enviada sin entrada', report({ ...FIX, rows: [FIX.rows[0]] }), /V3/],
+    ['fila no enviada', report({ ...FIX, rows: [...FIX.rows, { id: 'V2', changed: 'x', deviation: null }] }), /V2/],
+    ['fila repetida', report({ ...FIX, rows: [FIX.rows[0], FIX.rows[0], FIX.rows[1]] }), /dos entradas/],
+    ['otra fase', report({ ...FIX, phase: 'implement' }), /phase tiene que ser "fix"/],
+    ['changed vacío', report({ ...FIX, rows: [{ ...FIX.rows[0], changed: '' }, FIX.rows[1]] }), /changed/],
+    ['sin la marca', `${JSON.stringify(FIX)}\n`, /STATUS: done/],
+    ['clave de más', report({ ...FIX, tasks: [] }), /tasks/],
+  ]
+  for (const [name, text, cause] of cases) assert.match(errorOf(admitFix(text, ['V1', 'V3'])), cause, name)
 })
 
 test('la admisión de plan necesita el header completo: sin sus datos, sdd phase se niega antes de lanzar', () => {

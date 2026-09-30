@@ -4,11 +4,13 @@ import { dirtyPaths } from '../git.ts'
 import { withLock } from '../lock.ts'
 import { isRunId, readStatus, writeJsonAtomic } from '../runs.ts'
 import { SddError, TERMINAL } from '../types.ts'
-import { harvestTreeHolds, isWriterRun, readHarvest } from '../writer-store.ts'
+import { harvestTreeHolds, isWriterRun, readControl, readHarvest } from '../writer-store.ts'
 import type { DocumentStep, PhaseStep } from './phase.ts'
-import { LOCK_FILE, flowDir, lstatOrNull, pathInvalid } from './read.ts'
+import { LOCK_FILE, flowDir, lstatOrNull, pathInvalid, readFlow } from './read.ts'
 import type { FlowStatus, Next } from './status.ts'
-import type { AttestationRef, VerifyReceiptRef } from './verify-receipt.ts'
+import { type ChainState, classesPath, orientation } from './chain.ts'
+import { chainBaseOf, chainView, classificationDetail, redProposals } from './chain-facts.ts'
+import type { AttestationRef, VerifyReceipt, VerifyReceiptRef } from './verify-receipt.ts'
 
 // El estado de las fases de un flujo que no se lee de sus artefactos: la última corrida, la ampliación
 // y el cierre inline, por fase. Vive en el flujo, junto al registro de aprobaciones, y se escribe bajo
@@ -30,7 +32,43 @@ export interface PhaseRecord {
   phases: Partial<Record<DocumentStep, PhaseEntry>>
   /** Los recibos de `sdd verify` y las acreditaciones de filas manuales, en orden: solo su id y su digest. */
   verify?: { receipts: VerifyReceiptRef[]; attestations: AttestationRef[] }
+  /** Las cadenas de writers de `implement`; un registro anterior no la trae. */
+  implement?: ImplementRecord
 }
+
+/** Una corrida de writer de la cadena. `implement` es el writer inicial; `fix`, una corrección desde un recibo rojo. */
+export type RunKind = 'implement' | 'continuation' | 'block' | 'fix'
+export type ChainClass = 'implementation' | 'contract' | 'environment' | 'design'
+export type TerminalCode = 'takeover' | 'back_to_plan' | 'no_progress' | 'fix_cap' | 'failure_cap' | 'resume_unavailable' | 'legacy'
+export interface RunEntry {
+  kind: RunKind; run: string
+  /** El eslabón del que parte: una corrida, una toma, o `null` en la primera cadena con el árbol limpio. */
+  parent: string | null
+  /** La corrida interrumpida que esta reanuda. */
+  resumes?: string
+  /** El commit base de la cadena al registrarla: un relanzamiento sin control parte de esta misma base. */
+  base?: string
+  at: string
+  /** Las tasks congeladas al lanzar: todas las pendientes, las de un bloque o las que siguen. */
+  pending?: string[]
+  /** El recibo rojo del que parte un `fix`. */
+  receipt?: { id: string; digest: string }
+}
+/** La toma del conductor: el árbol que declaró vive en el almacén, y acá queda su referencia. */
+export interface TakeoverEntry { kind: 'takeover'; id: string; parent: string | null; at: string; map: { ref: string; digest: string }; reason?: string }
+export type ChainEntry = RunEntry | TakeoverEntry
+export interface ChainTerminal { code: TerminalCode; at: string; detail: string }
+export interface Chain { id: string; entries: ChainEntry[]; terminal: ChainTerminal | null }
+export interface Classification {
+  receipt: { id: string; digest: string }
+  /** La aprobación del plan vigente al clasificar: la época del conteo de fallos. */
+  epoch: string | null
+  at: string
+  rows: { row: string; class: ChainClass; proposed: ChainClass | null; reason: string }[]
+}
+/** Lo que no es un eslabón: un lanzamiento que falló antes del spawn o una negativa que conviene dejar registrada. */
+export interface ChainEvent { kind: 'launch_failed' | 'refused'; at: string; chain?: string; run?: string; detail: string }
+export interface ImplementRecord { schema: 1; chains: Chain[]; classifications: Classification[]; events: ChainEvent[] }
 
 const PHASE_STEPS: readonly string[] = ['specify', 'plan', 'tasks', 'implement']
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -68,7 +106,154 @@ export function readPhaseRecord(root: string, id: string): PhaseRecord {
     const problem = verifyProblem(data.verify)
     if (problem !== null) throw invalid(id, `verify ${problem}`)
   }
+  if (data.implement !== undefined) {
+    const problem = implementProblem(data.implement)
+    if (problem !== null) throw invalid(id, `implement ${problem}`)
+  }
   return data as unknown as PhaseRecord
+}
+
+const RUN_KINDS: readonly string[] = ['implement', 'continuation', 'block', 'fix']
+const CLASSES: readonly string[] = ['implementation', 'contract', 'environment', 'design']
+const TERMINALS: readonly string[] = ['takeover', 'back_to_plan', 'no_progress', 'fix_cap', 'failure_cap', 'resume_unavailable', 'legacy']
+const ISO = (v: unknown) => typeof v === 'string' && !Number.isNaN(Date.parse(v))
+const digested = (v: Record<string, unknown>) => typeof v.digest === 'string' && DIGEST.test(v.digest)
+/** Un recibo se nombra por `id`; el mapa de una toma, por `ref`. Cada uno con su clave y su digest. */
+const receiptRef = (v: unknown) => isRecord(v) && onlyKeys(v, ['id', 'digest']) === undefined && text(v.id) && digested(v)
+const mapRef = (v: unknown) => isRecord(v) && onlyKeys(v, ['ref', 'digest']) === undefined && text(v.ref) && digested(v)
+const onlyKeys = (v: Record<string, unknown>, keys: readonly string[]) => Object.keys(v).find((k) => !keys.includes(k))
+
+/** Qué le falta a una entrada de la cadena para tener su forma; `null` si la tiene. */
+function entryOfChainProblem(e: unknown): string | null {
+  if (!isRecord(e)) return 'no es un mapa'
+  if (e.kind === 'takeover') {
+    const extra = onlyKeys(e, ['kind', 'id', 'parent', 'at', 'map', 'reason'])
+    if (extra) return `trae la clave desconocida ${extra}`
+    if (!text(e.id) || !(e.parent === null || text(e.parent)) || !ISO(e.at) || !mapRef(e.map)) return 'es una toma sin id, padre, fecha o mapa'
+    if (e.reason !== undefined && !text(e.reason)) return 'es una toma con una razón vacía'
+    return null
+  }
+  if (!RUN_KINDS.includes(String(e.kind))) return `tiene el tipo desconocido ${JSON.stringify(e.kind)}`
+  const extra = onlyKeys(e, ['kind', 'run', 'parent', 'resumes', 'base', 'at', 'pending', 'receipt'])
+  if (extra) return `trae la clave desconocida ${extra}`
+  if (e.base !== undefined && !text(e.base)) return 'tiene una base vacía'
+  if (!(typeof e.run === 'string' && isRunId(e.run)) || !(e.parent === null || text(e.parent)) || !ISO(e.at)) return 'es una corrida sin id, padre o fecha'
+  if (e.resumes !== undefined && !(typeof e.resumes === 'string' && isRunId(e.resumes))) return 'reanuda algo que no es una corrida'
+  if (e.pending !== undefined && !texts(e.pending)) return 'tiene pending que no es una lista de tasks'
+  // Una corrección nombra el recibo del que sale; las demás corridas no parten de un recibo.
+  if (e.kind === 'fix' ? !receiptRef(e.receipt) : e.receipt !== undefined) return e.kind === 'fix' ? 'es una corrección sin recibo con id y digest' : 'trae un recibo y no es una corrección'
+  return null
+}
+
+/** Qué le falta a la clave `implement` para tener la forma del registro; `null` si la tiene. */
+function implementProblem(v: unknown): string | null {
+  if (!isRecord(v)) return 'no es un mapa'
+  const extra = onlyKeys(v, ['schema', 'chains', 'classifications', 'events'])
+  if (extra) return `trae la clave desconocida ${extra}`
+  if (v.schema !== 1) return 'schema no es 1'
+  if (!Array.isArray(v.chains) || !Array.isArray(v.classifications) || !Array.isArray(v.events)) return 'no trae las listas chains, classifications y events'
+  const chainIds = new Set<string>()
+  for (const [i, c] of v.chains.entries()) {
+    if (!isRecord(c) || !text(c.id) || !Array.isArray(c.entries)) return `chains[${i}] no es una cadena con id y entradas`
+    if (chainIds.has(c.id as string)) return `chains[${i}] repite el id ${c.id}`
+    chainIds.add(c.id as string)
+    for (const [k, e] of c.entries.entries()) {
+      const problem = entryOfChainProblem(e)
+      if (problem !== null) return `chains[${i}].entries[${k}] ${problem}`
+    }
+    const term = c.terminal
+    if (term !== null && !(isRecord(term) && TERMINALS.includes(String(term.code)) && ISO(term.at) && typeof term.detail === 'string')) {
+      return `chains[${i}].terminal no es null ni un terminal con código, fecha y detalle`
+    }
+  }
+  for (const [i, c] of v.classifications.entries()) {
+    if (!isRecord(c) || !receiptRef(c.receipt) || !(c.epoch === null || text(c.epoch)) || !ISO(c.at) || !Array.isArray(c.rows)) {
+      return `classifications[${i}] no es una clasificación con recibo, época, fecha y filas`
+    }
+    const bad = c.rows.find((r) => !(isRecord(r) && text(r.row) && CLASSES.includes(String(r.class))
+      && (r.proposed === null || CLASSES.includes(String(r.proposed))) && text(r.reason)))
+    if (bad !== undefined) return `classifications[${i}] tiene una fila sin id, clase o razón`
+  }
+  for (const [i, e] of v.events.entries()) {
+    if (!isRecord(e) || !['launch_failed', 'refused'].includes(String(e.kind)) || !ISO(e.at) || typeof e.detail !== 'string') {
+      return `events[${i}] no es un evento con tipo, fecha y detalle`
+    }
+    const extra = onlyKeys(e, ['kind', 'at', 'chain', 'run', 'detail'])
+    if (extra) return `events[${i}] trae la clave desconocida ${extra}`
+    if (e.chain !== undefined && !text(e.chain)) return `events[${i}] nombra una cadena que no es texto`
+    if (e.run !== undefined && !(typeof e.run === 'string' && isRunId(e.run))) return `events[${i}] nombra algo que no es una corrida`
+  }
+  return null
+}
+
+const emptyImplement = (): ImplementRecord => ({ schema: 1, chains: [], classifications: [], events: [] })
+
+/** El registro de cadenas del flujo; vacío si el registro es anterior. */
+export const implementOf = (r: PhaseRecord): ImplementRecord => r.implement ?? emptyImplement()
+
+/** La última toma del flujo, en cualquiera de sus cadenas; `null` si nunca hubo una. */
+export function latestTakeover(imp: ImplementRecord): TakeoverEntry | null {
+  for (const c of [...imp.chains].reverse()) {
+    for (const e of [...c.entries].reverse()) if (e.kind === 'takeover') return e
+  }
+  return null
+}
+
+/**
+ * Si un recibo es posterior a la última toma del flujo: corrió sobre ella o empezó después. Un recibo anterior
+ * no acredita el árbol aunque la huella vuelva a coincidir, también si después de la toma se abrió otra cadena.
+ */
+export function receiptAfterTakeover(r: Pick<VerifyReceipt, 'started_at' | 'writer'>, imp: ImplementRecord): boolean {
+  const t = latestTakeover(imp)
+  return t === null || r.writer?.takeover === t.id || Date.parse(r.started_at) > Date.parse(t.at)
+}
+
+// Las cuatro escrituras del registro de cadenas. Cada una lee y escribe el registro entero, y va dentro de
+// `withFlowLock`: el llamador toma el lock y decide, en el mismo tramo, qué escribir.
+
+/** Agrega una entrada a la cadena `chain`, o abre una cadena nueva con esa entrada si `chain` es `null`. Devuelve el id de la cadena. */
+export function appendEntry(root: string, id: string, chain: string | null, entry: ChainEntry): string {
+  const r = readPhaseRecord(root, id)
+  const imp = implementOf(r)
+  let target = chain
+  let chains: Chain[]
+  if (target === null) {
+    target = `c${imp.chains.length + 1}`
+    chains = [...imp.chains, { id: target, entries: [entry], terminal: null }]
+  } else {
+    if (!imp.chains.some((c) => c.id === target)) throw new Error(`la cadena ${target} no existe en el registro`)
+    chains = imp.chains.map((c) => (c.id === target ? { ...c, entries: [...c.entries, entry] } : c))
+  }
+  const last_run = 'run' in entry ? { id: entry.run, step: 'implement' as const } : r.last_run
+  writePhaseRecord(root, id, { ...r, last_run, implement: { ...imp, chains } })
+  return target
+}
+
+/** Registra una clasificación. Una ya registrada para el mismo recibo no se reemplaza: devuelve la existente. */
+export function appendClassification(root: string, id: string, c: Classification): Classification {
+  const r = readPhaseRecord(root, id)
+  const imp = implementOf(r)
+  const existing = imp.classifications.find((x) => x.receipt.id === c.receipt.id)
+  if (existing) return existing
+  writePhaseRecord(root, id, { ...r, implement: { ...imp, classifications: [...imp.classifications, c] } })
+  return c
+}
+
+export function appendEvent(root: string, id: string, e: ChainEvent): void {
+  const r = readPhaseRecord(root, id)
+  const imp = implementOf(r)
+  writePhaseRecord(root, id, { ...r, implement: { ...imp, events: [...imp.events, e] } })
+}
+
+/** Cierra la cadena con su terminal. Un terminal ya escrito no se reemplaza: devuelve el que quedó. */
+export function closeChain(root: string, id: string, chain: string, terminal: ChainTerminal): ChainTerminal {
+  const r = readPhaseRecord(root, id)
+  const imp = implementOf(r)
+  const c = imp.chains.find((x) => x.id === chain)
+  if (!c) throw new Error(`la cadena ${chain} no existe en el registro`)
+  if (c.terminal !== null) return c.terminal
+  writePhaseRecord(root, id, { ...r, implement: { ...imp, chains: imp.chains.map((x) => (x.id === chain ? { ...x, terminal } : x)) } })
+  return terminal
 }
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/
@@ -206,6 +391,8 @@ export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'de
  * se puede leer no tumba a quien lista: queda dicho en `detail`.
  */
 export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root: string, id: string, status: T): Next {
+  const chained = chainNext(root, id, status)
+  if (chained !== null) return chained
   if (status.next.step === 'verify') return { ...status.next, command: `./bin/sdd-ai sdd verify ${id}` }
   if ((status.depth !== 'normal' && status.depth !== 'completa') || !PHASE_STEPS.includes(status.next.step)) return status.next
   try {
@@ -213,5 +400,65 @@ export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root
     return phase ? { ...status.next, ...phase } : status.next
   } catch (e) {
     return { ...status.next, detail: `no se pudo leer el registro de fases: ${(e as Error).message}` }
+  }
+}
+
+/**
+ * El `next` de un flujo con una cadena de writers, en `implement`, `verify` o `review_and_commit`: lo decide
+ * el estado de la cadena. `null` sin cadena o fuera de esos pasos. Si el estado no se puede leer, lo dice en
+ * vez de proponer el comando del paso.
+ */
+function chainNext(root: string, id: string, status: Pick<FlowStatus, 'depth' | 'next'>): Next | null {
+  const step = status.next.step
+  if ((status.depth !== 'normal' && status.depth !== 'completa') || !['implement', 'verify', 'review_and_commit'].includes(step)) return null
+  let view: ReturnType<typeof chainView>
+  try {
+    view = chainView(root, id, readFlow(root, id))
+  } catch (e) {
+    return { step: status.next.step, detail: `no se pudo leer la cadena del writer: ${(e as Error).message}` }
+  }
+  const s = view.state
+  if (s.chain === null) return null
+  const n = s.next
+  const phase = `./bin/sdd-ai sdd phase ${id}`
+  const detail = orientation(id, n)
+  if (step === 'review_and_commit') {
+    const link = s.last
+    if (link === null) return null
+    // Sin la base o la familia del writer no hay comando de revisión que proponer: se dice qué falta.
+    let base: string | null
+    let family: string | undefined
+    try {
+      base = chainBaseOf(root, view.input.imp, s.chain)
+      family = link.kind === 'takeover' ? undefined : readControl(root, link.run).family
+    } catch (e) {
+      return { step: status.next.step, detail: `no se pudo leer el control de la cadena para armar la revisión: ${(e as Error).message}` }
+    }
+    if (base === null) return { step: status.next.step, detail: 'la cadena no tiene ninguna corrida lanzada: no hay base para la revisión' }
+    if (link.kind === 'takeover') return { ...status.next, command: `./bin/sdd-ai review start --base ${base} --untracked`, detail: 'el candidato es de autoría mezclada: el writer de la cadena y la toma del conductor' }
+    return { ...status.next, command: `./bin/sdd-ai review start --harvest ${link.run} --base ${base} --author ${family}` }
+  }
+  switch (n.kind) {
+    case 'verify':
+    case 'repeat_verify':
+      return step === 'verify' ? { ...status.next, command: `./bin/sdd-ai sdd verify ${id}`, ...(n.kind === 'repeat_verify' ? { detail } : {}) }
+        : { ...status.next, detail: `el último eslabón está completo: marca en tasks.md las tasks acreditadas (${s.covered.join(', ') || 'ninguna'}) y corre ./bin/sdd-ai sdd verify ${id}` }
+    case 'wait': return { ...status.next, command: `./bin/sdd-ai wait ${n.run}` }
+    case 'orphan': return { ...status.next, command: `./bin/sdd-ai cancel ${n.run}`, detail }
+    case 'classify': {
+      // El comando trae el archivo de clases, y el detalle, las propuestas y la plantilla para escribirlo.
+      const proposals = view.receipt ? `\n${classificationDetail(view.receipt, redProposals(root, id, view.receipt))}` : ''
+      return { ...status.next, command: `${phase} --classes ${classesPath(id, n.receipt)}`, detail: `${detail}${proposals}` }
+    }
+    case 'start':
+    case 'continue':
+    case 'resume':
+    case 'fix':
+      return { ...status.next, command: phase, detail }
+    case 'blocks_or_takeover': return { ...status.next, command: `${phase} --blocks`, detail }
+    case 'attest': return { ...status.next, command: `./bin/sdd-ai sdd verify ${id} --attest ${n.rows[0]}`, detail }
+    case 'takeover':
+    case 'conductor': return { ...status.next, command: `./bin/sdd-ai sdd verify ${id} --takeover`, detail }
+    default: return { ...status.next, detail }
   }
 }

@@ -25,7 +25,7 @@ import type {
 import { ARTIFACT_SYSTEM_PROMPT, REFUTER_SYSTEM_PROMPT, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId } from './workers/claude.ts'
 import { codexResume, codexRetry, codexReviewLaunch, withResultFile } from './workers/codex.ts'
 import {
-  type GroupIdentity, captureTreeAtBase, freezeHarvest, groupState, readControl, readProcess, recordGroup, writeControl,
+  type GroupIdentity, captureTreeAtBase, freezeHarvest, groupState, launchTreeDiff, launchTreeHolds, readControl, readProcess, recordGroup, writeControl,
 } from './writer-store.ts'
 import { type DocumentContract, admitPlan, admitSpecify, admitTasks } from './sdd/phase.ts'
 import { readPhaseRecord, withFlowLock, writePhaseRecord } from './sdd/phase-state.ts'
@@ -457,12 +457,19 @@ function retryArgs(ctx: RunContext, args: string[], field: RejectedField): { arg
 function sessionOf(family: Family, args: string[], facts: StreamFacts): string | undefined {
   const i = args.indexOf('--session-id')
   if (family === 'claude' && i >= 0 && i + 1 < args.length) return args[i + 1]
+  const r = args.indexOf('--resume')
+  if (family === 'claude' && r >= 0 && r + 1 < args.length) return args[r + 1]
   return facts.sessionId
 }
 
+/** Si el argv ya reanuda una sesión: el de una corrida encadenada que continúa la de otra. */
+const isResumeArgs = (family: Family, args: string[]) => (family === 'claude' ? args.includes('--resume') : args[1] === 'resume')
+
 function resumeLaunch(ctx: RunContext, launch: LaunchSpec, sessionId: string): LaunchSpec | null {
   const { dir, family, prefix } = ctx
-  const args = family === 'claude' ? claudeResume(launch.args) : codexResume(launch.args, sessionId, join(dir, `result${prefix}-resume.md`))
+  // Un argv que ya reanuda la sesión sirve tal cual para cerrarla: solo cambia el mensaje.
+  const args = isResumeArgs(family, launch.args) ? launch.args
+    : family === 'claude' ? claudeResume(launch.args) : codexResume(launch.args, sessionId, join(dir, `result${prefix}-resume.md`))
   return args ? { ...launch, args, stdinFile: join(dir, `resume${prefix}.md`) } : null
 }
 
@@ -951,6 +958,28 @@ export async function settleGroup(g: GroupIdentity, graceMs: number, state: (g: 
 }
 
 /**
+ * Con la cosecha de un writer de cadena congelada, el terminal que esa cosecha implica queda escrito bajo
+ * el lock del flujo: un bloque sin progreso (`no_progress`) o una segunda corrección que no es candidato
+ * (`fix_cap`). Un fallo acá no toca la cosecha: el próximo verbo que escriba lo vuelve a derivar.
+ */
+async function persistHarvestTerminal(root: string, flow: string): Promise<void> {
+  try {
+    const { chainView } = await import('./sdd/chain-facts.ts')
+    const { closeChain, withFlowLock } = await import('./sdd/phase-state.ts')
+    const { readFlow } = await import('./sdd/read.ts')
+    withFlowLock(root, flow, () => {
+      const view = chainView(root, flow, readFlow(root, flow))
+      const derived = view.state.derived
+      if (derived && (derived.code === 'no_progress' || derived.code === 'fix_cap') && view.state.chain && view.state.chain.terminal === null) {
+        closeChain(root, flow, view.state.chain.id, { ...derived, at: new Date().toISOString() })
+      }
+    })
+  } catch {
+    // El terminal se deriva igual en cada consulta; escribirlo acá solo lo adelanta.
+  }
+}
+
+/**
  * El writer de una corrida: corre en su almacén y no escribe nada en `.sdd-ai/runs/<id>/`. Antes de
  * lanzar comprueba que el árbol siga en la base; al terminar, confirma que el grupo cesó y recién
  * entonces congela la cosecha, que es el terminal y libera la reserva. Sin cese confirmado, deja
@@ -963,11 +992,14 @@ async function superviseWriter(ctx: RunContext, resumeSec: number): Promise<Stat
   const control = readControl(root, id)
   const done = async (outcome: Outcome, report?: string): Promise<Status> => {
     const record = await freezeHarvest(root, id, outcome, report)
+    if (control.phase?.kind) await persistHarvestTerminal(root, control.phase.flow)
     return setStatus(dir, { state: record.state, ended_at: new Date().toISOString() })
   }
   if (existsSync(cancelFile)) return done({ state: 'cancelled' })
-  // Un cambio en el árbol entre `run` y el arranque no es del writer: no se lanza.
-  const dirty = dirtyPaths(root)
+  // Un cambio en el árbol entre `run` y el arranque no es del writer: no se lanza. Una corrida con padre
+  // parte del árbol del padre; las demás, del árbol limpio.
+  const chained = control.phase?.launch_from !== undefined
+  const dirty = chained ? (launchTreeDiff(root, control) ?? ['(el árbol del eslabón anterior no se puede leer)']) : dirtyPaths(root)
   if (dirty.length > 0 || headCommit(root) !== control.base) {
     const detail = dirty.length > 0 ? `cambió: ${dirty.join(', ')}` : 'HEAD ya no es la base'
     return done({ state: 'launch_failed', reason: 'tree_changed', detail })
@@ -975,8 +1007,9 @@ async function superviseWriter(ctx: RunContext, resumeSec: number): Promise<Stat
   writeControl(root, { ...control, spawning: new Date().toISOString() })
   const wctx: RunContext = {
     ...ctx, writer: { root, id },
-    // Un primer intento que ya cambió el árbol no se reintenta: se congela lo que dejó.
-    canRetry: async () => captureTreeAtBase(root, id),
+    // Un primer intento que ya cambió el árbol no se reintenta: se congela lo que dejó. Una corrida que
+    // reanuda una sesión tampoco: hereda un perfil que el proveedor ya aceptó.
+    canRetry: async () => !isResumeArgs(argv.family, argv.launch?.args ?? []) && (chained ? launchTreeHolds(root, control) : captureTreeAtBase(root, id)),
   }
   const r = await runAttempts(wctx, argv.launch, Date.now() + argv.deadline_sec * 1000, resumeSec, 'write')
   const patch: Partial<Status> = {}

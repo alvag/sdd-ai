@@ -6,7 +6,8 @@ import { join } from 'node:path'
 import { runHook } from '../src/hooks.ts'
 import { writeJsonAtomic } from '../src/runs.ts'
 import {
-  PHASES_FILE, type PhaseProbe, type PhaseRecord, activeRun, phaseNext, readPhaseRecord, withFlowLock, writePhaseRecord,
+  PHASES_FILE, type PhaseProbe, type PhaseRecord, activeRun, appendClassification, appendEntry, appendEvent, closeChain, implementOf, phaseNext,
+  readPhaseRecord, withFlowLock, writePhaseRecord,
 } from '../src/sdd/phase-state.ts'
 import type { FlowStatus, Step } from '../src/sdd/status.ts'
 import { payload } from './hook-contract.ts'
@@ -146,4 +147,78 @@ test('next.command sigue el estado de la fase en sdd status, el listado y la lí
   assert.match(v.one.detail, /registro de fases/)
   assert.deepEqual(v.listed, v.one)
   assert.match(v.line, /^- f \(completa\): plan · no se pudo leer el registro de fases/)
+})
+
+test('registro de cadenas: se lee sin la clave, guarda el orden explícito y no reemplaza un terminal ni una clasificación', () => {
+  const repo = makeRepo()
+  const dir = join(repo, '.plans', 'f')
+  mkdirSync(dir, { recursive: true })
+  // Un registro anterior, sin implement, se lee igual y su vista de cadenas está vacía.
+  writeFileSync(join(dir, PHASES_FILE), JSON.stringify({ schema_version: 1, last_run: null, phases: {} }))
+  assert.deepEqual(implementOf(readPhaseRecord(repo, 'f')), { schema: 1, chains: [], classifications: [], events: [] })
+
+  const at = '2026-09-29T20:00:00.000Z'
+  const digest = `sha256:${'a'.repeat(64)}`
+  withFlowLock(repo, 'f', () => {
+    const c1 = appendEntry(repo, 'f', null, { kind: 'implement', run: '20260929-2000-aaaa', parent: null, at, pending: ['T1', 'T2'] })
+    appendEntry(repo, 'f', c1, { kind: 'continuation', run: '20260929-2001-bbbb', parent: '20260929-2000-aaaa', at, pending: ['T2'] })
+    appendEntry(repo, 'f', c1, { kind: 'fix', run: '20260929-2002-cccc', parent: '20260929-2001-bbbb', at, receipt: { id: '20260929-2001-rrrr', digest } })
+    appendEntry(repo, 'f', c1, { kind: 'takeover', id: 't1', parent: '20260929-2002-cccc', at, map: { ref: 'takeovers/t1.json', digest }, reason: 'a mano' })
+    assert.equal(c1, 'c1')
+    assert.deepEqual(closeChain(repo, 'f', c1, { code: 'fix_cap', at, detail: 'dos correcciones' }).code, 'fix_cap')
+    // Un terminal ya escrito no se reemplaza.
+    assert.deepEqual(closeChain(repo, 'f', c1, { code: 'takeover', at, detail: 'toma' }).code, 'fix_cap')
+    const cls = { receipt: { id: '20260929-2001-rrrr', digest }, epoch: 'e1', at, rows: [{ row: 'V1', class: 'implementation' as const, proposed: 'implementation' as const, reason: 'la suma' }] }
+    appendClassification(repo, 'f', cls)
+    assert.deepEqual(appendClassification(repo, 'f', { ...cls, epoch: 'e2' }).epoch, 'e1')
+    appendEvent(repo, 'f', { kind: 'launch_failed', at, chain: c1, run: '20260929-2003-dddd', detail: 'no arrancó' })
+    assert.equal(appendEntry(repo, 'f', null, { kind: 'implement', run: '20260929-2004-eeee', parent: 't1', at, pending: ['T3'] }), 'c2')
+  })
+  const r = readPhaseRecord(repo, 'f')
+  const imp = implementOf(r)
+  assert.deepEqual(imp.chains.map((c) => [c.id, c.entries.map((e) => e.kind), c.terminal?.code ?? null]),
+    [['c1', ['implement', 'continuation', 'fix', 'takeover'], 'fix_cap'], ['c2', ['implement'], null]])
+  // El padre de cada eslabón es explícito: el orden no sale de los ids.
+  assert.deepEqual(imp.chains[0].entries.map((e) => e.parent), [null, '20260929-2000-aaaa', '20260929-2001-bbbb', '20260929-2002-cccc'])
+  assert.equal(imp.classifications.length, 1)
+  assert.equal(imp.events[0].kind, 'launch_failed')
+  assert.deepEqual(r.last_run, { id: '20260929-2004-eeee', step: 'implement' })
+
+  const broken: unknown[] = [
+    { schema: 2, chains: [], classifications: [], events: [] },
+    { schema: 1, chains: [{ id: 'c1', entries: [{ kind: 'otra', run: '20260929-2000-aaaa', parent: null, at }], terminal: null }], classifications: [], events: [] },
+    { schema: 1, chains: [{ id: 'c1', entries: [], terminal: { code: 'rara', at, detail: '' } }], classifications: [], events: [] },
+    { schema: 1, chains: [], classifications: [{ receipt: { id: 'x', digest }, epoch: null, at, rows: [{ row: 'V1', class: 'implementation', proposed: null, reason: '' }] }], events: [] },
+    { schema: 1, chains: [], classifications: [], events: [{ kind: 'otro', at, detail: '' }] },
+    { schema: 1, chains: [], classifications: [], events: [], extra: 1 },
+    // El mapa de una toma se nombra por ref, y el recibo de una clasificación o de un fix, por id.
+    { schema: 1, chains: [{ id: 'c1', entries: [{ kind: 'takeover', id: 't1', parent: null, at, map: { id: 'm', digest } }], terminal: null }], classifications: [], events: [] },
+    { schema: 1, chains: [], classifications: [{ receipt: { ref: 'x', digest }, epoch: null, at, rows: [] }], events: [] },
+    // Un fix nombra su recibo; las demás corridas no traen uno.
+    { schema: 1, chains: [{ id: 'c1', entries: [{ kind: 'fix', run: '20260929-2000-aaaa', parent: null, at }], terminal: null }], classifications: [], events: [] },
+    { schema: 1, chains: [{ id: 'c1', entries: [{ kind: 'implement', run: '20260929-2000-aaaa', parent: null, at, receipt: { id: 'x', digest } }], terminal: null }], classifications: [], events: [] },
+    // Un evento nombra su cadena con texto y su corrida con un id de corrida, sin claves de más.
+    { schema: 1, chains: [], classifications: [], events: [{ kind: 'launch_failed', at, chain: 1, detail: '' }] },
+    { schema: 1, chains: [], classifications: [], events: [{ kind: 'launch_failed', at, run: '../fuera', detail: '' }] },
+    { schema: 1, chains: [], classifications: [], events: [{ kind: 'refused', at, detail: '', extra: true }] },
+    { schema: 1, chains: [{ id: 'c1', entries: [{ kind: 'implement', run: '20260929-2000-aaaa', parent: null, base: '', at }], terminal: null }], classifications: [], events: [] },
+  ]
+  for (const b of broken) {
+    writeFileSync(join(dir, PHASES_FILE), JSON.stringify({ schema_version: 1, last_run: null, phases: {}, implement: b }))
+    assert.throws(() => readPhaseRecord(repo, 'f'), (e: unknown) => (e as { code?: string }).code === 'phases_invalid', JSON.stringify(b))
+  }
+})
+
+test('consultas de cadena: status orienta por la cadena sin escribir el registro', async () => {
+  const { chainFlow, chainSetup, runBin } = await import('./helpers.ts')
+  const s = chainSetup({ writers: [{ actions: [{ write: 'src/a.ts', content: 'x\n' }], report: `Hecho.\n\n${JSON.stringify({ phase: 'implement', missing_context: [], tasks: [{ id: 'T1', completion: 'done', change_kind: 'behavior_change', changed: 'x', deviation: null, check: 'V1' }, { id: 'T2', completion: 'pending', change_kind: 'behavior_change', changed: 'no', deviation: null, check: 'V1' }] })}\n\nSTATUS: done\n` }] })
+  chainFlow(s, { tasks: 2 })
+  runBin(s, ['wait', runBin(s, ['sdd', 'phase', 'f']).out.id, '--max', '30'])
+  const file = join(s.repo, '.plans', 'f', 'sdd-ai-phases.json')
+  const before = readFileSync(file, 'utf8')
+  const next = runBin(s, ['sdd', 'status', 'f']).out.next
+  assert.deepEqual([next.step, next.command], ['implement', './bin/sdd-ai sdd phase f'])
+  assert.match(next.detail, /sigue con T2/)
+  runBin(s, ['sdd', 'status'])
+  assert.equal(readFileSync(file, 'utf8'), before)
 })

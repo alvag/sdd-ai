@@ -30,7 +30,7 @@ export interface VerifyReceipt {
   id: string; flow: string; mode: 'final' | 'baseline'; started_at: string; ended_at: string
   before: CandidateFingerprint; after: CandidateFingerprint; plan_fingerprint: string
   coverage: Record<string, string[]>; rows: RowResult[]
-  writer?: { run: string; end_mark: boolean; tree_matches: boolean | 'not_comparable' }
+  writer?: { run: string; end_mark: boolean; tree_matches: boolean | 'not_comparable'; takeover?: string }
   dirtied_paths?: string[]; green: boolean
 }
 export interface VerifyReceiptRef { id: string; digest: string; mode: 'final' | 'baseline' }
