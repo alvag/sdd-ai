@@ -124,12 +124,13 @@ function pendingBlock(where: string, bytes: number): SddError {
  * medir sin pendientes para decir si lo que no entra es un archivo, el contexto o un bloque de
  * pendientes. Con lentes, el reparto se mide con el prompt más grande entre la base con sus pendientes y
  * cada lente; los pendientes quedan en la base y las lentes van con `targets: []`, solo en los lotes
- * que tienen rutas.
+ * que tienen rutas con líneas en CAMBIOS: una lente revisa solo lo que cambió, y sin eso no tiene qué citar.
  */
 export function planRoundJobs(c: Candidate, contextTexts: Map<string, string>, plan: RoundPlan, entries: LedgerEntry[],
   cap: number, reviewers: readonly Reviewer[] = ['base']): { reviewers: readonly Reviewer[]; batches: string[][]; jobs: PlannedJob[] } {
   const all = c.files.map((f) => f.path)
-  const lenses = all.length === 0 ? [] : reviewers.filter((r): r is Exclude<Reviewer, 'base'> => r !== 'base')
+  const cited = (paths: string[]) => paths.some((p) => Object.hasOwn(plan.changed, p))
+  const lenses = cited(all) ? reviewers.filter((r): r is Exclude<Reviewer, 'base'> => r !== 'base') : []
   const plannedReviewers: readonly Reviewer[] = ['base', ...lenses]
   const whole = renderRoundPrompt(c, renderMaterial(c, contextTexts), plan, entries, cap)
   const wholeMaterial = lenses.length > 0 ? renderMaterial(c, contextTexts) : ''
@@ -171,6 +172,6 @@ export function planRoundJobs(c: Candidate, contextTexts: Map<string, string>, p
     return { key: `base-b${i + 1}`, reviewer: 'base', batch: i + 1, paths, targets: goals, text: render(paths, goals) }
   })
   const lensJobs = lenses.flatMap((lens) => batches.flatMap((paths, i): PlannedJob[] =>
-    paths.length === 0 ? [] : [{ key: `${lens}-b${i + 1}`, reviewer: lens, batch: i + 1, paths, targets: [], text: renderLens(lens, paths) }]))
+    cited(paths) ? [{ key: `${lens}-b${i + 1}`, reviewer: lens, batch: i + 1, paths, targets: [], text: renderLens(lens, paths) }] : []))
   return { reviewers: plannedReviewers, batches, jobs: [...baseJobs, ...lensJobs] }
 }

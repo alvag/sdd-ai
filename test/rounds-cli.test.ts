@@ -772,6 +772,12 @@ function checkBatchedLenses(): void {
     assert.ok(measure(job.text) <= REVIEW_PROMPT_BUDGET, job.key)
     if (job.reviewer !== 'base') assert.deepEqual(job.targets, [])
   }
+
+  // Una lente revisa solo CAMBIOS: en un lote sin líneas que cambiaron no corre.
+  const one = planRoundJobs(candidate, new Map(), { ...plan, changed: { 'y/dos.txt': [[5, 5]] } }, [], 4, ROUND_REVIEWERS)
+  assert.deepEqual(one.batches, [['x/uno.txt'], ['y/dos.txt']])
+  assert.deepEqual(one.jobs.map((j) => j.key), ['base-b1', 'base-b2', ...ROUND_REVIEWERS.slice(1).map((r) => `${r}-b2`)])
+  assert.deepEqual(one.reviewers, ROUND_REVIEWERS)
 }
 
 function checkEmptyLensLots(): void {
@@ -796,6 +802,11 @@ function checkEmptyLensLots(): void {
     assert.ok(measure(job.text) <= REVIEW_PROMPT_BUDGET, job.key)
     if (job.reviewer !== 'base') assert.deepEqual(job.targets, [])
   }
+
+  // Sin líneas citables en CAMBIOS, la ronda corre solo la base aunque el candidato tenga archivos.
+  const uncited = planRoundJobs(candidate, new Map(), plan, [], 4, ROUND_REVIEWERS)
+  assert.deepEqual(uncited.jobs.map((j) => j.key), ['base-b1'])
+  assert.deepEqual(uncited.reviewers, ['base'])
 }
 
 test('con lentes un delta sin señal nueva corre solo la base', () => {
