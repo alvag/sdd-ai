@@ -15,10 +15,11 @@ import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
 import { type SkillCheck, doctor } from './doctor.ts'
 import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, repoRoot } from './git.ts'
+import { type InitAnswers, applyInit, planInit } from './init.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
-import { nativeProfile, resolve } from './resolve.ts'
+import { roleProfiles, resolve } from './resolve.ts'
 import { renderArtifactMaterial, renderArtifactPrompt, renderArtifactRoundPrompt } from './review/artifact-prompt.ts'
 import {
   type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, readMaterial, validateArtifactArgs,
@@ -105,12 +106,7 @@ function definedEnv(env: Env): Record<string, string> {
 }
 
 function nativeProfiles(root: string, env: Env): RoleProfiles {
-  const workers = loadWorkers(root)
-  const codexRoot = loadCodexRoot(env)
-  const entries = READ_ONLY_ROLES.map((role) => [role, {
-    claude: nativeProfile('claude', role, workers, codexRoot), codex: nativeProfile('codex', role, workers, codexRoot),
-  }])
-  return Object.fromEntries(entries) as RoleProfiles
+  return roleProfiles(loadWorkers(root), loadCodexRoot(env))
 }
 
 /** La caída propone la familia, el modelo y el esfuerzo del conductor; el usuario decide. */
@@ -2107,6 +2103,37 @@ function agents(args: string[], env: Env, cwd: string): Result {
   return { code: 0, out: { written, removed, next: 'reabre la sesión para que el CLI cargue los agentes y la skill' } }
 }
 
+/**
+ * `init` prepara el checkout: sin `--apply`, un ensayo que no escribe; con `--apply`, el plan de ese
+ * ensayo, atado a su digest.
+ */
+function init(args: string[], env: Env, cwd: string): Result {
+  const { values } = parseArgs({
+    args, strict: true, allowPositionals: false,
+    options: { apply: { type: 'boolean' }, digest: { type: 'string' }, families: { type: 'string' }, jira: { type: 'string' }, from: { type: 'string' } },
+  })
+  const answers: InitAnswers = {}
+  if (values.families !== undefined) answers.families = parseFamiliesFlag(values.families)
+  if (values.jira !== undefined) {
+    if (values.jira !== 'on' && values.jira !== 'off') throw new SddError('usage', `--jira tiene que ser on u off, no ${JSON.stringify(values.jira)}`)
+    answers.jira = values.jira
+  }
+  if (values.from !== undefined) answers.from = resolvePath(cwd, values.from)
+  const root = repoRoot(cwd)
+  // Un worktree sin node_modules se prepara con el binario de otro checkout: los comandos lo nombran.
+  const bin = realpathSync(PKG_DIR) === realpathSync(root) ? './bin/sdd-ai' : `node ${shellArg(BIN_PATH)}`
+  const flags: string[] = []
+  if (answers.families !== undefined) flags.push('--families', answers.families.join(','))
+  if (answers.jira !== undefined) flags.push('--jira', answers.jira)
+  if (answers.from !== undefined) flags.push('--from', shellArg(answers.from))
+  const command = (digest?: string) => [bin, 'init', ...(digest === undefined ? [] : ['--apply', '--digest', digest]), ...flags].join(' ')
+  if (!values.apply) return { code: 0, out: planInit(root, answers, env, { command }) }
+  if (values.digest === undefined) {
+    throw new SddError('usage', 'init --apply necesita --digest con el digest del ensayo', { next: command() })
+  }
+  return { code: 0, out: applyInit(root, answers, values.digest, env, { command }) }
+}
+
 const PHASE_STEPS: readonly string[] = ['specify', 'plan', 'tasks', 'implement']
 
 /**
@@ -2827,14 +2854,14 @@ function skillCheck(cwd: string): SkillCheck {
 
 /** Los comandos que solo consultan: con una verificación en curso, informan en vez de detenerse. */
 const READS = (cmd: string | undefined, rest: string[]) =>
-  cmd === 'wait' || cmd === 'doctor' || (cmd === 'review' && rest[0] === 'status') || (cmd === 'sdd' && rest[0] === 'status')
+  cmd === 'wait' || cmd === 'doctor' || (cmd === 'init' && !rest.includes('--apply')) || (cmd === 'review' && rest[0] === 'status') || (cmd === 'sdd' && rest[0] === 'status')
 
 /**
  * Antes de cualquier verbo, resuelve una restauración de `sdd verify` que quedó interrumpida en este
  * checkout. El supervisor interno no la corre: es parte de una corrida en curso, no un verbo.
  */
 function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string): void {
-  if (!['run', 'review', 'wait', 'cancel', 'agents', 'sdd', 'doctor'].includes(cmd ?? '')) return
+  if (!['run', 'review', 'wait', 'cancel', 'agents', 'sdd', 'doctor', 'init'].includes(cmd ?? '')) return
   let root: string
   try {
     root = repoRoot(cwd)
@@ -2854,6 +2881,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'wait': return await wait(rest, env, cwd)
       case 'cancel': return await cancel(rest, cwd)
       case 'agents': return agents(rest, env, cwd)
+      case 'init': return init(rest, env, cwd)
       case 'sdd': return await sdd(rest, env, cwd)
       case 'doctor': {
         const report = doctor(undefined, skillCheck(cwd))
@@ -2861,7 +2889,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }
       default:
-        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa run | review | wait | cancel | agents sync | sdd status | sdd approve | doctor' })
+        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | run | review | wait | cancel | agents sync | sdd status | sdd approve | doctor' })
     }
   } catch (e) {
     if (e instanceof SddError) {

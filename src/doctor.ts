@@ -4,7 +4,7 @@ import type { Family, WorkerTask } from './types.ts'
 import { claudeLaunch, claudeResume, claudeReviewLaunch, claudeWriterLaunch } from './workers/claude.ts'
 import { codexLaunch, codexResume, codexReviewLaunch, codexWriterLaunch } from './workers/codex.ts'
 
-type Exec = (cmd: string, args: string[]) => { status: number | null; stdout: string }
+export type Exec = (cmd: string, args: string[]) => { status: number | null; stdout: string }
 
 export interface CliReport {
   family: Family
@@ -62,6 +62,11 @@ export function checkFlags(help: string, flags: string[]): { flag: string; prese
 const defaultExec: Exec = (cmd, args) => {
   const r = spawnSync(cmd, args, { encoding: 'utf8' })
   return { status: r.error ? null : r.status, stdout: r.stdout ?? '' }
+}
+
+/** Familias cuya CLI responde en PATH. */
+export function detectClis(exec: Exec = defaultExec): Family[] {
+  return (['claude', 'codex'] as Family[]).filter((family) => exec(family, ['--version']).status !== null)
 }
 
 /**

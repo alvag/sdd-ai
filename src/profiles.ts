@@ -8,6 +8,21 @@ export type PortableEffort = 'bajo' | 'medio' | 'alto' | 'muy_alto' | 'maximo'
 export interface FamilyProfile { model?: string; effort?: PortableEffort | 'heredado' }
 export interface WorkersFile { roles: Partial<Record<Role, Partial<Record<Family, FamilyProfile>>>> }
 
+/** Perfiles que escribe init; la resolución normal nunca los usa como relleno. */
+export const DEFAULT_PROFILES: Readonly<Record<Role, Record<Family, { model: string; effort: PortableEffort }>>> = {
+  explore: { claude: { model: 'sonnet', effort: 'alto' }, codex: { model: 'gpt-6-luna', effort: 'alto' } },
+  'counter-plan': { claude: { model: 'opus', effort: 'alto' }, codex: { model: 'gpt-6.1-sol', effort: 'alto' } },
+  investigate: { claude: { model: 'opus', effort: 'muy_alto' }, codex: { model: 'gpt-6.1-sol', effort: 'muy_alto' } },
+  debate: { claude: { model: 'opus', effort: 'alto' }, codex: { model: 'gpt-6.1-sol', effort: 'alto' } },
+  'design-review': { claude: { model: 'opus', effort: 'muy_alto' }, codex: { model: 'gpt-6.1-sol', effort: 'muy_alto' } },
+  implement: { claude: { model: 'sonnet', effort: 'medio' }, codex: { model: 'gpt-6.1-sol', effort: 'medio' } },
+  refute: { claude: { model: 'opus', effort: 'alto' }, codex: { model: 'gpt-6.1-sol', effort: 'alto' } },
+  'code-review': { claude: { model: 'opus', effort: 'alto' }, codex: { model: 'gpt-6.1-sol', effort: 'alto' } },
+  specify: { claude: { model: 'opus', effort: 'alto' }, codex: { model: 'gpt-6.1-sol', effort: 'alto' } },
+  plan: { claude: { model: 'opus', effort: 'alto' }, codex: { model: 'gpt-6.1-sol', effort: 'alto' } },
+  tasks: { claude: { model: 'sonnet', effort: 'alto' }, codex: { model: 'gpt-6.1-sol', effort: 'alto' } },
+}
+
 const PORTABLE: readonly string[] = ['bajo', 'medio', 'alto', 'muy_alto', 'maximo']
 const WORKERS_PATH = join('.sdd-ai', 'workers.yml')
 
@@ -123,5 +138,18 @@ export function loadCodexRoot(env: Record<string, string | undefined>): Profile 
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {}
     throw e
+  }
+}
+
+/** Catálogo local de Codex, incluidos los modelos ocultos; su ausencia no es un error. */
+export function loadCodexCatalog(env: Record<string, string | undefined>): Set<string> | null {
+  const home = env.CODEX_HOME || join(homedir(), '.codex')
+  try {
+    const value: unknown = JSON.parse(readFileSync(join(home, 'models_cache.json'), 'utf8'))
+    if (typeof value !== 'object' || value === null || !Array.isArray((value as { models?: unknown }).models)) return null
+    return new Set((value as { models: unknown[] }).models.flatMap((m) =>
+      typeof m === 'object' && m !== null && typeof (m as { slug?: unknown }).slug === 'string' ? [(m as { slug: string }).slug] : []))
+  } catch {
+    return null
   }
 }

@@ -96,21 +96,25 @@ function write(file: string, content: string): void {
   writeFileSync(file, content)
 }
 
-/** Borra los agentes que generó sdd-ai y ya no corresponden a ningún rol; reconoce los suyos por la marca. */
-function removeLeftovers(root: string, keep: readonly string[]): string[] {
-  const removed: string[] = []
+/** Los agentes que generó sdd-ai y ya no corresponden a ningún rol; reconoce los suyos por la marca. */
+export function leftoverAgents(root: string): string[] {
+  const keep = READ_ONLY_ROLES.flatMap((role) => FAMILIES.map((family) => agentPath(root, family, role)))
+  const out: string[] = []
   for (const family of FAMILIES) {
     const dir = join(root, AGENT_DIRS[family])
     if (!existsSync(dir)) continue
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const file = join(dir, entry.name)
-      if (!entry.isFile() || keep.includes(file)) continue
-      if (readFileSync(file, 'utf8').includes(MARK_TAG)) {
-        rmSync(file)
-        removed.push(file)
-      }
+      if (entry.isFile() && !keep.includes(file) && readFileSync(file, 'utf8').includes(MARK_TAG)) out.push(file)
     }
   }
+  return out
+}
+
+/** Borra los agentes que sobran: los que `leftoverAgents` reconoce como generados y sin rol. */
+function removeLeftovers(root: string): string[] {
+  const removed = leftoverAgents(root)
+  for (const file of removed) rmSync(file)
   return removed
 }
 
@@ -125,7 +129,7 @@ export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles)
       written.push(file)
     }
   }
-  const removed = removeLeftovers(root, written)
+  const removed = removeLeftovers(root)
   for (const rel of SKILL_PATHS) {
     const dest = join(root, rel)
     mkdirSync(dirname(dest), { recursive: true })

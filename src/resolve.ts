@@ -1,7 +1,8 @@
+import type { RoleProfiles } from './agents.ts'
 import type { WorkersFile } from './profiles.ts'
 import {
   type Conductor, type Effort, type Family, type Origin, type Profile, type Resolution, type Role,
-  opposite, toNativeEffort,
+  READ_ONLY_ROLES, opposite, toNativeEffort,
 } from './types.ts'
 
 export interface ResolveInput {
@@ -60,4 +61,12 @@ export function nativeProfile(family: Family, role: Role, workers: WorkersFile |
   if (r.model !== undefined) p.model = r.model
   if (r.effort !== undefined) p.effort = r.effort
   return p
+}
+
+/** Perfiles nativos de los agentes de solo lectura. */
+export function roleProfiles(workers: WorkersFile | null, codexRoot: Profile): RoleProfiles {
+  return Object.fromEntries(READ_ONLY_ROLES.map((role) => [role, {
+    claude: nativeProfile('claude', role, workers, codexRoot),
+    codex: nativeProfile('codex', role, workers, codexRoot),
+  }])) as RoleProfiles
 }

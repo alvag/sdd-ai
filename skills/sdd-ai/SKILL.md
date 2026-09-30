@@ -702,3 +702,49 @@ falta; el paso siguiente lo sigue decidiendo `sdd status`, no el hijo.
     `implement`;
   - el registro de las fases vive en `.plans/<id>/sdd-ai-phases.json`, bajo el mismo lock que `sdd
     approve`: un writer que desobedece sus reglas podría alterarlo.
+
+## 10. Preparar el checkout: `init`
+
+`init` deja listo un checkout de sdd-ai:
+- escribe `.sdd-ai/config.yml` y `.sdd-ai/workers.yml`;
+- asegura `.sdd-ai/.gitignore`;
+- corre `agents sync`;
+- trae el reporte de `doctor`.
+
+Úsalo en un checkout nuevo, en un worktree nuevo o cuando los perfiles de los workers quedaron viejos.
+Funciona solo en un checkout de sdd-ai: en otro repositorio sale con `runtime_missing`, porque usar
+sdd-ai ahí es la instalación global.
+
+1. **Ensaya.** `./bin/sdd-ai init` no escribe nada. Devuelve:
+   - la config vigente (`current`) y las CLIs detectadas;
+   - las preguntas del asistente (`questions`);
+   - cada archivo con lo que le haría (`files`: `create`, `update` con sus `changes`, `unchanged` o
+     `invalid` con su error);
+   - lo que cambia en los perfiles (`workers`);
+   - las copias que sincronizaría (`agents`);
+   - los avisos (`notes`) y un `digest`.
+2. **Pregunta.** Cada pregunta de `questions` trae su opción vigente primero:
+   - En Claude Code, con `AskUserQuestion`, pasando `header`, `question` y las opciones con `label`
+     y `description`. `value` no se muestra.
+   - En Codex, con las opciones numeradas.
+
+   Si una respuesta no es la primera opción, vuelve a ensayar con el `flag` de esa pregunta y el
+   `value` elegido, por ejemplo `--families claude` o `--jira on`.
+3. **Muestra el ensayo.** Enséñale al usuario `files`, `workers` y `notes`. Los perfiles no se
+   preguntan:
+   - un `workers.yml` nuevo lleva los defaults de cada rol;
+   - uno existente conserva sus perfiles, suma los que faltan y pierde los inexistentes, que son los
+     roles retirados o desconocidos y los modelos de Codex que no están en su catálogo local;
+   - `differs` lista, como dato, los perfiles propios que difieren del default.
+4. **Aplica** solo si el usuario confirma, con el comando que trae `next`:
+   `init --apply --digest <digest>` con los mismos flags. Escribe exactamente lo que mostró el
+   ensayo. Si sale `digest_mismatch`, algo cambió desde entonces: vuelve a ensayar y muéstrale el
+   plan nuevo.
+5. **Cierra** con lo que diga `closing` y el reporte de `doctor`. Si se sincronizaron agentes, hay que
+   reabrir la sesión.
+
+En un worktree nuevo, `init` propone copiar la config y los perfiles del checkout principal (`seed`),
+y `--from <ruta>` elige otro checkout. Como el worktree no tiene `node_modules`, corre desde él
+`node <principal>/bin/sdd-ai init`, o `npm ci` y después `./bin/sdd-ai init`.
+
+`init` no escribe hooks ni archivos de ignore y no corre `npm ci`: lo que falte lo avisa en `notes`.
