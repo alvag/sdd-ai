@@ -55,6 +55,9 @@ function readOnlyLines(t: RouteThresholds): string[] {
       'a la corrida, y se conserva si `run` falla antes.',
     '- Si el encargo no se puede escribir, porque el usuario prohíbe toda escritura o porque el entorno no deja escribir fuera ' +
       'del repositorio, la exploración va inline, y es una excepción admitida.',
+    '- Antes de rediseñar algo o de repetir una investigación, al arrancar un flujo, ante un «¿por qué se decidió esto?» ' +
+      'o cuando el código cita un motivo que no está escrito, se buscan antecedentes con `./bin/sdd-ai recall "<tema>"`: ' +
+      'busca en Engram, en el vault, en `.plans/` y en el log de Git, y su `next` dice qué fuente manda.',
   ]
 }
 

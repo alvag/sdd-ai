@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { homedir } from 'node:os'
 import { parse } from 'yaml'
 import { type Family, SddError, isFamily } from './types.ts'
 
@@ -113,6 +114,29 @@ export function loadJiraMode(root: string): JiraMode {
     return { mode: 'invalid', detail: `${CONFIG_PATH}: YAML ilegible (${(e as Error).message.split('\n')[0]})` }
   }
   return parseJiraMode(doc)
+}
+
+export type VaultPath = { kind: 'none' } | { kind: 'path'; path: string } | { kind: 'invalid'; detail: string }
+
+/** Solo lee la ruta declarada: no descubre ni configura un vault. */
+export function loadVaultPath(root: string): VaultPath {
+  try {
+    const doc: unknown = parse(readFileSync(join(root, CONFIG_PATH), 'utf8'))
+    if (doc === null || doc === undefined) return { kind: 'none' }
+    if (!isRecord(doc)) return { kind: 'invalid', detail: `${CONFIG_PATH}: el archivo tiene que ser un mapa` }
+    const block = doc['knowledge-vault']
+    if (block === undefined || block === null) return { kind: 'none' }
+    if (!isRecord(block)) return { kind: 'invalid', detail: `${CONFIG_PATH}: knowledge-vault tiene que ser un mapa` }
+    const value = block.path_vault
+    if (value === undefined) return { kind: 'none' }
+    if (typeof value !== 'string' || !value.trim()) {
+      return { kind: 'invalid', detail: `${CONFIG_PATH}: knowledge-vault.path_vault tiene que ser una cadena no vacía` }
+    }
+    return { kind: 'path', path: resolve(root, value.startsWith('~/') ? join(homedir(), value.slice(2)) : value) }
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'none' }
+    return { kind: 'invalid', detail: `${CONFIG_PATH} no se puede leer: ${(e as Error).message.split('\n')[0]}` }
+  }
 }
 
 export function parseFamiliesFlag(v: string): Family[] {

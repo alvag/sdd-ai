@@ -20,6 +20,7 @@ import { withLock, withLockAsync } from './lock.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { DEFAULT_KEEP_DAYS, type EntryKind, applyPrune, planPrune, pruneContext } from './prune.ts'
+import { RECALL_NEXT, recall } from './recall.ts'
 import { roleProfiles, resolve } from './resolve.ts'
 import { renderArtifactMaterial, renderArtifactPrompt, renderArtifactRoundPrompt } from './review/artifact-prompt.ts'
 import {
@@ -2891,6 +2892,13 @@ function skillCheck(cwd: string): SkillCheck {
   return { copies: skillCopies(root, PKG_DIR) }
 }
 
+/** `recall` no tiene opciones: todo lo que sigue es el tema, también una palabra que empieza con `-`. */
+function recallCommand(rest: string[], env: Env, cwd: string): Result {
+  const topic = (rest[0] === '--' ? rest.slice(1) : rest).join(' ').trim()
+  if (!topic) throw new SddError('usage', 'recall necesita un tema', { next: './bin/sdd-ai recall "<tema>"' })
+  return { code: 0, out: { state: 'ok', ...recall(repoRoot(cwd), topic, { env }), next: RECALL_NEXT } }
+}
+
 /** Los comandos que solo consultan: con una verificación en curso, informan en vez de detenerse. */
 const READS = (cmd: string | undefined, rest: string[]) =>
   cmd === 'wait' || cmd === 'doctor' || (cmd === 'init' && !rest.includes('--apply')) || (cmd === 'prune' && !rest.includes('--apply')) || (cmd === 'review' && rest[0] === 'status') || (cmd === 'sdd' && rest[0] === 'status')
@@ -2922,6 +2930,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'agents': return agents(rest, env, cwd)
       case 'init': return init(rest, env, cwd)
       case 'prune': return prune(rest, cwd)
+      case 'recall': return recallCommand(rest, env, cwd)
       case 'sdd': return await sdd(rest, env, cwd)
       case 'doctor': {
         const report = doctor(undefined, skillCheck(cwd))
@@ -2929,7 +2938,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }
       default:
-        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | prune | run | review | wait | cancel | agents sync | sdd status | sdd approve | doctor' })
+        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | prune | recall | run | review | wait | cancel | agents sync | sdd status | sdd approve | doctor' })
     }
   } catch (e) {
     if (e instanceof SddError) {

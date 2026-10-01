@@ -151,6 +151,9 @@ test('con jira on el bootstrap exige SDD, nombra las dos partes y no ofrece ruta
       'se borra cuando `run` confirma que copió el encargo a la corrida, y se conserva si `run` falla antes.',
     '- Si el encargo no se puede escribir, porque el usuario prohíbe toda escritura o porque el entorno no deja escribir fuera del ' +
       'repositorio, la exploración va inline, y es una excepción admitida.',
+    '- Antes de rediseñar algo o de repetir una investigación, al arrancar un flujo, ante un «¿por qué se decidió esto?» ' +
+      'o cuando el código cita un motivo que no está escrito, se buscan antecedentes con `./bin/sdd-ai recall "<tema>"`: ' +
+      'busca en Engram, en el vault, en `.plans/` y en el log de Git, y su `next` dice qué fuente manda.',
     '- Primero se validan las premisas y se corren checks focalizados; después, los completos.',
     '- Una refutación de solo lectura se pide con `./bin/sdd-ai run --role refute --prompt-file <encargo>`.',
     '- Al cerrar, el conductor declara la ruta que siguió y los supuestos que tomó.',
@@ -164,6 +167,16 @@ test('con jira on el bootstrap exige SDD, nombra las dos partes y no ofrece ruta
     for (const line of texts.flatMap((t) => t.split('\n'))) {
       assert.ok(!line.includes('--role implement') && !line.includes('sin permiso previo'), line)
       assert.ok(!line.includes('inline') || line.includes('la exploración va inline'), line)
+    }
+  }
+})
+
+test('el bootstrap, con Jira y sin Jira, pide buscar antecedentes con recall y dice cuándo', () => {
+  for (const text of [renderBootstrap(), renderBootstrap(undefined, undefined, 'on')]) {
+    const line = text.split('\n').find((value) => value.includes('./bin/sdd-ai recall "<tema>"'))
+    assert.ok(line)
+    for (const word of ['Engram', 'vault', '`.plans/`', 'Git', 'por qué se decidió', 'rediseñar', 'repetir una investigación', 'arrancar un flujo', 'motivo que no está escrito']) {
+      assert.ok(line.includes(word), word)
     }
   }
 })

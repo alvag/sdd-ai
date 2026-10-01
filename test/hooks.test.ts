@@ -1140,6 +1140,17 @@ test('un hook crea .sdd-ai/.gitignore si falta y no toca uno existente; si no pu
   }
 })
 
+test('dentro de un subagente, la guarda niega sdd-ai recall', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    const command = './bin/sdd-ai recall "tema"'
+    const out = shell(cli, repo, command, CHILD)
+    assert.match(denial(out), /un worker no delega ni toca las corridas del conductor/)
+    assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [])
+    assert.equal(shell(cli, repo, command), '')
+  }
+})
+
 test('dentro de un subagente, la guarda niega sdd-ai prune con o sin --apply', () => {
   for (const cli of CLIS) {
     const repo = flowRepo()
