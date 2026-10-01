@@ -12,9 +12,17 @@ export function runsRoot(root: string): string {
   const home = join(root, '.sdd-ai')
   const runs = join(home, 'runs')
   mkdirSync(runs, { recursive: true })
-  const ignore = join(home, '.gitignore')
-  if (!existsSync(ignore)) writeFileSync(ignore, '*\n')
+  ensureIgnore(home)
   return runs
+}
+
+/** No pisa un archivo existente, tampoco si otro proceso acaba de crearlo. */
+export function ensureIgnore(home: string): void {
+  try {
+    writeFileSync(join(home, '.gitignore'), '*\n', { flag: 'wx' })
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+  }
 }
 
 const pad = (n: number) => String(n).padStart(2, '0')

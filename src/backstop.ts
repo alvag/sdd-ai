@@ -2,7 +2,7 @@ import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync
 import { join } from 'node:path'
 import type { JiraMode } from './config.ts'
 import { type Crossed, type JiraBootstrap, ROUTE, type RouteThresholds, renderReminder } from './route.ts'
-import { readJson, writeJsonAtomic } from './runs.ts'
+import { ensureIgnore, readJson, writeJsonAtomic } from './runs.ts'
 import { shellPipelines } from './shell.ts'
 
 /**
@@ -57,6 +57,17 @@ function filesFor(root: string, session: string): Files | undefined {
   if (!SESSION_ID.test(session) || !existsSync(join(root, '.sdd-ai'))) return undefined
   const dir = join(root, '.sdd-ai', 'hooks', 'route')
   return { dir, state: join(dir, `${session}.json`), trail: join(dir, `${session}.jsonl`), lock: join(dir, `${session}.lock`) }
+}
+
+function writableFiles(root: string, session: string): Files | undefined {
+  const files = filesFor(root, session)
+  if (!files) return undefined
+  try {
+    ensureIgnore(join(root, '.sdd-ai'))
+    return files
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -169,7 +180,7 @@ function ensureState(root: string, session: string, files: Files, via: string, i
 /** Empieza el rastro de la sesión si todavía no existe. `via` dice qué evento lo empezó. */
 export function startTrail(root: string, session: string, via: string): void {
   try {
-    const files = filesFor(root, session)
+    const files = writableFiles(root, session)
     if (!files) return
     mkdirSync(files.dir, { recursive: true })
     withLock(files.lock, () => ensureState(root, session, files, via, { writeState: writeJsonAtomic }))
@@ -181,7 +192,7 @@ export function startTrail(root: string, session: string, via: string): void {
 /** Marca que la sesión recibió el bootstrap y dice si ya lo tenía marcado. Ante un error, `false`. */
 export function markBootstrap(root: string, session: string): boolean {
   try {
-    const files = filesFor(root, session)
+    const files = writableFiles(root, session)
     if (!files) return false
     mkdirSync(files.dir, { recursive: true })
     return withLock(files.lock, () => {
@@ -230,7 +241,7 @@ export function readBinding(root: string, session: string): FlowBinding | null |
 /** Guarda la liga de la sesión, o la borra con `null`, sin tocar los contadores. Devuelve si la guardó. */
 export function setBinding(root: string, session: string, b: FlowBinding | null): boolean {
   try {
-    const files = filesFor(root, session)
+    const files = writableFiles(root, session)
     if (!files) return false
     mkdirSync(files.dir, { recursive: true })
     return withLock(files.lock, () => {
@@ -280,7 +291,7 @@ export function countTool(
   io: StateIo = { writeState: writeJsonAtomic }, jira?: () => JiraMode,
 ): string {
   try {
-    const files = filesFor(root, session)
+    const files = writableFiles(root, session)
     if (!files) return ''
     if (typeof p.agent_id === 'string' && p.agent_id !== '') return ''
     mkdirSync(files.dir, { recursive: true })

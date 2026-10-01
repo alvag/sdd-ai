@@ -7,7 +7,7 @@ import { repoRoot } from './git.ts'
 import { confirm, release, reserve } from './native-launch.ts'
 import { type OpenRun, type OpenState, describe, openRuns, runKey } from './open-runs.ts'
 import { renderBootstrap } from './route.ts'
-import { readJson, readStatus, writeJsonAtomic } from './runs.ts'
+import { ensureIgnore, readJson, readStatus, writeJsonAtomic } from './runs.ts'
 import { withPhaseNext } from './sdd/phase-state.ts'
 import { type ListEntry, listFlows, lstatOrNull, readFlow } from './sdd/read.ts'
 import { restoreIntentOpen } from './sdd/restore.ts'
@@ -46,6 +46,19 @@ export function runHook(stdin: string, cli: HookCli): string {
     // `existsSync` y no `runsRoot`, que lo crearía: un repo sin sdd-ai no se toca.
     if (!existsSync(join(root, '.sdd-ai'))) return ''
     if (typeof p.session_id !== 'string' || !validSession) return guardCommit(p, root, null)
+    try {
+      ensureIgnore(join(root, '.sdd-ai'))
+    } catch {
+      if (p.hook_event_name === 'PreToolUse') return preToolUse(p, root, p.session_id, cli)
+      if (p.hook_event_name === 'PostToolUse' || p.hook_event_name === 'PostToolUseFailure') {
+        try {
+          postDispatch(p, root, p.hook_event_name === 'PostToolUse' ? 'confirm' : 'release')
+        } catch {
+          // Confirmar o liberar el despacho no depende del estado del hook.
+        }
+      }
+      return ''
+    }
     // El rastro empieza con el primer evento que ve de la sesión, también si abrió antes de los hooks.
     const via = p.hook_event_name === 'SessionStart' ? `SessionStart:${String(p.source)}` : String(p.hook_event_name)
     startTrail(root, p.session_id, via)
@@ -180,6 +193,7 @@ function runsReminder(root: string, session: string): string {
   const keys = own.map(runKey)
   if (keys.every((k) => seen.has(k))) return ''
   try {
+    ensureIgnore(join(root, '.sdd-ai'))
     mkdirSync(join(root, '.sdd-ai', 'hooks'), { recursive: true })
     writeJsonAtomic(file, { reminded: [...new Set([...seen, ...keys])] })
   } catch {
@@ -456,22 +470,22 @@ function postDispatch(p: Payload, root: string, action: 'confirm' | 'release'): 
 }
 
 /**
- * Los comandos de corridas; `sdd approve`, `sdd phase` y `sdd verify` se suman aparte, porque `sdd status`
- * sí lo puede correr un worker.
+ * Los comandos del conductor que un subagente no corre: los de corridas y `prune`. `sdd approve`, `sdd phase`
+ * y `sdd verify` se suman aparte, porque `sdd status` sí lo puede correr un worker.
  */
-const RUN_COMMANDS = new Set(['run', 'review', 'wait', 'cancel'])
+const CONDUCTOR_COMMANDS = new Set(['run', 'review', 'wait', 'cancel', 'prune'])
 const CONDUCTOR_SDD = new Set(['approve', 'phase', 'verify'])
 
 /**
  * Si el tramo invoca `sdd-ai`, una ruta que termina en `bin/sdd-ai` o `node <ruta>/bin/sdd-ai`, con uno
- * de los comandos de corridas, con `sdd approve`, con `sdd phase` o con `sdd verify`.
+ * de los comandos de corridas, con `prune`, con `sdd approve`, con `sdd phase` o con `sdd verify`.
  */
 function invokesConductorCommand(segment: string): boolean {
   const tokens = segment.trim().split(/\s+/)
   if (tokens[0] === 'node') tokens.shift()
   const [bin, command, sub] = tokens
   if (bin !== 'sdd-ai' && !(bin ?? '').endsWith('bin/sdd-ai')) return false
-  return RUN_COMMANDS.has(command ?? '') || (command === 'sdd' && CONDUCTOR_SDD.has(sub ?? ''))
+  return CONDUCTOR_COMMANDS.has(command ?? '') || (command === 'sdd' && CONDUCTOR_SDD.has(sub ?? ''))
 }
 
 /**

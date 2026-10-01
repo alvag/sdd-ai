@@ -65,7 +65,8 @@ function holderAlive(h: Holder, since: number): boolean {
   return isAlive(h.pid) && Date.now() - since < DEGRADED_WAIT_MS
 }
 
-function acquire(file: string, busy: () => SddError): void {
+/** Con `busy` en `null` no espera: si el lock está tomado, devuelve `false`. */
+function acquire(file: string, busy: (() => SddError) | null): boolean {
   const seen = readProcess(process.pid)
   const mine: Holder = { pid: process.pid, lstart: seen && seen !== 'gone' ? seen.lstart : null }
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
@@ -75,17 +76,28 @@ function acquire(file: string, busy: () => SddError): void {
     for (;;) {
       try {
         linkSync(tmp, file)
-        return
+        return true
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
       }
       const holder = holderOf(file)
       if (holder === 'released') continue
+      if (busy === null) return false
       if (holder === 'orphan' || !holderAlive(holder, since)) throw busy()
       sleep(POLL_MS)
     }
   } finally {
     rmSync(tmp, { force: true })
+  }
+}
+
+/** Intenta tomar el lock una vez: si ya lo tiene otro, vivo, muerto o huérfano, devuelve `ok: false` sin esperar. */
+export function tryWithLock<T>(file: string, fn: () => T): { ok: true; value: T } | { ok: false } {
+  if (!acquire(file, null)) return { ok: false }
+  try {
+    return { ok: true, value: fn() }
+  } finally {
+    rmSync(file, { force: true })
   }
 }
 

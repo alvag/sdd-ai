@@ -1093,6 +1093,65 @@ function boundRepo(cli: Cli, shape: FlowShape = { plan: { status: 'implementing'
 
 const USER_COMMITS = /el commit lo hace el usuario/
 
+test('un hook crea .sdd-ai/.gitignore si falta y no toca uno existente; si no puede crearlo, SessionStart, Stop y PostToolUse no escriben ni dicen nada, y las guardas siguen negando', () => {
+  for (const cli of CLIS) {
+    const fresh = flowRepo()
+    fire(cli, 'session-start', fresh, { session_id: 's1', source: 'startup' })
+    assert.equal(readFileSync(join(fresh, '.sdd-ai', '.gitignore'), 'utf8'), '*\n', cli)
+
+    const existing = flowRepo()
+    const ignore = join(existing, '.sdd-ai', '.gitignore')
+    writeFileSync(ignore, 'x\n')
+    fire(cli, 'session-start', existing, { session_id: 's1', source: 'startup' })
+    post(cli, existing, 'echo ok')
+    assert.equal(readFileSync(ignore, 'utf8'), 'x\n', cli)
+
+    const blocked = flowRepo()
+    makeRun(blocked, '20260101-0001-aaaa', { state: 'running' })
+    unlinkSync(join(blocked, '.sdd-ai', '.gitignore'))
+    const home = join(blocked, '.sdd-ai')
+    chmodSync(home, 0o555)
+    try {
+      assert.equal(fire(cli, 'session-start', blocked, { session_id: 's1', source: 'startup' }), '', cli)
+      assert.equal(fire(cli, 'stop', blocked, { session_id: 's1' }), '', cli)
+      assert.equal(post(cli, blocked, './bin/sdd-ai sdd status f'), '', cli)
+      assert.match(denial(shell(cli, blocked, './bin/sdd-ai run --role explore --prompt-file x', CHILD)), /un worker no delega ni toca las corridas del conductor/, cli)
+      assert.equal(existsSync(join(home, '.gitignore')), false, cli)
+      assert.equal(existsSync(join(home, 'hooks')), false, cli)
+    } finally {
+      chmodSync(home, 0o755)
+    }
+
+    const linked = boundRepo(cli)
+    const linkedHome = join(linked, '.sdd-ai')
+    const state = join(routeDir(linked), 's1.json')
+    const trail = join(routeDir(linked), 's1.jsonl')
+    const before = [readFileSync(state), readFileSync(trail)]
+    unlinkSync(join(linkedHome, '.gitignore'))
+    chmodSync(linkedHome, 0o555)
+    try {
+      assert.match(denial(shell(cli, linked, 'git commit -m x')), /flujo f1.*implement/, cli)
+      assert.deepEqual(readFileSync(state), before[0], cli)
+      assert.deepEqual(readFileSync(trail), before[1], cli)
+      assert.equal(existsSync(join(linkedHome, '.gitignore')), false, cli)
+    } finally {
+      chmodSync(linkedHome, 0o755)
+    }
+  }
+})
+
+test('dentro de un subagente, la guarda niega sdd-ai prune con o sin --apply', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    for (const command of ['./bin/sdd-ai prune', './bin/sdd-ai prune --apply --digest abc']) {
+      const out = shell(cli, repo, command, CHILD)
+      assert.match(denial(out), /un worker no delega ni toca las corridas del conductor/, command)
+      assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [], command)
+      assert.equal(shell(cli, repo, command), '', command)
+    }
+  }
+})
+
 test('con liga niega el commit antes de review_and_commit y lo deja pasar desde ahí', () => {
   for (const cli of CLIS) {
     for (const [step, shape, passes] of GUARD_STEPS) {

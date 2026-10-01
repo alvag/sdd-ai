@@ -4,7 +4,7 @@ import {
   accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, delimiter, isAbsolute, join, resolve as resolvePath } from 'node:path'
+import { basename, delimiter, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
 import { type RoleProfiles, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
@@ -19,6 +19,7 @@ import { type InitAnswers, applyInit, planInit } from './init.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
+import { DEFAULT_KEEP_DAYS, type EntryKind, applyPrune, planPrune, pruneContext } from './prune.ts'
 import { roleProfiles, resolve } from './resolve.ts'
 import { renderArtifactMaterial, renderArtifactPrompt, renderArtifactRoundPrompt } from './review/artifact-prompt.ts'
 import {
@@ -2134,6 +2135,43 @@ function init(args: string[], env: Env, cwd: string): Result {
   return { code: 0, out: applyInit(root, answers, values.digest, env, { command }) }
 }
 
+function prune(rest: string[], cwd: string): Result {
+  const { values } = parseArgs({
+    args: rest, strict: true, allowPositionals: false,
+    options: { 'keep-days': { type: 'string' }, apply: { type: 'boolean' }, digest: { type: 'string' } },
+  })
+  const days = values['keep-days'] ?? String(DEFAULT_KEEP_DAYS)
+  if (!/^[1-9]\d*$/.test(days) || !Number.isSafeInteger(Number(days))) throw new SddError('usage', '--keep-days necesita un entero desde 1')
+  const keepDays = Number(days)
+  const base = `./bin/sdd-ai prune${keepDays === DEFAULT_KEEP_DAYS ? '' : ` --keep-days ${keepDays}`}`
+  if (values.apply && !values.digest) throw new SddError('usage', 'prune --apply necesita --digest con el digest del ensayo', { next: base })
+  if (!values.apply && values.digest !== undefined) throw new SddError('usage', '--digest requiere --apply', { next: base })
+  const ctx = pruneContext(repoRoot(cwd), keepDays)
+  const display = (path: string): string => {
+    const rel = relative(ctx.root, path)
+    return rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel) ? path : rel
+  }
+  if (!values.apply) {
+    const plan = planPrune(ctx)
+    const candidates: Partial<Record<EntryKind, Array<{ id: string; path: string; bytes: number }>>> = {}
+    for (const c of plan.candidates) for (const e of c.entries) {
+      (candidates[e.kind] ??= []).push({ id: c.id, path: display(e.path), bytes: e.bytes })
+    }
+    return { code: 0, out: {
+      state: 'dry_run', keep_days: keepDays, candidates, kept: plan.kept, bytes: plan.bytes, digest: plan.digest,
+      next: plan.candidates.length === 0 ? 'no hay nada que borrar' : `muéstrale este ensayo al usuario y pregúntale si lo aplica; con su sí: ${base} --apply --digest ${plan.digest}`,
+    } }
+  }
+  const applied = applyPrune(ctx, values.digest!)
+  if (applied.kind === 'mismatch') throw new SddError('digest_mismatch', 'el plan cambió desde el ensayo', { next: base })
+  if (applied.kind === 'failed') throw new SddError('prune_failed', 'el borrado falló; la aplicación se detuvo', {
+    detail: JSON.stringify({ deleted: applied.deleted, freed_bytes: applied.bytes, failed: {
+      ...applied.failed, path: display(applied.failed.path), removed: applied.failed.removed.map(display),
+    } }), next: base,
+  })
+  return { code: 0, out: { state: 'applied', deleted: applied.deleted, kept_on_recheck: applied.kept, freed_bytes: applied.bytes, next: base } }
+}
+
 const PHASE_STEPS: readonly string[] = ['specify', 'plan', 'tasks', 'implement']
 
 /**
@@ -2855,14 +2893,14 @@ function skillCheck(cwd: string): SkillCheck {
 
 /** Los comandos que solo consultan: con una verificación en curso, informan en vez de detenerse. */
 const READS = (cmd: string | undefined, rest: string[]) =>
-  cmd === 'wait' || cmd === 'doctor' || (cmd === 'init' && !rest.includes('--apply')) || (cmd === 'review' && rest[0] === 'status') || (cmd === 'sdd' && rest[0] === 'status')
+  cmd === 'wait' || cmd === 'doctor' || (cmd === 'init' && !rest.includes('--apply')) || (cmd === 'prune' && !rest.includes('--apply')) || (cmd === 'review' && rest[0] === 'status') || (cmd === 'sdd' && rest[0] === 'status')
 
 /**
  * Antes de cualquier verbo, resuelve una restauración de `sdd verify` que quedó interrumpida en este
  * checkout. El supervisor interno no la corre: es parte de una corrida en curso, no un verbo.
  */
 function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string): void {
-  if (!['run', 'review', 'wait', 'cancel', 'agents', 'sdd', 'doctor', 'init'].includes(cmd ?? '')) return
+  if (!['run', 'review', 'wait', 'cancel', 'agents', 'sdd', 'doctor', 'init', 'prune'].includes(cmd ?? '')) return
   let root: string
   try {
     root = repoRoot(cwd)
@@ -2883,6 +2921,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'cancel': return await cancel(rest, cwd)
       case 'agents': return agents(rest, env, cwd)
       case 'init': return init(rest, env, cwd)
+      case 'prune': return prune(rest, cwd)
       case 'sdd': return await sdd(rest, env, cwd)
       case 'doctor': {
         const report = doctor(undefined, skillCheck(cwd))
@@ -2890,7 +2929,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }
       default:
-        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | run | review | wait | cancel | agents sync | sdd status | sdd approve | doctor' })
+        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | prune | run | review | wait | cancel | agents sync | sdd status | sdd approve | doctor' })
     }
   } catch (e) {
     if (e instanceof SddError) {

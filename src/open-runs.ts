@@ -19,6 +19,11 @@ export interface OpenRun {
   next: string
 }
 
+export interface Openness {
+  kind: 'worker' | 'native' | 'review'; open: OpenState; session: string | null; next: string
+  round?: number; launch?: number; attempt?: number; undecided?: number; disputed?: number
+}
+
 interface RunRequest { session?: unknown; kind?: string }
 
 /**
@@ -49,9 +54,8 @@ export function openRuns(root: string): OpenRun[] {
   const open: OpenRun[] = []
   for (const id of [...ids].sort()) {
     try {
-      const store = writers ? join(writers, id) : undefined
-      const run = store && existsSync(join(store, 'control.json')) ? classifyWriter(store, join(runs, id), id) : classify(join(runs, id), id)
-      if (run) open.push(run)
+      const run = runOpenness(root, id, writers)
+      if (run && run.session !== null) open.push({ ...run, id, session: run.session })
     } catch {
       // Una corrida a medio escribir o corrupta no es asunto del hook.
     }
@@ -60,28 +64,39 @@ export function openRuns(root: string): OpenRun[] {
 }
 
 /**
+ * Lanza si la corrida no se puede leer: quien llama decide qué hacer con una ilegible. `writers` se pasa
+ * resuelto cuando se recorren muchas corridas: en un worktree, resolverlo lanza Git.
+ */
+export function runOpenness(root: string, id: string, writers: string | undefined = writersDir(root)): Openness | null {
+  const store = writers ? join(writers, id) : undefined
+  const dir = join(root, '.sdd-ai', 'runs', id)
+  return store && existsSync(join(store, 'control.json')) ? classifyWriter(store, dir, id) : classify(dir, id)
+}
+
+/**
  * Un writer sigue abierto mientras no haya cosecha congelada, y después hasta que `wait` la entregue.
  * La entrega se lee del almacén, o de la corrida visible cuando `wait` no pudo escribir el almacén. La
  * visible no vale si ya estaba al congelar la cosecha: la dejó el writer, y la cosecha la anotó como
  * corrida alterada.
  */
-function classifyWriter(store: string, run: string, id: string): OpenRun | undefined {
-  const session = readJson<{ session?: unknown }>(join(store, 'control.json')).session
-  if (typeof session !== 'string' || session === '') return undefined
-  const worker: OpenRun = { id, session, kind: 'worker', open: 'running', next: `./bin/sdd-ai wait ${id}` }
+function classifyWriter(store: string, run: string, id: string): Openness | null {
+  const owner = readJson<{ session?: unknown }>(join(store, 'control.json')).session
+  const session = typeof owner === 'string' && owner !== '' ? owner : null
+  const worker: Openness = { session, kind: 'worker', open: 'running', next: `./bin/sdd-ai wait ${id}` }
   const harvestFile = join(store, 'harvest.json')
   if (!existsSync(harvestFile)) return worker
   const harvest = readJson<{ state: RunState; runAltered?: Array<{ path: string }> }>(harvestFile)
   const status = { state: harvest.state } as Status
+  // Sin dueña no hay entrega que esperar: solo cuenta si la cosecha dice que el writer pudo seguir.
+  if (session === null) return TERMINAL.has(status.state) ? null : worker
   const planted = (harvest.runAltered ?? []).some((f) => f.path === './delivered.json' || f.path === '.')
   if (!isDelivered(store, status) && (planted || !isDelivered(run, status))) return { ...worker, open: 'undelivered' }
-  return undefined
+  return null
 }
 
-function classify(dir: string, id: string): OpenRun | undefined {
+function classify(dir: string, id: string): Openness | null {
   const request = readJson<RunRequest>(join(dir, 'request.json'))
-  if (typeof request.session !== 'string' || request.session === '') return undefined
-  const session = request.session
+  const session = typeof request.session === 'string' && request.session !== '' ? request.session : null
   const s = readStatus(dir)
 
   // Una nativa queda `delegated`, que es terminal: su apertura la dice el lanzamiento, no el estado.
@@ -90,34 +105,34 @@ function classify(dir: string, id: string): OpenRun | undefined {
     const launch = launchState(dir, s)
     if (launch.kind === 'pending') {
       const next = `despachar ${native.agent} citando ${join(dir, 'prompt.md')}, o ./bin/sdd-ai cancel ${id}`
-      return { id, session, kind: 'native', open: 'native_pending', attempt: launch.attempt, next }
+      return { session, kind: 'native', open: 'native_pending', attempt: launch.attempt, next }
     }
     if (launch.kind === 'reserved') {
       const next = `preguntarle al usuario si reintenta (./bin/sdd-ai cancel ${id} y después ./bin/sdd-ai run --retry ${id}) o la descarta (./bin/sdd-ai cancel ${id})`
-      return { id, session, kind: 'native', open: 'native_unconfirmed', attempt: launch.attempt, next }
+      return { session, kind: 'native', open: 'native_unconfirmed', attempt: launch.attempt, next }
     }
-    return undefined
+    return null
   }
 
   if (request.kind === 'review') {
-    const review: OpenRun = { id, session, kind: 'review', open: 'running', next: `./bin/sdd-ai review status ${id}` }
+    const review: Openness = { session, kind: 'review', open: 'running', next: `./bin/sdd-ai review status ${id}` }
     if (s.round !== undefined) review.round = s.round
     if (s.launch !== undefined) review.launch = s.launch
     if (!TERMINAL.has(s.state)) return review
-    if (!isDelivered(dir, s)) return { ...review, open: 'undelivered' }
+    if (session !== null && !isDelivered(dir, s)) return { ...review, open: 'undelivered' }
     const ledgerFile = join(dir, 'ledger.json')
-    if (!existsSync(ledgerFile)) return undefined
+    if (!existsSync(ledgerFile)) return null
     const ledger = readJson<Ledger>(ledgerFile)
     const pending = undecided(ledger)
-    if (pending.length === 0) return undefined
+    if (pending.length === 0) return null
     const disputed = ledger.entries.filter((e) => e.state === 'en-disputa').length
     return { ...review, open: 'review_pending', undecided: pending.length, disputed }
   }
 
-  const worker: OpenRun = { id, session, kind: 'worker', open: 'running', next: `./bin/sdd-ai wait ${id}` }
+  const worker: Openness = { session, kind: 'worker', open: 'running', next: `./bin/sdd-ai wait ${id}` }
   if (!TERMINAL.has(s.state)) return worker
-  if (!isDelivered(dir, s)) return { ...worker, open: 'undelivered' }
-  return undefined
+  if (session !== null && !isDelivered(dir, s)) return { ...worker, open: 'undelivered' }
+  return null
 }
 
 /** Qué recordó ya `Stop`: cambia si cambia el estado abierto, la ronda, el lanzamiento o el intento. */
