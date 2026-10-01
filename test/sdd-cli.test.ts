@@ -169,11 +169,10 @@ test('sin id lista los directorios de .plans con el mismo next, y aísla los rot
   const r = sdd(repo, 'status')
   assert.equal(r.code, 0)
   const flows = Object.fromEntries(r.out.flows.map((f: { id: string }) => [f.id, f]))
-  assert.deepEqual(Object.keys(flows), ['estudios', 'fifo', 'link', 'ok', 'x'.repeat(129)])
+  assert.deepEqual(Object.keys(flows), ['fifo', 'link', 'ok', 'x'.repeat(129)])
   for (const f of r.out.flows) assert.deepEqual(Object.keys(f), ['id', 'depth', 'next', 'blocked', 'blocked_reasons'])
 
-  assert.deepEqual(flows.estudios.next, { step: 'no_artifacts' })
-  assert.equal(flows.estudios.blocked, false)
+  assert.deepEqual(sdd(repo, 'status', 'estudios').out.next, { step: 'no_artifacts' })
   assert.deepEqual(codes(flows.fifo.blocked_reasons), ['artifact_unreadable'])
   assert.deepEqual(codes(flows.link.blocked_reasons), ['path_invalid'])
   assert.deepEqual(codes(flows['x'.repeat(129)].blocked_reasons), ['id_invalid'])
@@ -182,7 +181,7 @@ test('sin id lista los directorios de .plans con el mismo next, y aísla los rot
     assert.deepEqual(flows[id].next, { step: 'resolve_blockers' }, id)
   }
   assert.equal(flows.ok.depth, 'completa')
-  for (const id of ['estudios', 'fifo', 'ok']) assert.deepEqual(flows[id].next, sdd(repo, 'status', id).out.next, id)
+  for (const id of ['fifo', 'ok']) assert.deepEqual(flows[id].next, sdd(repo, 'status', id).out.next, id)
 
   const empty = sdd(makeRepo(), 'status')
   assert.equal(empty.code, 0)

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { type Candidate, changedRanges, freeze, freezeStable, readContext, readContextBlobs, snapshot } from '../src/review/candidate.ts'
+import { type Candidate, changedRanges, freeze, freezeStable, readContext, readContextBlobs, snapshot, stillChanged } from '../src/review/candidate.ts'
 import { renderMaterial } from '../src/review/prompt.ts'
 import { SddError } from '../src/types.ts'
 import { makeRepo } from './helpers.ts'
@@ -199,6 +199,21 @@ test('changedRanges: solo las líneas añadidas o sustituidas entre candidatos, 
   writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 3\n', 'línea tres\n').replace('línea 12\n', 'línea doce\nextra\n'))
   const next = round(repo, base, dir)
   assert.deepEqual(changedRanges(prev, next, dir), { 'a.txt': [[12, 13]] })
+})
+
+test('stillChanged: conserva solo líneas distintas de la base y las rutas binarias', () => {
+  const { repo, base } = repoWithBase()
+  const dir = runDir()
+  writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 3\n', 'tres\n').replace('línea 12\n', 'doce\n'))
+  writeFileSync(join(repo, 'b.txt'), 'otra versión\n')
+  writeFileSync(join(repo, 'bin.dat'), Buffer.from([0, 7, 0]))
+  const prev = round(repo, base, dir)
+  writeFileSync(join(repo, 'a.txt'), lines(20).replace('línea 12\n', 'doce corregida\nextra\n'))
+  writeFileSync(join(repo, 'b.txt'), lines(5, 'b'))
+  writeFileSync(join(repo, 'bin.dat'), Buffer.from([0, 8, 0]))
+  const next = round(repo, base, dir)
+  const changed = changedRanges(prev, next, dir)
+  assert.deepEqual(stillChanged({ ...changed, 'b.txt': [[1, 5]] }, next), { 'a.txt': [[12, 13]], 'bin.dat': 'binary' })
 })
 
 test('changedRanges: un archivo nuevo o que antes estaba borrado cambia entero', () => {

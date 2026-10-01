@@ -125,10 +125,13 @@ test('Claude: el result trae el uso de tokens', () => {
   })
 })
 
-test('Codex: el uso de tokens es la suma de los turnos', () => {
-  const turn = fixture('codex-stream.jsonl').split('\n').find((l) => l.includes('"turn.completed"')) ?? ''
-  assert.deepEqual(scan('codex', `${turn}\n${turn}`).usage, {
-    input_tokens: 82242, output_tokens: 218, cache_read_input_tokens: 63232, cache_creation_input_tokens: 0, reasoning_output_tokens: 0,
+test('Codex: el uso de tokens es el del último turno, que trae el acumulado del hilo', () => {
+  const turns = [
+    { input_tokens: 10, cached_input_tokens: 4, output_tokens: 5 },
+    { input_tokens: 25, cached_input_tokens: 10, output_tokens: 8, cache_write_input_tokens: 2, reasoning_output_tokens: 1 },
+  ].map((usage) => JSON.stringify({ type: 'turn.completed', usage })).join('\n')
+  assert.deepEqual(scan('codex', turns).usage, {
+    input_tokens: 25, output_tokens: 8, cache_read_input_tokens: 10, cache_creation_input_tokens: 2, reasoning_output_tokens: 1,
   })
 })
 

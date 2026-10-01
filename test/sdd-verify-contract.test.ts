@@ -15,7 +15,7 @@ const TEST_ROW = {
   implementation_paths: ['src/export.ts'], test_paths: ['test/export.test.ts'], test_name: 'exporta a CSV', report_format: 'tap',
 }
 const BUILD_ROW = { id: 'V2', acs: ['AC-2'], kind: 'build', obligation: 'none', obligation_reason: 'no hay seam', argv: ['npm', 'run', 'typecheck'], timeout_ms: 300000, expect: { exit_code: 0 } }
-const INSPECTION_ROW = { id: 'V3', acs: ['AC-3'], kind: 'inspección', obligation: 'none', obligation_reason: 'lectura', argv: ['grep', '-c', 'x', 'README.md'], timeout_ms: 1000, expect: { exit_code: 0 } }
+const INSPECTION_ROW = { id: 'V3', acs: ['AC-3'], kind: 'inspection', obligation: 'none', obligation_reason: 'lectura', argv: ['grep', '-c', 'x', 'README.md'], timeout_ms: 1000, expect: { exit_code: 0 } }
 const MANUAL_ROW = { id: 'V4', acs: ['AC-4'], kind: 'manual', obligation: 'none', obligation_reason: 'es visual', observation: 'el CSV abre en una planilla' }
 const RAW = { schema_version: 1, rows: [TEST_ROW, BUILD_ROW, INSPECTION_ROW, MANUAL_ROW] }
 
@@ -32,6 +32,13 @@ const rejection = (fn: () => unknown): string => {
 test('la admisión conserva los cuatro tipos de fila con sus campos', () => {
   const c = admitVerification(RAW, ACS)
   assert.deepEqual(c, RAW)
+})
+
+test('el contrato admite inspection y rechaza inspección con un mensaje que nombra el valor nuevo', () => {
+  const raw = { schema_version: 1, rows: [INSPECTION_ROW] }
+  assert.deepEqual(admitVerification(raw, ['AC-3']), raw)
+  assert.match(rejection(() => admitVerification({ ...raw, rows: [{ ...INSPECTION_ROW, kind: 'inspección' }] }, ['AC-3'])),
+    /verification\.rows\[0\]\.kind: «inspección» se llama ahora «inspection»/)
 })
 
 test('la admisión rechaza cada fila incompleta o incompatible con su tipo', () => {

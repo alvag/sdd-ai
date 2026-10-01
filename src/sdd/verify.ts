@@ -9,6 +9,7 @@ import { type CandidateFingerprint, candidateFingerprint, dirtyPaths, harvestTre
 import { Rejection } from '../review/admit.ts'
 import { killGroup } from '../supervisor.ts'
 import { type Family, SddError } from '../types.ts'
+import { isTestPath } from '../test-paths.ts'
 import { canWriteStore, controlUnavailable, flowWriterOpen, latestFlowHarvest, recordVerifyGroup, releaseWriter, reserveWriter } from '../writer-store.ts'
 import { isFlowId } from './id.ts'
 import { criteriaIds, replaceSection, setHeaderStatus } from './markdown.ts'
@@ -500,8 +501,7 @@ function contractIncoherence(start: VerifyStart, row: TestRow, candidate: RowExe
   const green = read(candidate)
   if (!reverted || !green) return null
   const inImpl = (p: string) => row.implementation_paths.includes(p)
-  const inTest = (p: string) => row.test_paths.includes(p)
-    || /(?:^|\/)(?:tests?|__tests__)\//.test(p) || /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(p)
+  const inTest = (p: string) => row.test_paths.includes(p) || isTestPath(p)
   const seen = new Set([green.stdout, green.stderr].flatMap((text) => loadFailures(start.root, text)).map(failureKey))
   const entries = parseTap(reverted.stdout)
   const fileFailed = entries.some((e) => !e.ok && !e.suite && row.test_paths.some((p) => e.name === p || e.name.endsWith(`/${p}`)))

@@ -25,7 +25,7 @@ import {
   type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, readMaterial, validateArtifactArgs,
 } from './review/artifact.ts'
 import {
-  type Candidate, type Selection, baseOf, candidateHash, changedRanges, freeze, freezeStable, freezeStableWith, readContext, readContextFile, sha256 as candidateSha256, snapshot,
+  type Candidate, type Selection, baseOf, candidateHash, changedRanges, freeze, freezeStable, freezeStableWith, readContext, readContextFile, sha256 as candidateSha256, snapshot, stillChanged,
 } from './review/candidate.ts'
 import { type PlannedJob, planJobs, planRoundJobs, sliceCandidate } from './review/batch.ts'
 import {
@@ -1502,7 +1502,7 @@ async function reviewRoundDiff(o: {
     const contextTexts = readContext(root, candidate)
     material = renderMaterial(candidate, contextTexts)
     if (ledger) {
-      plan = { n, prev_hash: prev.hash, identical, targets: goals, changed }
+      plan = { n, prev_hash: prev.hash, identical, targets: goals, changed: candidate.subject ? changed : stillChanged(changed, candidate) }
       if (values.head) plan.head = values.head
       planned = planRoundJobs(candidate, contextTexts, plan, ledger.entries, ROUND_CAP, delta?.level === 'high' ? REVIEWERS : ['base'])
     } else {

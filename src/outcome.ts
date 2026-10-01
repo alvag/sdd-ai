@@ -11,7 +11,7 @@ export interface StreamFacts {
   model?: string
   /** El proveedor rechazó el modelo o el esfuerzo pedido; `diagnostic` es su mensaje textual. */
   rejected?: { field: RejectedField; diagnostic: string }
-  /** Tokens que informa el CLI: el `result` de Claude, o la suma de los turnos de Codex. */
+  /** Tokens que informa el CLI: el `result` de Claude, o el último acumulado del hilo de Codex. */
   usage?: Usage
   /** Herramientas que usó el worker, en orden: `tool_use:<nombre>` en Claude, el tipo de item en Codex. */
   toolEvents: string[]
@@ -79,7 +79,7 @@ export function scanLine(family: Family, facts: StreamFacts, line: string): void
       if (e.type === 'item.completed' && kind === 'agent_message' && typeof e.item.text === 'string') facts.result = e.item.text
     }
   } else if (e.type === 'turn.completed' && typeof e.usage === 'object' && e.usage !== null) {
-    facts.usage = addCodexUsage(facts.usage, e.usage)
+    facts.usage = codexUsage(e.usage)
   } else if (e.type === 'error' && typeof e.message === 'string') noteCodexError(facts, e.message)
   else if (e.type === 'turn.failed' && typeof e.error?.message === 'string') noteCodexError(facts, e.error.message)
 }
@@ -97,9 +97,9 @@ function claudeUsage(u: Record<string, unknown>): Usage {
   return out
 }
 
-/** Codex informa el uso por turno y con otros nombres para la caché; se suman con los de Claude. */
-function addCodexUsage(acc: Usage | undefined, u: Record<string, unknown>): Usage {
-  const out: Usage = { ...acc }
+/** Codex informa el acumulado del hilo: vale el último, con los nombres de caché traducidos. */
+function codexUsage(u: Record<string, unknown>): Usage {
+  const out: Usage = {}
   const pairs: Array<[keyof Usage, string]> = [
     ['input_tokens', 'input_tokens'], ['output_tokens', 'output_tokens'],
     ['cache_read_input_tokens', 'cached_input_tokens'], ['cache_creation_input_tokens', 'cache_write_input_tokens'],
@@ -107,7 +107,16 @@ function addCodexUsage(acc: Usage | undefined, u: Record<string, unknown>): Usag
   ]
   for (const [to, from] of pairs) {
     const v = num(u[from])
-    if (v !== undefined) out[to] = (out[to] ?? 0) + v
+    if (v !== undefined) out[to] = v
+  }
+  return out
+}
+
+export function usageSince(total: Usage, before: Usage): Usage {
+  const out: Usage = {}
+  for (const key of Object.keys(total) as Array<keyof Usage>) {
+    const value = total[key]
+    if (value !== undefined) out[key] = Math.max(0, value - (before[key] ?? 0))
   }
   return out
 }

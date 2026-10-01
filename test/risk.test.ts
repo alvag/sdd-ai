@@ -50,6 +50,21 @@ test('cada señal sube el nivel con su motivo y su ruta', () => {
   ])
 })
 
+test('una prueba que lanza un proceso no sube el nivel, en el candidato ni en el delta', () => {
+  for (const path of ['test/a.test.ts', 'tests/b.ts', 'src/c.spec.ts', '__tests__/d.py', 'src/a.ts']) {
+    const { repo, base } = repoWith({ [path]: 'base\n' })
+    write(repo, path, 'base\nexecFileSync(cmd)\n')
+    const initial = classify(freeze(repo, { base, context: [] }))
+    const production = path === 'src/a.ts'
+    assert.equal(initial.level, production ? 'high' : 'normal', path)
+    assert.equal(initial.reasons.some((r) => r.signal === 'process'), production, path)
+    const { prev, next, dir } = rounds(repo, base, () => write(repo, path, 'base\nexecFileSync(cmd)\nspawn(cmd)\n'))
+    const delta = classifyDelta(prev, next, changedRanges(prev, next, dir), dir)
+    assert.equal(delta.level, production ? 'high' : 'normal', path)
+    assert.equal(delta.reasons.some((r) => r.signal === 'process'), production, path)
+  }
+})
+
 test('los patrones de procesos respetan los bordes de palabra', () => {
   const { repo, base } = repoWith({ 'base.txt': 'x\n' })
   add(repo, {

@@ -7,6 +7,7 @@ import { buildIndex, gitDirs, indexEnv } from '../git.ts'
 import { SddError } from '../types.ts'
 import type { ArtifactKind, ArtifactRole } from './artifact.ts'
 import type { ChangedRanges } from './ledger.ts'
+import { addedLines, sections } from './diff.ts'
 
 /**
  * Lo que se revisa. `untracked` suma los archivos nuevos que Git no ignora, armando el candidato desde
@@ -310,6 +311,27 @@ export function changedRanges(prev: Candidate, next: Candidate, dir: string): Ch
       const ranges = changedSide(blobDiff(dir, before.sha256, f.sha256, f.path))
       if (ranges.length > 0) out[f.path] = ranges
     }
+  }
+  return out
+}
+
+/** Solo las líneas corregidas que siguen agregadas contra la base se pueden citar en el diff. */
+export function stillChanged(changed: ChangedRanges, c: Candidate): ChangedRanges {
+  const texts = new Map(sections(c.diff, c.files).map((s) => [s.path, s.text]))
+  const out: ChangedRanges = {}
+  for (const [path, ranges] of Object.entries(changed)) {
+    if (ranges === 'binary') {
+      out[path] = ranges
+      continue
+    }
+    const kept: Array<[number, number]> = []
+    for (const { line } of addedLines(texts.get(path) ?? '')) {
+      if (!ranges.some(([a, b]) => line >= a && line <= b)) continue
+      const last = kept.at(-1)
+      if (last && last[1] + 1 === line) last[1] = line
+      else kept.push([line, line])
+    }
+    if (kept.length > 0) out[path] = kept
   }
   return out
 }

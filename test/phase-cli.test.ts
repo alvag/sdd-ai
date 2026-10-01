@@ -101,7 +101,7 @@ const PLAN_CONTRACT: PlanContract = {
   approach: 'Directo.', decisions: 'ninguno', files: '- `src/a.ts`',
   verification: {
     schema_version: 1,
-    rows: [{ id: 'V1', acs: ['AC-1', 'AC-2'], kind: 'inspección', obligation: 'none', obligation_reason: 'lectura', argv: ['npm', 'test'], timeout_ms: 60000, expect: { exit_code: 0 } }],
+    rows: [{ id: 'V1', acs: ['AC-1', 'AC-2'], kind: 'inspection', obligation: 'none', obligation_reason: 'lectura', argv: ['npm', 'test'], timeout_ms: 60000, expect: { exit_code: 0 } }],
   },
 }
 const TASKS_CONTRACT: TasksContract = {

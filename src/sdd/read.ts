@@ -258,9 +258,9 @@ const blockedEntry = (id: string, reason: Reason): ListEntry =>
   ({ id, depth: null, next: { step: 'resolve_blockers' }, blocked: true, blocked_reasons: [reason] })
 
 /**
- * Los directorios de `.plans/` salvo `archived/`, como los lista el retomado de `sdd-flow`; los archivos
- * sueltos se ignoran. Un nombre que no es un id, un enlace o un flujo roto salen bloqueados sin romper
- * el listado, y los dos primeros sin leerse.
+ * Los directorios de `.plans/` con algún artefacto, salvo `archived/`; los archivos sueltos se ignoran.
+ * Un nombre que no es un id, un enlace o un flujo roto salen bloqueados sin romper el listado, y los
+ * dos primeros sin leerse.
  */
 export function listFlows(root: string): ListEntry[] {
   const plans = join(root, '.plans')
@@ -271,6 +271,8 @@ export function listFlows(root: string): ListEntry[] {
   const jira = loadJiraMode(root)
   const names = readdirSync(plans, { withFileTypes: true })
     .filter((e) => e.name !== 'archived' && (e.isDirectory() || e.isSymbolicLink()))
+    .filter((e) => e.isSymbolicLink() || !isFlowId(e.name)
+      || [FILE_NAMES.spec, FILE_NAMES.plan, FILE_NAMES.tasks, FILE_NAMES.handoff].some((name) => lstatOrNull(join(plans, e.name, name)) !== null))
     .map((e) => e.name)
     .sort()
   return names.map((id): ListEntry => {

@@ -102,7 +102,7 @@ const SCHEMA: Record<PhaseStep, string> = {
     "schema_version": 1,
     "rows": [
       { "id": "V1", "acs": ["AC-1"], "kind": "test", "obligation": "red_on_revert" | "green_on_base" | "none", "obligation_reason": "<solo con none: por qué no se confirma>", "argv": ["node", "--test", "--test-reporter=tap", "<ruta de la prueba>"], "timeout_ms": 120000, "expect": { "exit_code": 0, "output_pattern": "<opcional: RegExp de JavaScript, sin flags>" }, "implementation_paths": ["<ruta que habilita el criterio>"], "test_paths": ["<ruta de la prueba>"], "test_name": "<nombre exacto del test en el reporte>", "report_format": "tap" },
-      { "id": "V2", "acs": ["AC-2"], "kind": "build" | "inspección", "obligation": "none", "obligation_reason": "<por qué no se confirma>", "argv": ["<ejecutable>", "<argumento>"], "timeout_ms": 300000, "expect": { "exit_code": 0 } },
+      { "id": "V2", "acs": ["AC-2"], "kind": "build" | "inspection", "obligation": "none", "obligation_reason": "<por qué no se confirma>", "argv": ["<ejecutable>", "<argumento>"], "timeout_ms": 300000, "expect": { "exit_code": 0 } },
       { "id": "V3", "acs": ["AC-3"], "kind": "manual", "obligation": "none", "obligation_reason": "<por qué no se confirma>", "observation": "<qué tiene que observar una persona>" }
     ]
   }

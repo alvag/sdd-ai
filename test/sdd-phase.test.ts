@@ -121,7 +121,7 @@ const PLAN_C = {
   approach: 'Un módulo nuevo.', decisions: 'ninguno', files: '- `src/export.ts` — nuevo',
   verification: {
     schema_version: 1 as const,
-    rows: [{ id: 'V1', acs: ['AC-1'], kind: 'inspección' as const, obligation: 'none' as const, obligation_reason: 'lectura de la salida', argv: ['npm', 'test'], timeout_ms: 60000, expect: { exit_code: 0 } }],
+    rows: [{ id: 'V1', acs: ['AC-1'], kind: 'inspection' as const, obligation: 'none' as const, obligation_reason: 'lectura de la salida', argv: ['npm', 'test'], timeout_ms: 60000, expect: { exit_code: 0 } }],
   },
 }
 const PLAN_ACS = ['AC-1']

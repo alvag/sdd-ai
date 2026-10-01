@@ -7,12 +7,12 @@ import { readHeader, section } from './markdown.ts'
 // de `plan` lo entrega como JSON, la admisión lo valida contra los criterios de la spec y `plan.md` lo
 // guarda en un bloque cercado dentro de `## Verification`.
 
-export type RowKind = 'test' | 'build' | 'inspección' | 'manual'
+export type RowKind = 'test' | 'build' | 'inspection' | 'manual'
 export type Obligation = 'red_on_revert' | 'green_on_base' | 'none'
 /** `output_pattern` es el `source` de una RegExp de JavaScript, sin flags. */
 export interface Expect { exit_code: number; output_pattern?: string }
 export interface RowBase { id: string; acs: string[]; kind: RowKind; obligation: Obligation; obligation_reason?: string }
-export interface CommandRow extends RowBase { kind: 'build' | 'inspección'; argv: string[]; timeout_ms: number; expect: Expect }
+export interface CommandRow extends RowBase { kind: 'build' | 'inspection'; argv: string[]; timeout_ms: number; expect: Expect }
 export interface TestRow extends RowBase {
   kind: 'test'; argv: string[]; timeout_ms: number; expect: Expect
   implementation_paths: string[]; test_paths: string[]; test_name: string; report_format: 'tap'
@@ -95,11 +95,12 @@ export function admitVerification(raw: unknown, acs: readonly string[]): Verific
     const where = `verification.rows[${index}]`
     if (!isMap(rawRow)) throw new Rejection(`${where} tiene que ser un objeto`)
     const kind = rawRow.kind
+    if (kind === 'inspección') throw new Rejection(`${where}.kind: «inspección» se llama ahora «inspection»`)
     const common = ['id', 'acs', 'kind', 'obligation', 'obligation_reason']
     const permitted = kind === 'test' ? [...common, 'argv', 'timeout_ms', 'expect', 'implementation_paths', 'test_paths', 'test_name', 'report_format']
-      : kind === 'build' || kind === 'inspección' ? [...common, 'argv', 'timeout_ms', 'expect']
+      : kind === 'build' || kind === 'inspection' ? [...common, 'argv', 'timeout_ms', 'expect']
         : kind === 'manual' ? [...common, 'observation'] : null
-    if (!permitted) throw new Rejection(`${where}.kind tiene que ser test, build, inspección o manual`)
+    if (!permitted) throw new Rejection(`${where}.kind tiene que ser test, build, inspection o manual`)
     keys(rawRow, permitted, where)
     const id = nonempty(rawRow.id, `${where}.id`)
     if (!ROW_ID.test(id)) throw new Rejection(`${where}.id tiene que tener la forma V<n>: ${JSON.stringify(id)}`)

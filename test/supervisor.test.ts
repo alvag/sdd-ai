@@ -247,6 +247,31 @@ test('Codex reanuda con exec resume, sin -C ni -s', async () => {
   assert.equal(readFileSync(join(dir, 'result-resume.md'), 'utf8'), 'ok')
 })
 
+test('una reanudación de Codex guarda en metrics.json solo su propio consumo', async () => {
+  const dir = prepareCli('codex', 'usage-then-hang-unless-resume-codex', codexArgs)
+  const s = await supervise(dir)
+  assert.equal(s.state, 'done')
+  const metrics = JSON.parse(readFileSync(join(dir, 'metrics.json'), 'utf8'))
+  assert.deepEqual(metrics.attempts.map((a: { usage: unknown }) => a.usage), [
+    { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 5 },
+    { input_tokens: 15, cache_read_input_tokens: 6, output_tokens: 3 },
+  ])
+})
+
+test('una reanudación de Codex sin el hilo en el stream guarda solo su propio consumo', async () => {
+  // El argv ya reanuda el hilo T1, como una corrida encadenada: el stream no lo vuelve a informar.
+  const dir = prepareCli('codex', 'resumed-usage-then-hang-codex', (d) => [
+    'exec', 'resume', '--json', '--output-last-message', join(d, 'result.md'), '-c', 'sandbox_mode="read-only"', 'T1', '-',
+  ])
+  const s = await supervise(dir)
+  assert.equal(s.state, 'done')
+  assert.deepEqual(calls(dir).map((c) => c.slice(0, 2)), [['exec', 'resume'], ['exec', 'resume']])
+  assert.deepEqual(metrics(dir).attempts.map((a: { usage: unknown }) => a.usage), [
+    { input_tokens: 10, cache_read_input_tokens: 4, output_tokens: 5 },
+    { input_tokens: 15, cache_read_input_tokens: 6, output_tokens: 3 },
+  ])
+})
+
 test('una reanudación que también se agota termina en timeout con la sesión', async () => {
   process.env.FAKE_FAMILY = 'claude'
   const dir = prepareCli('claude', 'hang-always-session', () => ['-p', '--session-id', 's1'], { resume_sec: 1 })

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 import { createInterface } from 'node:readline'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { type Outcome, type StreamFacts, classify, emptyFacts, scanLine } from './outcome.ts'
+import { type Outcome, type StreamFacts, classify, emptyFacts, scanLine, usageSince } from './outcome.ts'
 import { type Admission, type AdmittedReview, type RoundReview, type Unverifiable, admit, admitRefutation, admitRound, parseLocation } from './review/admit.ts'
 import { sliceCandidate } from './review/batch.ts'
 import { type Candidate, readContextBlobs } from './review/candidate.ts'
@@ -20,7 +20,7 @@ import { type RiskRecord, readRisk } from './review/risk.ts'
 import { dirtyPaths, headCommit } from './git.ts'
 import { readJson, setStatus, writeJsonAtomic } from './runs.ts'
 import type {
-  AttemptKind, AttemptMetrics, Family, LaunchSpec, RejectedField, Resolution, ResumeInfo, RetryInfo, RunState, Status, WorkerTask,
+  AttemptKind, AttemptMetrics, Family, LaunchSpec, RejectedField, Resolution, ResumeInfo, RetryInfo, RunState, Status, Usage, WorkerTask,
 } from './types.ts'
 import { ARTIFACT_SYSTEM_PROMPT, REFUTER_SYSTEM_PROMPT, claudeResume, claudeRetry, claudeReviewLaunch, withSessionId } from './workers/claude.ts'
 import { codexResume, codexRetry, codexReviewLaunch, withResultFile } from './workers/codex.ts'
@@ -175,6 +175,7 @@ interface RunContext {
   argv: ArgvFile
   job?: { reviewer: Reviewer | 'refute'; batch: number; launch: number }
   once: { started: boolean }
+  threadUsage: Map<string, Usage>
   /** Un writer: su identidad de grupo se registra en el almacén al arrancar. */
   writer?: { root: string; id: string }
   /** Antes del reintento por perfil: si devuelve falso, no se reintenta. */
@@ -334,7 +335,15 @@ function recordAttempt(ctx: RunContext, kind: AttemptKind, suffix: string, launc
       result: existsSync(a.resultFile) ? relative(dir, a.resultFile) : null,
     },
   }
-  if (a.facts.usage) entry.usage = a.facts.usage
+  if (a.facts.usage) {
+    // Codex informa el acumulado del hilo: un intento que lo reanuda guarda lo que sumó desde el último
+    // acumulado conocido. El hilo sale de su argv, porque el stream de una reanudación puede no traerlo.
+    const resumed = ctx.family === 'codex' && isResumeArgs(ctx.family, launch.args) ? sessionOf(ctx.family, launch.args, a.facts) : undefined
+    const before = resumed ? ctx.threadUsage.get(resumed) : undefined
+    entry.usage = before ? usageSince(a.facts.usage, before) : a.facts.usage
+    const sessionId = resumed ?? a.facts.sessionId
+    if (ctx.family === 'codex' && sessionId) ctx.threadUsage.set(sessionId, a.facts.usage)
+  }
   if (a.outcome.reason) entry.reason = a.outcome.reason
   m.attempts.push(entry)
   writeJsonAtomic(file, withTotals(m))
@@ -459,6 +468,9 @@ function sessionOf(family: Family, args: string[], facts: StreamFacts): string |
   if (family === 'claude' && i >= 0 && i + 1 < args.length) return args[i + 1]
   const r = args.indexOf('--resume')
   if (family === 'claude' && r >= 0 && r + 1 < args.length) return args[r + 1]
+  // Un argv de Codex que ya reanuda lleva el hilo justo antes del `-` final (`codexResume`): el stream
+  // de la reanudación puede no volver a informarlo.
+  if (family === 'codex' && args[1] === 'resume' && args.length > 3 && args.at(-1) === '-') return args.at(-2)
   return facts.sessionId
 }
 
@@ -844,7 +856,7 @@ export async function supervise(dir: string, argvName = 'argv.json'): Promise<St
   const cancelFile = join(dir, 'cancel.request')
   const ctx: RunContext = {
     dir, family: argv.family, grace: argv.grace_ms ?? 10_000, cancelFile, tag: argv.tag ?? '', round: argv.round ?? 1,
-    prefix: '', argv, once: { started: false },
+    prefix: '', argv, once: { started: false }, threadUsage: new Map(),
   }
   const resumeSec = argv.resume_sec ?? DEFAULT_RESUME_SEC
   if (argv.kind === 'review') return superviseReview(ctx, resumeSec)

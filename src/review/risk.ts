@@ -1,6 +1,7 @@
 import { type Candidate, type CandidateFile, type ReplacedHunk, replacedHunks } from './candidate.ts'
 import { addedLines, sections } from './diff.ts'
 import type { ChangedRanges } from './ledger.ts'
+import { isTestPath } from '../test-paths.ts'
 
 export type RiskLevel = 'normal' | 'high'
 export type RiskSignal = 'path' | 'shell' | 'executable' | 'process'
@@ -78,7 +79,7 @@ export function classify(c: Candidate): Risk {
     f.from ? pathSignal(f.from) : undefined,
     scriptChanged(f, section(f.path)) ? shellSignal(f.path) : undefined,
     f.status !== 'D' && f.old_mode !== undefined ? executableSignal(f.path, f.old_mode, f.mode) : undefined,
-    processSignal(f.path, addedLines(section(f.path))),
+    isTestPath(f.path) ? undefined : processSignal(f.path, addedLines(section(f.path))),
   ]))
 }
 
@@ -114,7 +115,7 @@ export function classifyDelta(prev: Candidate, next: Candidate, changed: Changed
     const ranges = changed[f.path]
     // Un archivo que solo cambió de ruta no trae líneas nuevas, aunque en su ruta nueva todas figuren cambiadas.
     const moved = prev.files.some((p) => p.status !== 'D' && p.sha256 === f.sha256)
-    if (Array.isArray(ranges) && !moved) found.push(newProcessSignal(f.path, addedLines(section(f.path)), hunks[f.path] ?? []))
+    if (Array.isArray(ranges) && !moved && !isTestPath(f.path)) found.push(newProcessSignal(f.path, addedLines(section(f.path)), hunks[f.path] ?? []))
   }
   return risk(found)
 }

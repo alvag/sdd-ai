@@ -229,6 +229,26 @@ test('dos rondas: un aceptado se corrige y queda resuelto; un rechazado se retir
   assert.equal(plan.prev_hash, runJson(s, id, 'candidate.json').hash)
 })
 
+test('una línea que la corrección devolvió a la base no figura en CAMBIOS de la ronda siguiente', () => {
+  const s = setup([firstRound([grave]), nextRound([{ id: 'F-1', answer: 'resolved' }])])
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 5: 'cinco cambiada', 8: 'ocho cambiada' }))
+  const started = cli(s, ['review', 'start', '--base', s.base, '--author', 'codex'])
+  assert.equal(started.code, 0, JSON.stringify(started.out))
+  const id = started.out.id
+  waitRound(s, id)
+  assert.equal(cli(s, ['review', 'decide', id, 'accept', 'F-1']).code, 0)
+  writeFileSync(join(s.repo, 'a.txt'), lines(10, { 8: 'ocho corregida' }))
+  const r = cli(s, ['review', 'round', id])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  waitRound(s, id)
+  const prompt = readFileSync(runFile(s, id, 'prompt-r2-l1-base-b1.md'), 'utf8')
+  const changes = /<<<CAMBIOS [^\n]+>>>\n([\s\S]*?)<<<FIN CAMBIOS /.exec(prompt)?.[1]
+  assert.ok(changes, prompt)
+  assert.match(changes, /a\.txt: 8/)
+  assert.doesNotMatch(changes, /a\.txt: 5/)
+  assert.deepEqual(runJson(s, id, 'round-r2.json').changed, { 'a.txt': [[8, 8]] })
+})
+
 test('la ronda siguiente usa el revisor de la ronda 1 en una sesión nueva, y un refutador del rol refute', () => {
   const inferential = { ...grave, evidence: 'inferential' }
   const s = setup([

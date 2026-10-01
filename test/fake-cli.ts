@@ -298,6 +298,28 @@ switch (process.env.FAKE_MODE) {
     if (args[0] === 'exec' && args[1] === 'resume') okCodex()
     else hang(codexThread)
     break
+  case 'usage-then-hang-unless-resume-codex':
+    if (args[0] === 'exec' && args[1] === 'resume') {
+      okCodex()
+      process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 25, cached_input_tokens: 10, output_tokens: 8 } })}\n`)
+    } else {
+      hang(`${codexThread}\n${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 5 } })}`)
+    }
+    break
+  case 'resumed-usage-then-hang-codex': {
+    // Una corrida encadenada que ya reanuda el hilo: su stream no repite `thread.started`. El primer intento
+    // informa uso y se agota; la reanudación informa el acumulado y entrega.
+    const turn = (input_tokens: number, cached_input_tokens: number, output_tokens: number) =>
+      JSON.stringify({ type: 'turn.completed', usage: { input_tokens, cached_input_tokens, output_tokens } })
+    if (callCount() === 1) {
+      hang(turn(10, 4, 5))
+      break
+    }
+    process.stdout.write(`{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n${turn(25, 10, 8)}\n`)
+    const i = args.indexOf('--output-last-message')
+    if (i >= 0) writeFileSync(args[i + 1], 'ok')
+    break
+  }
   case 'hang-always-session':
     hang(process.env.FAKE_FAMILY === 'codex' ? codexThread : claudeInit())
     break
