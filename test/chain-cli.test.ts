@@ -276,7 +276,7 @@ test('orienta de cosecha a verify y revisa solo el verde vigente', () => {
   assert.equal(runBin(s, ['sdd', 'verify', 'f']).out.green, true)
   // El verde vigente propone una sola revisión, del candidato acumulado de la última cosecha.
   const green = status()
-  assert.deepEqual([green.step, green.command], ['review_and_commit', `./bin/sdd-ai review start --harvest ${fix.out.id} --base ${s.base} --author codex`], JSON.stringify(green))
+  assert.deepEqual([green.step, green.command], ['review_and_commit', `./bin/sdd-ai review start --harvest ${fix.out.id} --base ${s.base} --author codex --flow f`], JSON.stringify(green))
   // Sin el control del writer no hay comando de revisión que armar: la consulta dice qué falta.
   const fixControl = join(storeOf(s, fix.out.id), 'control.json')
   const saved = readFileSync(fixControl, 'utf8')

@@ -866,7 +866,7 @@ export function verifyProjectionOf(root: string, contextPath: string, frozen: st
   return null
 }
 
-function writeTextAtomic(file: string, text: string): void {
+export function writeTextAtomic(file: string, text: string): void {
   const tmp = `${file}.${process.pid}.tmp`
   writeFileSync(tmp, text)
   renameSync(tmp, file)

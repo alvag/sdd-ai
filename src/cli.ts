@@ -1,7 +1,7 @@
 import { type SpawnOptions, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync,
+  accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
@@ -27,7 +27,7 @@ import {
   type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, readMaterial, validateArtifactArgs,
 } from './review/artifact.ts'
 import {
-  type Candidate, type Selection, baseOf, candidateHash, changedRanges, freeze, freezeStable, freezeStableWith, readContext, readContextFile, sha256 as candidateSha256, snapshot, stillChanged,
+  type Candidate, type Selection, baseOf, changedRanges, freeze, freezeStable, freezeStableWith, readContext, snapshot, stillChanged,
 } from './review/candidate.ts'
 import { type PlannedJob, planJobs, planRoundJobs, sliceCandidate } from './review/batch.ts'
 import {
@@ -46,6 +46,8 @@ import {
   type Conductor, DISPATCHABLE_ROLES, type Family, type NativeProfile, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
   type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isDispatchableRole, isFamily, isPhaseRole, opposite, toNativeEffort,
 } from './types.ts'
+import { type Freshness, type ReviewRequest, REVIEW_LOCK, converged, freshness, untrackedOf } from './review/standing.ts'
+import { applyCommit, planCommit } from './sdd/commit.ts'
 import { approve } from './sdd/approve.ts'
 import { criteriaIds, taskLines } from './sdd/markdown.ts'
 import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
@@ -67,7 +69,7 @@ import { isFlowId } from './sdd/id.ts'
 import { assertNoBlockers, checkApplyInput, readAntecedents, renderAntecedents, startApply, startChecks, startPreview } from './sdd/start.ts'
 import { type FlowStatus, headerData, resolve as resolveFlow } from './sdd/status.ts'
 import { type ManualRow, type VerificationRow, readVerification } from './sdd/verification-contract.ts'
-import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal, verifyProjectionOf } from './sdd/verify.ts'
+import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal } from './sdd/verify.ts'
 import { type VerifyReceipt, type VerifyReceiptRef, readVerifyReceipt, receiptDir } from './sdd/verify-receipt.ts'
 import { claudeLaunch, claudeResume, claudeWriterLaunch, withSessionId } from './workers/claude.ts'
 import { codexLaunch, codexResume, codexWriterLaunch, withResultFile } from './workers/codex.ts'
@@ -414,7 +416,9 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
   const reserved = reserveWriter(root, id)
   if (!reserved.ok) {
     throw new SddError('writer_open', `ya hay un writer abierto en este repositorio: ${reserved.holder}`, {
-      next: reserved.verify
+      next: reserved.commit
+        ? 'espera a que termine sdd commit y vuelve a lanzar el writer'
+        : reserved.verify
         ? 'espera a que termine sdd verify, que tiene archivos revertidos para confirmar filas, y vuelve a lanzar el writer'
         : `espera o recibe esa corrida (./bin/sdd-ai wait ${reserved.holder}) antes de lanzar otro writer`,
     })
@@ -533,14 +537,6 @@ export function launchSupervisor(dir: string, argv: ArgvFile, env: Env, status: 
   writeFileSync(join(dir, 'supervisor.pid'), String(supervisor.pid))
 }
 
-interface ReviewRequest {
-  /** Un diff, o un artefacto con sus insumos: una corrida anterior a los artefactos siempre es un diff. */
-  kind: 'review'; selection: Selection | ArtifactSelection; author: Family; degradations: string[]
-  overrides?: { families?: string; model?: string; effort?: string; deadline_sec?: number }
-  /** El nivel congelado al empezar; una corrida anterior a la clasificación no lo trae. */
-  risk?: RiskRecord
-}
-
 /**
  * El número del lanzamiento siguiente de una ronda: uno más que el mayor que ya dejó su argv. Se cuenta
  * del directorio porque un supervisor que murió no deja registro.
@@ -565,10 +561,6 @@ function diffSelection(req: ReviewRequest): Selection {
   if (isArtifact(req.selection)) throw new Error('la revisión es de un artefacto, no de un diff')
   return req.selection
 }
-
-/** Lo que una selección arrastra entre rondas y reinicios: los archivos nuevos y la cosecha. */
-const untrackedOf = (sel: Selection): Pick<Selection, 'untracked' | 'harvest'> =>
-  ({ ...(sel.untracked ? { untracked: true } : {}), ...(sel.harvest ? { harvest: sel.harvest } : {}) })
 
 /** Un delta con riesgo alto: la ronda no corre y se propone reiniciar con lentes, con el mismo head. */
 function riskHigh(root: string, req: ReviewRequest, delta: Risk, head: string | undefined): SddError {
@@ -647,6 +639,7 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
       spec: { type: 'string' },
       plan: { type: 'string' },
       harvest: { type: 'string' },
+      flow: { type: 'string' },
       untracked: { type: 'boolean', default: false },
     },
   })
@@ -674,6 +667,16 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   if (!Number.isFinite(deadline) || deadline <= 0) throw new SddError('usage', `--deadline inválido: ${values.deadline}`)
 
   const root = repoRoot(cwd)
+  let flowBase: unknown
+  if (values.flow !== undefined) {
+    if (artifact || values.head !== undefined || (!values.untracked && values.harvest === undefined)) {
+      throw new SddError('usage', '--flow exige --untracked o --harvest, sin --artifact ni --head')
+    }
+    if (!isFlowId(values.flow)) throw new SddError('flow_not_found', `no existe el flujo ${values.flow}`)
+    const flow = readFlow(root, values.flow)
+    if (flow.facts.files.plan === 'absent') throw new SddError('flow_not_found', `no existe el flujo ${values.flow}`)
+    flowBase = headerData(flow.facts.planHeader)?.base_commit
+  }
   const conductor = detectConductor(env, {
     conductor: values.conductor, conductorModel: values['conductor-model'], conductorEffort: values['conductor-effort'],
   })
@@ -706,6 +709,9 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
     : { base: values.base ?? '', context: values.context.map(abs), ...(values.untracked ? { untracked: true } : {}) }
   if (values.head) selection.head = values.head
   const candidate = freezeStable(root, selection)
+  if (values.flow !== undefined && candidate.base_sha !== flowBase) {
+    throw new SddError('flow_base_mismatch', `la base de la revisión ${candidate.base_sha} no es la del flujo ${String(flowBase)}`)
+  }
   // Lo que se congeló tiene que ser la cosecha: si el árbol cambió en el medio, no se revisa.
   if (harvested && !harvestTreeHolds(root, harvested.id)) throw harvestStale(harvested)
   const classified = classify(candidate)
@@ -723,7 +729,7 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   const planned = writeJobs(dir, '-l1', jobs)
   writeJsonAtomic(join(dir, 'candidate.json'), candidate)
   const request: ReviewRequest & Record<string, unknown> = {
-    kind: 'review', selection, author, degradations, conductor,
+    kind: 'review', selection, author, degradations, conductor, ...(values.flow ? { flow: values.flow } : {}),
     overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline }, risk,
   }
   const session = ownerSession(env, conductor.family)
@@ -775,76 +781,8 @@ function restartCommand(req: ReviewRequest, root?: string): string {
   parts.push(`--author ${req.author}`)
   if (sel.untracked && !harvest) parts.push('--untracked')
   if (req.risk?.forced) parts.push('--risk high')
+  if (req.flow) parts.push(`--flow ${shellArg(req.flow)}`)
   return parts.join(' ')
-}
-
-function resolvesTo(root: string, ref: string | undefined, sha: string | null): boolean {
-  if (!ref || !sha) return true
-  try {
-    return freeze(root, { base: ref, context: [] }).base_sha === sha
-  } catch {
-    return false
-  }
-}
-
-/**
- * Vigencia del candidato: con `--head`, reconstruye con los SHAs congelados y solo informa si el ref
- * se movió; sin `--head`, reconstruye con la misma base y el mismo contexto sobre el árbol. Si la
- * reconstrucción falla, cuenta como `stale`.
- */
-interface Freshness { stale: boolean; ref_moved?: boolean; stale_reason?: 'inputs' | 'artifact'; verify_projection?: Array<{ path: string; receipt: string }> }
-
-function freshness(root: string, dir: string, req: ReviewRequest, c: Candidate, head: string | undefined): Freshness {
-  if (isArtifact(req.selection)) return artifactFreshness(root, req.selection, c)
-  const sel = req.selection
-  let moved: Pick<Freshness, 'ref_moved'> = {}
-  try {
-    const again = c.head_sha
-      ? freeze(root, { base: baseOf(c), head: c.head_sha, context: sel.context })
-      : freeze(root, { base: sel.base, context: sel.context, ...untrackedOf(sel) })
-    moved = c.head_sha ? { ref_moved: !resolvesTo(root, head, c.head_sha) || !resolvesTo(root, sel.base, c.base_sha) } : {}
-    if (again.hash === c.hash) return { stale: false, ...moved }
-    const projection = verifyProjections(root, dir, c, again)
-    return projection ? { stale: false, ...moved, verify_projection: projection } : { stale: true, ...moved }
-  } catch {
-    return { stale: true, ...moved }
-  }
-}
-
-/**
- * Si lo único que cambió del contexto desde que se congeló es la proyección de `sdd verify` en un plan,
- * respaldada por un recibo íntegro, y con los sha congelados el hash vuelve a ser el de la revisión.
- * Devuelve cada contexto reconocido con su recibo, o `null` si algo más cambió.
- */
-function verifyProjections(root: string, dir: string, c: Candidate, again: Candidate): Array<{ path: string; receipt: string }> | null {
-  if (c.context.length !== again.context.length || c.context.some((x, i) => x.path !== again.context[i].path)) return null
-  const found: Array<{ path: string; receipt: string }> = []
-  for (const [i, frozen] of c.context.entries()) {
-    const now = again.context[i]
-    if (frozen.sha256 === now.sha256) continue
-    const current = readContextFile(root, frozen.path).bytes
-    if (candidateSha256(current) !== now.sha256) return null
-    const receipt = verifyProjectionOf(root, frozen.path, readFileSync(join(dir, 'blobs', frozen.sha256), 'utf8'), current.toString('utf8'))
-    if (receipt === null) return null
-    found.push({ path: frozen.path, receipt })
-  }
-  if (found.length === 0) return null
-  const restored = again.context.map((x, i) => (found.some((f) => f.path === x.path) ? c.context[i] : x))
-  return candidateHash({ ...again, context: restored }) === c.hash ? found : null
-}
-
-/**
- * Vigencia de un artefacto, sin Git: primero los insumos y el contexto, porque un cambio ahí invalida la
- * revisión entera; después el artefacto, que cambia a propósito entre rondas.
- */
-function artifactFreshness(root: string, sel: ArtifactSelection, c: Candidate): Freshness {
-  if (!inputsUnchanged(root, c)) return { stale: true, stale_reason: 'inputs' }
-  try {
-    return freezeArtifact(root, sel).candidate.hash === c.hash ? { stale: false } : { stale: true, stale_reason: 'artifact' }
-  } catch (e) {
-    if (e instanceof SddError) return { stale: true, stale_reason: 'artifact' }
-    throw e
-  }
 }
 
 const inputsChanged = (id: string, req: ReviewRequest) =>
@@ -860,7 +798,6 @@ function headOf(dir: string, req: ReviewRequest, n: number): string | undefined 
 }
 
 /** El lock que serializa `review decide` y `review round` sobre una revisión. */
-const REVIEW_LOCK = 'review.lock'
 const reviewBusy = (dir: string) => existsSync(join(dir, REVIEW_LOCK))
 const busyNext = (id: string) => `otra operación de la revisión está en curso (decide o round); vuelve a consultar con ./bin/sdd-ai review status ${id}`
 
@@ -939,6 +876,7 @@ function roundNext(root: string, id: string, dir: string, req: ReviewRequest, s:
   const verify = goals.filter((t) => t.kind === 'verify').map((t) => t.id)
   if (verify.length > 0) return `corrige los aceptados (${verify.join(', ')}) y lanza ./bin/sdd-ai review round ${id}`
   if (goals.length > 0) return `lanza ./bin/sdd-ai review round ${id} para que el revisor responda los rechazos`
+  if (!converged(dir, s, ledger)) return relaunchNext(id, dir, req, s, round, ledger.completed, env)
   if (isArtifact(req.selection)) {
     if (fresh.stale) return `el artefacto cambió desde la revisión; revisa de nuevo: ${restartCommand(req)}`
     return `la revisión está vigente; ${ARTIFACT_NOTE}`
@@ -2396,6 +2334,33 @@ function resumeLink(p: ImplementPhase, s: ChainState, run: string): ChainLaunch 
   }
 }
 
+/** El perfil concreto del origen, incluso si una corrida antigua solo lo guardó en el almacén. */
+function inheritedProfile(root: string, record: PhaseRecord, origin: string): { model: string | null; effort: string | null } {
+  const entries = implementOf(record).chains.flatMap((c) => c.entries)
+  let model: string | null = null
+  let effort: string | null = null
+  const seen = new Set<string>()
+  let run: string | null = origin
+  while (run && !seen.has(run)) {
+    seen.add(run)
+    const entry: RunEntry | undefined = entries.find((e): e is RunEntry => e.kind !== 'takeover' && e.run === run)
+    if (entry?.launch) {
+      model ??= entry.launch.model
+      effort ??= entry.launch.effort
+    }
+    try {
+      const resolved = readJson<Resolution>(join(runDir(root, run), 'resolved.json'))
+      model ??= resolved.model ?? null
+      effort ??= resolved.effort ?? null
+    } catch {
+      // Un origen retirado todavía puede tener el perfil en su entrada o en su padre.
+    }
+    if (model !== null && effort !== null) break
+    run = entry?.resumes ?? entry?.parent ?? null
+  }
+  return { model, effort }
+}
+
 /**
  * Registra la corrida en la cadena y la lanza, bajo el lock del flujo. Antes de registrar nada comprueba la
  * sesión que reanuda, `HEAD` y el árbol del padre; el registro queda antes del control, y su digest entra en
@@ -2440,10 +2405,28 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
   const frozen = frozenInputs(root, read)
   const run = newRunId()
   const at = new Date().toISOString()
-  const chain = appendEntry(root, id, l.chain, {
-    kind: l.kind, run, parent: l.parent, base: l.base, at, pending: l.pending, ...(l.resumes ? { resumes: l.resumes } : {}),
-    ...(l.fix ? { receipt: l.fix.receipt } : {}),
-  })
+  const text = writerPrompt(l.prompt)
+  const profile = l.mode === 'initial' ? { model: resolution.model ?? null, effort: resolution.effort ?? null }
+    : inheritedProfile(root, readPhaseRecord(root, id), l.origin!)
+  const launch = { prompt_digest: bytesHash(text), family: resolution.family, ...profile }
+  // La copia queda entera en su lugar antes de registrar la entrada, y se borra si el registro falla: en el peor
+  // caso queda una copia sin entrada, nunca una entrada sin su copia.
+  const promptDir = join(flowDir(root, id), 'runs', run)
+  const promptCopy = join(promptDir, 'encargo.md')
+  const promptTmp = `${promptCopy}.${process.pid}.tmp`
+  let chain: string
+  try {
+    mkdirSync(promptDir, { recursive: true })
+    writeFileSync(promptTmp, text)
+    renameSync(promptTmp, promptCopy)
+    chain = appendEntry(root, id, l.chain, {
+      kind: l.kind, run, parent: l.parent, base: l.base, at, pending: l.pending, launch, ...(l.resumes ? { resumes: l.resumes } : {}),
+      ...(l.fix ? { receipt: l.fix.receipt } : {}),
+    })
+  } catch (e) {
+    rmSync(promptDir, { recursive: true, force: true })
+    throw e
+  }
   const phase: NonNullable<WriterControl['phase']> = {
     flow: id, pending: l.pending, inputs: frozen.hashes, handoff_header: headerHash(read.facts.handoffHeader),
     kind: l.kind, chain, parent: l.parent, ...(l.launchFrom ? { launch_from: l.launchFrom } : {}), ...(l.resumes ? { resumes: l.resumes } : {}),
@@ -2732,6 +2715,7 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
   const [sub, ...rest] = args
   if (sub === 'start') return sddStart(rest, env, cwd)
   if (sub === 'phase') return sddPhase(rest, env, cwd)
+  if (sub === 'commit') return sddCommit(rest, env, cwd)
   if (sub === 'status') {
     const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { json: { type: 'boolean', default: false } } })
     if (positionals.length > 1) throw new SddError('usage', 'sdd status recibe un solo id', { next: './bin/sdd-ai sdd status [<id>]' })
@@ -2750,7 +2734,7 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
     return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
   }
   if (sub === 'verify') return sddVerify(rest, env, cwd)
-  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd start <id> | ./bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id>' })
+  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd start <id> | ./bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id> | ./bin/sdd-ai sdd commit <id> --subject <asunto> [--apply --digest <d>]' })
 }
 
 function sddStart(args: string[], env: Env, cwd: string): Result {
@@ -2776,6 +2760,19 @@ function sddStart(args: string[], env: Env, cwd: string): Result {
   assertNoBlockers(startChecks(root, positionals[0], options, deps).blockers)
   recoverPendingRestore(root, 'blocking')
   return { code: 0, out: startApply(root, positionals[0], input, deps) }
+}
+
+function sddCommit(args: string[], env: Env, cwd: string): Result {
+  if (env.SDD_AI_WORKER === '1') throw new SddError('recursion', 'un worker no commitea', { next: 'responde el encargo al conductor' })
+  const { values, positionals } = parseArgs({ args, strict: true, allowPositionals: true,
+    options: { subject: { type: 'string' }, apply: { type: 'boolean', default: false }, digest: { type: 'string' } } })
+  if (positionals.length !== 1 || values.subject === undefined || (values.apply && !values.digest) || (!values.apply && values.digest !== undefined)) {
+    throw new SddError('usage', 'sdd commit recibe un id y --subject; --apply exige --digest y el digest solo va con --apply', {
+      next: `./bin/sdd-ai sdd commit ${positionals[0] ?? '<id>'} --subject "<asunto>"`,
+    })
+  }
+  const root = repoRoot(cwd)
+  return { code: 0, out: values.apply ? applyCommit(root, positionals[0], values.subject, values.digest!) : planCommit(root, positionals[0], values.subject) }
 }
 
 const VERIFY_USAGE = './bin/sdd-ai sdd verify <id> [--baseline | --attest V<n> | --takeover [--reason <texto>]] [--conductor claude|codex]'
@@ -2949,6 +2946,8 @@ function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string)
   // El ensayo de `sdd start` no escribe nada, y la recuperación escribe aun en modo no bloqueante: `sddStart` la corre
   // él mismo, bloqueante, solo con `--apply` y después de validar.
   if (cmd === 'sdd' && rest[0] === 'start') return
+  // Commit se niega ante una restauración pendiente: nunca la ejecuta como efecto previo.
+  if (cmd === 'sdd' && rest[0] === 'commit') return
   if (!['run', 'review', 'wait', 'cancel', 'agents', 'sdd', 'doctor', 'init', 'prune'].includes(cmd ?? '')) return
   let root: string
   try {
@@ -2979,7 +2978,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }
       default:
-        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | prune | recall | run | review | wait | cancel | agents sync | sdd start | sdd status | sdd approve | doctor' })
+        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | prune | recall | run | review | wait | cancel | agents sync | sdd start | sdd status | sdd approve | sdd commit | doctor' })
     }
   } catch (e) {
     if (e instanceof SddError) {

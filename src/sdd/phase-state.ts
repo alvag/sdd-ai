@@ -3,11 +3,13 @@ import { join } from 'node:path'
 import { dirtyPaths } from '../git.ts'
 import { withLock } from '../lock.ts'
 import { isRunId, readStatus, writeJsonAtomic } from '../runs.ts'
-import { SddError, TERMINAL } from '../types.ts'
+import { type Family, SddError, TERMINAL } from '../types.ts'
 import { harvestTreeHolds, isWriterRun, readControl, readHarvest } from '../writer-store.ts'
 import type { DocumentStep, PhaseStep } from './phase.ts'
 import { LOCK_FILE, flowDir, lstatOrNull, pathInvalid, readFlow } from './read.ts'
-import type { FlowStatus, Next } from './status.ts'
+import { type FlowStatus, type Next, headerData } from './status.ts'
+import { reviewStartCommand } from '../review/standing.ts'
+import { commitNext, isCommitSha } from './commit.ts'
 import { type ChainState, classesPath, orientation } from './chain.ts'
 import { chainBaseOf, chainView, classificationDetail, redProposals } from './chain-facts.ts'
 import type { AttestationRef, VerifyReceipt, VerifyReceiptRef } from './verify-receipt.ts'
@@ -34,13 +36,23 @@ export interface PhaseRecord {
   verify?: { receipts: VerifyReceiptRef[]; attestations: AttestationRef[] }
   /** Las cadenas de writers de `implement`; un registro anterior no la trae. */
   implement?: ImplementRecord
+  commit?: CommitRecord
 }
 
 /** Una corrida de writer de la cadena. `implement` es el writer inicial; `fix`, una corrección desde un recibo rojo. */
 export type RunKind = 'implement' | 'continuation' | 'block' | 'fix'
 export type ChainClass = 'implementation' | 'contract' | 'environment' | 'design'
 export type TerminalCode = 'takeover' | 'back_to_plan' | 'no_progress' | 'fix_cap' | 'failure_cap' | 'resume_unavailable' | 'legacy'
+export interface LaunchInfo { prompt_digest: string; family: Family; model: string | null; effort: string | null }
+export interface CommitIntent {
+  state: 'intent'; at: string; digest: string; parent: string; tree: string; message: string; paths: string[]
+  receipt: { id: string; digest: string }; review: string
+}
+export interface CommitDone extends Omit<CommitIntent, 'state'> { state: 'done'; sha: string }
+export type CommitRecord = CommitIntent | CommitDone
+
 export interface RunEntry {
+  launch?: LaunchInfo
   kind: RunKind; run: string
   /** El eslabón del que parte: una corrida, una toma, o `null` en la primera cadena con el árbol limpio. */
   parent: string | null
@@ -110,6 +122,10 @@ export function readPhaseRecord(root: string, id: string): PhaseRecord {
     const problem = implementProblem(data.implement)
     if (problem !== null) throw invalid(id, `implement ${problem}`)
   }
+  if (data.commit !== undefined) {
+    const problem = commitProblem(data.commit)
+    if (problem !== null) throw invalid(id, `commit ${problem}`)
+  }
   return data as unknown as PhaseRecord
 }
 
@@ -134,8 +150,14 @@ function entryOfChainProblem(e: unknown): string | null {
     return null
   }
   if (!RUN_KINDS.includes(String(e.kind))) return `tiene el tipo desconocido ${JSON.stringify(e.kind)}`
-  const extra = onlyKeys(e, ['kind', 'run', 'parent', 'resumes', 'base', 'at', 'pending', 'receipt'])
+  const extra = onlyKeys(e, ['kind', 'run', 'parent', 'resumes', 'base', 'at', 'pending', 'receipt', 'launch'])
   if (extra) return `trae la clave desconocida ${extra}`
+  if (e.launch !== undefined) {
+    const l = e.launch
+    if (!isRecord(l) || Object.keys(l).length !== LAUNCH_KEYS.length || onlyKeys(l, LAUNCH_KEYS)
+      || typeof l.prompt_digest !== 'string' || !DIGEST.test(l.prompt_digest) || !['claude', 'codex'].includes(String(l.family))
+      || !(l.model === null || text(l.model)) || !(l.effort === null || text(l.effort))) return 'tiene launch inválido'
+  }
   if (e.base !== undefined && !text(e.base)) return 'tiene una base vacía'
   if (!(typeof e.run === 'string' && isRunId(e.run)) || !(e.parent === null || text(e.parent)) || !ISO(e.at)) return 'es una corrida sin id, padre o fecha'
   if (e.resumes !== undefined && !(typeof e.resumes === 'string' && isRunId(e.resumes))) return 'reanuda algo que no es una corrida'
@@ -143,6 +165,29 @@ function entryOfChainProblem(e: unknown): string | null {
   // Una corrección nombra el recibo del que sale; las demás corridas no parten de un recibo.
   if (e.kind === 'fix' ? !receiptRef(e.receipt) : e.receipt !== undefined) return e.kind === 'fix' ? 'es una corrección sin recibo con id y digest' : 'trae un recibo y no es una corrección'
   return null
+}
+
+/** Las claves de `launch`: exactamente estas, todas presentes. */
+const LAUNCH_KEYS: readonly string[] = ['prompt_digest', 'family', 'model', 'effort']
+
+function commitProblem(c: unknown): string | null {
+  if (!isRecord(c) || !['intent', 'done'].includes(String(c.state))) return 'no es intent ni done'
+  const keys = ['state', 'at', 'digest', 'parent', 'tree', 'message', 'paths', 'receipt', 'review', ...(c.state === 'done' ? ['sha'] : [])]
+  if (Object.keys(c).length !== keys.length || onlyKeys(c, keys)) return 'tiene claves incorrectas'
+  const sha = isCommitSha
+  const date = typeof c.at === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(c.at) && ISO(c.at)
+  if (!date || !digested(c) || !sha(c.parent) || !sha(c.tree) || (c.state === 'done' && !sha(c.sha))) return 'tiene fecha, digest o sha inválido'
+  if (!text(c.message) || !Array.isArray(c.paths) || !c.paths.every(text) || c.paths.length === 0 || !receiptRef(c.receipt)
+    || typeof c.review !== 'string' || !isRunId(c.review)) return 'tiene mensaje, rutas, recibo o revisión inválidos'
+  return null
+}
+
+/** Escribe o borra el commit del flujo; quien llama tiene el lock del flujo. */
+export function writeCommitRecord(root: string, id: string, c: CommitRecord | undefined): void {
+  const record = readPhaseRecord(root, id)
+  if (c === undefined) delete record.commit
+  else record.commit = c
+  writePhaseRecord(root, id, record)
 }
 
 /** Qué le falta a la clave `implement` para tener la forma del registro; `null` si la tiene. */
@@ -392,6 +437,21 @@ export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'de
  */
 export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root: string, id: string, status: T): Next {
   const chained = chainNext(root, id, status)
+  if (status.next.step === 'review_and_commit') {
+    // Un next de la cadena sin comando es un diagnóstico (control ilegible, cadena sin corridas): se muestra tal cual.
+    if (chained !== null && chained.command === undefined) return chained
+    let next = chained ?? status.next
+    if (chained === null) {
+      try {
+        const base = headerData(readFlow(root, id).facts.planHeader)?.base_commit
+        // Solo un sha entra al comando: el header es texto editable y el comando se ejecuta tal cual.
+        if (isCommitSha(base)) next = { ...next, command: reviewStartCommand(id, base) }
+      } catch {
+        return next
+      }
+    }
+    return commitNext(root, id, next)
+  }
   if (chained !== null) return chained
   if (status.next.step === 'verify') return { ...status.next, command: `./bin/sdd-ai sdd verify ${id}` }
   if ((status.depth !== 'normal' && status.depth !== 'completa') || !PHASE_STEPS.includes(status.next.step)) return status.next
@@ -435,8 +495,9 @@ function chainNext(root: string, id: string, status: Pick<FlowStatus, 'depth' | 
       return { step: status.next.step, detail: `no se pudo leer el control de la cadena para armar la revisión: ${(e as Error).message}` }
     }
     if (base === null) return { step: status.next.step, detail: 'la cadena no tiene ninguna corrida lanzada: no hay base para la revisión' }
-    if (link.kind === 'takeover') return { ...status.next, command: `./bin/sdd-ai review start --base ${base} --untracked`, detail: 'el candidato es de autoría mezclada: el writer de la cadena y la toma del conductor' }
-    return { ...status.next, command: `./bin/sdd-ai review start --harvest ${link.run} --base ${base} --author ${family}` }
+    if (link.kind === 'takeover') return { ...status.next, command: reviewStartCommand(id, base), detail: 'el candidato es de autoría mezclada: el writer de la cadena y la toma del conductor' }
+    if (family === undefined) return { step: status.next.step, detail: `el control de ${link.run} no dice la familia del writer: no hay comando de revisión que proponer` }
+    return { ...status.next, command: reviewStartCommand(id, base, { run: link.run, author: family }) }
   }
   switch (n.kind) {
     case 'verify':

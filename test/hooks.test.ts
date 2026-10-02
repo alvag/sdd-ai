@@ -1380,3 +1380,13 @@ test('una restauraciÃ³n de verify pendiente niega el commit aunque el flujo estÃ
     assert.equal(shell(cli, repo, 'git commit -m x'), '')
   }
 })
+
+test('un subagente no corre sdd-ai sdd commit', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    const out = shell(cli, repo, './bin/sdd-ai sdd commit f --subject x', CHILD)
+    assert.match(denial(out), /un worker no delega ni toca las corridas del conductor/)
+    assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [])
+    assert.equal(shell(cli, repo, './bin/sdd-ai sdd commit f --subject x'), '')
+  }
+})

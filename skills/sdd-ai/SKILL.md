@@ -116,6 +116,9 @@ el reporte está completo.
   la misma familia, sin la diversidad de la otra.
 - **Si eres Codex**, pide escalamiento para `review start`, igual que para `run`.
 
+- La revisión final de un flujo SDD lleva `--flow <id>`, con `--untracked` o `--harvest`, sin
+  `--head` ni `--artifact`, y con la base del plan. Así `sdd status` y `sdd commit` la reconocen.
+
 ### Nivel de riesgo y revisores
 
 `review start` clasifica el candidato en `normal` o `high` y lo congela en la corrida. La respuesta
@@ -441,6 +444,8 @@ Claude Code carga los hooks del repositorio sin pedir nada. Codex los ejecuta so
 usuario los aprueba en `/hooks`, y vuelve a pedirlo cada vez que cambian sus definiciones.
 
 ### La guarda del commit
+
+El camino normal es `sdd commit`; el commit a mano sigue disponible desde `review_and_commit`.
 
 - **Con tu sesión ligada a un flujo**, un `git commit` a este repositorio se niega mientras el paso
   siguiente del flujo esté antes de `review_and_commit`. Vale tanto para uno tuyo como para uno de un
@@ -835,6 +840,46 @@ proyecta `## Verify` en el plan y deja `status: verified`.
 verde que corresponda al árbol actual y al plan aprobado actual. Si el recibo ya no vale,
 `status` agrega la nota `verified_stale` y devuelve el paso a `verify`: corre de nuevo la
 verificación antes de continuar.
+
+### El commit: `sdd commit`
+
+Con el recibo final válido y una revisión de código del flujo terminada, convergida y vigente,
+`sdd status` propone el ensayo:
+
+```sh
+./bin/sdd-ai sdd commit <id> --subject "agrega el comportamiento acordado"
+```
+
+El asunto va en español, con inicial minúscula, en una sola línea. El binario pone el tipo desde
+`change_type`, el ticket del flujo o de la rama si existe y los Extras del plan. La primera línea
+completa debe tener menos de 72 caracteres. No agrega firmas ni atribuciones.
+
+Muestra al usuario el ensayo completo: las rutas, sus orígenes, las sensibles, el mensaje, el recibo,
+la revisión y el digest. Pide su sí explícito antes de aplicar. Solo con ese permiso, repite el mismo
+asunto con el digest mostrado:
+
+```sh
+./bin/sdd-ai sdd commit <id> --subject "agrega el comportamiento acordado" --apply --digest <digest>
+```
+
+En Codex, corre el `--apply --digest` con escalada, fuera del sandbox. `git_unwritable` pide repetir
+el mismo comando con escalada antes de tocar el índice. Si el usuario no la aprueba, puede hacer
+el commit desde su terminal. Un digest distinto se rechaza: vuelve a mostrar el ensayo y pide el sí.
+
+- `already_committed`: no crea otro commit. El ensayo informa qué falta del índice, registro o header;
+  el `--apply` con su digest completa esos pendientes. Si no falta nada, sigue el estado del flujo.
+- `commit_failed`: muestra el error de Git y no reintenta automáticamente. Corrige la causa antes de
+  volver al ensayo; lo staged del usuario se conserva.
+- `commit_altered`: un hook cambió el contenido, el modo o el mensaje; el verbo deshace su commit.
+  Revisa las rutas indicadas. Si el hook tocó el árbol, vuelve a verificar y revisar ese contenido.
+- **Sin mover ninguna referencia** (`commit_altered` si un hook cambió de rama, `commit_failed` si HEAD avanzó con
+  commits que no son del intento): revisa el historial con el usuario antes de repetir nada. El `next` dice si
+  quedó un commit del intento, y con él la intención en el registro para reconocerlo.
+
+El commit incluye el contenido verificado sin filtros `clean`. Los hooks de Git sí corren. Un hook
+`commit-msg` que cambia el mensaje impide usar el verbo. El commit a mano sigue disponible desde
+`review_and_commit`; en ese camino el conductor actualiza el header como antes. El verbo no hace
+push, PR ni archivo.
 
 ## 10. Retener lo que guarda sdd-ai: `prune`
 

@@ -470,15 +470,16 @@ function postDispatch(p: Payload, root: string, action: 'confirm' | 'release'): 
 }
 
 /**
- * Los comandos del conductor que un subagente no corre: los de corridas, `prune` y `recall`. `sdd start`, `sdd approve`, `sdd phase`
- * y `sdd verify` se suman aparte, porque `sdd status` sí lo puede correr un worker.
+ * Los comandos del conductor que un subagente no corre: los de corridas, `prune` y `recall`. `sdd start`, `sdd approve`,
+ * `sdd phase`, `sdd verify` y `sdd commit` se suman aparte, porque `sdd status` sí lo puede correr un worker.
  */
 const CONDUCTOR_COMMANDS = new Set(['run', 'review', 'wait', 'cancel', 'prune', 'recall'])
-const CONDUCTOR_SDD = new Set(['start', 'approve', 'phase', 'verify'])
+const CONDUCTOR_SDD = new Set(['start', 'approve', 'phase', 'verify', 'commit'])
 
 /**
  * Si el tramo invoca `sdd-ai`, una ruta que termina en `bin/sdd-ai` o `node <ruta>/bin/sdd-ai`, con uno
- * de los comandos de corridas, con `prune`, con `recall`, con `sdd start`, con `sdd approve`, con `sdd phase` o con `sdd verify`.
+ * de los comandos de corridas, con `prune`, con `recall`, con `sdd start`, con `sdd approve`, con `sdd phase`, con
+ * `sdd verify` o con `sdd commit`.
  */
 function invokesConductorCommand(segment: string): boolean {
   const tokens = segment.trim().split(/\s+/)
