@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { freeze, readContext } from '../../../src/review/candidate.ts'
 import type { Ledger, RoundPlan } from '../../../src/review/ledger.ts'
 import { renderMaterial, renderReviewPrompt, renderRoundPrompt } from '../../../src/review/prompt.ts'
-import { makeFakeBin, makeRepo, warmFakeBin } from '../../helpers.ts'
+import { makeFakeBin, makeRepo } from '../../helpers.ts'
 
 export const GOLDEN_DIR = import.meta.dirname
 const BIN = join(import.meta.dirname, '..', '..', '..', 'bin', 'sdd-ai')
@@ -77,7 +77,6 @@ export function reviewEnv(repo: string, answers: string[]): Record<string, strin
   const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
   symlinkSync(process.execPath, join(bin, 'node'))
   makeFakeBin(bin, 'claude')
-  warmFakeBin(bin, 'claude')
   const work = mkdtempSync(join(tmpdir(), 'sdd-ai-fake-'))
   writeFileSync(join(work, 'answers.json'), JSON.stringify(answers))
   return {

@@ -10,7 +10,8 @@
     "node": ">=26"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.ts\"",
+    "test": "node --import ./test/no-subprocess.ts --test \"test/**/*.test.ts\"",
+    "test:unit": "node --import ./test/no-subprocess.ts --test \"test/**/*.unit.test.ts\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

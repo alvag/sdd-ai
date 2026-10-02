@@ -1,24 +1,33 @@
 import { execFileSync, spawnSync } from 'node:child_process'
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { type Question, gateQuestionFor } from '../src/approval/question.ts'
 import { readFlow } from '../src/sdd/read.ts'
 import { type GateId, resolve } from '../src/sdd/status.ts'
 
-/** Ejecutable `claude` o `codex` en `dir` que delega en el CLI falso de los tests. */
-export function makeFakeBin(dir: string, name: 'claude' | 'codex'): void {
-  const file = join(dir, name)
-  writeFileSync(file, `#!/bin/sh\nexec "${process.execPath}" "${join(import.meta.dirname, 'fake-cli.ts')}" "$@"\n`)
-  chmodSync(file, 0o755)
-}
+let fakeBinScript: string | undefined
 
 /**
- * Ejecuta una vez el bin falso. macOS evalúa la primera ejecución de un ejecutable nuevo (unos 0,4 s,
- * a veces más con la suite en paralelo): un test con un tope de 1 s no puede pagarla dentro del tope.
+ * Enlace `claude` o `codex` en `dir` a un script que comparte todo el proceso. macOS evalúa la primera
+ * ejecución de un ejecutable nuevo (unos 0,4 s, a veces más con la suite en paralelo), y un test con un
+ * tope de 1 s no puede pagarla dentro del tope. Un enlace nuevo a un script que ya corrió no la paga:
+ * el script se crea y se ejecuta una sola vez, en el primer uso. Es de solo lectura, para que un test
+ * que escriba sobre el enlace falle en vez de cambiar el bin de los demás escenarios; para reemplazar
+ * un bin, primero se borra el enlace.
  */
-export function warmFakeBin(dir: string, name: 'claude' | 'codex'): void {
-  spawnSync(join(dir, name), [], { env: { PATH: process.env.PATH, FAKE_MODE: 'ok-claude' }, input: '' })
+export function makeFakeBin(dir: string, name: 'claude' | 'codex'): void {
+  if (fakeBinScript === undefined) {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-fake-bin-')))
+    process.on('exit', () => rmSync(base, { recursive: true, force: true }))
+    fakeBinScript = join(base, 'fake-cli')
+    writeFileSync(fakeBinScript, `#!/bin/sh\nexec "${process.execPath}" "${join(import.meta.dirname, 'fake-cli.ts')}" "$@"\n`, { mode: 0o555 })
+    const r = spawnSync(fakeBinScript, [], { env: { PATH: process.env.PATH, FAKE_MODE: 'ok-claude' }, input: '', encoding: 'utf8' })
+    if (r.error || r.status !== 0) throw new Error(`el bin falso no arranca: ${r.error?.message ?? r.stderr}`)
+  }
+  const file = join(dir, name)
+  rmSync(file, { force: true })
+  symlinkSync(fakeBinScript, file)
 }
 
 /** Repo Git vacío en un directorio temporal (ruta real, sin el symlink de /var en macOS). */

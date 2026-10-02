@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+import { enableCompileCache } from 'node:module'
+
+// Preparar TypeScript es lo que más cuesta al arrancar; la caché de Node, fuera del repo, lo evita
+// desde la segunda vez. Si no se puede activar, Node lo informa en lo que devuelve, sin lanzar, y el
+// binario sigue sin caché, más lento.
+enableCompileCache()
+
 // Un hook corre en cada evento de la sesión: no carga el CLI entero, solo lo que responde el evento.
 if (process.argv[2] === 'hook') {
   const { runHook } = await import('../src/hooks.ts')

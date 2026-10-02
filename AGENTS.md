@@ -39,3 +39,16 @@ planes y las tasks que proponen nombres: un nombre en español ahí termina en e
 Hay valores anteriores a esta regla que están en español, como los estados del ledger de `review`
 (`abierto`, `aceptado`) o el nivel de riesgo `no_aplica`. Se conservan hasta que un cambio los toque
 por otro motivo.
+
+## Tests
+
+- `npm test` corre la suite completa. `node --test` corre cada archivo en su propio proceso, en
+  paralelo, y los tests de un mismo archivo en serie: la suite tarda lo que tarda su archivo más
+  lento.
+- Un archivo que corre el binario, `git` u otro proceso tarda segundos por test. Conviene que ninguno
+  pase de unos 50 s dentro de la suite completa: si crece más, se parte por tema y lo común va a un
+  módulo `<prefijo>-fixture.ts`, que no termina en `.test.ts`.
+- `npm run test:unit` corre solo los `*.unit.test.ts`, en segundos. Esos archivos no pueden lanzar
+  subprocesos, ni directamente ni a través de `src/`: con `npm test` y con `npm run test:unit`,
+  `test/no-subprocess.ts` hace fallar el test que lo intente. Un `node --test` a mano lo aplica solo
+  con `--import ./test/no-subprocess.ts`. Un test que necesita un proceso va en un `*.test.ts` común.

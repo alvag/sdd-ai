@@ -271,6 +271,8 @@ test('una corrida que no lanza su supervisor no deja temporales', () => {
   const s = setup({ families: '[codex, claude]', bins: ['codex'] })
   const tmp = mkdtempSync(join(tmpdir(), 'sdd-ai-tmp-'))
   s.env.TMPDIR = tmp
+  // La caché de compilación de Node también se escribiría en este temporal: se apaga para ver solo lo de sdd-ai.
+  s.env.NODE_DISABLE_COMPILE_CACHE = '1'
   writeFileSync(join(s.repo, 'grande.txt'), 'x'.repeat(100).concat('\n').repeat(2200))
   git(s.repo, 'add', '-N', 'grande.txt')
   const r = cli(s, ['review', 'start', '--base', s.base])

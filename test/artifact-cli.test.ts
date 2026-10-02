@@ -5,7 +5,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { GOLDEN_DIR, goldenRepo } from './fixtures/golden-diff/capture.ts'
-import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
+import { makeFakeBin, makeRepo } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 const git = (repo: string, ...args: string[]) =>
@@ -40,7 +40,6 @@ function setup(answers: string[], o: { single?: boolean } = {}): Setup {
   const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
   symlinkSync(process.execPath, join(bin, 'node'))
   makeFakeBin(bin, 'claude')
-  warmFakeBin(bin, 'claude')
   const work = mkdtempSync(join(tmpdir(), 'sdd-ai-fake-'))
   writeFileSync(join(work, 'answers.json'), JSON.stringify(answers))
   const env: Record<string, string> = {

@@ -18,7 +18,7 @@ import { type Family, type Resolution, opposite } from '../src/types.ts'
 import { type PhaseRecord, readPhaseRecord, withFlowLock, writePhaseRecord } from '../src/sdd/phase-state.ts'
 import { freezeLaunch } from '../src/sdd/publish.ts'
 import { readFlow } from '../src/sdd/read.ts'
-import { makeFakeBin, makeRepo, warmFakeBin } from './helpers.ts'
+import { makeFakeBin, makeRepo } from './helpers.ts'
 
 const FAKE = join(import.meta.dirname, 'fake-cli.ts')
 
@@ -204,7 +204,6 @@ function prepareCli(family: Family, mode: string, args: (dir: string) => string[
   writeFileSync(join(dir, 'prompt.md'), 'encargo')
   const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
   makeFakeBin(bin, family)
-  warmFakeBin(bin, family)
   const argv: ArgvFile = {
     family, launch: { cmd: join(bin, family), args: args(dir), cwd: dir, stdinFile: join(dir, 'prompt.md') },
     deadline_sec: 1, grace_ms: 200, resume_sec: 5, ...over,
@@ -348,7 +347,6 @@ const BASE_TMP = tmpdir()
 function isolate(family: Family): string {
   const bin = mkdtempSync(join(BASE_TMP, 'sdd-ai-bin-'))
   makeFakeBin(bin, family)
-  warmFakeBin(bin, family)
   process.env.PATH = `${bin}:${BASE_PATH}`
   const tmp = mkdtempSync(join(BASE_TMP, 'sdd-ai-tmp-'))
   process.env.TMPDIR = tmp
