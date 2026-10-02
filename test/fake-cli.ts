@@ -26,6 +26,7 @@ function okClaude(): void {
 }
 
 function okCodex(): void {
+  if (process.env.FAKE_PROMPT_FILE) writeFileSync(process.env.FAKE_PROMPT_FILE, readFileSync(0, 'utf8'))
   process.stdout.write(fixture('codex-stream.jsonl'))
   const i = args.indexOf('--output-last-message')
   if (i >= 0) writeFileSync(args[i + 1], 'ok')

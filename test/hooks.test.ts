@@ -833,6 +833,19 @@ test('sdd status o approve en el primer tramo liga la sesión, también con sali
   }
 })
 
+test('sdd start --apply liga la sesión al flujo y el ensayo no liga', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f1', { spec: false, handoff: { profundidad: 'normal', phase: 'specify' } })
+    for (const command of ['./bin/sdd-ai sdd start f1', './bin/sdd-ai sdd start f1 --topic "x"', './bin/sdd-ai sdd start -- --apply']) {
+      post(cli, repo, command)
+      assert.equal(bound(repo), null, command)
+    }
+    post(cli, repo, './bin/sdd-ai sdd start f1 --apply --depth normal --risk low --change-type feat --request p.md')
+    assert.deepEqual(bound(repo), { id: 'f1', step: 'specify', gate: null })
+  }
+})
+
 test('otro id cambia la liga y el mismo renueva la referencia', () => {
   for (const cli of CLIS) {
     const repo = flowRepo()
@@ -1148,6 +1161,18 @@ test('dentro de un subagente, la guarda niega sdd-ai recall', () => {
     assert.match(denial(out), /un worker no delega ni toca las corridas del conductor/)
     assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [])
     assert.equal(shell(cli, repo, command), '')
+  }
+})
+
+test('dentro de un subagente, la guarda niega sdd start, el ensayo y --apply', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    for (const command of ['./bin/sdd-ai sdd start f1', './bin/sdd-ai sdd start f1 --apply --depth normal --risk low --change-type feat --request p.md']) {
+      const out = shell(cli, repo, command, CHILD)
+      assert.match(denial(out), /un worker no delega ni toca las corridas del conductor/, command)
+      assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [], command)
+      assert.equal(shell(cli, repo, command), '', command)
+    }
   }
 })
 

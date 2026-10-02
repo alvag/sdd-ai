@@ -63,6 +63,8 @@ import {
 import { freezeLaunch } from './sdd/publish.ts'
 import { FILE_NAMES, type FlowRead, LOCK_FILE, artifactHash, bytesHash, flowDir, headerHash, listFlows, readFlow } from './sdd/read.ts'
 import { recoverPendingRestore } from './sdd/restore.ts'
+import { isFlowId } from './sdd/id.ts'
+import { assertNoBlockers, checkApplyInput, readAntecedents, renderAntecedents, startApply, startChecks, startPreview } from './sdd/start.ts'
 import { type FlowStatus, headerData, resolve as resolveFlow } from './sdd/status.ts'
 import { type ManualRow, type VerificationRow, readVerification } from './sdd/verification-contract.ts'
 import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal, verifyProjectionOf } from './sdd/verify.ts'
@@ -157,10 +159,15 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
       'conductor-effort': { type: 'string' },
       deadline: { type: 'string' },
       retry: { type: 'string' },
+      flow: { type: 'string' },
     },
   })
   if (env.SDD_AI_WORKER === '1') {
     throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
+  }
+  // `--retry` hereda el encargo congelado de la corrida original: anexarle antecedentes lo cambiaría.
+  if (values.flow !== undefined && values.retry !== undefined) {
+    throw new SddError('usage', '--flow no va con --retry', { next: 'lanza una corrida nueva con --prompt-file <encargo> --flow <id>' })
   }
   if (values.retry !== undefined) checkRunId(values.retry)
   // Un writer se relanza con lo que guardó su almacén, nunca con su corrida visible, que pudo cambiar.
@@ -187,6 +194,9 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   }
   if (!isDispatchableRole(roleArg)) throw new SddError('usage', `rol desconocido: ${roleArg}`, { next: `usa uno de: ${DISPATCHABLE_ROLES.join(', ')}` })
   const role = roleArg
+  if (values.flow !== undefined && role !== 'explore' && role !== 'investigate') {
+    throw new SddError('usage', '--flow solo va con --role explore o investigate', { next: 'quita --flow, o usa --role explore o --role investigate' })
+  }
   const deadlineArg = values.deadline ?? '600'
   const deadline = Number(deadlineArg)
   if (!Number.isFinite(deadline) || deadline <= 0) throw new SddError('usage', `--deadline inválido: ${deadlineArg}`)
@@ -223,6 +233,8 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   } else {
     throw new SddError('usage', 'falta el encargo', { next: 'pasa --prompt-file <archivo> o --retry <id>' })
   }
+
+  if (values.flow !== undefined) prompt += `\n\n${renderAntecedents(values.flow, readAntecedents(root, values.flow))}`
 
   if (role === 'implement') {
     return await runWriter({
@@ -2718,6 +2730,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
  */
 async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
   const [sub, ...rest] = args
+  if (sub === 'start') return sddStart(rest, env, cwd)
   if (sub === 'phase') return sddPhase(rest, env, cwd)
   if (sub === 'status') {
     const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { json: { type: 'boolean', default: false } } })
@@ -2737,7 +2750,32 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
     return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
   }
   if (sub === 'verify') return sddVerify(rest, env, cwd)
-  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id>' })
+  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd start <id> | ./bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id>' })
+}
+
+function sddStart(args: string[], env: Env, cwd: string): Result {
+  const { values, positionals } = parseArgs({
+    args, strict: true, allowPositionals: true,
+    options: {
+      apply: { type: 'boolean', default: false }, topic: { type: 'string' }, 'base-branch': { type: 'string' },
+      depth: { type: 'string' }, risk: { type: 'string' }, 'change-type': { type: 'string' }, request: { type: 'string' },
+    },
+  })
+  if (positionals.length !== 1 || !isFlowId(positionals[0])) throw new SddError('usage', 'sdd start recibe un solo id válido', { next: './bin/sdd-ai sdd start <id>' })
+  if (!values.apply) for (const flag of ['depth', 'risk', 'change-type', 'request'] as const) {
+    if (values[flag] !== undefined) throw new SddError('usage', `--${flag} solo va con --apply`, { next: 'quita los flags de aplicación para el ensayo, o agrega --apply' })
+  }
+  const root = repoRoot(cwd)
+  const deps = { env, hasCli: (family: Family) => inPath(family, env) }
+  const options = { topic: values.topic, baseBranch: values['base-branch'] }
+  if (!values.apply) return { code: 0, out: startPreview(root, positionals[0], options, deps) }
+  const input = { ...options, depth: values.depth, risk: values.risk, changeType: values['change-type'],
+    requestFile: values.request === undefined ? undefined : resolvePath(cwd, values.request) }
+  // Los flags, el pedido y los bloqueos se validan antes de recuperar: un --apply que se niega no escribe nada.
+  checkApplyInput(input)
+  assertNoBlockers(startChecks(root, positionals[0], options, deps).blockers)
+  recoverPendingRestore(root, 'blocking')
+  return { code: 0, out: startApply(root, positionals[0], input, deps) }
 }
 
 const VERIFY_USAGE = './bin/sdd-ai sdd verify <id> [--baseline | --attest V<n> | --takeover [--reason <texto>]] [--conductor claude|codex]'
@@ -2908,6 +2946,9 @@ const READS = (cmd: string | undefined, rest: string[]) =>
  * checkout. El supervisor interno no la corre: es parte de una corrida en curso, no un verbo.
  */
 function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string): void {
+  // El ensayo de `sdd start` no escribe nada, y la recuperación escribe aun en modo no bloqueante: `sddStart` la corre
+  // él mismo, bloqueante, solo con `--apply` y después de validar.
+  if (cmd === 'sdd' && rest[0] === 'start') return
   if (!['run', 'review', 'wait', 'cancel', 'agents', 'sdd', 'doctor', 'init', 'prune'].includes(cmd ?? '')) return
   let root: string
   try {
@@ -2938,7 +2979,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }
       default:
-        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | prune | recall | run | review | wait | cancel | agents sync | sdd status | sdd approve | doctor' })
+        throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | prune | recall | run | review | wait | cancel | agents sync | sdd start | sdd status | sdd approve | doctor' })
     }
   } catch (e) {
     if (e instanceof SddError) {

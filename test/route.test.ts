@@ -154,6 +154,8 @@ test('con jira on el bootstrap exige SDD, nombra las dos partes y no ofrece ruta
     '- Antes de rediseñar algo o de repetir una investigación, al arrancar un flujo, ante un «¿por qué se decidió esto?» ' +
       'o cuando el código cita un motivo que no está escrito, se buscan antecedentes con `./bin/sdd-ai recall "<tema>"`: ' +
       'busca en Engram, en el vault, en `.plans/` y en el log de Git, y su `next` dice qué fuente manda.',
+    '- Un flujo SDD se arranca con `./bin/sdd-ai sdd start <id>`: el ensayo muestra el config, las familias y los antecedentes ' +
+      'sin escribir nada; `--apply` crea `.plans/<id>/` con lo que el usuario confirmó.',
     '- Primero se validan las premisas y se corren checks focalizados; después, los completos.',
     '- Una refutación de solo lectura se pide con `./bin/sdd-ai run --role refute --prompt-file <encargo>`.',
     '- Al cerrar, el conductor declara la ruta que siguió y los supuestos que tomó.',
@@ -177,6 +179,16 @@ test('el bootstrap, con Jira y sin Jira, pide buscar antecedentes con recall y d
     assert.ok(line)
     for (const word of ['Engram', 'vault', '`.plans/`', 'Git', 'por qué se decidió', 'rediseñar', 'repetir una investigación', 'arrancar un flujo', 'motivo que no está escrito']) {
       assert.ok(line.includes(word), word)
+    }
+  }
+})
+
+test('el bootstrap, con Jira y sin Jira, dice que un flujo SDD se arranca con sdd start', () => {
+  for (const text of [renderBootstrap(), renderBootstrap(undefined, undefined, 'on')]) {
+    const line = text.split('\n').find((value) => value.includes('./bin/sdd-ai sdd start <id>'))
+    assert.ok(line)
+    for (const part of ['ensayo', 'config', 'familias', 'antecedentes', 'sin escribir nada', '--apply', 'crea `.plans/<id>/`', 'usuario confirmó']) {
+      assert.ok(line.includes(part), part)
     }
   }
 })

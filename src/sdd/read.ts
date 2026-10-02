@@ -23,7 +23,7 @@ type FileKey = (typeof ARTIFACTS)[number] | 'approvals'
 export const FILE_NAMES: Record<FileKey, string> = {
   spec: 'spec.md', plan: 'plan.md', tasks: 'tasks.md', handoff: 'handoff.md', approvals: APPROVALS_FILE,
 }
-const START_FLOW = 'para empezar un flujo, corre /sdd-flow en Claude Code o $sdd-flow en Codex'
+const startFlowNext = (id: string) => `para empezar un flujo, corre ./bin/sdd-ai sdd start ${id} o /sdd-flow en Claude Code ($sdd-flow en Codex)`
 
 const outside = (rel: string) => rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -58,7 +58,7 @@ export function flowDir(root: string, id: string): string {
   const dir = join(plans, id)
   for (const [path, what] of [[plans, '.plans'], [dir, `.plans/${id}`]]) {
     const st = lstatOrNull(path)
-    if (st === null) throw new SddError('flow_not_found', `no existe el flujo ${id} en .plans/`, { next: START_FLOW })
+    if (st === null) throw new SddError('flow_not_found', `no existe el flujo ${id} en .plans/`, { next: startFlowNext(id) })
     if (st.isSymbolicLink()) throw pathInvalid(what, 'es un enlace simbólico')
     if (!st.isDirectory()) throw pathInvalid(what, 'no es un directorio')
   }

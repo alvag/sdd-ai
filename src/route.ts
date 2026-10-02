@@ -58,6 +58,8 @@ function readOnlyLines(t: RouteThresholds): string[] {
     '- Antes de rediseñar algo o de repetir una investigación, al arrancar un flujo, ante un «¿por qué se decidió esto?» ' +
       'o cuando el código cita un motivo que no está escrito, se buscan antecedentes con `./bin/sdd-ai recall "<tema>"`: ' +
       'busca en Engram, en el vault, en `.plans/` y en el log de Git, y su `next` dice qué fuente manda.',
+    '- Un flujo SDD se arranca con `./bin/sdd-ai sdd start <id>`: el ensayo muestra el config, las familias y los antecedentes ' +
+      'sin escribir nada; `--apply` crea `.plans/<id>/` con lo que el usuario confirmó.',
   ]
 }
 

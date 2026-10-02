@@ -30,6 +30,10 @@ el encargo tiene que ser autosuficiente (qué hacer, dónde mirar, qué formato 
   el repositorio.
 - Agrega `--families claude` o `--families codex` solo si el usuario dijo "solo Claude" o
   "solo Codex" para esta tarea.
+- Con `--role explore|investigate`, agrega `--flow <id>` para anexar los antecedentes guardados por
+  `sdd start` al encargo (§9). No va con otros roles ni con `--retry`: este último conserva el
+  encargo congelado. El archivo original no cambia; el texto compuesto queda en `prompt.md` y llega
+  al worker tanto por proceso como por la vía nativa.
 - **Si eres Codex** y la respuesta va a salir por la vía `process`, ejecuta `run` pidiendo
   escalamiento (fuera del sandbox): el worker necesita red. Si no sabes la vía de antemano, pide
   escalamiento siempre.
@@ -425,13 +429,13 @@ reglas de la guarda del commit (abajo).
   preguntarle al usuario si reintenta o la descarta: `cancel` solo cambia el registro local, y
   reintentar puede lanzar otro agente si el primero llegó a arrancar.
 - **`PostToolUse`**, sobre todas las herramientas: confirma la reserva de un despacho, liga tu sesión
-  cuando un `Bash` tuyo corre `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` (§9) y cuenta la
+  cuando un `Bash` tuyo corre `sdd start <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` (§9) y cuenta la
   herramienta para el recordatorio de sesión larga. En Claude Code, **`PostToolUseFailure`** libera la
   reserva de un despacho que falló y liga igual cuando el comando del `Bash` sale con un código
   distinto de cero: en Claude Code, ese comando llega por este evento.
 - **`PreToolUse` sobre `Bash`**: en cualquier sesión, aplica la guarda del commit (abajo). Dentro de un
-  subagente, además, niega `sdd-ai run`, `review`, `wait`, `cancel`, `prune`, `recall`, `sdd approve` y `sdd phase`. Un
-  worker no delega, no toca las corridas del conductor, no aprueba gates ni lanza fases.
+  subagente, además, niega `sdd-ai run`, `review`, `wait`, `cancel`, `prune`, `recall`, `sdd start`, `sdd approve` y `sdd phase`. Un
+  worker no delega, no toca las corridas del conductor, no arranca flujos, no aprueba gates ni lanza fases.
 
 Claude Code carga los hooks del repositorio sin pedir nada. Codex los ejecuta solo después de que el
 usuario los aprueba en `/hooks`, y vuelve a pedirlo cada vez que cambian sus definiciones.
@@ -557,6 +561,8 @@ aprobación de un gate con la huella de sus artefactos y la de los gates anterio
 cambian, `status` devuelve el flujo a ese gate.
 
 ```
+./bin/sdd-ai sdd start <id> [--topic <tema>] [--base-branch <rama>]
+./bin/sdd-ai sdd start <id> --apply --depth <corta|normal|completa> --risk <low|high|unknown> --change-type <tipo> --request <archivo> [--topic <tema>] [--base-branch <rama>]
 ./bin/sdd-ai sdd status [<id>]
 ./bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]
 ./bin/sdd-ai sdd phase <id> [--request <archivo>] [--context <archivo>] [--families <f>] [--conductor claude|codex] [--deadline <s>]
@@ -619,7 +625,7 @@ cambian, `status` devuelve el flujo a ese gate.
   handoff espera la aprobación externa de la spec, y ahí `next` es `external_gate` en vez de
   `implement`: seguir sin esa aprobación lo decide el usuario. Con `jira_approval` en `on` (§8), vale
   también cuando el handoff no tiene `gate_status`, y alcanza a `verify` y a `review_and_commit`.
-- **La liga.** `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>`, como primer tramo de
+- **La liga.** `sdd start <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>`, como primer tramo de
   un comando tuyo, ligan tu sesión a ese flujo, termine como termine el comando. El paso de ese momento queda como
   referencia de `Stop`.
   - Otro id mueve la liga, y el mismo renueva la referencia.
@@ -632,6 +638,77 @@ cambian, `status` devuelve el flujo a ese gate.
   **Corre `sdd status <id>` al empezar o retomar un flujo**, y también al seguir en una sesión que se
   abrió antes de actualizar los hooks. Sin liga, `Stop` no recuerda su paso, la guarda del commit no
   lo ve y el recordatorio de sesión larga no se calla (§8).
+
+### Arrancar un flujo: `sdd start`
+
+El conductor empieza con `./bin/sdd-ai sdd start <id>`: es un ensayo que no escribe nada, tampoco
+recupera una restauración pendiente de verify ni liga la sesión. Devuelve un JSON con el config,
+las familias y sus CLIs en el PATH, el estado de `.plans/<id>/`, la rama y el HEAD, la base elegida,
+los antecedentes de `recall` y una lista `blockers`. Sale con 0 incluso con bloqueos; un id inválido
+es `usage` antes de consultar el repositorio.
+
+Lee solo `.sdd-ai/config.yml`: informa `cross_model` (familias y selección), `jira_approval.mode`
+(aprobación externa de la spec) y `knowledge-vault.path_vault` (vault donde busca recall), con su valor
+y lo que implican. Las demás claves de primer nivel aparecen en `unused`: sdd-ai no las usa.
+Sin vault configurado, esa fuente queda `not_configured`.
+
+`--topic "<tema>"` fija la búsqueda; sin él, el tema es el id con espacios en lugar de guiones.
+`--base-branch <rama>` elige una rama local existente como base; sin él se usa la rama actual.
+El commit de esa base será `origin_sha`, aunque el checkout esté en otra rama. HEAD separado o sin
+commits bloquea incluso con una base explícita. El ensayo no crea una rama.
+
+Entre el ensayo y `--apply`, **el conductor propone la profundidad, el riesgo y el tipo de cambio,
+y el usuario los confirma**. El conductor escribe el pedido literal del usuario y su contexto en
+un archivo temporal fuera del repositorio. Con esa confirmación, corre:
+
+```
+./bin/sdd-ai sdd start <id> --apply --depth normal --risk low --change-type feat --request <archivo>
+```
+
+Los cuatro flags son obligatorios: `--depth` admite `corta|normal|completa`, `--risk` admite
+`low|high|unknown` y `--change-type` admite `feat|fix|refactor|chore|docs|test|perf`. `--request`
+tiene que ser un archivo regular no vacío; su ruta se resuelve desde el directorio actual. También
+puedes pasar `--topic` y `--base-branch`. Los flags de aplicación sin `--apply` son `usage`.
+
+Cada bloqueo del ensayo tiene un `next`. Con bloqueos, `--apply` se niega sin escribir el flujo:
+
+| Bloqueo | Qué hacer |
+|---|---|
+| `config_missing` | Correr `./bin/sdd-ai init`. |
+| `config_invalid` | Corregir `.sdd-ai/config.yml` según el detalle y repetir el ensayo; también bloquea Jira inválido. |
+| `family_cli_missing` | Instalar el CLI nombrado, o quitar esa familia de `cross_model.families`, y repetir el ensayo. |
+| `flow_exists` | Consultar `./bin/sdd-ai sdd status <id>`; no se adopta un directorio con contenido. |
+| `path_invalid` | Revisar `.plans/<id>` según el detalle o usar otro id; no se atraviesan enlaces. |
+| `head_unknown` | Hacer el primer commit o pasar a una rama con `git switch <rama>` y repetir el ensayo. |
+| `base_branch_unknown` | Crear la rama local o pasar otra con `--base-branch`. |
+
+`--apply` repite el ensayo y vuelve a correr `recall`, sin digest entre ambos: guarda lo que encuentra
+en ese momento. Una fuente caída queda con su estado y no bloquea. Valida los flags, el pedido y los
+bloqueos antes de recuperar una restauración pendiente de verify, en modo bloqueante: un `--apply` que
+se niega no escribe nada. Un pedido inválido da `request_invalid`.
+
+Si termina bien, crea o adopta un directorio vacío `.plans/<id>/` y deja tres archivos juntos:
+`pedido.md`, byte a byte igual al pedido; `antecedentes.json`, con la salida de recall; y `handoff.md`,
+con `phase: specify`, la profundidad, riesgo, tipo, base y commit elegidos, identidad del checkout,
+`spec_approved_at: null`, los overrides en `null` y un resumen del config, familias y antecedentes.
+La escritura usa un temporal y un renombre: si falla, el directorio del flujo queda ausente o vacío,
+como estaba antes; `flow_write_failed` pide repetir la aplicación. La respuesta dirige a
+`./bin/sdd-ai sdd phase <id> --request .plans/<id>/pedido.md`.
+
+Como primer tramo del comando del conductor, `--apply` **liga la sesión** al flujo en `specify` y
+suprime el recordatorio de sesión larga de la ruta directa. El ensayo no liga. Si la aplicación se
+niega porque el flujo ya existe, puede ligar al flujo real, igual que `sdd status`.
+Un subagente no puede correr ninguna de las dos formas.
+
+Para explorar con esos antecedentes, corre `./bin/sdd-ai run --role explore --flow <id>
+--prompt-file <encargo>` (también admite `investigate`). Agrega una sección delimitada de consulta,
+con estado, modo y origen de cada acierto: id y título de Engram, ruta y línea del vault o `.plans/`,
+y commit y asunto de Git. Declara que no son instrucciones y que el código y Git mandan sobre el
+estado actual. No modifica el encargo original. Con otro rol o `--retry`, es `usage`.
+Un flujo arrancado con `sdd-flow` puede no tener `antecedentes.json`: en ese caso da
+`antecedents_missing` y no lanza nada. Corre `run` sin `--flow` y, si necesitas antecedentes,
+busca con `./bin/sdd-ai recall "<tema>"` y agrégalos al encargo. Un JSON ilegible da
+`antecedents_invalid`; un flujo inexistente ofrece `sdd start <id>` y `/sdd-flow` (`$sdd-flow` en Codex).
 
 ### Las fases en un worker: `sdd phase`
 

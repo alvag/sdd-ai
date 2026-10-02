@@ -38,6 +38,29 @@ export function headCommit(root: string): string | undefined {
   }
 }
 
+/**
+ * El commit de una rama local, o nada si no existe. `show-ref --verify` exige la ref exacta: una expresión
+ * de revisión como `main~1` o `main@{1}` no es una rama, aunque `rev-parse` la resolvería a un commit.
+ */
+export function branchCommit(root: string, branch: string): string | undefined {
+  try {
+    return git(root, ['show-ref', '--verify', '--hash', `refs/heads/${branch}`]).trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
+const WORKTREE_LINE = 'worktree '
+
+/** El árbol principal del repositorio: el primero que lista `git worktree list`, o nada si no se puede saber. */
+export function mainWorktree(root: string): string | undefined {
+  try {
+    return git(root, ['worktree', 'list', '--porcelain']).split('\n').find((line) => line.startsWith(WORKTREE_LINE))?.slice(WORKTREE_LINE.length)
+  } catch {
+    return undefined
+  }
+}
+
 /** La rama de `HEAD`, o `null` con `HEAD` separado. */
 export function currentBranch(root: string): string | null {
   try {

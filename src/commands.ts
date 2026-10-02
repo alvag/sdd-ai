@@ -7,7 +7,7 @@ import { isFlowId } from './sdd/id.ts'
 import { shellPipelines } from './shell.ts'
 
 /** Un comando del binario que liga la sesión a un flujo. */
-export interface Binding { verb: 'status' | 'approve' | 'phase' | 'verify'; id: string }
+export interface Binding { verb: 'start' | 'status' | 'approve' | 'phase' | 'verify'; id: string }
 
 /** Dónde actúa un `git commit`: un directorio, o desconocido si el comando no deja saberlo. */
 export type CommitTarget = { dir: string } | { unknown: true }
@@ -71,25 +71,30 @@ function commandWords(segment: string): Word[] {
 
 /** Las opciones de cada verbo que liga, como las declara su `parseArgs`: las booleanas y las que llevan valor. */
 const OPTIONS: Record<Binding['verb'], { flags: string[]; values: string[]; count: number }> = {
+  start: { flags: ['--apply'], values: ['--topic', '--base-branch', '--depth', '--risk', '--change-type', '--request'], count: 1 },
   status: { flags: ['--json'], values: [], count: 1 },
   approve: { flags: [], values: ['--conductor'], count: 2 },
   phase: { flags: [], values: ['--request', '--context', '--families', '--conductor', '--deadline'], count: 1 },
   verify: { flags: ['--baseline'], values: ['--attest', '--conductor'], count: 1 },
 }
 
-/** Los posicionales como los separa el `parseArgs` estricto de la CLI; `undefined` si ella los rechazaría. */
-function positionals(args: string[], o: { flags: string[]; values: string[] }): string[] | undefined {
+/**
+ * Los argumentos como los separa el `parseArgs` estricto de la CLI: los posicionales y las banderas que vio antes
+ * de un `--`. `undefined` si ella los rechazaría.
+ */
+function splitArgs(args: string[], o: { flags: string[]; values: string[] }): { args: string[]; flags: string[] } | undefined {
   const out: string[] = []
+  const flags: string[] = []
   for (let i = 0; i < args.length; i++) {
     const a = args[i]
-    if (a === '--') return [...out, ...args.slice(i + 1)]
+    if (a === '--') return { args: [...out, ...args.slice(i + 1)], flags }
     if (!a.startsWith('-') || a === '-') out.push(a)
-    else if (o.flags.includes(a)) continue
+    else if (o.flags.includes(a)) flags.push(a)
     else if (o.values.some((v) => a.startsWith(`${v}=`))) continue
     else if (o.values.includes(a) && i + 1 < args.length) i++
     else return undefined
   }
-  return out
+  return { args: out, flags }
 }
 
 function bindingOf(segment: string): Binding | undefined {
@@ -98,13 +103,15 @@ function bindingOf(segment: string): Binding | undefined {
   const bin = ws[start]
   if (bin === undefined || (bin !== 'sdd-ai' && !bin.endsWith('bin/sdd-ai')) || ws[start + 1] !== 'sdd') return undefined
   const verb = ws[start + 2]
-  if (verb !== 'status' && verb !== 'approve' && verb !== 'phase' && verb !== 'verify') return undefined
-  const args = positionals(ws.slice(start + 3), OPTIONS[verb])
-  if (args === undefined || args.length !== OPTIONS[verb].count || !isFlowId(args[0])) return undefined
+  if (verb !== 'start' && verb !== 'status' && verb !== 'approve' && verb !== 'phase' && verb !== 'verify') return undefined
+  const parsed = splitArgs(ws.slice(start + 3), OPTIONS[verb])
+  if (parsed === undefined || (verb === 'start' && !parsed.flags.includes('--apply'))) return undefined
+  const args = parsed.args
+  if (args.length !== OPTIONS[verb].count || !isFlowId(args[0])) return undefined
   return { verb, id: args[0] }
 }
 
-/** `sdd status <id>`, `sdd approve <id> <gate>`, `sdd phase <id>` o `sdd verify <id>` del binario, solo en el primer tramo de la cadena. */
+/** `sdd start <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>`, `sdd phase <id>` o `sdd verify <id>`, solo en el primer tramo. */
 export function bindingCommand(command: string): Binding | undefined {
   return bindingOf(shellPipelines(command)[0][0])
 }
