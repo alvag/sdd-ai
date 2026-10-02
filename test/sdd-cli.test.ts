@@ -294,13 +294,23 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
 
 test('approve trae en next el comando de la fase', () => {
   const repo = makeRepo()
-  specOnly(repo)
+  const dir = specOnly(repo)
+  writeFileSync(join(dir, 'handoff.md'), readFileSync(join(dir, 'handoff.md'), 'utf8').replace('profundidad: completa', 'branch: feature/f\nprofundidad: completa'))
 
   answer(repo, 'f', 'spec')
   const spec = sdd(repo, 'approve', 'f', 'spec')
   assert.equal(spec.code, 0, JSON.stringify(spec.out))
   assert.deepEqual(spec.out.next, { step: 'plan', artifacts: ['plan.md'], command: './bin/sdd-ai sdd phase f' })
   assert.deepEqual(sdd(repo, 'status', 'f').out, spec.out)
+})
+
+test('sdd approve de la spec devuelve el paso branch con el comando de sdd branch', () => {
+  const repo = makeRepo()
+  specOnly(repo)
+  answer(repo, 'f', 'spec')
+  const r = sdd(repo, 'approve', 'f', 'spec')
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  assert.deepEqual(r.out.next, { step: 'branch', command: './bin/sdd-ai sdd branch f' })
 })
 
 test('approve rechaza sin escribir un gate inexistente, un artefacto faltante, tasks vacías, un gate anterior pendiente o un flujo bloqueado', () => {

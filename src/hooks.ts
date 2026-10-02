@@ -429,7 +429,7 @@ function postToolUseFailure(p: Payload, root: string, session: string): string {
 }
 
 /**
- * Liga la sesión al flujo de un `sdd start <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` del
+ * Liga la sesión al flujo de un `sdd start <id> --apply`, `sdd branch <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` del
  * conductor en el primer tramo, con el paso de ese momento como referencia de `Stop`, termine como termine el comando.
  * Un flujo que no se puede leer o sin artefactos no cambia la liga. Devuelve el aviso si no se pudo
  * guardar, o `''`.
@@ -470,15 +470,15 @@ function postDispatch(p: Payload, root: string, action: 'confirm' | 'release'): 
 }
 
 /**
- * Los comandos del conductor que un subagente no corre: los de corridas, `prune` y `recall`. `sdd start`, `sdd approve`,
+ * Los comandos del conductor que un subagente no corre: los de corridas, `prune` y `recall`. `sdd start`, `sdd branch`, `sdd approve`,
  * `sdd phase`, `sdd verify` y `sdd commit` se suman aparte, porque `sdd status` sí lo puede correr un worker.
  */
 const CONDUCTOR_COMMANDS = new Set(['run', 'review', 'wait', 'cancel', 'prune', 'recall'])
-const CONDUCTOR_SDD = new Set(['start', 'approve', 'phase', 'verify', 'commit'])
+const CONDUCTOR_SDD = new Set(['start', 'branch', 'approve', 'phase', 'verify', 'commit'])
 
 /**
  * Si el tramo invoca `sdd-ai`, una ruta que termina en `bin/sdd-ai` o `node <ruta>/bin/sdd-ai`, con uno
- * de los comandos de corridas, con `prune`, con `recall`, con `sdd start`, con `sdd approve`, con `sdd phase`, con
+ * de los comandos de corridas, con `prune`, con `recall`, con `sdd start`, con `sdd branch`, con `sdd approve`, con `sdd phase`, con
  * `sdd verify` o con `sdd commit`.
  */
 function invokesConductorCommand(segment: string): boolean {

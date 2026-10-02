@@ -74,7 +74,7 @@ export function currentBranch(root: string): string | null {
  * Las rutas con cambios sin commitear: modificadas, borradas, nuevas y renombradas. Lo ignorado no cuenta.
  * Sin los locks opcionales, `git status` no reescribe el índice: consultarlo no escribe nada en `.git`.
  */
-export function dirtyPaths(root: string): string[] {
+export function dirtyPaths(root: string, o: { renameSources?: boolean } = {}): string[] {
   const parts = git(root, ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=all']).split('\0')
   const out: string[] = []
   for (let i = 0; i < parts.length; i++) {
@@ -82,9 +82,47 @@ export function dirtyPaths(root: string): string[] {
     if (entry === '') continue
     out.push(entry.slice(3))
     // Un renombre o una copia traen después la ruta de origen.
-    if (entry[0] === 'R' || entry[0] === 'C') i++
+    if (entry[0] === 'R' || entry[0] === 'C') {
+      i++
+      if (o.renameSources && parts[i]) out.push(parts[i])
+    }
   }
   return out
+}
+
+export function isValidBranchName(root: string, name: string): boolean {
+  if (!name || name.startsWith('-')) return false
+  try { git(root, ['check-ref-format', '--branch', name]); return true } catch { return false }
+}
+
+export function isCommit(root: string, sha: string): boolean {
+  if (!/^[0-9a-f]{40,64}$/.test(sha)) return false
+  try { return !!git(root, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`]).trim() } catch { return false }
+}
+
+/**
+ * Una rama local que impide crear `name` por la jerarquía de refs: un prefijo de su ruta que ya es una rama (`feature`
+ * para `feature/x`) o una rama debajo de ella (`feature/x/y`). `check-ref-format` acepta esos nombres y Git falla recién
+ * al crear la ref.
+ */
+export function branchRefConflict(root: string, name: string): string | null {
+  const segments = name.split('/')
+  for (let i = 1; i < segments.length; i++) {
+    const prefix = segments.slice(0, i).join('/')
+    if (branchCommit(root, prefix)) return prefix
+  }
+  const below = git(root, ['for-each-ref', '--count=1', '--format=%(refname:short)', `refs/heads/${name}/`]).trim()
+  return below || null
+}
+
+/** Crea la rama `name` en `start` y cambia a ella. El error de Git sale tal cual, con su stderr. */
+export function createBranch(root: string, name: string, start: string): void {
+  git(root, ['switch', '-c', name, start])
+}
+
+/** Cambia a una rama local que existe; `--no-guess` impide que Git la cree desde un remoto. */
+export function switchBranch(root: string, name: string): void {
+  git(root, ['switch', '--no-guess', name])
 }
 
 /** El directorio de Git del checkout y el común, con rutas reales: en un worktree son distintos. */

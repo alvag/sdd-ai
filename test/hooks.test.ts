@@ -778,7 +778,7 @@ function writeFlow(repo: string, id: string, o: FlowShape = {}): void {
   mkdirSync(dir, { recursive: true })
   const front = (data: Record<string, unknown>, body: string) =>
     `---\n${Object.entries(data).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n')}\n---\n\n${body}\n`
-  const handoff = o.handoff === undefined ? { profundidad: 'completa', spec_approved_at: SPEC_APPROVED } : o.handoff
+  const handoff = o.handoff === undefined ? { profundidad: 'completa', spec_approved_at: SPEC_APPROVED, branch: 'feature/f' } : o.handoff
   if (handoff !== null) writeFileSync(join(dir, 'handoff.md'), front(handoff, '# Handoff'))
   if (o.spec ?? true) writeFileSync(join(dir, 'spec.md'), '# Spec\n\n- **AC-1** — algo.\n')
   if (o.plan) writeFileSync(join(dir, 'plan.md'), front({ profundidad: 'completa', ...o.plan }, '# Plan'))
@@ -843,6 +843,29 @@ test('sdd start --apply liga la sesión al flujo y el ensayo no liga', () => {
     }
     post(cli, repo, './bin/sdd-ai sdd start f1 --apply --depth normal --risk low --change-type feat --request p.md')
     assert.deepEqual(bound(repo), { id: 'f1', step: 'specify', gate: null })
+  }
+})
+
+test('dentro de un subagente, la guarda niega sdd branch, el ensayo y --apply', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    for (const command of ['./bin/sdd-ai sdd branch f', './bin/sdd-ai sdd branch f --apply']) {
+      assert.match(denial(shell(cli, repo, command, CHILD)), /un worker no delega ni toca las corridas del conductor/)
+      assert.equal(shell(cli, repo, command), '')
+    }
+  }
+})
+
+test('sdd branch --apply liga la sesión al flujo y el ensayo no liga', () => {
+  for (const cli of CLIS) {
+    const repo = flowRepo()
+    writeFlow(repo, 'f')
+    post(cli, repo, './bin/sdd-ai sdd branch f')
+    assert.equal(bound(repo), null)
+    post(cli, repo, './bin/sdd-ai sdd branch f --prefix feature')
+    assert.equal(bound(repo), null)
+    post(cli, repo, './bin/sdd-ai sdd branch f --apply --prefix feature --refreeze')
+    assert.deepEqual(bound(repo), { id: 'f', step: 'plan', gate: null })
   }
 })
 

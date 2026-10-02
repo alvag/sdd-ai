@@ -7,7 +7,7 @@ import { isFlowId } from './sdd/id.ts'
 import { shellPipelines } from './shell.ts'
 
 /** Un comando del binario que liga la sesión a un flujo. */
-export interface Binding { verb: 'start' | 'status' | 'approve' | 'phase' | 'verify'; id: string }
+export interface Binding { verb: 'start' | 'branch' | 'status' | 'approve' | 'phase' | 'verify'; id: string }
 
 /** Dónde actúa un `git commit`: un directorio, o desconocido si el comando no deja saberlo. */
 export type CommitTarget = { dir: string } | { unknown: true }
@@ -71,6 +71,7 @@ function commandWords(segment: string): Word[] {
 
 /** Las opciones de cada verbo que liga, como las declara su `parseArgs`: las booleanas y las que llevan valor. */
 const OPTIONS: Record<Binding['verb'], { flags: string[]; values: string[]; count: number }> = {
+  branch: { flags: ['--apply', '--current', '--refreeze'], values: ['--prefix'], count: 1 },
   start: { flags: ['--apply'], values: ['--topic', '--base-branch', '--depth', '--risk', '--change-type', '--request'], count: 1 },
   status: { flags: ['--json'], values: [], count: 1 },
   approve: { flags: [], values: ['--conductor'], count: 2 },
@@ -103,15 +104,15 @@ function bindingOf(segment: string): Binding | undefined {
   const bin = ws[start]
   if (bin === undefined || (bin !== 'sdd-ai' && !bin.endsWith('bin/sdd-ai')) || ws[start + 1] !== 'sdd') return undefined
   const verb = ws[start + 2]
-  if (verb !== 'start' && verb !== 'status' && verb !== 'approve' && verb !== 'phase' && verb !== 'verify') return undefined
+  if (verb !== 'start' && verb !== 'branch' && verb !== 'status' && verb !== 'approve' && verb !== 'phase' && verb !== 'verify') return undefined
   const parsed = splitArgs(ws.slice(start + 3), OPTIONS[verb])
-  if (parsed === undefined || (verb === 'start' && !parsed.flags.includes('--apply'))) return undefined
+  if (parsed === undefined || ((verb === 'start' || verb === 'branch') && !parsed.flags.includes('--apply'))) return undefined
   const args = parsed.args
   if (args.length !== OPTIONS[verb].count || !isFlowId(args[0])) return undefined
   return { verb, id: args[0] }
 }
 
-/** `sdd start <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>`, `sdd phase <id>` o `sdd verify <id>`, solo en el primer tramo. */
+/** `sdd start <id> --apply`, `sdd branch <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>`, `sdd phase <id>` o `sdd verify <id>`, solo en el primer tramo. */
 export function bindingCommand(command: string): Binding | undefined {
   return bindingOf(shellPipelines(command)[0][0])
 }

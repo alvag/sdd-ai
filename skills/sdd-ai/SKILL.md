@@ -432,12 +432,12 @@ reglas de la guarda del commit (abajo).
   preguntarle al usuario si reintenta o la descarta: `cancel` solo cambia el registro local, y
   reintentar puede lanzar otro agente si el primero llegó a arrancar.
 - **`PostToolUse`**, sobre todas las herramientas: confirma la reserva de un despacho, liga tu sesión
-  cuando un `Bash` tuyo corre `sdd start <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` (§9) y cuenta la
+  cuando un `Bash` tuyo corre `sdd start <id> --apply`, `sdd branch <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>` (§9) y cuenta la
   herramienta para el recordatorio de sesión larga. En Claude Code, **`PostToolUseFailure`** libera la
   reserva de un despacho que falló y liga igual cuando el comando del `Bash` sale con un código
   distinto de cero: en Claude Code, ese comando llega por este evento.
 - **`PreToolUse` sobre `Bash`**: en cualquier sesión, aplica la guarda del commit (abajo). Dentro de un
-  subagente, además, niega `sdd-ai run`, `review`, `wait`, `cancel`, `prune`, `recall`, `sdd start`, `sdd approve` y `sdd phase`. Un
+  subagente, además, niega `sdd-ai run`, `review`, `wait`, `cancel`, `prune`, `recall`, `sdd start`, `sdd branch`, `sdd approve` y `sdd phase`. Un
   worker no delega, no toca las corridas del conductor, no arranca flujos, no aprueba gates ni lanza fases.
 
 Claude Code carga los hooks del repositorio sin pedir nada. Codex los ejecuta solo después de que el
@@ -568,6 +568,8 @@ cambian, `status` devuelve el flujo a ese gate.
 ```
 ./bin/sdd-ai sdd start <id> [--topic <tema>] [--base-branch <rama>]
 ./bin/sdd-ai sdd start <id> --apply --depth <corta|normal|completa> --risk <low|high|unknown> --change-type <tipo> --request <archivo> [--topic <tema>] [--base-branch <rama>]
+./bin/sdd-ai sdd branch <id> [--prefix <p>]
+./bin/sdd-ai sdd branch <id> --apply [--current | --prefix <p>] [--refreeze]
 ./bin/sdd-ai sdd status [<id>]
 ./bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]
 ./bin/sdd-ai sdd phase <id> [--request <archivo>] [--context <archivo>] [--families <f>] [--conductor claude|codex] [--deadline <s>]
@@ -577,7 +579,8 @@ cambian, `status` devuelve el flujo a ese gate.
   (`pending`, `approved`, `approved_unfingerprinted` o `stale`), las `tasks` con la primera pendiente,
   `next` con su `step`, y `blocked_reasons` y `notes`, cada una con su `code` y su `detail`. Sale con 0
   aunque el flujo esté bloqueado; con bloqueos, `next` es `resolve_blockers`. Sin id, lista los
-  flujos de `.plans/` con su `next`.
+  flujos de `.plans/` con su `next`. El paso `branch`, con el comando `sdd branch <id>`, aparece
+  antes de `plan` si falta `branch` en el handoff; en corta, antes de que exista `plan.md`.
 - **`sdd approve` responde el mismo estado que `status`, con su `next`.** Si sigue un gate,
   `next.question` trae su pregunta canónica, la misma que `status`; si sigue una fase,
   `next.command` trae su comando.
@@ -630,7 +633,7 @@ cambian, `status` devuelve el flujo a ese gate.
   handoff espera la aprobación externa de la spec, y ahí `next` es `external_gate` en vez de
   `implement`: seguir sin esa aprobación lo decide el usuario. Con `jira_approval` en `on` (§8), vale
   también cuando el handoff no tiene `gate_status`, y alcanza a `verify` y a `review_and_commit`.
-- **La liga.** `sdd start <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>`, como primer tramo de
+- **La liga.** `sdd start <id> --apply`, `sdd branch <id> --apply`, `sdd status <id>`, `sdd approve <id> <gate>` o `sdd phase <id>`, como primer tramo de
   un comando tuyo, ligan tu sesión a ese flujo, termine como termine el comando. El paso de ese momento queda como
   referencia de `Stop`.
   - Otro id mueve la liga, y el mismo renueva la referencia.
@@ -653,12 +656,14 @@ los antecedentes de `recall` y una lista `blockers`. Sale con 0 incluso con bloq
 es `usage` antes de consultar el repositorio.
 
 Lee solo `.sdd-ai/config.yml`: informa `cross_model` (familias y selección), `jira_approval.mode`
-(aprobación externa de la spec) y `knowledge-vault.path_vault` (vault donde busca recall), con su valor
+(aprobación externa de la spec), `knowledge-vault.path_vault` (vault donde busca recall), `branch_format`,
+`branch_prefix` (nombre que armará `sdd branch`) y `default_branch` (base por defecto), con su valor
 y lo que implican. Las demás claves de primer nivel aparecen en `unused`: sdd-ai no las usa.
 Sin vault configurado, esa fuente queda `not_configured`.
 
 `--topic "<tema>"` fija la búsqueda; sin él, el tema es el id con espacios en lugar de guiones.
-`--base-branch <rama>` elige una rama local existente como base; sin él se usa la rama actual.
+`--base-branch <rama>` elige una rama local existente como base; sin él se usa `default_branch` y,
+si tampoco está declarada, la rama actual.
 El commit de esa base será `origin_sha`, aunque el checkout esté en otra rama. HEAD separado o sin
 commits bloquea incluso con una base explícita. El ensayo no crea una rama.
 
@@ -715,6 +720,72 @@ Un flujo arrancado con `sdd-flow` puede no tener `antecedentes.json`: en ese cas
 busca con `./bin/sdd-ai recall "<tema>"` y agrégalos al encargo. Un JSON ilegible da
 `antecedents_invalid`; un flujo inexistente ofrece `sdd start <id>` y `/sdd-flow` (`$sdd-flow` en Codex).
 
+### Crear la rama: `sdd branch`
+
+El conductor corre `./bin/sdd-ai sdd branch <id>` justo después de aprobar la spec en normal y
+completa. En corta, lo corre justo después de `sdd start`, antes de `specify`: después ya existe
+`plan.md` y el verbo se niega con `plan_exists`. El ensayo no escribe archivos ni refs y sale con 0,
+incluso con bloqueos. Informa el nombre y sus partes, HEAD, la base congelada y su punta local,
+las salidas con sus bloqueos, `recommended`, `ask` y `next`. Se pregunta al usuario solo si `ask`
+no está vacía: `exit` pide elegir la salida y `base_advanced` avisa que la base avanzó. Sin motivos,
+se aplica la recomendación; los gates siguen siendo humanos y `sdd approve` solo registra.
+
+- **`new`**, con `--apply`, crea una rama desde `origin_sha` y cambia a ella. El nombre sale de
+  `branch_format` (por defecto `{type}/{ticket}-{slug}`), `--prefix` o `branch_prefix`, y si faltan,
+  `change_type` (`feat` da `feature`). `{ticket}` es el id con forma de clave, y `{slug}` es el slug
+  normalizado. Se omiten las partes ausentes con su separador. `--prefix <p>` también sirve en el ensayo.
+- **`current`**, con `--apply --current`, registra la rama actual con `base_commit` igual a HEAD,
+  sin mover HEAD ni crear refs. No puede ser la base. No admite `--prefix` ni `--refreeze`.
+- **`--refreeze`**, solo con `--apply`, corta desde la punta local de `base_branch` y actualiza
+  `origin_sha`; sin él, conserva la base congelada aunque haya avanzado. No hay fetch, pull ni push.
+
+El ensayo recomienda `current` si el nombre construido ya es el actual, y `new` desde la base.
+Desde otra rama, recomienda `new` si su nombre contiene el id, y `current` si no, con `ask: ['exit']`.
+Si la recomendación tiene bloqueos y la otra salida no, ofrece la otra y pide elegir; si ninguna
+sirve, no propone un `--apply`. La aplicación repite todas las comprobaciones bajo el lock del flujo.
+
+Cada bloqueo trae un `next`; la aplicación se niega con el código del primero y todos en `detail`:
+
+| Código | Qué hacer |
+|---|---|
+| `flow_blocked` | Resolver los motivos que muestra `sdd status <id>`. |
+| `handoff_invalid` | Corregir el header y `change_type`; al retomar, completar a mano `base_commit` si falta o no es un commit. |
+| `config_invalid` | Corregir el YAML y los valores de texto de `.sdd-ai/config.yml`; usar solo los placeholders conocidos. |
+| `spec_not_approved` | Consultar `sdd status` y aprobar la spec vigente; en corta no se exige este gate. |
+| `plan_exists` | Seguir el flujo con `sdd status`; la rama se elige antes de escribir el plan. |
+| `head_unknown` | Pasar a una rama con commits. |
+| `tree_dirty` | Commitear o guardar las rutas indicadas, fuera de `.plans/`, `.specify/`, `.sdd-ai/` y `.cross-model/`. Un renombre cuenta también por su origen. |
+| `phase_running` | Recibir la corrida con `wait`. |
+| `writer_open` | Seguir el `next`, que depende de quién tiene la reserva: recibir el writer con `wait`, o esperar a que terminen `sdd verify` o `sdd commit`. Solo una reserva de `sdd branch` cuyo proceso ya no corre se borra a mano, con el lock que nombra el `next`. |
+| `flow_busy` | Esperar al comando dueño; borrar el lock indicado solo si ya no hay otro comando corriendo. |
+| `base_branch_unknown` | Completar `base_branch` o corregir `origin_sha`; crear la base local si se necesita su punta. |
+| `branch_name_invalid` | Corregir el formato, el prefijo o el slug para que Git acepte el nombre. |
+| `branch_is_base` | Elegir otra rama o un prefijo distinto; no registrar la base con `--current`. |
+| `branch_exists` | Elegir otro prefijo o registrar la actual con `--current`; nunca se agrega un sufijo automático. También sale cuando otra rama impide crearla por la jerarquía de refs, como `feature` frente a `feature/<id>`. |
+| `branch_recorded` | Quitar los flags que contradicen la rama registrada y repetir `--apply`. |
+| `branch_create_failed` | Corregir la causa de Git y repetir el mismo `--apply`; la intención ya está en el handoff. Si no se puede corregir, elegir otra rama con `--prefix` o `--current`. |
+| `branch_switch_failed` | Git no pudo volver a la rama registrada: corregir la causa con el detalle y repetir el mismo `--apply`. |
+
+Primero se escribe atómicamente el handoff y después se crea la rama. El header queda con `branch`,
+`worktree_branch`, `branch_prefix`, `base_commit`, `spec_approved_at` de la última aprobación registrada
+(o el valor acreditado por el header; en corta, `null`) y `phase: plan`. Solo cambia `origin_sha` si
+faltaba o se pidió `--refreeze`. El resto del header, sus comentarios y el cuerpo se conservan,
+salvo la sección `## Rama`, que lleva la salida, la base y los commits; al repetir se reemplaza.
+
+Si el handoff ya nombra la rama, el ensayo informa `recorded` y `retake`: `none` cuando está al día,
+`handoff` si solo falta actualizarlo, `create` si falta la ref y `switch` para volver a la rama existente.
+La retoma usa el `base_commit` registrado, nunca lo reconstruye. Repetir `--apply` no escribe nada si
+ya está al día; acepta `--current` cuando HEAD ya está en ella, un `--prefix` que dé el mismo nombre
+y `--refreeze` (sin recongelar de nuevo). Si la rama registrada todavía no existe, es solo una
+intención: `--prefix` o `--current` la reemplazan por otra elección. La respuesta dice `created`,
+`switched` y `handoff_written`.
+
+Crear una ref toma la reserva de writer del repositorio hasta que exista, incluso entre worktrees,
+y la libera al terminar. Si ya está tomada, `new` se bloquea con `writer_open`; `--current` y cambiar
+a una rama existente no la toman ni se bloquean por ella. Un writer abierto del propio flujo sí bloquea
+las dos salidas. La reserva puede quedar huérfana si el proceso muere antes de liberarla.
+Después de aplicar, `next` es el de `sdd status`. El ensayo no liga la sesión; `--apply` sí la liga.
+
 ### Las fases en un worker: `sdd phase`
 
 `sdd phase <id>` lanza la fase que dice `sdd status` (`specify`, `plan`, `tasks` o `implement`) en un
@@ -734,7 +805,9 @@ falta; el paso siguiente lo sigue decidiendo `sdd status`, no el hijo.
   fase (un gate, `verify` o cualquier otro), con una corrida de fase activa del flujo (el `next` trae su
   `wait`), con la fase esperando ampliación sin `--context`, con la fase cerrada inline, con `--context`
   sin ampliación o `--request` fuera de la primera corrida de `specify`. En `plan` se niega si falta la
-  rama, `HEAD` o `change_type`, `profundidad` o `risk` en el header de `handoff.md`; en `tasks`, si la
+  rama (`branch_missing`) o la del handoff no coincide con la actual (`branch_mismatch`): ambos
+  ofrecen `sdd branch <id>`. También se niega si falta `HEAD` o `change_type`, `profundidad` o `risk`
+  en el header de `handoff.md`; en `tasks`, si la
   spec no tiene criterios `- **AC-<n>:**` en `## Criterios de aceptación`; en `implement`, si alguna task
   pendiente no sigue la línea `- [ ] **T<n> — <título>**` de la plantilla. En esos tres casos la fase va
   inline.

@@ -362,7 +362,7 @@ export function withFlowLock<T>(root: string, id: string, fn: () => T): T {
   const lock = join(flowDir(root, id), LOCK_FILE)
   if (lstatOrNull(lock)?.isSymbolicLink()) throw pathInvalid(`.plans/${id}/${LOCK_FILE}`, 'es un enlace simbólico')
   const busy = () => new SddError('flow_busy', `otro comando de sdd-ai tiene tomado el flujo ${id}`, {
-    next: `si no hay otro sdd approve ni sdd phase corriendo, borra .plans/${id}/${LOCK_FILE} y vuelve a correr el comando`,
+    next: `si no hay otro sdd approve, sdd phase ni sdd branch corriendo, borra .plans/${id}/${LOCK_FILE} y vuelve a correr el comando`,
   })
   return withLock(lock, busy, fn)
 }
@@ -436,6 +436,7 @@ export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'de
  * se puede leer no tumba a quien lista: queda dicho en `detail`.
  */
 export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root: string, id: string, status: T): Next {
+  if (status.next.step === 'branch') return { ...status.next, command: `./bin/sdd-ai sdd branch ${id}` }
   const chained = chainNext(root, id, status)
   if (status.next.step === 'review_and_commit') {
     // Un next de la cadena sin comando es un diagnóstico (control ilegible, cadena sin corridas): se muestra tal cual.

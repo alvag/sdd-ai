@@ -297,7 +297,8 @@ test('la admisión de plan necesita el header completo: sin sus datos, sdd phase
   execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base'], { cwd: repo })
   const dir = join(repo, '.plans', 'f')
   mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'handoff.md'), '---\nprofundidad: completa\nchange_type: feat\nspec_approved_at: 2026-09-29T08:59:18-05:00\n---\n')
+  const branch = execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim()
+  writeFileSync(join(dir, 'handoff.md'), `---\nbranch: ${branch}\nprofundidad: completa\nchange_type: feat\nspec_approved_at: 2026-09-29T08:59:18-05:00\n---\n`)
   writeFileSync(join(dir, 'spec.md'), '# Spec\n\n## Criterios de aceptación\n\n- **AC-1:** algo. (pedido)\n')
   const r = spawnSync(join(import.meta.dirname, '..', 'bin', 'sdd-ai'), ['sdd', 'phase', 'f'], {
     cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 's' },

@@ -6,6 +6,44 @@ import { type Family, SddError, isFamily } from './types.ts'
 
 export interface CrossModel { families: Family[]; selection?: string }
 
+export interface BranchConfig { format: string; prefix: string | null }
+export const DEFAULT_BRANCH_FORMAT = '{type}/{ticket}-{slug}'
+
+/** `.sdd-ai/config.yml` como mapa; sin archivo, vacío. Un YAML ilegible o que no es un mapa lanza `config_invalid`. */
+export function readConfigMap(root: string): Record<string, unknown> {
+  try {
+    const doc: unknown = parse(readFileSync(join(root, CONFIG_PATH), 'utf8'))
+    if (doc === null || doc === undefined) return {}
+    if (!isRecord(doc)) throw new Error('el archivo tiene que ser un mapa')
+    return doc
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return {}
+    throw new SddError('config_invalid', `${CONFIG_PATH}: ${(e as Error).message}`)
+  }
+}
+
+function branchText(doc: Record<string, unknown>, key: string, allowEmpty: boolean): string | null {
+  const value = doc[key]
+  if (value === undefined) return null
+  if (typeof value !== 'string' || (!allowEmpty && !value.trim())) {
+    throw new SddError('config_invalid', `${CONFIG_PATH}: ${key} tiene que ser texto${allowEmpty ? '' : ' no vacío'}, no ${JSON.stringify(value)}`)
+  }
+  return value.trim() || null
+}
+
+export function loadBranchConfig(root: string): BranchConfig {
+  const doc = readConfigMap(root)
+  const format = branchText(doc, 'branch_format', false) ?? DEFAULT_BRANCH_FORMAT
+  if ([...format.matchAll(/\{([^{}]*)\}/g)].some((m) => !['type', 'ticket', 'slug'].includes(m[1])) || /[{}]/.test(format.replace(/\{(type|ticket|slug)\}/g, ''))) {
+    throw new SddError('config_invalid', `${CONFIG_PATH}: branch_format tiene placeholders desconocidos: ${JSON.stringify(format)}`)
+  }
+  return { format, prefix: branchText(doc, 'branch_prefix', true) }
+}
+
+export function loadDefaultBranch(root: string): string | null {
+  return branchText(readConfigMap(root), 'default_branch', false)
+}
+
 const CONFIG_PATH = join('.sdd-ai', 'config.yml')
 
 function suggestBlock(present: Family[]): string {

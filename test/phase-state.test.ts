@@ -113,7 +113,7 @@ test('next.command sigue el estado de la fase en sdd status, el listado y la lí
   mkdirSync(join(repo, '.sdd-ai'), { recursive: true })
   const dir = join(repo, '.plans', 'f')
   mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'handoff.md'), '---\nprofundidad: completa\nrisk: low\nchange_type: feat\nspec_approved_at: 2026-09-29T08:59:18-05:00\n---\n')
+  writeFileSync(join(dir, 'handoff.md'), '---\nbranch: feature/f\nprofundidad: completa\nrisk: low\nchange_type: feat\nspec_approved_at: 2026-09-29T08:59:18-05:00\n---\n')
   writeFileSync(join(dir, 'spec.md'), '# Spec\n\n## Criterios de aceptación\n\n- **AC-1:** algo. (pedido)\n')
   const seen = () => {
     const one = sddStatus(repo, 'f').next

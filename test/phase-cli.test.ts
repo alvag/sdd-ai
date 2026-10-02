@@ -84,7 +84,7 @@ function flowAt(repo: string, step: 'specify' | 'plan' | 'tasks' | 'implement', 
   const dir = join(repo, '.plans', 'f')
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(repo, '.git', 'info', 'exclude'), '.plans/\n.sdd-ai/\n')
-  writeFileSync(join(dir, 'handoff.md'), HANDOFF(depth, step !== 'specify'))
+  writeFileSync(join(dir, 'handoff.md'), HANDOFF(depth, step !== 'specify').replace('phase: specify\n', `phase: specify\nbranch: ${currentBranch(repo)}\n`))
   if (step !== 'specify') writeFileSync(join(dir, 'spec.md'), SPEC_MD)
   if (step === 'tasks' || step === 'implement') writeFileSync(join(dir, 'plan.md'), PLAN_MD(depth, step === 'implement' ? 'tasks-ready' : 'plan-approved'))
   if (step === 'implement') writeFileSync(join(dir, 'tasks.md'), '# Tasks\n\n- [ ] **T1 — exportar**  · cubre: AC-1, AC-2\n  - **Pasos:** hacerlo.\n')
@@ -319,6 +319,20 @@ test('sdd phase se niega cuando el paso no es una fase', () => {
     assert.match(r.out.message, new RegExp(step), step)
     assert.deepEqual(runsOf(s.repo), [], step)
     assert.deepEqual(snapshotOf(s.dir), before, step)
+  }
+})
+
+test('sdd phase no lanza plan sin la rama del handoff ni con otra rama y su next es sdd branch', () => {
+  for (const [branch, code] of [[null, 'branch_missing'], ['otra', 'branch_mismatch']] as const) {
+    const s = setup({ bins: ['codex'] })
+    commit(s.repo)
+    const dir = flowAt(s.repo, 'plan')
+    writeFileSync(join(dir, 'handoff.md'), HANDOFF('completa', true).replace('phase: specify\n', `phase: specify\n${branch ? `branch: ${branch}\n` : ''}`))
+    const r = cli(s, ['sdd', 'phase', 'f'])
+    assert.equal(r.code, 2, JSON.stringify(r.out))
+    assert.equal(r.out.code, code)
+    assert.equal(r.out.next, './bin/sdd-ai sdd branch f')
+    assert.deepEqual(runsOf(s.repo), [])
   }
 })
 

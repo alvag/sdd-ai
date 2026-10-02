@@ -58,9 +58,23 @@ export function canWriteStore(root: string): boolean {
  * es `verify` cuando la tomó `sdd verify` para revertir y restaurar filas; su `id` es el del recibo, y
  * `group`, el grupo de procesos de la fila que está corriendo.
  */
-export interface Reservation { id: string; pid: number; lstart: string | null; gitDir: string; kind?: 'verify' | 'commit'; group?: number }
+export interface Reservation { id: string; pid: number; lstart: string | null; gitDir: string; kind?: 'verify' | 'commit' | 'branch'; group?: number }
 
 const lockOf = (root: string) => join(storeRoot(root), 'writer.lock')
+
+/** Dónde vive la reserva de writer: en el directorio común de Git, compartido por todos los worktrees. */
+export const writerLockPath = (root: string) => lockOf(root)
+
+/**
+ * Quién tiene la reserva de writer, o `null` si no la tiene nadie. Un lock que existe y no se puede leer da
+ * `'desconocida'` y cuenta como tomado, porque `reserveWriter` también choca con él.
+ */
+export function writerReservation(root: string): string | null {
+  try { lstatSync(lockOf(root)) } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? null : 'desconocida'
+  }
+  return readReservation(root)?.id ?? 'desconocida'
+}
 
 export function readReservation(root: string): Reservation | undefined {
   try {
@@ -74,7 +88,7 @@ export function readReservation(root: string): Reservation | undefined {
  * Toma la reserva de writer del repositorio. El contenido se escribe en un temporal propio y el lock
  * nace con `link`, que falla si ya existe y lo deja completo desde que aparece.
  */
-export function reserveWriter(root: string, id: string, kind?: 'verify' | 'commit'): { ok: true } | { ok: false; holder: string; verify?: true; commit?: true } {
+export function reserveWriter(root: string, id: string, kind?: 'verify' | 'commit' | 'branch'): { ok: true } | { ok: false; holder: string; verify?: true; commit?: true; branch?: true } {
   const dir = storeRoot(root)
   mkdirSync(dir, { recursive: true })
   const seen = readProcess(process.pid)
@@ -89,6 +103,7 @@ export function reserveWriter(root: string, id: string, kind?: 'verify' | 'commi
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
     const held = readReservation(root)
+    if (held?.kind === 'branch') return { ok: false, holder: `sdd branch (${held.id})`, branch: true }
     if (held?.kind === 'commit') return { ok: false, holder: `el commit ${held.id}`, commit: true }
     return held?.kind === 'verify' ? { ok: false, holder: `la verificación ${held.id}`, verify: true } : { ok: false, holder: held?.id ?? 'desconocida' }
   } finally {

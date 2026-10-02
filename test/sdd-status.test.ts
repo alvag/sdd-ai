@@ -35,7 +35,7 @@ function flow(depth: Depth, status: string, o: Partial<FlowFacts> = {}): FlowFac
     id: 'f',
     files: { spec: corta ? 'absent' : 'present', plan: 'present', tasks: corta ? 'absent' : 'present', handoff: 'present' },
     planHeader: hdr({ profundidad: depth, status }),
-    handoffHeader: hdr({ profundidad: depth, spec_approved_at: SPEC_APPROVED_AT }),
+    handoffHeader: hdr({ profundidad: depth, spec_approved_at: SPEC_APPROVED_AT, branch: 'feature/f' }),
     planSections: corta ? { spec: 'present', tasks: 'present' } : { spec: 'absent', tasks: 'absent' },
     tasksFile: corta ? null : tasks,
     tasksSection: corta ? tasks : null,
@@ -229,6 +229,19 @@ test('next recorre los gates en orden y un artefacto posterior no hace avanzar',
   assert.deepEqual(resolve(flow('normal', 'planned')).next, { step: 'gate', gate: 'plan-tasks', artifacts: ['plan.md', 'tasks.md'] })
   assert.deepEqual(resolve(flow('normal', 'planned', { files: { spec: 'present', plan: 'present', tasks: 'absent', handoff: 'present' }, tasksFile: null })).next,
     { step: 'tasks', artifacts: ['tasks.md'] })
+})
+
+test('con la spec aprobada y sin rama en el handoff el paso siguiente es branch, y en corta lo es antes de escribir plan.md', () => {
+  for (const depth of ['normal', 'completa'] as const) {
+    const facts = flow(depth, 'planned', { ...noPlan, handoffHeader: hdr({ profundidad: depth, spec_approved_at: SPEC_APPROVED_AT }) })
+    assert.deepEqual(resolve(facts).next, { step: 'branch' })
+    assert.deepEqual(resolve({ ...facts, handoffHeader: hdr({ profundidad: depth, spec_approved_at: SPEC_APPROVED_AT, branch: 'feature/f' }) }).next,
+      { step: 'plan', artifacts: depth === 'normal' ? ['plan.md', 'tasks.md'] : ['plan.md'] })
+  }
+  const short = flow('corta', 'planned', { ...noPlan, files: { spec: 'absent', plan: 'absent', tasks: 'absent', handoff: 'present' }, handoffHeader: hdr({ profundidad: 'corta' }) })
+  assert.deepEqual(resolve(short).next, { step: 'branch' })
+  const written = flow('corta', 'planned', { handoffHeader: hdr({ profundidad: 'corta' }) })
+  assert.equal(resolve(written).next.step, 'gate')
 })
 
 test('con los gates aprobados next es implement con la primera pendiente o verify', () => {

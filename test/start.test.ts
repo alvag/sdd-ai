@@ -57,6 +57,7 @@ function cli(s: Setup, args: string[]) {
 const flags = (s: Setup) => ['--apply', '--depth', 'normal', '--risk', 'low', '--change-type', 'feat', '--request', s.request]
 const preview = (s: Setup, id = 'mi-flujo', extra: string[] = []) => cli(s, ['sdd', 'start', id, ...extra])
 const apply = (s: Setup, id = 'mi-flujo', extra: string[] = []) => preview(s, id, [...flags(s), ...extra])
+
 function tree(root: string): Array<{ path: string; bytes?: string; mode: number }> {
   const out: Array<{ path: string; bytes?: string; mode: number }> = []
   const walk = (path: string) => {
@@ -119,7 +120,7 @@ test('el ensayo muestra las claves de config que sdd-ai usa con lo que implican,
   const r = preview(s)
   assert.equal(r.code, 0)
   assert.deepEqual(r.out.config.unused, ['vault_archive'])
-  assert.deepEqual(r.out.config.used.map((v: { key: string }) => v.key), ['cross_model', 'jira_approval.mode', 'knowledge-vault.path_vault'])
+  assert.deepEqual(r.out.config.used.map((v: { key: string }) => v.key), ['cross_model', 'branch_format', 'branch_prefix', 'default_branch', 'jira_approval.mode', 'knowledge-vault.path_vault'])
   for (const v of r.out.config.used) {
     assert.ok(v.means.length > 0)
     assert.ok(Object.hasOwn(v, 'value'))
@@ -392,4 +393,45 @@ test('sdd status de un flujo inexistente nombra sdd start con el id y /sdd-flow'
   assert.equal(r.out.code, 'flow_not_found')
   assert.ok(r.out.next.includes('./bin/sdd-ai sdd start nada'))
   assert.ok(r.out.next.includes('/sdd-flow'))
+})
+
+test('sdd start toma la base de --base-branch, de default_branch o de la rama actual e informa las claves de rama del config', () => {
+  const s = setup()
+  const base = git(s, 'rev-parse', 'HEAD')
+  git(s, 'branch', 'base')
+  git(s, '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'New main')
+  configure(s, '[claude, codex]', "default_branch: base\nbranch_format: '{type}/{slug}'\nbranch_prefix: fix\n")
+  const r = preview(s)
+  assert.equal(r.out.base_branch, 'base')
+  assert.equal(r.out.origin_sha, base)
+  for (const [key, value] of [['branch_format', '{type}/{slug}'], ['branch_prefix', 'fix'], ['default_branch', 'base']]) {
+    const entry = r.out.config.used.find((v: { key: string }) => v.key === key)
+    assert.equal(entry.value, value)
+    assert.ok(entry.means.length > 0)
+    assert.ok(!r.out.config.unused.includes(key))
+  }
+  const explicit = preview(s, 'mi-flujo', ['--base-branch', 'main'])
+  assert.equal(explicit.out.base_branch, 'main')
+  assert.equal(explicit.out.origin_sha, git(s, 'rev-parse', 'HEAD'))
+  const applied = apply(s)
+  assert.equal(applied.code, 0, JSON.stringify(applied.out))
+  assert.equal(applied.out.handoff.base_branch, 'base')
+  assert.equal(applied.out.handoff.origin_sha, base)
+  const plain = setup()
+  assert.equal(preview(plain).out.base_branch, 'main')
+  const used = preview(plain).out.config.used
+  for (const key of ['branch_format', 'branch_prefix', 'default_branch']) assert.equal(used.find((v: { key: string }) => v.key === key).value, null)
+  configure(plain, '[claude, codex]', 'default_branch: nope\n')
+  assert.equal(preview(plain).out.blockers[0].code, 'base_branch_unknown')
+  assert.equal(apply(plain).out.code, 'base_branch_unknown')
+  assert.equal(preview(plain, 'mi-flujo', ['--base-branch', 'main']).out.base_branch, 'main')
+  for (const extra of ['branch_prefix: 3\n', 'default_branch: 3\n', "default_branch: ''\n"]) {
+    configure(plain, '[claude, codex]', extra)
+    const invalid = preview(plain).out
+    assert.equal(invalid.blockers[0].code, 'config_invalid')
+    const key = extra.split(':')[0]
+    assert.match(invalid.config.used.find((v: { key: string }) => v.key === key).means, new RegExp(key))
+    assert.equal(apply(plain).out.code, 'config_invalid')
+    assert.equal(existsSync(join(plain.repo, '.plans')), false)
+  }
 })

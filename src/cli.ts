@@ -49,6 +49,7 @@ import {
 import { type Freshness, type ReviewRequest, REVIEW_LOCK, converged, freshness, untrackedOf } from './review/standing.ts'
 import { applyCommit, planCommit } from './sdd/commit.ts'
 import { approve } from './sdd/approve.ts'
+import { assertBranchApplicable, branchApply, branchPreview } from './sdd/branch.ts'
 import { criteriaIds, taskLines } from './sdd/markdown.ts'
 import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
 import {
@@ -77,7 +78,7 @@ import { writerEnvelopeBytes, writerPrompt } from './writer.ts'
 import {
   type HarvestRecord, type LaunchFrom, type WriterControl, canWriteStore, captureTreeAtBase, controlUnavailable, freezeHarvest, groupState, harvestTreeHolds, isWriterRun,
   flowWriterRuns, launchTreeDiff, launchTreeHolds, leaderMatches, readControl, readHarvest, readProcess, readReservation, releaseWriter, reserveWriter, runDirIdentity, runInventory,
-  registryDigest, sensitiveInventory, storeDir, writeControl, writeTakeoverMap, writerLaunchOf, writerSession,
+  registryDigest, sensitiveInventory, storeDir, writeControl, writeTakeoverMap, writerLaunchOf, writerLockPath, writerSession,
 } from './writer-store.ts'
 
 type Env = Record<string, string | undefined>
@@ -418,6 +419,8 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
     throw new SddError('writer_open', `ya hay un writer abierto en este repositorio: ${reserved.holder}`, {
       next: reserved.commit
         ? 'espera a que termine sdd commit y vuelve a lanzar el writer'
+        : reserved.branch
+        ? `espera a que termine sdd branch y vuelve a lanzar el writer; si su proceso ya no corre, la reserva quedó huérfana: borra ${writerLockPath(root)}`
         : reserved.verify
         ? 'espera a que termine sdd verify, que tiene archivos revertidos para confirmar filas, y vuelve a lanzar el writer'
         : `espera o recibe esa corrida (./bin/sdd-ai wait ${reserved.holder}) antes de lanzar otro writer`,
@@ -2188,7 +2191,7 @@ const stamped = (t: ChainTerminal): ChainTerminal => ({ ...t, at: new Date().toI
 async function phaseImplement(p: ImplementPhase): Promise<Result> {
   const { root, id } = p
   const busy = () => new SddError('flow_busy', `otro comando de sdd-ai tiene tomado el flujo ${id}`, {
-    next: `si no hay otro sdd approve ni sdd phase corriendo, borra .plans/${id}/${LOCK_FILE} y vuelve a correr el comando`,
+    next: `si no hay otro sdd approve, sdd phase ni sdd branch corriendo, borra .plans/${id}/${LOCK_FILE} y vuelve a correr el comando`,
   })
   return withLockAsync(join(flowDir(root, id), LOCK_FILE), busy, () => chainLaunch(p))
 }
@@ -2582,6 +2585,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     throw new SddError('phase_inline', 'en profundidad corta las fases van inline', { next: 'sigue la fase inline, en tu sesión' })
   }
   const step = status.next.step
+  if (step === 'branch') throw new SddError('branch_missing', `el flujo ${id} todavía no tiene rama`, { next: `./bin/sdd-ai sdd branch ${id}` })
   // En verify, sdd phase resuelve el último recibo rojo de una cadena de writers: la clasificación y el fix.
   // Sin writers de fase en el flujo no hay cadena, y verify no es una fase.
   const chainStep = step === 'verify' && status.depth !== null
@@ -2607,6 +2611,13 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   if (values.classes !== undefined || values.blocks) throw phaseUsage('--classes y --blocks van en implement o en verify')
 
   const doc = step as DocumentStep
+  if (doc === 'plan') {
+    const recorded = headerData(read.facts.handoffHeader)?.branch
+    const current = currentBranch(root)
+    if (recorded !== current) {
+      throw new SddError('branch_mismatch', `la rama del handoff (${String(recorded)}) no es la actual (${current})`, { next: `./bin/sdd-ai sdd branch ${id}` })
+    }
+  }
   const entry = record.phases[doc]
   if (entry?.inline) {
     throw new SddError('phase_inline', `la fase ${doc} del flujo ${id} la sigue el conductor inline: la ampliación volvió a devolver preguntas o faltantes`, {
@@ -2714,6 +2725,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
 async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
   const [sub, ...rest] = args
   if (sub === 'start') return sddStart(rest, env, cwd)
+  if (sub === 'branch') return sddBranch(rest, env, cwd)
   if (sub === 'phase') return sddPhase(rest, env, cwd)
   if (sub === 'commit') return sddCommit(rest, env, cwd)
   if (sub === 'status') {
@@ -2734,7 +2746,7 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
     return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
   }
   if (sub === 'verify') return sddVerify(rest, env, cwd)
-  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd start <id> | ./bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id> | ./bin/sdd-ai sdd commit <id> --subject <asunto> [--apply --digest <d>]' })
+  throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd start <id> | ./bin/sdd-ai sdd branch <id> [--apply [--current | --prefix <p>] [--refreeze]] | ./bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id> | ./bin/sdd-ai sdd commit <id> --subject <asunto> [--apply --digest <d>]' })
 }
 
 function sddStart(args: string[], env: Env, cwd: string): Result {
@@ -2760,6 +2772,29 @@ function sddStart(args: string[], env: Env, cwd: string): Result {
   assertNoBlockers(startChecks(root, positionals[0], options, deps).blockers)
   recoverPendingRestore(root, 'blocking')
   return { code: 0, out: startApply(root, positionals[0], input, deps) }
+}
+
+function sddBranch(args: string[], env: Env, cwd: string): Result {
+  if (env.SDD_AI_WORKER === '1') throw new SddError('recursion', 'un worker no crea la rama del flujo', { next: 'responde el encargo al conductor' })
+  const { values, positionals } = parseArgs({ args, strict: true, allowPositionals: true,
+    options: { apply: { type: 'boolean' }, current: { type: 'boolean' }, refreeze: { type: 'boolean' }, prefix: { type: 'string' } } })
+  if (positionals.length !== 1 || !isFlowId(positionals[0]) || (values.current && (values.prefix !== undefined || values.refreeze))
+    || (values.prefix !== undefined && !values.prefix.trim()) || (!values.apply && (values.current || values.refreeze))) {
+    throw new SddError('usage', 'sdd branch recibe un id válido; --current y --refreeze exigen --apply, y --current no acepta --prefix ni --refreeze', {
+      next: './bin/sdd-ai sdd branch <id> [--apply [--current | --prefix <p>] [--refreeze]]',
+    })
+  }
+  const root = repoRoot(cwd)
+  const id = positionals[0]
+  const options = { current: values.current, prefix: values.prefix, refreeze: values.refreeze }
+  const preview = branchPreview(root, id, options)
+  if (!values.apply) return { code: 0, out: preview }
+  assertBranchApplicable(preview, options)
+  recoverPendingRestore(root, 'blocking')
+  const applied = branchApply(root, id, options)
+  const { facts } = readFlow(root, id)
+  const status = resolveFlow(facts)
+  return { code: 0, out: { ...applied, next: nextOf(root, status, facts) } }
 }
 
 function sddCommit(args: string[], env: Env, cwd: string): Result {
@@ -2946,6 +2981,8 @@ function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string)
   // El ensayo de `sdd start` no escribe nada, y la recuperación escribe aun en modo no bloqueante: `sddStart` la corre
   // él mismo, bloqueante, solo con `--apply` y después de validar.
   if (cmd === 'sdd' && rest[0] === 'start') return
+  // El ensayo de branch no escribe: la aplicación recupera después de validar sus bloqueos.
+  if (cmd === 'sdd' && rest[0] === 'branch') return
   // Commit se niega ante una restauración pendiente: nunca la ejecuta como efecto previo.
   if (cmd === 'sdd' && rest[0] === 'commit') return
   if (!['run', 'review', 'wait', 'cancel', 'agents', 'sdd', 'doctor', 'init', 'prune'].includes(cmd ?? '')) return

@@ -57,7 +57,7 @@ export type GateState = 'pending' | 'approved' | 'approved_unfingerprinted' | 's
 export interface Reason { code: string; detail: string }
 export interface GateView { gate: GateId; artifacts: string[]; state: GateState }
 export interface GateResolution { depth: Depth | null; gates: GateView[]; blocked: Reason[]; notes: Reason[] }
-export type Step = 'no_artifacts' | 'depth' | 'specify' | 'plan' | 'tasks' | 'gate' | 'external_gate'
+export type Step = 'no_artifacts' | 'depth' | 'specify' | 'branch' | 'plan' | 'tasks' | 'gate' | 'external_gate'
   | 'implement' | 'verify' | 'review_and_commit' | 'push' | 'open_pr' | 'archive' | 'resolve_blockers'
 /** `command` y `detail` los agrega la CLI en un paso de fase: `resolve` nunca los escribe. */
 export interface Next { step: Step; gate?: GateId; artifacts?: string[]; task?: string; command?: string; detail?: string }
@@ -258,6 +258,8 @@ export function resolve(facts: FlowFacts): FlowStatus {
     const open = gates.find((g) => !APPROVED.includes(g.state))
     if (open) {
       const missing = missingParts(facts, open.gate)
+      const branch = headerData(facts.handoffHeader)?.branch
+      if (!(typeof branch === 'string' && branch.trim()) && (depth === 'corta' ? facts.files.plan === 'absent' : missing[0]?.step === 'plan')) return { step: 'branch' }
       if (missing.length > 0) return { step: missing[0].step, artifacts: missing.map((p) => p.name) }
       return { step: 'gate', gate: open.gate, artifacts: open.artifacts }
     }

@@ -1,8 +1,8 @@
 import { randomBytes } from 'node:crypto'
 import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parse, stringify } from 'yaml'
-import { type CrossModel, loadCrossModel, loadJiraMode, loadVaultPath } from '../config.ts'
+import { stringify } from 'yaml'
+import { type CrossModel, DEFAULT_BRANCH_FORMAT, loadBranchConfig, loadCrossModel, loadDefaultBranch, loadJiraMode, loadVaultPath, readConfigMap } from '../config.ts'
 import { branchCommit, currentBranch, headCommit, mainWorktree } from '../git.ts'
 import { type RecallResult, RECALL_NEXT, recall } from '../recall.ts'
 import { ensureIgnore } from '../runs.ts'
@@ -72,7 +72,7 @@ export function writeFlowFiles(root: string, id: string, files: Record<string, s
 
 export interface ConfigView {
   path: string; state: 'ok' | 'missing' | 'invalid'; detail?: string
-  used: Array<{ key: 'cross_model' | 'jira_approval.mode' | 'knowledge-vault.path_vault'; value: unknown; means: string }>
+  used: Array<{ key: 'cross_model' | 'jira_approval.mode' | 'knowledge-vault.path_vault' | 'branch_format' | 'branch_prefix' | 'default_branch'; value: unknown; means: string }>
   unused: string[]
 }
 export interface StartChecks {
@@ -84,15 +84,36 @@ export interface StartChecks {
 export interface StartPreview extends StartChecks {
   state: 'ok'; id: string; topic: string; antecedents: RecallResult & { next: string }; next: string
 }
-const quote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`
+/** Un argumento entre comillas simples, listo para un comando de shell. */
+export const quote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`
 
-/** Las claves de primer nivel del config; la validez la juzgan los loaders, que informan su propio error. */
-function configKeys(root: string): string[] {
+/**
+ * El config como mapa, para listar sus claves de primer nivel y mostrar los valores declarados. La validez la juzgan
+ * los loaders, que informan su propio error.
+ */
+function configValues(root: string): Record<string, unknown> {
   try {
-    const doc: unknown = parse(readFileSync(join(root, CONFIG_PATH), 'utf8'))
-    return isRecord(doc) ? Object.keys(doc) : []
+    return readConfigMap(root)
   } catch {
-    return []
+    return {}
+  }
+}
+
+/**
+ * Lo que da un loader de config, o su `fallback` si lanza `config_invalid`: el error pasa a ser un bloqueo, salvo que
+ * ya haya otro `config_invalid`, y vuelve en `error` para que el `means` de la clave lo muestre.
+ */
+function loadOrBlock<T>(load: () => T, fallback: T, config: ConfigView, blockers: Blocker[]): { value: T; error: string | null } {
+  try {
+    return { value: load(), error: null }
+  } catch (e) {
+    if (!(e instanceof SddError)) throw e
+    config.state = 'invalid'
+    if (!blockers.some((b) => b.code === 'config_invalid')) {
+      config.detail = e.message
+      blockers.push({ code: 'config_invalid', detail: e.message, next: CONFIG_INVALID_NEXT })
+    }
+    return { value: fallback, error: e.message }
   }
 }
 
@@ -112,7 +133,20 @@ export function startChecks(root: string, id: string, o: { baseBranch?: string }
   }
   config.used.push({ key: 'cross_model', value: cross ? { families: cross.families, selection: cross.selection ?? null } : null,
     means: cross ? `Workers de las familias ${cross.families.join(', ')}; selección ${cross.selection ?? 'no declarada'}.` : config.detail ?? '' })
-  config.unused = configKeys(root).filter((key) => !['cross_model', 'jira_approval', 'knowledge-vault'].includes(key))
+  const declared = configValues(root)
+  const keys = Object.keys(declared)
+  config.unused = keys.filter((key) => !['cross_model', 'jira_approval', 'knowledge-vault', 'branch_format', 'branch_prefix', 'default_branch'].includes(key))
+  const branch = loadOrBlock(() => loadBranchConfig(root), { format: DEFAULT_BRANCH_FORMAT, prefix: null }, config, blockers)
+  const base = loadOrBlock(() => loadDefaultBranch(root), null, config, blockers)
+  const defaultBranch = base.value
+  config.used.push(
+    { key: 'branch_format', value: declared.branch_format ?? null, means: branch.error ?? (keys.includes('branch_format')
+      ? `sdd branch arma el nombre con ${branch.value.format}.` : `sdd branch arma el nombre con ${DEFAULT_BRANCH_FORMAT}, el formato por defecto.`) },
+    { key: 'branch_prefix', value: declared.branch_prefix ?? null, means: branch.error ?? (branch.value.prefix
+      ? `sdd branch usa el prefijo ${branch.value.prefix}.` : 'sdd branch toma el prefijo del change_type: feat da feature.') },
+    { key: 'default_branch', value: declared.default_branch ?? null, means: base.error ?? (defaultBranch
+      ? `sdd start toma ${defaultBranch} como base si no se pasa --base-branch.` : 'sdd start toma la rama actual como base si no se pasa --base-branch.') },
+  )
   const jira = loadJiraMode(root)
   config.used.push({ key: 'jira_approval.mode', value: jira.mode, means: jira.mode === 'invalid' ? jira.detail
     : jira.mode === 'on' ? 'La spec necesita aprobación externa en Jira.' : 'La spec no necesita aprobación externa en Jira.' })
@@ -144,10 +178,10 @@ export function startChecks(root: string, id: string, o: { baseBranch?: string }
   const head = { branch: currentBranch(root), commit: headCommit(root) ?? null }
   if (!head.branch || !head.commit) blockers.push({ code: 'head_unknown', detail: 'HEAD está separado o el repositorio no tiene commits',
     next: 'haz el primer commit o pasa a una rama con git switch <rama>, y vuelve a correr el ensayo' })
-  const base_branch = o.baseBranch ?? head.branch
-  const origin_sha = o.baseBranch !== undefined ? branchCommit(root, o.baseBranch) ?? null : head.commit
-  if (o.baseBranch !== undefined && !origin_sha) blockers.push({ code: 'base_branch_unknown', detail: `no existe la rama local ${o.baseBranch}`,
-    next: 'crea la rama local o pasa otra con --base-branch' })
+  const base_branch = o.baseBranch ?? defaultBranch ?? head.branch
+  const origin_sha = o.baseBranch !== undefined || defaultBranch !== null ? (base_branch ? branchCommit(root, base_branch) ?? null : null) : head.commit
+  if ((o.baseBranch !== undefined || defaultBranch !== null) && !origin_sha) blockers.push({ code: 'base_branch_unknown', detail: `no existe la rama local ${base_branch}`,
+    next: 'crea la rama local, corrige default_branch o pasa --base-branch' })
   return { config, families, flow, head, base_branch, origin_sha, blockers }
 }
 
