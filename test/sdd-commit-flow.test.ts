@@ -16,7 +16,7 @@ test('review start --flow guarda el flujo en la corrida y rechaza un flujo que n
   for (const [flags, code] of [
     [['--untracked', '--flow', 'missing'], 'flow_not_found'],
     [['--flow', 'f'], 'usage'], [['--flow', 'f', '--untracked', '--head', 'HEAD'], 'usage'],
-    [['--flow', 'f', '--artifact', planPath, '--kind', 'spec', '--request', 'src/a.ts'], 'usage'],
+    [['--flow', 'f', '--head', 'HEAD'], 'usage'],
   ] as Array<[string[], string]>) {
     assert.equal(runBin(s, [...args, ...flags], { FAKE_MODE: 'review-ok' }).out.code, code)
     unchanged(s, before)

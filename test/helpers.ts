@@ -8,6 +8,11 @@ import { type GateId, resolve } from '../src/sdd/status.ts'
 
 let fakeBinScript: string | undefined
 
+/** Off por defecto; una clave explícita undefined retira el override del entorno final. */
+export function telemetryOff(env: Record<string, string | undefined>): Record<string, string> {
+  return Object.fromEntries(Object.entries({ SDD_AI_TELEMETRY: 'off', ...env }).filter((entry): entry is [string, string] => entry[1] !== undefined))
+}
+
 /**
  * Enlace `claude` o `codex` en `dir` a un script que comparte todo el proceso. macOS evalúa la primera
  * ejecución de un ejecutable nuevo (unos 0,4 s, a veces más con la suite en paralelo), y un test con un
@@ -138,7 +143,7 @@ export function chainSetup(o: { families?: string; bins?: Array<'claude' | 'code
   symlinkSync(process.execPath, join(bin, 'node'))
   for (const b of o.bins ?? ['codex']) makeFakeBin(bin, b)
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-chain-')))
-  const env: Record<string, string> = {
+  const env: Record<string, string> = telemetryOff({
     PATH: `${bin}:/usr/bin:/bin`,
     HOME: process.env.HOME ?? '',
     CLAUDECODE: '1',
@@ -150,7 +155,7 @@ export function chainSetup(o: { families?: string; bins?: Array<'claude' | 'code
     FAKE_CALLS_FILE: join(scratch, 'calls'),
     FAKE_PROMPTS_FILE: join(scratch, 'prompts'),
     FAKE_WRITERS: JSON.stringify(o.writers ?? []),
-  }
+  })
   mkdirSync(env.CLAUDE_CONFIG_DIR!, { recursive: true })
   mkdirSync(env.CODEX_HOME!, { recursive: true })
   return { repo, env, base: gitIn(repo, 'rev-parse', 'HEAD'), calls: env.FAKE_CALLS_FILE!, prompts: env.FAKE_PROMPTS_FILE! }

@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import {
   closeSync, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, writeSync,
 } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 import { createInterface } from 'node:readline'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -30,6 +30,12 @@ import {
 import { type DocumentContract, admitPlan, admitSpecify, admitTasks } from './sdd/phase.ts'
 import { readPhaseRecord, withFlowLock, writePhaseRecord } from './sdd/phase-state.ts'
 import { type FrozenLaunch, type PublishOutcome, publishPhase } from './sdd/publish.ts'
+import { closeTelemetry, perToken } from './telemetry.ts'
+
+export interface ExecutionContext {
+  root: string; run: string; flow: string | null; step: string | null; role: string | null
+  requested: { model: string | null; effort: string | null }
+}
 
 /** Un revisor sobre un lote. `prompt` es la ruta de su prompt, ya medido y escrito por la CLI. */
 export interface ReviewJob { key: string; reviewer: Reviewer; batch: number; paths: string[]; prompt: string; targets?: Target[] }
@@ -45,6 +51,7 @@ export interface JobRecord {
 }
 
 export interface ArgvFile {
+  execution?: ExecutionContext
   family: Family; deadline_sec: number; grace_ms?: number
   /** El worker de `run`. Una revisión arma el de cada trabajo, con su propio temporal. */
   launch?: LaunchSpec
@@ -171,6 +178,8 @@ export async function withScratch<T>(fn: (scratch: string) => Promise<T>): Promi
  * `run`). `job` es la procedencia que va a `metrics.json`. `once` se comparte entre los trabajos.
  */
 interface RunContext {
+  execution?: ExecutionContext
+  telemetry: { home: string; override: string | undefined }
   dir: string; family: Family; grace: number; cancelFile: string; tag: string; round: number; prefix: string
   argv: ArgvFile
   job?: { reviewer: Reviewer | 'refute'; batch: number; launch: number }
@@ -335,6 +344,9 @@ function recordAttempt(ctx: RunContext, kind: AttemptKind, suffix: string, launc
       result: existsSync(a.resultFile) ? relative(dir, a.resultFile) : null,
     },
   }
+  const thread = sessionOf(ctx.family, launch.args, a.facts)
+  const resumedCodex = ctx.family === 'codex' && isResumeArgs(ctx.family, launch.args)
+  const baseline = resumedCodex && thread ? ctx.threadUsage.get(thread) : undefined
   if (a.facts.usage) {
     // Codex informa el acumulado del hilo: un intento que lo reanuda guarda lo que sumó desde el último
     // acumulado conocido. El hilo sale de su argv, porque el stream de una reanudación puede no traerlo.
@@ -347,6 +359,27 @@ function recordAttempt(ctx: RunContext, kind: AttemptKind, suffix: string, launc
   if (a.outcome.reason) entry.reason = a.outcome.reason
   m.attempts.push(entry)
   writeJsonAtomic(file, withTotals(m))
+  if (ctx.execution) {
+    const tokens = perToken((key) => {
+      const value = a.facts.usage?.[key]
+      const before = baseline?.[key]
+      if (value === undefined) return null
+      return resumedCodex && before !== undefined ? usageSince({ [key]: value }, { [key]: before })[key] ?? null : value
+    })
+    const token_scope = perToken((key) => {
+      if (a.facts.usage?.[key] === undefined) return null
+      return resumedCodex && baseline?.[key] === undefined ? 'thread_cumulative' as const : 'attempt' as const
+    })
+    const e = ctx.execution
+    closeTelemetry(ctx.telemetry.home, e.root, ctx.telemetry.override, {
+      schema_version: 1, run: e.run, attempt: m.attempts.length - 1, attempt_kind: kind,
+      flow: e.flow, step: e.step, role: e.role, family: ctx.family,
+      model_requested: e.requested.model, effort_requested: e.requested.effort,
+      model_effective: a.facts.rejected?.field === 'model' ? null : a.facts.model ?? null,
+      effort_effective: null, via: 'process', closed_at: entry.ended_at, duration_ms: entry.duration_ms,
+      outcome: entry.outcome, thread_id: thread ?? null, tokens, token_scope,
+    })
+  }
 }
 
 /** Admite la respuesta del último intento y anota el resultado en su entrada de `metrics.json`. */
@@ -587,7 +620,8 @@ async function refuteSub(ctx: RunContext, resolution: Resolution, c: Candidate, 
     ({ outcome: { failed: reason, ids }, record: { ids, paths: sub.paths, outcome: 'inconclusive', reason }, toolEvents })
   const view = sliceCandidate(c, sub.paths)
   const prefix = `${ctx.tag}-l${launchN}-refute-s${j}`
-  const rctx: RunContext = { ...ctx, family: resolution.family, prefix, job: { reviewer: 'refute', batch: j, launch: launchN } }
+  const rctx: RunContext = { ...ctx, family: resolution.family, prefix, job: { reviewer: 'refute', batch: j, launch: launchN },
+    execution: ctx.execution ? { ...ctx.execution, role: 'refute', requested: { model: resolution.model ?? null, effort: resolution.effort ?? null } } : undefined }
   const promptFile = join(dir, `prompt${prefix}.md`)
   writeFileSync(promptFile, renderRefutePrompt(c, renderMaterial(c, contextTexts, view), sub.entries))
   return withScratch(async (scratch) => {
@@ -682,7 +716,8 @@ async function runAttempts(ctx: RunContext, launch: LaunchSpec, until: number, r
       outcome = { state: 'cancelled' }
     } else {
       current = { ...launch, args: next.args }
-      writeJsonAtomic(join(dir, `argv${ctx.prefix}-2.json`), { ...argv, launch: current })
+      if (ctx.execution) ctx.execution = { ...ctx.execution, requested: { ...ctx.execution.requested, [rejected.field]: null } }
+      writeJsonAtomic(join(dir, `argv${ctx.prefix}-2.json`), { ...argv, execution: ctx.execution, launch: current })
       last = await attempt(ctx, current, '-2', until)
       recordAttempt(ctx, 'profile_retry', '-2', current, last)
       toolEvents.push(...last.facts.toolEvents)
@@ -703,7 +738,7 @@ async function runAttempts(ctx: RunContext, launch: LaunchSpec, until: number, r
       writeFileSync(resumed.stdinFile, closingMessage(kind))
       resume = { session_id: sessionId, started_at: new Date().toISOString() }
       setStatus(dir, { resume })
-      writeJsonAtomic(join(dir, `argv${ctx.prefix}-resume.json`), { ...argv, launch: resumed })
+      writeJsonAtomic(join(dir, `argv${ctx.prefix}-resume.json`), { ...argv, execution: ctx.execution, launch: resumed })
       last = await attempt(ctx, resumed, '-resume', Date.now() + resumeSec * 1000)
       recordAttempt(ctx, 'resume', '-resume', resumed, last)
       toolEvents.push(...last.facts.toolEvents)
@@ -728,7 +763,8 @@ async function runJob(ctx: RunContext, job: ReviewJob, candidate: Candidate, pla
   const resolution = argv.reviewer_resolution
   if (!resolution) throw new Error('la ronda no trae la resolución del revisor')
   const prefix = `${ctx.tag}-l${launchN}-${job.key}`
-  const jctx: RunContext = { ...ctx, prefix, job: { reviewer: job.reviewer, batch: job.batch, launch: launchN } }
+  const jctx: RunContext = { ...ctx, prefix, job: { reviewer: job.reviewer, batch: job.batch, launch: launchN },
+    execution: ctx.execution ? { ...ctx.execution, requested: { model: resolution.model ?? null, effort: resolution.effort ?? null } } : undefined }
   const base = { key: job.key, reviewer: job.reviewer, batch: job.batch, launch: launchN, prompt_sha256: sha256(readFileSync(job.prompt)) }
   return withScratch(async (scratch) => {
     const launch = reviewLaunch(resolution, job.prompt, join(dir, `result${prefix}.md`), scratch, candidate.subject ? ARTIFACT_SYSTEM_PROMPT : undefined)
@@ -857,6 +893,7 @@ export async function supervise(dir: string, argvName = 'argv.json'): Promise<St
   const ctx: RunContext = {
     dir, family: argv.family, grace: argv.grace_ms ?? 10_000, cancelFile, tag: argv.tag ?? '', round: argv.round ?? 1,
     prefix: '', argv, once: { started: false }, threadUsage: new Map(),
+    execution: argv.execution, telemetry: { home: homedir(), override: process.env.SDD_AI_TELEMETRY },
   }
   const resumeSec = argv.resume_sec ?? DEFAULT_RESUME_SEC
   if (argv.kind === 'review') return superviseReview(ctx, resumeSec)

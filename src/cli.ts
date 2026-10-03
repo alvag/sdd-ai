@@ -27,7 +27,7 @@ import {
   type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, readMaterial, validateArtifactArgs,
 } from './review/artifact.ts'
 import {
-  type Candidate, type Selection, baseOf, changedRanges, freeze, freezeStable, freezeStableWith, readContext, snapshot, stillChanged,
+  type Candidate, type Selection, baseOf, changedRanges, freeze, freezeStable, freezeStableWith, readContext, resolveCommit, snapshot, stillChanged,
 } from './review/candidate.ts'
 import { type PlannedJob, planJobs, planRoundJobs, sliceCandidate } from './review/batch.ts'
 import {
@@ -39,7 +39,7 @@ import {
   checkRunId, createRun, isAlive, markDelivered, newRunId, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic,
 } from './runs.ts'
 import {
-  ARTIFACT_NOTE, type ArgvFile, type JobRecord, type PhaseResult, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, settleGroup, supervise,
+  ARTIFACT_NOTE, type ArgvFile, type ExecutionContext, type JobRecord, type PhaseResult, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, settleGroup, supervise,
   writeReceipt,
 } from './supervisor.ts'
 import {
@@ -54,7 +54,7 @@ import { criteriaIds, taskLines } from './sdd/markdown.ts'
 import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
 import {
   type ChainClass, type ChainEntry, type ChainTerminal, type PhaseRecord, type RunEntry, type RunKind, activeRun, appendClassification, appendEntry, appendEvent,
-  closeChain, implementOf, readPhaseRecord, withFlowLock, withPhaseNext, writePhaseRecord,
+  appendReviewRef, closeChain, implementOf, readPhaseRecord, withFlowLock, withPhaseNext, writePhaseRecord,
 } from './sdd/phase-state.ts'
 import {
   type ChainState, FIX_PROMPT_BUDGET, TAIL_BYTES, checkClassification, classesPath, lastLink, orientation, redRows, renderContinuationPrompt,
@@ -126,7 +126,7 @@ function fallbackNext(id: string, c: Conductor): string {
 
 /** Lo que `run` deja en `request.json` y un reintento vuelve a leer. */
 interface RunRequest {
-  role?: string; conductor?: Conductor
+  role?: string; conductor?: Conductor; flow?: string
   overrides?: { families?: string; model?: string; effort?: string; deadline_sec?: number }
 }
 
@@ -182,12 +182,15 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
       next: `./bin/sdd-ai sdd phase ${retryWriter.phase.flow}`,
     })
   }
+  let inheritedFlow: string | undefined
   if (retryWriter) {
     const r = retryWriter.request
     inheritRetry(values, { role: r.role, conductor: r.conductor, overrides: { families: r.families, model: r.model, effort: r.effort, deadline_sec: r.deadline_sec } })
   } else if (values.retry) {
     const request = join(runDir(repoRoot(cwd), values.retry), 'request.json')
-    inheritRetry(values, existsSync(request) ? readJson<RunRequest>(request) : {})
+    const original = existsSync(request) ? readJson<RunRequest>(request) : {}
+    inheritRetry(values, original)
+    inheritedFlow = original.flow
   }
   const roleArg = values.role ?? 'explore'
   const renamed = RETIRED_ROLES.get(roleArg)
@@ -248,7 +251,7 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   }
 
   const request = {
-    role, conductor, session, retry_of: values.retry,
+    role, conductor, session, retry_of: values.retry, flow: values.flow ?? inheritedFlow,
     overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline },
   }
   if (resolution.via === 'native') {
@@ -308,6 +311,17 @@ interface ProcessRun {
   conductor: Conductor; web?: boolean; argvExtra?: Partial<ArgvFile>; files?: Record<string, string | Buffer>
 }
 
+function executionContext(root: string, run: string, flow: string | undefined, step: string | null, role: string | null, resolution: Resolution): ExecutionContext {
+  return { root, run, flow: flow ?? null, step, role,
+    requested: { model: resolution.model ?? null, effort: resolution.effort ?? null } }
+}
+
+function reviewExecution(root: string, id: string, req: ReviewRequest, resolution: Resolution): ExecutionContext {
+  const artifact = isArtifact(req.selection) ? req.selection : null
+  const step = artifact ? ({ spec: 'specify', plan: 'plan', tasks: 'tasks' } as const)[artifact.kind] : 'review_and_commit'
+  return executionContext(root, id, req.flow, req.flow ? step : null, artifact ? 'design-review' : 'code-review', resolution)
+}
+
 /**
  * Una corrida por proceso de un worker de solo lectura: la crea y lanza su supervisor. Sin el CLI de la
  * familia resuelta, queda en `launch_failed` con la caída al conductor, que decide el usuario.
@@ -324,11 +338,14 @@ function startProcessRun(o: ProcessRun): { id: string; dir: string; launched: bo
   if (o.resolution.effort) task.effort = o.resolution.effort
   if (o.web) task.web = true
   const launch = o.resolution.family === 'claude' ? claudeLaunch(task) : codexLaunch(task)
-  launchSupervisor(dir, { family: o.resolution.family, launch, deadline_sec: o.deadline, ...o.argvExtra }, o.env, { fallback: o.conductor })
+  const execution = executionContext(o.root, id, typeof o.request.flow === 'string' ? o.request.flow : undefined,
+    typeof o.request.step === 'string' ? o.request.step : null, typeof o.request.role === 'string' ? o.request.role : null, o.resolution)
+  launchSupervisor(dir, { family: o.resolution.family, launch, deadline_sec: o.deadline, execution, ...o.argvExtra }, o.env, { fallback: o.conductor })
   return { id, dir, launched: true }
 }
 
 export interface WriterLaunch {
+  requested?: ExecutionContext['requested']
   root: string; env: Env; conductor: Conductor; session?: string; resolution: Resolution; prompt: string; deadline: number
   retryOf?: string; request: WriterControl['request']
   /** Cómo nombrar el encargo en un `next`: el archivo o el `--retry`. */
@@ -454,7 +471,15 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
       ? chainedLaunch(root, mode, w.chained.origin, storePrompt, task.resultFile) : null
     const family = copied?.family ?? resolution.family
     const launch = copied?.launch ?? (family === 'claude' ? claudeWriterLaunch(task) : codexWriterLaunch(task))
-    const argv: ArgvFile = { family, deadline_sec: w.deadline, kind: 'writer', root, id, launch }
+    const execution = executionContext(root, id, w.phase?.flow, w.phase ? 'implement' : null, 'implement', resolution)
+    if (w.requested) execution.requested = w.requested
+    if (copied && w.chained?.origin) {
+      const origin = storeDir(root, w.chained.origin)
+      const file = existsSync(join(origin, 'argv-2.json')) ? 'argv-2.json' : 'argv.json'
+      const original = readJson<ArgvFile>(join(origin, file))
+      if (original.execution) execution.requested = original.execution.requested
+    }
+    const argv: ArgvFile = { family, deadline_sec: w.deadline, kind: 'writer', root, id, launch, execution }
 
     // La corrida visible: lo que los hooks y el conductor leen. Después de lanzar, sdd-ai no escribe ahí.
     writeFileSync(join(dir, 'prompt.md'), w.prompt)
@@ -673,12 +698,12 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   const root = repoRoot(cwd)
   let flowBase: unknown
   if (values.flow !== undefined) {
-    if (artifact || values.head !== undefined || (!values.untracked && values.harvest === undefined)) {
-      throw new SddError('usage', '--flow exige --untracked o --harvest, sin --artifact ni --head')
+    if (values.head !== undefined || (!artifact && !values.untracked && values.harvest === undefined)) {
+      throw new SddError('usage', '--flow exige --untracked o --harvest en un diff, o --artifact; no admite --head')
     }
     if (!isFlowId(values.flow)) throw new SddError('flow_not_found', `no existe el flujo ${values.flow}`)
     const flow = readFlow(root, values.flow)
-    if (flow.facts.files.plan === 'absent') throw new SddError('flow_not_found', `no existe el flujo ${values.flow}`)
+    if (flow.facts.files.handoff === 'absent' || (!artifact && flow.facts.files.plan === 'absent')) throw new SddError('flow_not_found', `no existe el flujo ${values.flow}`)
     flowBase = headerData(flow.facts.planHeader)?.base_commit
   }
   const conductor = detectConductor(env, {
@@ -701,7 +726,7 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   const degradations = family === author ? ['same_family'] : []
   if (artifact) {
     return startArtifact({
-      root, env, sel: artifact, family, resolution, author, degradations, conductor, deadline,
+      root, env, sel: artifact, family, resolution, author, degradations, conductor, deadline, flow: values.flow,
       overrides: { families: values.families, model: values.model, effort: values.effort, deadline_sec: deadline },
     })
   }
@@ -712,6 +737,21 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
     ? { base: harvested.base, context: values.context.map(abs), untracked: true, harvest: values.harvest }
     : { base: values.base ?? '', context: values.context.map(abs), ...(values.untracked ? { untracked: true } : {}) }
   if (values.head) selection.head = values.head
+  if (!inPath(family, env)) {
+    throw new SddError('cli_missing', `${family} no está en PATH`, { next: `revisa con --families ${opposite(family)} y acepta la degradación` })
+  }
+  // La cita va antes de congelar: con .plans sin ignorar, el registro del flujo es parte del candidato, y
+  // escribirla después lo dejaría distinto de lo congelado.
+  const id = newRunId()
+  if (values.flow !== undefined) {
+    const baseSha = resolveCommit(root, selection.base)
+    appendReviewRef(root, values.flow, id, () => {
+      const flow = readFlow(root, values.flow!)
+      if (flow.facts.files.handoff === 'absent' || flow.facts.files.plan === 'absent') throw new SddError('flow_not_found', `no existe el flujo ${values.flow}`)
+      const base = headerData(flow.facts.planHeader)?.base_commit
+      if (base !== baseSha) throw new SddError('flow_base_mismatch', `la base de la revisión ${baseSha} no es la del flujo ${String(base)}`)
+    })
+  }
   const candidate = freezeStable(root, selection)
   if (values.flow !== undefined && candidate.base_sha !== flowBase) {
     throw new SddError('flow_base_mismatch', `la base de la revisión ${candidate.base_sha} no es la del flujo ${String(flowBase)}`)
@@ -724,11 +764,7 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   const contextTexts = readContext(root, candidate)
   // Todo se mide antes de crear la corrida: si algún prompt no entra, no queda nada escrito.
   const { reviewers, batches, jobs } = planFirstRound(candidate, contextTexts, risk)
-  if (!inPath(family, env)) {
-    throw new SddError('cli_missing', `${family} no está en PATH`, { next: `revisa con --families ${opposite(family)} y acepta la degradación` })
-  }
 
-  const id = newRunId()
   const dir = createRun(root, id)
   const planned = writeJobs(dir, '-l1', jobs)
   writeJsonAtomic(join(dir, 'candidate.json'), candidate)
@@ -747,6 +783,7 @@ async function reviewStart(args: string[], env: Env, cwd: string): Promise<Resul
   launchSupervisor(dir, {
     family, deadline_sec: deadline, kind: 'review', candidate: join(dir, 'candidate.json'), round: 1, tag: '', launch_n: 1,
     reviewer_resolution: resolution, refuter_resolution: refuter, jobs: planned, batches, risk,
+    execution: reviewExecution(root, id, request, resolution),
   }, env, { round: 1, launch: 1 }, 'argv-l1.json')
   return {
     code: 0,
@@ -775,6 +812,7 @@ function restartCommand(req: ReviewRequest, root?: string): string {
     for (const i of sel.inputs) parts.push(`--${i.role} ${shellArg(i.path)}`)
     for (const c of sel.context) parts.push(`--context ${shellArg(c)}`)
     parts.push(`--author ${req.author}`)
+    if (req.flow) parts.push(`--flow ${shellArg(req.flow)}`)
     return parts.join(' ')
   }
   const sel = req.selection
@@ -1191,6 +1229,7 @@ function planArtifactRound1(c: Candidate, bytes: Map<string, Buffer>): PlannedJo
  * perfil de `design-review`. No clasifica riesgo ni resuelve refutador: un artefacto no los usa.
  */
 function startArtifact(o: {
+  flow?: string
   root: string; env: Env; sel: ArtifactSelection; family: Family; resolution: Resolution; author: Family
   degradations: string[]; conductor: Conductor; deadline: number; overrides: ReviewRequest['overrides']
 }): Result {
@@ -1204,7 +1243,7 @@ function startArtifact(o: {
   const planned = writeJobs(dir, '-l1', jobs)
   writeJsonAtomic(join(dir, 'candidate.json'), candidate)
   const request: ReviewRequest & Record<string, unknown> = {
-    kind: 'review', selection: o.sel, author: o.author, degradations: o.degradations, conductor: o.conductor, overrides: o.overrides,
+    kind: 'review', selection: o.sel, author: o.author, degradations: o.degradations, conductor: o.conductor, overrides: o.overrides, flow: o.flow,
   }
   const session = ownerSession(o.env, o.conductor.family)
   if (session) request.session = session
@@ -1215,6 +1254,7 @@ function startArtifact(o: {
   launchSupervisor(dir, {
     family: o.family, deadline_sec: o.deadline, kind: 'review', candidate: join(dir, 'candidate.json'), round: 1, tag: '', launch_n: 1,
     reviewer_resolution: o.resolution, jobs: planned,
+    execution: reviewExecution(o.root, id, request, o.resolution),
   }, o.env, { round: 1, launch: 1 }, 'argv-l1.json')
   return {
     code: 0,
@@ -1337,6 +1377,7 @@ async function reviewRoundArtifact(o: {
     family: resolved.family, deadline_sec: req.overrides?.deadline_sec ?? 1800, kind: 'review',
     candidate: join(dir, `candidate${tag}.json`), round: n, tag, ...(plan ? { plan: join(dir, `round${tag}.json`) } : {}), launch_n: k,
     reviewer_resolution: resolved, jobs, kept, extra: o.extra,
+    execution: reviewExecution(root, id, req, resolved),
   }, o.env, { round: n, launch: k }, `argv${tag}-l${k}.json`)
   return {
     code: 0,
@@ -1497,6 +1538,7 @@ async function reviewRoundDiff(o: {
     candidate: join(dir, `candidate${tag}.json`), round: n, tag, ...(plan ? { plan: join(dir, `round${tag}.json`) } : {}), launch_n: k,
     reviewer_resolution: resolved, refuter_resolution: readJson<Resolution>(join(dir, 'resolved-refute.json')), jobs, kept,
     batches: planned.batches, risk: readRisk(req), extra: values.extra,
+    execution: reviewExecution(root, id, req, resolved),
   }, env, { round: n, launch: k }, `argv${tag}-l${k}.json`)
   return {
     code: 0,
@@ -2075,9 +2117,13 @@ function agents(args: string[], env: Env, cwd: string): Result {
 function init(args: string[], env: Env, cwd: string): Result {
   const { values } = parseArgs({
     args, strict: true, allowPositionals: false,
-    options: { apply: { type: 'boolean' }, digest: { type: 'string' }, families: { type: 'string' }, jira: { type: 'string' }, from: { type: 'string' } },
+    options: { apply: { type: 'boolean' }, digest: { type: 'string' }, families: { type: 'string' }, jira: { type: 'string' }, from: { type: 'string' }, telemetry: { type: 'string' } },
   })
   const answers: InitAnswers = {}
+  if (values.telemetry !== undefined) {
+    if (values.telemetry !== 'on' && values.telemetry !== 'off') throw new SddError('usage', '--telemetry tiene que ser on u off')
+    answers.telemetry = values.telemetry
+  }
   if (values.families !== undefined) answers.families = parseFamiliesFlag(values.families)
   if (values.jira !== undefined) {
     if (values.jira !== 'on' && values.jira !== 'off') throw new SddError('usage', `--jira tiene que ser on u off, no ${JSON.stringify(values.jira)}`)
@@ -2090,6 +2136,7 @@ function init(args: string[], env: Env, cwd: string): Result {
   const flags: string[] = []
   if (answers.families !== undefined) flags.push('--families', answers.families.join(','))
   if (answers.jira !== undefined) flags.push('--jira', answers.jira)
+  if (answers.telemetry !== undefined) flags.push('--telemetry', answers.telemetry)
   if (answers.from !== undefined) flags.push('--from', shellArg(answers.from))
   const command = (digest?: string) => [bin, 'init', ...(digest === undefined ? [] : ['--apply', '--digest', digest]), ...flags].join(' ')
   if (!values.apply) return { code: 0, out: planInit(root, answers, env, { command }) }
@@ -2448,7 +2495,7 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
   let result: Result
   try {
     result = await runWriter({
-      root, env, conductor, session: ownerSession(env, conductor.family), resolution, prompt: l.prompt, deadline: p.deadline, phase, id: run,
+      root, env, conductor, session: ownerSession(env, conductor.family), resolution, prompt: l.prompt, deadline: p.deadline, phase, id: run, requested: profile,
       chained: { mode: l.mode, ...(l.origin ? { origin: l.origin } : {}), base: l.base },
       request: { role: 'implement', families: p.families, conductor, deadline_sec: p.deadline }, source: `sdd phase ${id}`,
     })
@@ -2984,14 +3031,15 @@ const READS = (cmd: string | undefined, rest: string[]) =>
   cmd === 'wait' || cmd === 'doctor' || (cmd === 'init' && !rest.includes('--apply')) || (cmd === 'prune' && !rest.includes('--apply')) || (cmd === 'review' && rest[0] === 'status') || (cmd === 'sdd' && rest[0] === 'status')
 
 /**
- * Antes de cualquier verbo, resuelve una restauración de `sdd verify` que quedó interrumpida en este
- * checkout. El supervisor interno no la corre: es parte de una corrida en curso, no un verbo.
+ * La entrada común recupera una restauración interrumpida de `sdd verify`, salvo en start, branch
+ * y commit. start --apply y branch --apply recuperan después de validar; commit nunca recupera.
+ * El supervisor interno tampoco la corre: es parte de una corrida en curso.
  */
 function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string): void {
   // El ensayo de `sdd start` no escribe nada, y la recuperación escribe aun en modo no bloqueante: `sddStart` la corre
   // él mismo, bloqueante, solo con `--apply` y después de validar.
   if (cmd === 'sdd' && rest[0] === 'start') return
-  // Branch conserva las intenciones de verify: ni su consulta ni su aplicación ejecutan recuperación.
+  // El ensayo de branch no recupera; branch --apply recupera, bloqueante, después de validar.
   if (cmd === 'sdd' && rest[0] === 'branch') return
   // Commit se niega ante una restauración pendiente: nunca la ejecuta como efecto previo.
   if (cmd === 'sdd' && rest[0] === 'commit') return

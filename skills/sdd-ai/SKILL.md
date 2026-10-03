@@ -40,6 +40,17 @@ el encargo tiene que ser autosuficiente (qué hacer, dónde mirar, qué formato 
 
 ## 3. Sigue la respuesta
 
+La telemetría local es opcional: `telemetry: on|off` en `~/.sdd-ai/config.yml`, apagada por
+defecto. `SDD_AI_TELEMETRY=on|off` tiene prioridad incluso si el archivo no se lee; otros valores
+se ignoran. El supervisor captura la variable al arrancar y lee el archivo en cada cierre de
+intento. Con on publica una línea JSONL privada por intento en `~/.sdd-ai/telemetry/`, antes de
+terminar la corrida: consultar o admitir la respuesta no la duplica. Solo registra identificación,
+perfiles y consumo, nunca prompts, respuestas, código, salidas ni diagnósticos. Los archivos nuevos
+tienen permisos 0600 y el directorio 0700. La vía nativa no genera líneas ni se exportan métricas
+anteriores. Si una reanudación Codex carece de baseline, conserva el contador acumulado del hilo,
+su id y el scope `thread_cumulative` por contador; `metrics.json` conserva su comportamiento.
+La telemetría calla sus fallos: nada avisa cuando está encendida y no escribe.
+
 Cuando `run` devuelve un `id`, ya copió el encargo a la corrida: borra el temporal. Si `run` falla
 antes, consérvalo para reintentar.
 
@@ -118,6 +129,16 @@ el reporte está completo.
 
 - La revisión final de un flujo SDD lleva `--flow <id>`, con `--untracked` o `--harvest`, sin
   `--head` ni `--artifact`, y con la base del plan. Así `sdd status` y `sdd commit` la reconocen.
+
+Antes de crear la corrida de ese diff y lanzar al revisor, su id queda citado en `reviews` de
+`sdd-ai-phases.json`. Las citas se acumulan sin borrar fases, writer, verify ni commit y permanecen
+durante rondas y recepción. El lock vivo del flujo se espera; uno huérfano niega con `flow_busy`.
+Un registro inválido (`phases_invalid`), un flujo ausente en este checkout (`flow_not_found`), una
+ruta inválida (`path_invalid`), una base distinta o un fallo de escritura impiden crear y lanzar
+la corrida. Un fallo posterior deja la cita. Citar no concede validez ni gates: siguen mandando
+la convergencia, la base y el respaldo del candidato. No hay protección retroactiva automática
+para revisiones anteriores ni al continuarlas. `--artifact --flow` también se admite: exige el
+handoff local, no plan ni base, transporta la asociación y nunca cita una revisión final.
 
 ### Nivel de riesgo y revisores
 
@@ -786,6 +807,7 @@ Cada bloqueo trae un `next`; la aplicación se niega con el código del primero 
 | `tree_dirty` | Commitear o guardar las rutas indicadas, fuera de `.plans/`, `.specify/`, `.sdd-ai/` y `.cross-model/`. Un renombre cuenta también por su origen. |
 | `phase_running` | Recibir la corrida con `wait`. |
 | `writer_open` | Seguir el `next`, que depende de quién tiene la reserva: recibir el writer con `wait`, o esperar a que terminen `sdd verify` o `sdd commit`. Solo una reserva de `sdd branch` cuyo proceso ya no corre se borra a mano, con el lock que nombra el `next`. |
+| `refs_busy` | Esperar al dueño de la reserva de refs; si murió, seguir el `next` para retirar su reserva huérfana. |
 | `flow_busy` | Esperar al comando dueño; borrar el lock indicado solo si ya no hay otro comando corriendo. |
 | `base_branch_unknown` | Completar `base_branch` o corregir `origin_sha`; crear la base local si se necesita su punta. |
 | `branch_name_invalid` | Corregir el formato, el prefijo o el slug para que Git acepte el nombre. |
@@ -809,10 +831,11 @@ y `--refreeze` (sin recongelar de nuevo). Si la rama registrada todavía no exis
 intención: `--prefix` o `--current` la reemplazan por otra elección. La respuesta dice `created`,
 `switched` y `handoff_written`.
 
-Crear una ref toma la reserva de writer del repositorio hasta que exista, incluso entre worktrees,
-y la libera al terminar. Si ya está tomada, `new` se bloquea con `writer_open`; `--current` y cambiar
-a una rama existente no la toman ni se bloquean por ella. Un writer abierto del propio flujo sí bloquea
-las dos salidas. La reserva puede quedar huérfana si el proceso muere antes de liberarla.
+Crear una rama o cambiar a una existente toma reservas de checkout y de refs, y las libera al
+terminar. La del checkout puede negar con `writer_open`; la de refs, compartida entre worktrees,
+con `refs_busy`. `--current` y completar solamente el handoff no toman esas reservas. Un writer
+abierto del propio flujo sí bloquea las dos salidas. Una reserva puede quedar huérfana si el proceso
+muere antes de liberarla.
 Después de aplicar, `next` es el de `sdd status`. El ensayo no liga la sesión; `--apply` sí la liga.
 
 ### Las fases en un worker: `sdd phase`
@@ -985,6 +1008,13 @@ push, PR ni archivo.
 
 ## 10. Retener lo que guarda sdd-ai: `prune`
 
+La telemetría de usuario tiene retención independiente de 30 días de calendario UTC: en cada cierre,
+con on u off, se borran solo archivos propios regulares de días anteriores a hoy menos 30; el día
+del límite se conserva. No se siguen enlaces ni se reescriben archivos que reciben líneas. `prune`
+y `--keep-days` no cambian esa retención ni borran las líneas recientes de una corrida eliminada.
+Una revisión final citada en un flujo sin archivar queda protegida por `cited`, también después de
+una pausa de más de siete días; al retomar sigue sujeta a las validaciones de status y commit.
+
 `sdd-ai prune` limpia por antigüedad lo que guarda este checkout: las corridas de `.sdd-ai/runs/`,
 sus almacenes de writer en el directorio Git, los recibos y acreditaciones de verify, las tomas,
 las sesiones de hooks y cada entrada de `.sdd-ai/tmp/`. La ventana es de 7 días; `--keep-days <n>`
@@ -1052,6 +1082,7 @@ sdd-ai ahí es la instalación global.
    - cada archivo con lo que le haría (`files`: `create`, `update` con sus `changes`, `unchanged` o
      `invalid` con su error);
    - lo que cambia en los perfiles (`workers`);
+   - la preferencia compartida del usuario (`user_config`), separada de los archivos del checkout;
    - las copias que sincronizaría (`agents`);
    - los avisos (`notes`) y un `digest`.
 2. **Pregunta.** Cada pregunta de `questions` trae su opción vigente primero:
@@ -1061,7 +1092,7 @@ sdd-ai ahí es la instalación global.
 
    Si una respuesta no es la primera opción, vuelve a ensayar con el `flag` de esa pregunta y el
    `value` elegido, por ejemplo `--families claude` o `--jira on`.
-3. **Muestra el ensayo.** Enséñale al usuario `files`, `workers` y `notes`. Los perfiles no se
+3. **Muestra el ensayo.** Enséñale al usuario `files`, `user_config`, `workers` y `notes`. Los perfiles no se
    preguntan:
    - un `workers.yml` nuevo lleva los defaults de cada rol;
    - uno existente conserva sus perfiles, suma los que faltan y pierde los inexistentes, que son los
@@ -1085,6 +1116,19 @@ y `--from <ruta>` elige otro checkout. Como el worktree no tiene `node_modules`,
 `node <principal>/bin/sdd-ai init`, o `npm ci` y después `./bin/sdd-ai init`.
 
 `init` no escribe hooks ni archivos de ignore y no corre `npm ci`: lo que falte lo avisa en `notes`.
+
+La preferencia de usuario es `telemetry: on|off` en `~/.sdd-ai/config.yml`. Solo si falta la clave
+y no hay flag se pregunta, con off primero y por defecto; una clave existente evita repetir la
+pregunta entre checkouts. `init --telemetry on|off` permite cambiarla, incluso en un checkout ya
+inicializado. El override de entorno no sustituye ni cambia la preferencia persistida. El ensayo
+no escribe: `user_config` muestra path, current, proposed, action y content cuando cambia. Su digest
+incluye los bytes y la ruta del archivo de usuario; si cambian, se exige un ensayo nuevo. Se
+conservan otras claves, comentarios, permisos y los enlaces a la configuración. YAML o clave
+inválidos, o un archivo ilegible, niegan init con `user_config_invalid` y nombran el archivo.
+Si no se puede escribir esa preferencia, se aplica el checkout y agents sync igualmente:
+`user_config.written` es false y `telemetry_preference_unwritten` indica repetir el ensayo con
+`init --telemetry <elección>` desde una terminal con acceso y aprobar su digest. Si la clave
+faltaba, volverá a preguntar; si ya existía, mantiene su valor y el cambio requiere otra vez el flag.
 
 ## 12. Buscar antecedentes: `recall`
 

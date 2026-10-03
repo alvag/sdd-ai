@@ -14,7 +14,7 @@ import { type FrozenLaunch, type PublishOutcome, freezeLaunch, publishPhase } fr
 import { readFlow } from '../src/sdd/read.ts'
 import { resolve } from '../src/sdd/status.ts'
 import { isPhaseRole, PHASE_ROLES } from '../src/types.ts'
-import { makeFakeBin, makeRepo } from './helpers.ts'
+import { makeFakeBin, makeRepo, telemetryOff } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 
@@ -28,19 +28,19 @@ function setup(opts: { families?: string; bins?: Array<'claude' | 'codex'>; mode
   const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
   symlinkSync(process.execPath, join(bin, 'node'))
   for (const b of opts.bins ?? []) makeFakeBin(bin, b)
-  const env: Record<string, string> = {
+  const env: Record<string, string> = telemetryOff({
     PATH: `${bin}:/usr/bin:/bin`,
     HOME: process.env.HOME ?? '',
     CLAUDECODE: '1',
     CLAUDE_CODE_SESSION_ID: 's-claude',
     CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')),
     FAKE_MODE: opts.mode ?? 'ok-codex',
-  }
+  })
   return { repo, env, bin }
 }
 
 function cli(s: Setup, args: string[], extraEnv: Record<string, string> = {}) {
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: { ...s.env, ...extraEnv }, encoding: 'utf8' })
+  const r = spawnSync(BIN, args, { cwd: s.repo, env: telemetryOff({ ...s.env, ...extraEnv }), encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), stderr: r.stderr }
 }
 

@@ -142,7 +142,7 @@ test('el ensayo de init no escribe nada y muestra config, preguntas, archivos, a
   assert.equal(plan.mode, 'dry_run')
   assert.equal(plan.current, null)
   assert.deepEqual(plan.detected, ['claude', 'codex'])
-  assert.deepEqual(plan.questions.map((q: Out) => q.id), ['families', 'jira_approval'])
+  assert.deepEqual(plan.questions.map((q: Out) => q.id), ['families', 'jira_approval', 'telemetry'])
   const config = fileOf(plan, '.sdd-ai/config.yml')
   assert.equal(config.action, 'create')
   assert.match(config.content, /families: \[claude, codex\]/)
@@ -181,7 +181,7 @@ test('las preguntas de init traen lo vigente primero y las respuestas cambian el
 
   const single = checkout({ bins: ['claude'] })
   const one = cli(single, ['init']).out
-  assert.deepEqual(one.questions.map((q: Out) => q.id), ['jira_approval'])
+  assert.deepEqual(one.questions.map((q: Out) => q.id), ['jira_approval', 'telemetry'])
   assert.match(fileOf(one, '.sdd-ai/config.yml').content, /families: \[claude\]\n {2}selection: full/)
 
   const answered = cli(c, ['init', '--families', 'claude', '--jira', 'on']).out

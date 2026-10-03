@@ -6,6 +6,10 @@
 // archivos en un solo proceso, no actúa.
 import { createRequire, syncBuiltinESMExports } from 'node:module'
 
+if (!process.execArgv.includes('--test') && process.argv[1]?.endsWith('.test.ts')) {
+  process.env.SDD_AI_TELEMETRY = 'off'
+}
+
 if (!process.execArgv.includes('--test') && process.argv[1]?.endsWith('.unit.test.ts')) {
   const childProcess: Record<string, unknown> = createRequire(import.meta.url)('node:child_process')
   for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {

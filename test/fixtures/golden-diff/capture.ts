@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { freeze, readContext } from '../../../src/review/candidate.ts'
 import type { Ledger, RoundPlan } from '../../../src/review/ledger.ts'
 import { renderMaterial, renderReviewPrompt, renderRoundPrompt } from '../../../src/review/prompt.ts'
-import { makeFakeBin, makeRepo } from '../../helpers.ts'
+import { makeFakeBin, makeRepo, telemetryOff } from '../../helpers.ts'
 
 export const GOLDEN_DIR = import.meta.dirname
 const BIN = join(import.meta.dirname, '..', '..', '..', 'bin', 'sdd-ai')
@@ -79,10 +79,10 @@ export function reviewEnv(repo: string, answers: string[]): Record<string, strin
   makeFakeBin(bin, 'claude')
   const work = mkdtempSync(join(tmpdir(), 'sdd-ai-fake-'))
   writeFileSync(join(work, 'answers.json'), JSON.stringify(answers))
-  return {
+  return telemetryOff({
     PATH: `${bin}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1',
     FAKE_MODE: 'scripted', FAKE_ANSWERS: join(work, 'answers.json'), FAKE_CALLS_FILE: join(work, 'calls'),
-  }
+  })
 }
 
 export function cli(repo: string, env: Record<string, string>, args: string[]) {

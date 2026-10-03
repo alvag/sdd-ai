@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
+import { homedir } from 'node:os'
 import { Scalar, isMap, parse, parseDocument } from 'yaml'
 import { agentName, agentsState, leftoverAgents, skillCopies, syncAgents } from './agents.ts'
 import { parseCrossModel, parseJiraMode } from './config.ts'
@@ -10,6 +11,7 @@ import { gitDirs } from './git.ts'
 import { DEFAULT_PROFILES, type WorkersFile, loadCodexCatalog, loadCodexRoot, parseWorkers } from './profiles.ts'
 import { roleProfiles } from './resolve.ts'
 import { type Family, READ_ONLY_ROLES, RETIRED_ROLES, ROLES, type Role, SddError } from './types.ts'
+import { type TelemetryPreference, type UserTelemetryPlan, planUserTelemetry, readUserConfig, writeUserTelemetry } from './user-config.ts'
 
 // `init` prepara un checkout de sdd-ai. El ensayo calcula el plan sin escribir nada; la aplicación lo
 // vuelve a calcular con las mismas funciones, comprueba que el digest sea el que vio el usuario y recién
@@ -35,7 +37,7 @@ const AGENT_FILES: Record<Family, (name: string) => string> = {
 }
 
 export type JiraAnswer = 'on' | 'off'
-export interface InitAnswers { families?: Family[]; jira?: JiraAnswer; from?: string }
+export interface InitAnswers { families?: Family[]; jira?: JiraAnswer; from?: string; telemetry?: TelemetryPreference }
 export interface InitOptions {
   /** El comando de `init` con los mismos flags, listo para la shell; con digest, el de la aplicación. */
   command: (digest?: string) => string
@@ -46,7 +48,7 @@ type Env = Record<string, string | undefined>
 interface Current { families: Family[]; selection?: string; jira: JiraAnswer }
 interface Resolved { families: Family[]; selection?: string; jira: JiraAnswer }
 interface Option { label: string; description: string; value: string }
-interface Question { id: 'families' | 'jira_approval'; flag: '--families' | '--jira'; header: string; question: string; options: Option[] }
+interface Question { id: 'families' | 'jira_approval' | 'telemetry'; flag: '--families' | '--jira' | '--telemetry'; header: string; question: string; options: Option[] }
 interface FileError { code: string; message: string; next?: string }
 interface PlannedFile { path: string; action: 'create' | 'update' | 'unchanged' | 'invalid'; content?: string; changes?: string[]; error?: FileError }
 interface RemovedProfile { path: string; reason: 'retired' | 'unknown' | 'model_not_in_catalog'; detail: string }
@@ -55,12 +57,14 @@ interface AgentChange { path: string; state: 'stale' | 'missing' | 'leftover' }
 interface Note { code: string; detail: string; next?: string }
 
 export interface InitPlan {
+  user_config: UserTelemetryPlan
   mode: 'dry_run'; root: string; current: Current | null; detected: Family[]; seed: { from: string } | null
   questions: Question[]; files: PlannedFile[]; workers: WorkersReport; agents: AgentChange[]; notes: Note[]
   digest: string; next: string
 }
 
 export interface InitResult {
+  user_config: Pick<UserTelemetryPlan, 'path' | 'action'> & { written: boolean }
   mode: 'applied'; root: string; written: string[]; agents: { written: string[]; removed: string[] } | null
   workers: WorkersReport; notes: Note[]; doctor: ReturnType<typeof doctor>; closing: string
 }
@@ -410,6 +414,8 @@ const OLDER_GENERATION = /^(?:Older|Previous generation|Legacy)\b/i
 
 function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): Planned {
   assertCheckout(root)
+  const userSnapshot = readUserConfig(env.HOME ?? homedir())
+  const user_config = planUserTelemetry(userSnapshot, answers.telemetry)
   const configText = readText(join(root, CONFIG_PATH))
   if (configText !== null && answers.from !== undefined) {
     throw new SddError('usage', `--from solo sirve cuando falta ${CONFIG_PATH}: este checkout ya tiene su config`)
@@ -507,22 +513,31 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
   // Las fuentes de los agentes y la raíz del config de Codex deciden qué escribe `agents sync`; las notas,
   // lo que el usuario vio. Todo lo que cambia el ensayo cambia el digest.
   const digest = createHash('sha256').update(JSON.stringify(canonical({
-    answers: { ...resolved, from: source },
+    answers: { ...resolved, from: source, telemetry: user_config.proposed },
     inputs: {
       config: sha(configText), workers: sha(workersText), ignore: sha(ignoreText),
+      user_config_path: userSnapshot.path, user_config_bytes: userSnapshot.bytes,
       source_config: sha(sourceConfig), source_workers: sha(sourceWorkers),
       catalog: loaded === null ? null : [...loaded.slugs].sort(), catalog_client: loaded?.clientVersion ?? null, codex_version: codexVersion, detected,
       agent_sources: AGENT_SOURCES.map((rel) => sha(readText(join(root, rel)))), codex_root: loadCodexRoot(env),
       hooks: FAMILIES.map((f) => sha(readQuiet(join(root, HOOK_FILES[f])))),
     },
-    files, agents, notes,
+    files, agents, notes, user_config,
   }))).digest('hex').slice(0, 16)
 
   const plan: InitPlan = {
     mode: 'dry_run', root, current, detected, seed: source === null ? null : { from: source }, questions: questionsFor(current, detected),
-    files, workers: report, agents, notes, digest,
-    next: `hazle al usuario las preguntas de questions; si alguna respuesta no es la primera opción, vuelve a ensayar con su flag. Muéstrale files, workers y notes y, si confirma, corre: ${o.command(digest)}`,
+    files, workers: report, agents, notes, digest, user_config,
+    next: `hazle al usuario las preguntas de questions; si alguna respuesta no es la primera opción, vuelve a ensayar con su flag. Muéstrale files, user_config, workers y notes y, si confirma, corre: ${o.command(digest)}`,
   }
+  if (userSnapshot.current === null && answers.telemetry === undefined) plan.questions.push({
+    id: 'telemetry', flag: '--telemetry', header: 'Telemetría',
+    question: '¿Guardar metadatos locales de consumo, sin contenido, durante 30 días?',
+    options: [
+      { label: 'off (por defecto)', description: 'Sin publicaciones de telemetría.', value: 'off' },
+      { label: 'on', description: 'Una línea privada por intento cerrado.', value: 'on' },
+    ],
+  })
   return { plan, workers }
 }
 
@@ -538,7 +553,7 @@ function writeAtomic(file: string, content: string): void {
   renameSync(tmp, file)
 }
 
-/** La aplicación: escribe exactamente lo que mostró el ensayo con ese digest, o nada. */
+/** Valida el digest antes de escribir el checkout; un fallo de preferencia se informa por separado. */
 export function applyInit(root: string, answers: InitAnswers, digest: string, env: Env, o: InitOptions): InitResult {
   const { plan, workers } = compute(root, answers, env, o)
   if (plan.digest !== digest) {
@@ -554,13 +569,21 @@ export function applyInit(root: string, answers: InitAnswers, digest: string, en
     }
   }
   const agents = plan.agents.length > 0 && workers !== null ? syncAgents(root, root, roleProfiles(workers, loadCodexRoot(env))) : null
+  let userWritten = false
+  try {
+    writeUserTelemetry(plan.user_config)
+    userWritten = plan.user_config.action !== 'unchanged'
+  } catch {
+    plan.notes.push({ code: 'telemetry_preference_unwritten', detail: `${plan.user_config.path}: no se escribió la preferencia de telemetría`,
+      next: `desde una terminal con acceso, repite init --telemetry ${plan.user_config.proposed}, revisa el ensayo y aprueba la aplicación con su digest` })
+  }
   const closing = [
     `Los perfiles de ${WORKERS_PATH} y las claves de la config que init no pregunta se cambian a mano.`,
     ...(agents === null ? [] : ['Reabre la sesión para que el CLI cargue los agentes y la skill.']),
   ].join(' ')
   return {
     mode: 'applied', root, written, agents, workers: plan.workers, notes: plan.notes,
+    user_config: { path: plan.user_config.path, action: plan.user_config.action, written: userWritten },
     doctor: doctor(o.exec, { copies: skillCopies(root, root) }), closing,
   }
 }
-

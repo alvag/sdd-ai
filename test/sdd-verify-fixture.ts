@@ -14,7 +14,7 @@ import { type CommandRow, type TestRow, admitVerification, renderVerification } 
 import { readFlow } from '../src/sdd/read.ts'
 import { resolve } from '../src/sdd/status.ts'
 import { SddError } from '../src/types.ts'
-import { askPair, makeFakeBin, makeRepo, writeClaudeTranscript } from './helpers.ts'
+import { askPair, makeFakeBin, makeRepo, telemetryOff, writeClaudeTranscript } from './helpers.ts'
 import { realpathSync } from 'node:fs'
 
 export const realpathTmp = () => realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-verify-')))
@@ -209,7 +209,7 @@ export const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 /** Corre el binario con un tope amplio: una corrida final ejecuta las filas y confirma con revert. */
 export function cli(repo: string, env: Record<string, string>, ...args: string[]): { code: number | null; out: Record<string, any> } {
   const { NODE_TEST_CONTEXT: _ctx, ...base } = process.env
-  const r = spawnSync(BIN, args, { cwd: repo, encoding: 'utf8', timeout: 120000, env: { ...base, ...env } as NodeJS.ProcessEnv })
+  const r = spawnSync(BIN, args, { cwd: repo, encoding: 'utf8', timeout: 120000, env: telemetryOff({ ...base, ...env }) })
   return { code: r.status, out: JSON.parse(r.stdout) }
 }
 
@@ -220,6 +220,21 @@ export const CLEAN_ROUND = '{"candidate_hash":"$HASH","inspection":{"status":"co
  * Un flujo verificable con una revisión de diff ya convergida sobre su código, con `plan.md` (y, si se pide,
  * `spec.md`) como contexto. Devuelve el repositorio, el entorno de un conductor Claude y el id de la revisión.
  */
+/** El entorno con que reviewedFlow lanza su revisión: un Claude falso con una ronda limpia, sin publicar telemetría. */
+export function reviewedFlowEnv(): { env: Record<string, string>; dirs: string[] } {
+  const bin = realpathTmp()
+  symlinkSync(process.execPath, join(bin, 'node'))
+  makeFakeBin(bin, 'claude')
+  const work = realpathTmp()
+  writeFileSync(join(work, 'answers.json'), JSON.stringify([CLEAN_ROUND]))
+  const claudeConfig = realpathTmp()
+  const env: Record<string, string> = telemetryOff({
+    PATH: `${bin}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: claudeConfig,
+    CODEX_SESSION_ID: '', CODEX_THREAD_ID: '', FAKE_MODE: 'scripted', FAKE_ANSWERS: join(work, 'answers.json'), FAKE_CALLS_FILE: join(work, 'calls'),
+  })
+  return { env, dirs: [bin, work, claudeConfig] }
+}
+
 export function reviewedFlow(contexts: string[], planAsDiff = false, frozenHead = false): { repo: string; env: Record<string, string>; id: string; base: string } {
   const { repo, base } = verifyFlow()
   if (planAsDiff) writeFileSync(join(repo, '.git/info/exclude'), '.plans/*\n!.plans/f/\n.plans/f/*\n!.plans/f/plan.md\n.sdd-ai/\n')
@@ -230,15 +245,7 @@ export function reviewedFlow(contexts: string[], planAsDiff = false, frozenHead 
     '  code-review:', '    claude:', '      model: opus', '      effort: alto',
     '  refute:', '    claude:', '      model: sonnet', '      effort: medio', '',
   ].join('\n'))
-  const bin = realpathTmp()
-  symlinkSync(process.execPath, join(bin, 'node'))
-  makeFakeBin(bin, 'claude')
-  const work = realpathTmp()
-  writeFileSync(join(work, 'answers.json'), JSON.stringify([CLEAN_ROUND]))
-  const env: Record<string, string> = {
-    PATH: `${bin}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: realpathTmp(),
-    CODEX_SESSION_ID: '', CODEX_THREAD_ID: '', FAKE_MODE: 'scripted', FAKE_ANSWERS: join(work, 'answers.json'), FAKE_CALLS_FILE: join(work, 'calls'),
-  }
+  const { env } = reviewedFlowEnv()
   const context = contexts.flatMap((c) => ['--context', c])
   if (frozenHead) {
     gitIn(repo, 'add', 'src', 'test')

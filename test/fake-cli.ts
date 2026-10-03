@@ -5,6 +5,7 @@ import {
   appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
 } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { setTimeout as sleep } from 'node:timers/promises'
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, 'fixtures', name), 'utf8')
 const args = process.argv.slice(2)
@@ -30,6 +31,37 @@ function okCodex(): void {
   process.stdout.write(fixture('codex-stream.jsonl'))
   const i = args.indexOf('--output-last-message')
   if (i >= 0) writeFileSync(args[i + 1], 'ok')
+}
+
+/** Guion de mediciones por intento, con barreras solo en la herramienta falsa. */
+async function telemetryScript(): Promise<void> {
+  const script = JSON.parse(process.env.FAKE_TELEMETRY_SCRIPT ?? '[]') as Array<{
+    usage?: Record<string, number>; model?: string; session?: string; hang?: boolean; barrier?: string; answer?: string; reject?: 'model' | 'effort'
+  }>
+  const entry = script[callCount() - 1] ?? {}
+  if (entry.barrier) {
+    writeFileSync(`${entry.barrier}.ready`, '')
+    while (!existsSync(entry.barrier)) await sleep(10)
+  }
+  if (entry.reject) {
+    fail(entry.reject === 'model' ? 'codex-modelo-rechazado.jsonl' : 'codex-esfuerzo-rechazado.jsonl')
+    return
+  }
+  const codex = args.includes('exec') || !args.includes('--output-format')
+  if (codex) {
+    process.stdout.write(`${JSON.stringify({ type: 'thread.started', thread_id: entry.session ?? 'TELEMETRY_THREAD' })}\n`)
+    if (entry.model) process.stdout.write(`${JSON.stringify({ type: 'session_meta', payload: { model: entry.model } })}\n`)
+    process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: entry.answer ?? 'PRIVATE_RESPONSE_MARKER' } })}\n`)
+    if (entry.usage) process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: entry.usage })}\n`)
+    const i = args.indexOf('--output-last-message')
+    if (i >= 0) writeFileSync(args[i + 1], entry.answer ?? 'ok')
+  } else {
+    process.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: entry.session ?? 'TELEMETRY_THREAD', model: entry.model ?? 'confirmed-model' })}\n`)
+    process.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"PRIVATE_OUTPUT_MARKER"}]}}\n')
+    process.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: entry.answer ?? 'ok', usage: entry.usage })}\n`)
+  }
+  process.stderr.write('PRIVATE_DIAGNOSTIC_MARKER\n')
+  if (entry.hang) setInterval(() => {}, 1000)
 }
 
 /** Emite una línea y deja el proceso vivo hasta que lo maten, como un worker que no terminó a tiempo. */
@@ -88,6 +120,10 @@ function scripted(): void {
   const answers = JSON.parse(readFileSync(process.env.FAKE_ANSWERS ?? '', 'utf8')) as string[]
   const answer = answers[callCount() - 1] ?? '__fail__'
   const codex = args[0] === 'exec'
+  if (answer === '__reject_model__' || answer === '__reject_effort__') {
+    fail(answer === '__reject_model__' ? codex ? 'codex-modelo-rechazado.jsonl' : 'claude-modelo-rechazado.jsonl' : 'codex-esfuerzo-rechazado.jsonl')
+    return
+  }
   const prompt = readFileSync(0, 'utf8')
   // Una reanudación solo recibe el mensaje de cierre: como la sesión real, recuerda el candidato anterior.
   const memory = `${process.env.FAKE_CALLS_FILE ?? '/dev/null'}.memoria`
@@ -346,6 +382,9 @@ switch (process.env.FAKE_MODE) {
     break
   case 'scripted':
     scripted()
+    break
+  case 'telemetry-script':
+    await telemetryScript()
     break
   case 'writer':
     writer()

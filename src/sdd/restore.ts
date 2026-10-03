@@ -13,7 +13,9 @@ import { receiptDir } from './verify-receipt.ts'
 
 // El revert de confirmación de `sdd verify`: devolver a la base las rutas de implementación de una fila,
 // correrla y restaurarlas. Antes de tocar el árbol queda una intención durable con los dos contenidos de
-// cada ruta; cualquier verbo la resuelve al arrancar, ruta por ruta, sin pisar lo que alguien editó.
+// cada ruta. La entrada común la recupera salvo en start, branch y commit: start --apply y
+// branch --apply lo hacen después de validar; commit nunca recupera. Se restaura ruta por ruta,
+// sin pisar lo que alguien editó.
 
 /** Una ruta de la intención: los sha256 de su contenido en el candidato y en la base, y sus modos. */
 export interface IntentPath { path: string; candidate: string; base: string; mode_candidate: string; mode_base: string }

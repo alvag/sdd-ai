@@ -11,7 +11,7 @@ import { createRun, writeJsonAtomic } from '../src/runs.ts'
 import { gitDirs } from '../src/git.ts'
 import { codexWriterLaunch } from '../src/workers/codex.ts'
 import { type WriterControl, readProcess, runDirIdentity, runInventory, sensitiveInventory, writeControl } from '../src/writer-store.ts'
-import { makeFakeBin, makeRepo } from './helpers.ts'
+import { makeFakeBin, makeRepo, telemetryOff } from './helpers.ts'
 
 export const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 
@@ -30,20 +30,20 @@ export function setup(opts: { families?: string; bins?: Array<'claude' | 'codex'
   for (const b of opts.bins ?? []) makeFakeBin(bin, b)
   const prompt = join(mkdtempSync(join(tmpdir(), 'sdd-ai-prompt-')), 'p.md')
   writeFileSync(prompt, 'Encargo de prueba.\n')
-  const env: Record<string, string> = {
+  const env: Record<string, string> = telemetryOff({
     PATH: `${bin}:/usr/bin:/bin`,
     HOME: process.env.HOME ?? '',
     CLAUDECODE: '1',
     CLAUDE_CODE_SESSION_ID: 's-claude',
     CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')),
     FAKE_MODE: opts.mode ?? 'ok-codex',
-  }
+  })
   return { repo, env, prompt, bin }
 }
 
 export function cli(s: Setup, args: string[], extraEnv: Record<string, string> = {}) {
   const started = Date.now()
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: { ...s.env, ...extraEnv }, encoding: 'utf8' })
+  const r = spawnSync(BIN, args, { cwd: s.repo, env: telemetryOff({ SDD_AI_TELEMETRY: s.env.SDD_AI_TELEMETRY, ...s.env, ...extraEnv }), encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), ms: Date.now() - started, stderr: r.stderr }
 }
 

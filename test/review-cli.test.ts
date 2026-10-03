@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LENSES } from '../src/review/ledger.ts'
 import { LENS_MANDATES } from '../src/review/prompt.ts'
-import { makeFakeBin, makeRepo } from './helpers.ts'
+import { makeFakeBin, makeRepo, telemetryOff } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 const lines = (n: number) => Array.from({ length: n }, (_, i) => `línea ${i + 1}\n`).join('')
@@ -28,10 +28,10 @@ function setup(opts: { families: string; bins: Array<'claude' | 'codex'>; mode?:
   const bin = mkdtempSync(join(tmpdir(), 'sdd-ai-bin-'))
   symlinkSync(process.execPath, join(bin, 'node'))
   for (const b of opts.bins) makeFakeBin(bin, b)
-  const env: Record<string, string> = {
+  const env: Record<string, string> = telemetryOff({
     PATH: `${bin}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1',
     CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')), FAKE_MODE: opts.mode ?? 'review-ok',
-  }
+  })
   return { repo, env, base: git(repo, 'rev-parse', 'HEAD') }
 }
 
@@ -456,13 +456,13 @@ function harvested(s: Setup, script: object): string {
 }
 
 const waitFor = (s: Setup, id: string, env: Record<string, string> = {}) =>
-  JSON.parse(spawnSync(BIN, ['wait', id, '--max', '30'], { cwd: s.repo, env: { ...s.env, ...env }, encoding: 'utf8' }).stdout)
+  JSON.parse(spawnSync(BIN, ['wait', id, '--max', '30'], { cwd: s.repo, env: telemetryOff({ ...s.env, ...env }), encoding: 'utf8' }).stdout)
 
 /** Ejecuta un `next` que empieza con `./bin/sdd-ai`. */
 function runNext(s: Setup, next: string, env: Record<string, string> = {}) {
   const cmd = /\.\/bin\/sdd-ai ([^;]+?)(?:\)|$)/.exec(next)?.[1] ?? ''
   const args = cmd.trim().split(/\s+/)
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: { ...s.env, ...env }, encoding: 'utf8' })
+  const r = spawnSync(BIN, args, { cwd: s.repo, env: telemetryOff({ ...s.env, ...env }), encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), args }
 }
 

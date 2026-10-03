@@ -37,6 +37,7 @@ export interface PhaseRecord {
   /** Las cadenas de writers de `implement`; un registro anterior no la trae. */
   implement?: ImplementRecord
   commit?: CommitRecord
+  reviews?: string[]
 }
 
 /** Una corrida de writer de la cadena. `implement` es el writer inicial; `fix`, una corrección desde un recibo rojo. */
@@ -109,6 +110,9 @@ export function readPhaseRecord(root: string, id: string): PhaseRecord {
     throw invalid(id, 'last_run no es null ni una corrida con su paso')
   }
   if (!isRecord(data.phases)) throw invalid(id, 'phases no es un mapa')
+  if (data.reviews !== undefined && !(Array.isArray(data.reviews) && data.reviews.every((r) => typeof r === 'string' && isRunId(r)))) {
+    throw invalid(id, 'reviews no es una lista de ids completos de corrida')
+  }
   for (const [step, entry] of Object.entries(data.phases)) {
     if (!DOCUMENT_STEPS.includes(step)) throw invalid(id, `phases.${step} no es una fase con registro`)
     const problem = entryProblem(entry)
@@ -322,6 +326,17 @@ export function appendReceiptRef(root: string, id: string, ref: VerifyReceiptRef
     const r = readPhaseRecord(root, id)
     const v = withVerify(r)
     writePhaseRecord(root, id, { ...r, verify: { ...v, receipts: [...v.receipts, ref] } })
+  })
+}
+
+/** Conserva una revisión por cita; no concede validez ni aprobaciones. */
+export function appendReviewRef(root: string, flow: string, run: string, validate: () => void): void {
+  if (!isRunId(run)) throw invalid(flow, 'la referencia de revisión no es un id completo')
+  withFlowLock(root, flow, () => {
+    validate()
+    const r = readPhaseRecord(root, flow)
+    const reviews = r.reviews ?? []
+    if (!reviews.includes(run)) writePhaseRecord(root, flow, { ...r, reviews: [...reviews, run] })
   })
 }
 

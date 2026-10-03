@@ -12,7 +12,7 @@ import { planRoundJobs } from '../src/review/batch.ts'
 import { freeze } from '../src/review/candidate.ts'
 import { REVIEW_PROMPT_BUDGET, measure } from '../src/review/prompt.ts'
 import { type Reviewer, type RoundPlan, type LedgerEntry } from '../src/review/ledger.ts'
-import { askPair, makeFakeBin, makeRepo, writeClaudeTranscript } from './helpers.ts'
+import { askPair, makeFakeBin, makeRepo, telemetryOff, writeClaudeTranscript } from './helpers.ts'
 
 export const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 
@@ -48,11 +48,11 @@ export function setup(answers: string[]): Setup {
   const work = mkdtempSync(join(tmpdir(), 'sdd-ai-fake-'))
   writeFileSync(join(work, 'answers.json'), JSON.stringify(answers))
   // Una sesión de Claude Code de fixture: su transcript es donde el usuario responde las preguntas.
-  const env: Record<string, string> = {
+  const env: Record<string, string> = telemetryOff({
     PATH: `${bin}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1',
     CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: mkdtempSync(join(tmpdir(), 'sdd-ai-claude-')),
     FAKE_MODE: 'scripted', FAKE_ANSWERS: join(work, 'answers.json'), FAKE_CALLS_FILE: join(work, 'calls'),
-  }
+  })
   return { repo, env, base: git(repo, 'rev-parse', 'HEAD') }
 }
 

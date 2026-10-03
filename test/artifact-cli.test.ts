@@ -5,7 +5,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { GOLDEN_DIR, goldenRepo } from './fixtures/golden-diff/capture.ts'
-import { makeFakeBin, makeRepo } from './helpers.ts'
+import { makeFakeBin, makeRepo, telemetryOff } from './helpers.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 const git = (repo: string, ...args: string[]) =>
@@ -42,10 +42,10 @@ function setup(answers: string[], o: { single?: boolean } = {}): Setup {
   makeFakeBin(bin, 'claude')
   const work = mkdtempSync(join(tmpdir(), 'sdd-ai-fake-'))
   writeFileSync(join(work, 'answers.json'), JSON.stringify(answers))
-  const env: Record<string, string> = {
+  const env: Record<string, string> = telemetryOff({
     PATH: `${bin}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1',
     FAKE_MODE: 'scripted', FAKE_ANSWERS: join(work, 'answers.json'), FAKE_CALLS_FILE: join(work, 'calls'),
-  }
+  })
   return { repo, env }
 }
 
@@ -439,7 +439,7 @@ test('de punta a punta: start, decide, round, relanzamiento y status con un arte
 test('una corrida anterior sin subject se lee como diff en status, report y wait', () => {
   const old = JSON.parse(readFileSync(join(GOLDEN_DIR, 'run-old.json'), 'utf8')) as { id: string; repo: string }
   const { repo } = goldenRepo()
-  const s: Setup = { repo, env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1' } }
+  const s: Setup = { repo, env: telemetryOff({ PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: process.env.HOME ?? '', CLAUDECODE: '1' }) }
   cpSync(join(GOLDEN_DIR, 'run-old'), join(repo, '.sdd-ai', 'runs', old.id), { recursive: true })
   for (const r of [cli(s, ['review', 'status', old.id]), cli(s, ['wait', old.id, '--max', '1'])]) {
     assert.equal(r.out.state, 'unavailable', JSON.stringify(r.out))

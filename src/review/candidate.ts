@@ -51,7 +51,7 @@ function git(root: string, args: string[], env?: Record<string, string>): string
 
 export const sha256 = (b: Buffer | string) => createHash('sha256').update(b).digest('hex')
 
-function resolveCommit(root: string, ref: string): string {
+export function resolveCommit(root: string, ref: string): string {
   try {
     return git(root, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).trim()
   } catch {
