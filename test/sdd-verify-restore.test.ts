@@ -9,7 +9,7 @@ import { currentAttestation, fileSha256, writeAttestation } from '../src/sdd/ver
 import { closeRestoreIntent, prepareIntent, restoreIntentOpen, revertPaths, writeRestoreIntent } from '../src/sdd/restore.ts'
 import { confirmationOutcome, evaluateRow, executeRows, patternMatches, prepareVerify, runBaseline } from '../src/sdd/verify.ts'
 import { type TestRow, admitVerification } from '../src/sdd/verification-contract.ts'
-import { flowWriterRuns, readReservation, releaseWriter, reserveWriter } from '../src/writer-store.ts'
+import { acquireReservation, ownReservation, flowWriterRuns, releaseReservation } from '../src/writer-store.ts'
 import { createHash } from 'node:crypto'
 import { makeRepo } from './helpers.ts'
 import {
@@ -89,17 +89,18 @@ test('al cortar una fila, también terminan los procesos que dejó en su grupo',
 test('mientras corre una fila, la reserva de la verificación anota su grupo, y lo quita al terminar', async () => {
   const repo = makeRepo()
   const run = join(realpathTmp(), 'run')
-  assert.deepEqual(reserveWriter(repo, '20260929-1500-aaaa', 'verify'), { ok: true })
-  const lock = join(repo, '.git', 'sdd-ai', 'writer.lock')
+  const reserved = acquireReservation(repo, '20260929-1500-aaaa', 'verify')
+  assert.ok(reserved.ok)
+  const lock = join(repo, '.git', 'sdd-ai', 'checkout.lock')
   // La reserva se anota apenas vuelve el lanzamiento, que puede ser después de que la fila arranca: la fila espera verla.
   const show = 'const read = () => JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).group; const end = Date.now() + 3000; '
     + 'const tick = () => (read() !== undefined || Date.now() > end ? process.stdout.write(JSON.stringify({ group: read(), pid: process.pid })) : setTimeout(tick, 10)); tick()'
   const [e] = await executeRows(repo, run, [cmd('V1', [process.execPath, '-e', show, lock])], new AbortController().signal, '', '20260929-1500-aaaa')
   const seen = JSON.parse(readFileSync(join(run, e.stdout_file), 'utf8')) as { group: number; pid: number }
   assert.equal(seen.group, seen.pid)
-  assert.equal(readReservation(repo)?.group, undefined)
-  assert.equal(readReservation(repo)?.id, '20260929-1500-aaaa')
-  releaseWriter(repo, '20260929-1500-aaaa')
+  assert.equal(ownReservation(repo)?.group, undefined)
+  assert.equal(ownReservation(repo)?.id, '20260929-1500-aaaa')
+  for (const handle of reserved.handles) assert.equal(releaseReservation(handle).state, 'released')
 })
 
 test('el sha256 de una salida se calcula por partes y coincide con el del contenido entero', () => {
@@ -132,7 +133,7 @@ test('si la prueba edita una ruta revertida, la restauración no la pisa y deja 
   assert.equal(await asyncCode(() => final(repo)), 'restore_conflict')
   assert.match(readFileSync(join(repo, 'src', 'a.ts'), 'utf8'), /\/\/ \d+/)
   assert.equal(restoreIntentOpen(repo), true)
-  assert.equal(readReservation(repo), undefined)
+  assert.equal(ownReservation(repo), undefined)
 })
 
 test('la base se mide contra el commit base: un archivo ignorado no la hace medible', async () => {
@@ -177,9 +178,10 @@ test('con una verificación en curso, un writer concurrente se niega; y doctor t
   assert.equal(cli(repo, {}, 'run', '--role', 'implement', '--prompt-file', encargo).out.code, 'verify_in_progress')
   // Sin intención pero con la reserva de la verificación tomada: writer_open.
   closeRestoreIntent(repo)
-  reserveWriter(repo, '20260929-1700-aaaa', 'verify')
+  const verifying = acquireReservation(repo, '20260929-1700-aaaa', 'verify')
+  assert.ok(verifying.ok)
   assert.equal(cli(repo, {}, 'run', '--role', 'implement', '--prompt-file', encargo).out.code, 'writer_open')
-  releaseWriter(repo, '20260929-1700-aaaa')
+  for (const handle of verifying.handles) assert.equal(releaseReservation(handle).state, 'released')
   // Una intención de un dueño muerto la resuelve también doctor.
   writeRestoreIntent(repo, { ...intent, owner_pid: spawnSync(process.execPath, ['-e', '']).pid as number, owner_lstart: null })
   revertPaths(repo, intent)

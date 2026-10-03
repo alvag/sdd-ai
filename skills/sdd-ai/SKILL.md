@@ -311,14 +311,43 @@ con sus umbrales; esta sección dice cómo.
   hace falta ninguna estructura: el binario lo envuelve en un contrato fijo que le deja leer el
   repositorio, también con el shell, y le prohíbe commitear, tocar esas rutas y ejecutar pruebas, builds
   o comandos que escriban; le pide declarar lo que se desvió y cerrar con `STATUS: done`.
-- **Mientras corre, no edites el árbol.** Espera con `./bin/sdd-ai wait <id>`. Hay un writer por
-  repositorio: otro `run --role implement`, desde cualquier sesión o worktree, se rechaza nombrando
-  el que está abierto.
+- **Mientras corre, no edites su árbol.** Espera con `./bin/sdd-ai wait <id>`. Hay una reserva por
+  checkout (`<gitDir>/sdd-ai/checkout.lock`): writer y verify se excluyen allí en ambos sentidos.
+  Worktrees distintos admiten writers y verificaciones simultáneos, con controles y recibos locales.
+  Antes de trabajar en paralelo, actualiza todos los worktrees con `main`: un binario anterior en
+  otro checkout no ve las reservas nuevas. Antes de volver a una rama sin este protocolo, exige que
+  no queden `checkout.lock`, `refs.lock` ni writers sin cosechar.
+- **Branch y commit.** Crear una ref o cambiar HEAD con branch, y aplicar commit, toman checkout y
+  `<commonDir>/sdd-ai/refs.lock` durante toda su aplicación: comprobaciones finales, hooks y registros.
+  Se excluyen localmente con writer y verify; las aplicaciones de branch/commit se serializan entre
+  checkouts. `refs_busy` informa el titular y pide reintentar al terminar, sin espera automática.
+  `--current` y completar solo el handoff no toman estas reservas; conservan gates, lock del flujo,
+  writer de fase propio y árbol limpio. Consultar branch y ensayar commit no cambian reservas.
+- **Compatibilidad.** El `writer.lock` legacy conserva exclusión global, sin migrarse. Los controles
+  y cosechas anteriores siguen legibles: writer se resuelve con wait/cancel y verify con su recuperación
+  habitual, solo después del cese de su proceso y del grupo de la fila. La restauración es del propietario.
+- **Reservas huérfanas.** Branch y commit no se recuperan automáticamente. Comprueba que terminaron
+  el proceso, hooks e hijos antes de borrar manualmente las rutas exactas del diagnóstico. Revisa por
+  separado locks de flujo y restauración. Limpiar no deshace refs ni completa el flujo: repite después
+  la aplicación para retomar su intención. Un mutex `<lock>.release` abandonado se conserva y produce
+  `release_abandoned`: comprueba el cese del liberador antes de retirarlo manualmente. Una liberación
+  retenida se reintenta por wait/cancel, recuperación de verify o limpieza manual de branch/commit;
+  wait y cancel la informan en el campo `release` de su respuesta.
 - **Lo que trae `wait`**: la base, cada archivo con su estado, sus líneas y sus modos (los nuevos
   incluidos), la ruta a `diff.patch`, el reporte del writer, si cerró con la marca, las rutas señaladas
   (`flagged`: cambios en el directorio de Git, `.sdd-ai/`, `.claude/`, `.codex/` o `.agents/`), la
   corrida alterada (`run_altered`: archivos de `.sdd-ai/runs/<id>/` que el writer tocó) y si `HEAD` se
   movió. El cambio sale del árbol real contra la base, no del reporte.
+  Los controles nuevos vigilan semánticamente HEAD propio y las ramas congeladas al lanzar (HEAD y
+  handoff): cambiar solo la representación suelta/empaquetada no alerta. Se excluyen refs ajenas,
+  estado reconocido de otros checkouts, mantenimiento `gc.log`, `gc.pid`, `rr-cache/` y temporales
+  Git `*.lock`; config, hooks, las refs de `refs/replace/` (cambian cómo Git resuelve un objeto) y los
+  demás archivos no excluidos siguen vigilados. Una lectura de HEAD o de una rama que falla se publica en
+  su recurso, con `ref_after: unreadable` y el error. Las diferencias
+  describen lo observado sin atribuir autoría: conservarlas o revertirlas requiere decisión humana.
+  Los controles legacy conservan su comparación física sin filtrar alertas retrospectivamente.
+  La concurrencia no cambia permisos del writer ni gates: branch y commit siguen a cargo del conductor,
+  incluido el consentimiento del usuario para commit.
 - **Antes de aceptar el cambio de un writer suelto, en este orden** (el de un writer de fase va por
   otro camino: primero `sdd verify` y después la revisión, en §9):
   1. Mira primero `flagged`, `run_altered` y `failed`. Si hay algo, díselo al usuario antes de seguir.

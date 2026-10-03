@@ -9,12 +9,24 @@ import { join } from 'node:path'
 import { captureTree, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries } from '../src/git.ts'
 import { SddError } from '../src/types.ts'
 import {
-  canWriteStore, diffInventory, groupState, leaderMatches, readControl, readProcess, readReservation, recordGroup, releaseWriter, reserveWriter,
+  acquireReservation, ownReservation, releaseReservation, canWriteStore, diffInventory, groupState, leaderMatches, readControl, readProcess, recordGroup,
   sensitiveInventory, storeDir, storeRoot, writeControl, freezeHarvest, launchTreeDiff, launchTreeHolds, readTakeoverMap, registryDigest,
-  runEntries, writeTakeoverMap, type WriterControl,
+  runEntries, writeTakeoverMap, type ReservationHandle, type WriterControl,
 } from '../src/writer-store.ts'
 import { headerHash, readFlow } from '../src/sdd/read.ts'
 import { makeRepo } from './helpers.ts'
+
+/** Toma la reserva de un writer en el checkout y devuelve sus handles, que la prueba libera por identidad. */
+function acquireWriter(root: string, id: string): ReservationHandle[] {
+  const r = acquireReservation(root, id, 'writer')
+  assert.equal(r.ok, true, JSON.stringify(r))
+  return r.ok ? r.handles : []
+}
+
+/** Libera por handle y exige que la liberación se haya completado: una retención o un mutex abandonado fallan la prueba. */
+function releaseHandles(handles: readonly ReservationHandle[]): void {
+  for (const handle of handles) assert.equal(releaseReservation(handle).state, 'released')
+}
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
@@ -220,7 +232,7 @@ test('en un worktree se vigilan el gitdir y el directorio común', () => {
   assert.equal(canWriteStore(wt), true)
   mkdirSync(storeDir(wt, 'id-1'), { recursive: true })
   writeFileSync(join(storeDir(wt, 'id-1'), 'control.json'), '{}\n')
-  assert.equal(reserveWriter(wt, 'id-1').ok, true)
+  acquireWriter(wt, 'id-1')
   assert.deepEqual(diffInventory(before, sensitiveInventory(wt)), [])
   writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main\n')
   writeFileSync(join(commonDir, 'config'), `${readFileSync(join(commonDir, 'config'), 'utf8')}[y]\n\tz = 1\n`)
@@ -257,29 +269,34 @@ test('canWriteStore falla si una de las dos rutas no se puede escribir', () => {
   }
 })
 
-test('el rechazo de la reserva nombra la corrida que la tiene, también entre procesos simultáneos', async () => {
+test('cada checkout toma su reserva aunque el otro tenga la suya, la liberación no deja restos y el rechazo entre procesos simultáneos nombra al ganador', async () => {
   const { repo } = committed({ 'a.txt': 'a\n' })
   const wt = withWorktree(repo)
-  assert.deepEqual(reserveWriter(repo, 'uno'), { ok: true })
-  // Un worktree del mismo repositorio comparte la reserva.
-  assert.deepEqual(reserveWriter(wt, 'dos'), { ok: false, holder: 'uno' })
-  releaseWriter(wt, 'dos')
-  assert.equal(readReservation(repo)?.id, 'uno')
-  releaseWriter(repo, 'uno')
-  assert.equal(readReservation(repo), undefined)
-  assert.deepEqual(readdirSync(storeRoot(repo)).filter((f) => f.startsWith('writer.lock')), [])
+  const first = acquireWriter(repo, 'uno')
+  // Cada checkout conserva su reserva independiente.
+  releaseHandles(acquireWriter(wt, 'dos'))
+  assert.equal(ownReservation(repo)?.id, 'uno')
+  releaseHandles(first)
+  assert.equal(ownReservation(repo), undefined)
+  // Ni la reserva ni su mutex de liberación quedan en el directorio Git de ninguno de los dos checkouts.
+  for (const checkout of [repo, wt]) {
+    const dir = join(gitDirs(checkout).gitDir, 'sdd-ai')
+    assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith('checkout.lock')), [], checkout)
+  }
 
   // Diez procesos a la vez: gana uno y los demás nombran al ganador.
-  const script = `import { reserveWriter } from ${JSON.stringify(join(import.meta.dirname, '..', 'src', 'writer-store.ts'))};`
-    + 'console.log(JSON.stringify(reserveWriter(process.argv[1], process.argv[2])))'
+  const script = `import { acquireReservation } from ${JSON.stringify(join(import.meta.dirname, '..', 'src', 'writer-store.ts'))};`
+    + 'const r = acquireReservation(process.argv[1], process.argv[2], "writer"); console.log(JSON.stringify(r.ok ? {ok:true} : {ok:false,holder:r.conflict?.holder?.id}))'
   const runs = await Promise.all(Array.from({ length: 10 }, (_, i) => new Promise<{ ok: boolean; holder?: string }>((res, rej) => {
     execFile(process.execPath, ['--input-type=module', '-e', script, repo, `p${i}`], (err, out) => (err ? rej(err) : res(JSON.parse(out))))
   })))
   const winners = runs.filter((r) => r.ok)
   assert.equal(winners.length, 1)
-  const holder = readReservation(repo)?.id
+  const holder = ownReservation(repo)?.id
   for (const r of runs.filter((x) => !x.ok)) assert.equal(r.holder, holder)
-  assert.deepEqual(readdirSync(storeRoot(repo)).filter((f) => f.startsWith('writer.lock.')), [])
+  // Ni los temporales ni el mutex de la reserva nueva quedan en el directorio Git del checkout.
+  const own = join(gitDirs(repo).gitDir, 'sdd-ai')
+  assert.deepEqual(readdirSync(own).filter((f) => f.startsWith('checkout.lock.')), [])
 })
 
 test('writeControl y readControl guardan el control en el almacén; desde otro checkout no se encuentra', () => {

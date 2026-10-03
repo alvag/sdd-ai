@@ -7,7 +7,7 @@ import { dirname, join, sep } from 'node:path'
 import { gitDirs } from '../git.ts'
 import { withLock } from '../lock.ts'
 import { SddError } from '../types.ts'
-import { liveVerifyGroup, processAlive, readProcess, releaseOrphanVerifyReservation } from '../writer-store.ts'
+import { ownReservation, inspectReservations, liveVerifyGroup, processAlive, readProcess, releaseOrphanVerifyReservation, reservationError } from '../writer-store.ts'
 import type { TestRow } from './verification-contract.ts'
 import { receiptDir } from './verify-receipt.ts'
 
@@ -236,7 +236,15 @@ export function recoverPendingRestore(root: string, mode: 'blocking' | 'non_bloc
       if (!existsSync(intentFile(root))) return 'none'
       const intent = JSON.parse(readFileSync(intentFile(root), 'utf8')) as RestoreIntent
       if (intent.checkout !== realpathSync(root)) return 'none'
-      const group = liveVerifyGroup(root, intent.receipt)
+      const reservation = ownReservation(root, 'verify', intent.receipt)
+      const conflict = inspectReservations(root, ['checkout'], reservation ? [reservation] : [])
+      if (conflict) {
+        if (mode === 'non_blocking') return 'in_progress'
+        // El titular puede ser cualquier operación del checkout: el error es el de esa reserva, con su código.
+        const held = reservationError(conflict)
+        throw new SddError(held.code, `${held.message}; la restauración de verify ${intent.receipt} espera a que termine`, { detail: held.detail, next: held.next })
+      }
+      const group = liveVerifyGroup(root, intent.receipt, reservation)
       if (processAlive(intent.owner_pid, intent.owner_lstart) || group !== null) {
         if (mode === 'non_blocking') return 'in_progress'
         throw new SddError('verify_in_progress', `sdd verify está confirmando filas con archivos revertidos (recibo ${intent.receipt})`, {

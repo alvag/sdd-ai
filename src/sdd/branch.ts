@@ -4,7 +4,7 @@ import { parseDocument } from 'yaml'
 import { DEFAULT_BRANCH_FORMAT, loadBranchConfig } from '../config.ts'
 import { branchCommit, branchRefConflict, createBranch, currentBranch, dirtyPaths, headCommit, isCommit, isValidBranchName, switchBranch } from '../git.ts'
 import { SddError } from '../types.ts'
-import { flowWriterOpen, readReservation, releaseWriter, reserveWriter, writerLockPath, writerReservation } from '../writer-store.ts'
+import { type ReservationHandle, acquireReservation, acquisitionError, flowWriterOpen, inspectReservations, releaseAll, reservationError } from '../writer-store.ts'
 import { activeRun, readPhaseRecord, withFlowLock } from './phase-state.ts'
 import { LOCK_FILE, flowDir, lstatOrNull, readFlow } from './read.ts'
 import { CHANGE_TYPES, quote } from './start.ts'
@@ -16,7 +16,7 @@ export type BranchAsk = 'exit' | 'base_advanced'
 export type BranchRetake = 'none' | 'handoff' | 'create' | 'switch'
 export type BranchBlockerCode = 'flow_blocked' | 'handoff_invalid' | 'config_invalid' | 'spec_not_approved' | 'plan_exists'
   | 'head_unknown' | 'tree_dirty' | 'phase_running' | 'writer_open' | 'flow_busy' | 'base_branch_unknown'
-  | 'branch_name_invalid' | 'branch_is_base' | 'branch_exists'
+  | 'branch_name_invalid' | 'branch_is_base' | 'branch_exists' | 'refs_busy' | 'release_abandoned'
 export interface BranchBlocker { code: BranchBlockerCode; detail: string; next: string }
 export interface BranchNameParts {
   name: string; format: string; type: string; type_source: 'flag' | 'config' | 'change_type'; ticket: string | null; slug: string | null
@@ -82,7 +82,7 @@ function complete(root: string, facts: FlowFacts, branch: string): boolean {
     && !!text(h.base_commit) && isCommit(root, String(h.base_commit)) && h.spec_approved_at === approvedAt(facts) && h.phase === 'plan'
 }
 
-export function branchPreview(root: string, id: string, o: BranchOptions & { locked?: boolean } = {}): BranchPreview {
+export function branchPreview(root: string, id: string, o: BranchOptions & { locked?: boolean; ownHandles?: ReservationHandle[] } = {}): BranchPreview {
   const { facts } = readFlow(root, id)
   const status = resolve(facts)
   const h = headerData(facts.handoffHeader)
@@ -118,8 +118,11 @@ export function branchPreview(root: string, id: string, o: BranchOptions & { loc
   const origin_sha = text(h?.origin_sha)
   const tip = baseBranch ? branchCommit(root, baseBranch) ?? null : null
   const base = { branch: baseBranch, origin_sha, tip, advanced: !!origin_sha && !!tip && origin_sha !== tip }
-  const reservation = writerReservation(root)
-  const writerBlock = (): BranchBlocker => ({ code: 'writer_open', detail: `la reserva de writer está tomada por ${reservation}`, next: reservationNext(root) })
+  const reservation = inspectReservations(root, ['checkout', 'refs'], o.ownHandles)
+  const writerBlock = (): BranchBlocker => {
+    const error = reservationError(reservation!)
+    return { code: error.code, detail: `${error.message}${error.detail ? `; ${error.detail}` : ''}`, next: error.next ?? statusCommand(id) }
+  }
   const exists = recorded !== null && !!branchCommit(root, recorded)
   // Una rama registrada que todavía no existe es solo una intención: --prefix o --current la reemplazan por otra elección.
   const rechoose = recorded !== null && !exists && (o.current || o.prefix !== undefined)
@@ -128,9 +131,9 @@ export function branchPreview(root: string, id: string, o: BranchOptions & { loc
     if (!text(h?.base_commit) || !isCommit(root, String(h?.base_commit))) add('handoff_invalid', 'base_commit falta o no es un commit', 'completa base_commit a mano en el handoff y vuelve a correr sdd branch')
     const conflict = retake === 'create' ? branchRefConflict(root, recorded) : null
     if (conflict) blockers.push({ code: 'branch_exists', detail: `la rama ${conflict} impide crear ${recorded}`, next: rechooseHint(id) })
-    if (retake === 'create' && reservation !== null) blockers.push(writerBlock())
+    if ((retake === 'create' || retake === 'switch') && reservation !== null) blockers.push(writerBlock())
     return { state: 'ok', id, name, head, base, recorded, retake, exits: [], recommended: null, ask: [], blockers,
-      next: blockers[0]?.next ?? (retake === 'none' ? statusCommand(id) : applyCommand(id)) }
+      next: primaryBlocker(blockers)?.next ?? (retake === 'none' ? statusCommand(id) : applyCommand(id)) }
   }
   const newBlockers: BranchBlocker[] = []
   const currentBlockers: BranchBlocker[] = []
@@ -157,24 +160,18 @@ export function branchPreview(root: string, id: string, o: BranchOptions & { loc
   }
   if (base.advanced && !newBlockers.length) ask.push('base_advanced')
   // Con un bloqueo del flujo no hay nada que elegir: ninguna salida se aplicaría.
-  if (blockers.length) return { state: 'ok', id, name, head, base, recorded, retake: null, exits, recommended: null, ask: [], blockers, next: blockers[0].next }
+  if (blockers.length) return { state: 'ok', id, name, head, base, recorded, retake: null, exits, recommended: null, ask: [], blockers, next: primaryBlocker(blockers)!.next }
   return { state: 'ok', id, name, head, base, recorded, retake: null, exits, recommended, ask, blockers,
-    next: exitNext(id, o, recommended, preferredBlockers[0]) }
+    next: exitNext(id, o, recommended, primaryBlocker(preferredBlockers)) }
 }
 
 /**
- * Qué hacer con una reserva de writer tomada, según quién la tiene. Solo la de `sdd branch` se puede borrar a mano si su
- * proceso murió: la de un writer, `sdd verify` o `sdd commit` la libera su propio comando, que antes deja el árbol en
- * orden.
+ * El bloqueo que se informa primero, en el preview y en la aplicación. La contención de refs va adelante: mientras
+ * otra aplicación de branch o commit trabaja, los demás bloqueos pueden ser efecto de ella (su commit deja el árbol
+ * sucio hasta terminar), y al reintentar se ven los que sigan. El resto, en `detail`.
  */
-function reservationNext(root: string): string {
-  const held = readReservation(root)
-  if (held?.kind === 'branch') {
-    return `espera a que termine sdd branch y vuelve a correrlo; si su proceso ya no corre, la reserva quedó huérfana: borra ${writerLockPath(root)}`
-  }
-  if (held?.kind === 'verify') return 'espera a que termine sdd verify y vuelve a correr sdd branch'
-  if (held?.kind === 'commit') return 'espera a que termine sdd commit y vuelve a correr sdd branch'
-  return held ? `recibe esa corrida (./bin/sdd-ai wait ${held.id}) y vuelve a correr sdd branch` : 'espera a que se libere la reserva de writer y vuelve a correr sdd branch'
+function primaryBlocker(blockers: readonly BranchBlocker[]): BranchBlocker | undefined {
+  return blockers.find((b) => b.code === 'refs_busy') ?? blockers[0]
 }
 
 /** El commit desde el que corta `new`: la punta de la base con `--refreeze` o sin `origin_sha`, y si no, `origin_sha`. */
@@ -192,7 +189,7 @@ function exitNext(id: string, o: BranchOptions, recommended: BranchExit | null, 
 export function assertBranchApplicable(preview: BranchPreview, o: BranchOptions): void {
   const retaking = preview.retake !== null
   const blockers = [...preview.blockers, ...(retaking ? [] : preview.exits.find((e) => e.exit === (o.current ? 'current' : 'new'))?.blockers ?? [])]
-  const first = blockers[0]
+  const first = primaryBlocker(blockers)
   if (first) throw new SddError(first.code, first.detail, { detail: JSON.stringify(blockers), next: first.next })
   if (retaking && ((o.current && preview.head.branch !== preview.recorded) || (o.prefix !== undefined && preview.name?.name !== preview.recorded))) {
     throw new SddError('branch_recorded', `el flujo ya tiene la rama ${preview.recorded}; los flags la contradicen`, { next: applyCommand(preview.id) })
@@ -225,24 +222,34 @@ function writeHandoff(root: string, id: string, preview: BranchPreview, branch: 
 
 export function branchApply(root: string, id: string, o: BranchOptions = {}, io: BranchIo = GIT_IO): BranchApplied {
   return withFlowLock(root, id, (): BranchApplied => {
-    const p = branchPreview(root, id, { ...o, locked: true })
-    assertBranchApplicable(p, o)
-    const { facts } = readFlow(root, id)
-    const h = headerData(facts.handoffHeader)
-    const retaking = p.retake !== null
-    const exit = retaking ? 'recorded' : o.current ? 'current' : 'new'
-    const branch = retaking ? p.recorded! : o.current ? p.head.branch! : p.name!.name
-    const baseCommit = retaking ? String(h!.base_commit) : o.current ? p.head.commit! : startCommit(p.base, o.refreeze)!
-    const origin = !retaking && !o.current && (o.refreeze || !p.base.origin_sha) ? baseCommit : null
-    const creating = retaking ? p.retake === 'create' : !o.current
-    const switching = creating || p.retake === 'switch'
-    const writing = !retaking || !complete(root, facts, branch)
-    const reservationId = `branch-${id}`
-    if (creating) {
-      const reservation = reserveWriter(root, reservationId, 'branch')
-      if (!reservation.ok) throw new SddError('writer_open', `la reserva está tomada por ${reservation.holder}`, { next: 'espera a que termine y vuelve a correr sdd branch' })
+    const preliminary = branchPreview(root, id, { ...o, locked: true })
+    assertBranchApplicable(preliminary, o)
+    // Lo que la aplicación hace en Git: crear la rama y cambiar a ella, o solo cambiar a una que ya existe.
+    // `--current` y completar el handoff no hacen ninguna de las dos, y por eso no toman reservas.
+    const gitEffects = (p: BranchPreview) => {
+      const creating = p.retake !== null ? p.retake === 'create' : !o.current
+      return { creating, switching: creating || p.retake === 'switch' }
+    }
+    const modifiesGit = (p: BranchPreview) => gitEffects(p).switching
+    const handles: ReservationHandle[] = []
+    if (modifiesGit(preliminary)) {
+      const reservation = acquireReservation(root, `branch-${id}`, 'branch')
+      if (!reservation.ok) throw acquisitionError(reservation)
+      handles.push(...reservation.handles)
     }
     try {
+      const p = branchPreview(root, id, { ...o, locked: true, ownHandles: handles })
+      assertBranchApplicable(p, o)
+      if (modifiesGit(p) && !handles.length) throw new SddError('branch_changed', 'la retoma ahora requiere modificar Git', { next: `reintenta ${applyCommand(id)}` })
+      const { facts } = readFlow(root, id)
+      const h = headerData(facts.handoffHeader)
+      const retaking = p.retake !== null
+      const exit = retaking ? 'recorded' : o.current ? 'current' : 'new'
+      const branch = retaking ? p.recorded! : o.current ? p.head.branch! : p.name!.name
+      const baseCommit = retaking ? String(h!.base_commit) : o.current ? p.head.commit! : startCommit(p.base, o.refreeze)!
+      const origin = !retaking && !o.current && (o.refreeze || !p.base.origin_sha) ? baseCommit : null
+      const { creating, switching } = gitEffects(p)
+      const writing = !retaking || !complete(root, facts, branch)
       if (creating) {
         const taken = branchCommit(root, branch) ? branch : branchRefConflict(root, branch)
         if (taken) throw new SddError('branch_exists', `la rama ${taken} ya existe o impide crear ${branch}`, { next: rechooseHint(id) })
@@ -262,7 +269,7 @@ export function branchApply(root: string, id: string, o: BranchOptions = {}, io:
       return { state: 'ok', id, branch, exit, base_commit: baseCommit, base: p.base, created: creating, switched: switching, handoff_written: writing,
         ...(origin !== null && origin !== p.base.origin_sha ? { origin_sha: { before: p.base.origin_sha, after: origin } } : {}) }
     } finally {
-      if (creating) releaseWriter(root, reservationId)
+      releaseAll(handles)
     }
   })
 }

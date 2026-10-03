@@ -10,7 +10,7 @@ import { type SupervisorSpawn, runWriter } from '../src/cli.ts'
 import { readStatus } from '../src/runs.ts'
 import { openRuns } from '../src/open-runs.ts'
 import { settleGroup } from '../src/supervisor.ts'
-import { readReservation } from '../src/writer-store.ts'
+import { ownReservation } from '../src/writer-store.ts'
 import { SddError } from '../src/types.ts'
 import {
   BIN, cli, storeOf, lockOf, readJsonFile, writerSetup, whenRunning, implement, alive, deadPid, prepared,
@@ -226,5 +226,5 @@ test('el writer cuyo supervisor no arranca termina en launch_failed, wait lo dev
   const w = cli(s, ['wait', id, '--max', '30'])
   assert.deepEqual([w.code, w.out.state, w.out.reason], [1, 'launch_failed', 'supervisor_not_started'])
   assert.ok(w.ms < 5000, `wait tardó ${w.ms} ms`)
-  assert.equal(readReservation(s.repo), undefined)
+  assert.equal(ownReservation(s.repo), undefined)
 })

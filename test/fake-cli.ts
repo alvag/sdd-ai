@@ -146,6 +146,14 @@ interface WriterScript {
   recall?: string
   /** Espera a que exista este archivo (ruta absoluta) antes de actuar, hasta 30 s: la corrida sigue activa mientras tanto. Si no aparece, sale con 1 sin actuar. */
   waitFor?: string
+  /**
+   * Una barrera (ruta absoluta sin extensión) antes de actuar, o después de escribir: el writer crea `<ruta>.arrived`
+   * con su pid y espera `<ruta>.release`, hasta 60 s. Así una prueba lo detiene en un punto conocido mientras
+   * comprueba otra operación; el tope es mayor que el de `waitFor` porque la prueba sostiene la barrera mientras
+   * corre la operación que compite. Si nadie la libera, sale con error.
+   */
+  beforeBarrier?: string
+  afterBarrier?: string
 }
 
 const runDirs = () => {
@@ -226,6 +234,14 @@ function writer(): void {
     ? JSON.stringify(codex ? { type: 'thread.started', thread_id: s.id } : { type: 'system', subtype: 'init', session_id: s.id, model: 'claude-falso', tools: [] })
     : codex ? codexThread : claudeInit()
   process.stdout.write(`${opening}\n`)
+  const barrier = (path: string | undefined) => {
+    if (!path) return
+    writeFileSync(`${path}.arrived`, String(process.pid))
+    const until = Date.now() + 60_000
+    while (!existsSync(`${path}.release`) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+    if (!existsSync(`${path}.release`)) throw new Error(`fake-cli: barrera sin liberar ${path}`)
+  }
+  barrier(script.beforeBarrier)
   if (resumed && script.recall && s.remembered !== undefined) writeFileSync(script.recall, s.remembered)
   if (script.waitFor) {
     const until = Date.now() + 30_000
@@ -238,6 +254,7 @@ function writer(): void {
     }
   }
   if (!resumed || perCall) for (const a of script.actions ?? []) act(a)
+  barrier(script.afterBarrier)
   if (script.rejectModel && (args.includes('-m') || args.includes('--model'))) {
     fail(codex ? 'codex-modelo-rechazado.jsonl' : 'claude-modelo-rechazado.jsonl')
     return

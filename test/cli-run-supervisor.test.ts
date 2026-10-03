@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { type SupervisorSpawn, defaultWaitMax, launchSupervisor } from '../src/cli.ts'
 import { createRun, isDelivered, markDelivered, readStatus, setStatus } from '../src/runs.ts'
@@ -244,20 +244,22 @@ test('la reserva se libera al congelar la cosecha y el resultado sigue sin entre
   assert.deepEqual(openRuns(s.repo), [])
 })
 
-test('una reserva sin control de un run todavía vivo no se libera, y la de un run muerto sí, también con cancel sin directorio de corrida', () => {
+test('una reserva legacy sin control de un run todavía vivo no se libera, y la de un run muerto sí, también con cancel sin directorio de corrida', () => {
   const s = writerSetup()
-  const { gitDir } = gitDirs(s.repo)
+  const { gitDir, commonDir } = gitDirs(s.repo)
+  // La reserva que deja el binario anterior cuando su lanzamiento muere antes de escribir el control.
+  const legacy = join(commonDir, 'sdd-ai', 'writer.lock')
   const lstart = execFileSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }).trim()
-  mkdirSync(join(s.repo, '.git', 'sdd-ai'), { recursive: true })
-  writeFileSync(lockOf(s.repo), JSON.stringify({ id: 'lanzando', pid: process.pid, lstart, gitDir }))
+  mkdirSync(dirname(legacy), { recursive: true })
+  writeFileSync(legacy, JSON.stringify({ id: 'lanzando', pid: process.pid, lstart, gitDir }))
   const live = cli(s, ['cancel', 'lanzando'])
   assert.deepEqual([live.code, live.out.state], [1, 'launching'])
-  assert.equal(readJsonFile(lockOf(s.repo)).id, 'lanzando')
-  writeFileSync(lockOf(s.repo), JSON.stringify({ id: 'huerfana', pid: deadPid(), lstart: null, gitDir }))
+  assert.equal(readJsonFile(legacy).id, 'lanzando')
+  writeFileSync(legacy, JSON.stringify({ id: 'huerfana', pid: deadPid(), lstart: null, gitDir }))
   assert.equal(existsSync(join(s.repo, '.sdd-ai', 'runs', 'huerfana')), false)
   const dead = cli(s, ['cancel', 'huerfana'])
   assert.deepEqual([dead.code, dead.out.state], [0, 'released'])
-  assert.equal(existsSync(lockOf(s.repo)), false)
+  assert.equal(existsSync(legacy), false)
 })
 
 test('con control sin spawning y el supervisor muerto, el writer nunca se lanzó: con el árbol en la base, cancel libera sin cosecha; con el árbol cambiado, deja launch_failed con tree_changed', () => {
@@ -290,7 +292,7 @@ test('con spawning y sin identidad registrada, el cese es incierto y solo --writ
   assert.equal(existsSync(lockOf(s.repo)), false)
 })
 
-test('dos worktrees comparten la reserva y tienen almacenes de corrida separados, y wait, cancel y --retry desde el otro worktree fallan con run_not_found', async () => {
+test('dos worktrees tienen reservas y almacenes de corrida separados, y wait, cancel y --retry desde el otro worktree fallan con run_not_found', async () => {
   const s = writerSetup({ script: { hang: true } })
   const wt = join(realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-wt-'))), 'wt')
   git(s.repo, 'worktree', 'add', '-q', wt, '-b', 'otra')
@@ -300,13 +302,28 @@ test('dos worktrees comparten la reserva y tienen almacenes de corrida separados
   const id = implement(s).out.id
   await whenRunning(s.repo, id)
   const again = implement(other)
-  assert.deepEqual([again.out.code, again.out.message.includes(id)], ['writer_open', true])
-  for (const args of [['wait', id, '--max', '1'], ['cancel', id], ['run', '--retry', id]]) {
-    const r = cli(other, args)
-    assert.deepEqual([r.code, r.out.code], [1, 'run_not_found'], args.join(' '))
+  const otherId = again.out.id
+  let failed = false
+  try {
+    assert.equal(again.code, 0, JSON.stringify(again.out))
+    await whenRunning(wt, otherId)
+    for (const args of [['wait', id, '--max', '1'], ['cancel', id], ['run', '--retry', id]]) {
+      const r = cli(other, args)
+      assert.deepEqual([r.code, r.out.code], [1, 'run_not_found'], args.join(' '))
+    }
+    assert.equal(existsSync(join(gitDirs(wt).gitDir, 'sdd-ai', 'runs', id)), false)
+    assert.equal(readJsonFile(lockOf(s.repo)).id, id)
+    assert.equal(readJsonFile(lockOf(wt)).id, otherId)
+  } catch (e) {
+    failed = true
+    throw e
+  } finally {
+    // Los dos writers cuelgan: se cancelan los dos aunque falle una aserción, para no filtrarlos a las pruebas
+    // siguientes. Si el cuerpo ya falló, su error manda: una limpieza fallida se informa por stderr sin taparlo.
+    const runs: [WSetup, string][] = otherId ? [[s, id], [other, otherId]] : [[s, id]]
+    const outcomes = runs.map(([setup, run]) => ({ cancel: cli(setup, ['cancel', run]).code, state: cli(setup, ['wait', run, '--max', '20']).out.state }))
+    const expected = { cancel: 0, state: 'cancelled' }
+    if (!failed) for (const outcome of outcomes) assert.deepEqual(outcome, expected)
+    else if (outcomes.some((o) => o.cancel !== 0 || o.state !== 'cancelled')) process.stderr.write(`limpieza incompleta: ${JSON.stringify(outcomes)}\n`)
   }
-  assert.equal(existsSync(join(gitDirs(wt).gitDir, 'sdd-ai', 'runs', id)), false)
-  assert.equal(readJsonFile(lockOf(s.repo)).id, id)
-  assert.equal(cli(s, ['cancel', id]).code, 0)
-  assert.equal(cli(s, ['wait', id, '--max', '20']).out.state, 'cancelled')
 })

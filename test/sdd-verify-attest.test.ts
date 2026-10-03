@@ -12,7 +12,7 @@ import { prove } from '../src/approval/proof.ts'
 import { randomUUID } from 'node:crypto'
 import { readHeader, section } from '../src/sdd/markdown.ts'
 import { readFlow } from '../src/sdd/read.ts'
-import { readReservation, releaseWriter } from '../src/writer-store.ts'
+import { ownReservation, releaseReservation } from '../src/writer-store.ts'
 import {
   realpathTmp, TASKS_MD, RED_ROW, BUILD_ROW, approveAll, verifyFlow, planOf, statusOf, final, asyncCode, fakeHarvest,
   MANUAL_ROW, answered, cli, reviewedFlow, reviewStatus, PLAN,
@@ -42,7 +42,7 @@ test('una fila manual queda pendiente hasta acreditarla, y la acreditación venc
 
   // Sin respuesta, --attest pide la pregunta canónica; una fila que no es manual o no existe es un error de uso.
   const start = prepareVerify(repo, 'f', 'final')
-  releaseWriter(repo, start.receiptId)
+  assert.equal(releaseReservation(start.reservation).state, 'released')
   const q = attestQuestion('f', 'V2', MANUAL_ROW.observation, candidateFingerprint(repo, 'f', start.baseCommit), start.planFingerprint)
   assert.equal(await asyncCode(() => attestRow(repo, 'f', 'V2', { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: realpathTmp() })), 'approval_missing')
   assert.equal(await asyncCode(() => attestRow(repo, 'f', 'V1', answered(q, 'Acreditar'))), 'usage')
@@ -85,7 +85,7 @@ test('la acreditación no se registra fuera de verify, con un contrato en prosa 
   // Una respuesta que ya consumió una aprobación no acredita una fila.
   const { repo } = verifyFlow({ rows: [RED_ROW, MANUAL_ROW] })
   const start = prepareVerify(repo, 'f', 'final')
-  releaseWriter(repo, start.receiptId)
+  assert.equal(releaseReservation(start.reservation).state, 'released')
   const q = attestQuestion('f', 'V2', MANUAL_ROW.observation, candidateFingerprint(repo, 'f', start.baseCommit), start.planFingerprint)
   const env = answered(q, 'Acreditar')
   const file = join(repo, '.plans', 'f', 'sdd-ai-approvals.json')
@@ -107,7 +107,7 @@ test('la base se mide antes del writer sin tocar el plan, y la corrida final mue
   assert.deepEqual(receipt.rows.map((r) => r.baseline), ['not_measurable', 'passed'])
   assert.equal(planOf(repo), before)
   assert.equal(statusOf(repo).next.step, 'implement')
-  assert.equal(readReservation(repo), undefined)
+  assert.equal(ownReservation(repo), undefined)
 
   // Después de implementar, la corrida final trae la observación de base; la baseline nunca valida verified.
   writeFileSync(join(repo, '.plans', 'f', 'tasks.md'), TASKS_MD(true))
@@ -214,7 +214,7 @@ test('un writer del flujo con la cosecha congelada pero procesos vivos sigue abi
     await exited
   }
   // Con el grupo terminado, la cosecha cerrada ya no lo deja abierto.
-  releaseWriter(repo, prepareVerify(repo, 'f', 'final').receiptId)
+  releaseReservation(prepareVerify(repo, 'f', 'final').reservation)
 })
 
 test('varias filas que comparten un AC quedan todas en el recibo, en su cobertura y en la proyección', async () => {

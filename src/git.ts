@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
@@ -131,6 +131,90 @@ export function gitDirs(root: string): { gitDir: string; commonDir: string } {
   return { gitDir: realpathSync(gitDir), commonDir: realpathSync(commonDir) }
 }
 
+/**
+ * Una ref vigilada: si existe, `symbolic` es su destino cuando es simbólica, `object` el id al que apunta (el de la
+ * tag, si es anotada) y `commit` el commit al que resuelve.
+ */
+export interface GitRefState { exists: boolean; symbolic: string | null; object: string | null; commit: string | null }
+export interface GitState {
+  version: 1
+  head: { target: string | null; commit: string }
+  refs: Record<string, GitRefState>
+  /**
+   * Las refs de `refs/replace/`, sueltas o empaquetadas, con el objeto al que apuntan. Cambian el contenido con que
+   * Git resuelve un objeto sin cambiar su id, así que se vigilan aunque no sean de este flujo.
+   */
+  replace?: Record<string, string>
+}
+
+type FrozenCheckout = Checkout & { commonDir: string }
+
+/** Lecturas exactas con rutas congeladas; ningún nombre se interpreta como expresión de revisión. */
+function frozenGit(checkout: FrozenCheckout) {
+  const read = (args: string[]) => {
+    const result = spawnSync('git', ['--git-dir', checkout.gitDir, '--work-tree', checkout.root, ...args], {
+      cwd: checkout.root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, GIT_DIR: checkout.gitDir, GIT_COMMON_DIR: checkout.commonDir, GIT_WORK_TREE: checkout.root },
+    })
+    // Manda el estado de salida: Git escribe advertencias en stderr aun cuando la lectura sale bien.
+    if (result.error || result.status !== 0) {
+      throw Object.assign(new Error(result.error?.message || result.stderr.trim() || `git ${args[0]} salió con ${result.status}`), { status: result.status })
+    }
+    return result.stdout.trim()
+  }
+  const symbolic = (ref: string): string | null => {
+    try { return read(['symbolic-ref', '--no-recurse', '-q', ref]) } catch (e) {
+      if ((e as { status?: number }).status === 1) return null
+      throw e
+    }
+  }
+  return { read, symbolic }
+}
+
+/** El HEAD del checkout: su destino simbólico, o `null` si está separado, y su commit. */
+export function readHeadState(checkout: FrozenCheckout): GitState['head'] {
+  const { read, symbolic } = frozenGit(checkout)
+  return { target: symbolic('HEAD'), commit: read(['rev-parse', '--verify', 'HEAD^{commit}']) }
+}
+
+/** Una ref exacta: distingue la ausencia, que no es un error, de una lectura que falla. */
+export function readRefState(checkout: FrozenCheckout, ref: string): GitRefState {
+  const { read, symbolic } = frozenGit(checkout)
+  if (!ref.startsWith('refs/')) throw new Error(`ref no exacta: ${ref}`)
+  read(['check-ref-format', ref])
+  const target = symbolic(ref)
+  // for-each-ref distingue ausencia de error y verifica después el nombre exacto, no un prefijo.
+  const found = read(['for-each-ref', '--format=%(refname) %(objectname)', ref]).split('\n')
+    .find((line) => line.startsWith(`${ref} `))
+  if (!found && target !== null) throw new Error(`ref simbólica ilegible: ${ref} -> ${target}`)
+  return found ? { exists: true, symbolic: target, object: found.slice(ref.length + 1), commit: read(['rev-parse', '--verify', `${ref}^{commit}`]) }
+    : { exists: false, symbolic: null, object: null, commit: null }
+}
+
+/** Las refs de reemplazo del repositorio, con el objeto al que apunta cada una. */
+export function readReplaceRefs(checkout: FrozenCheckout): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const line of frozenGit(checkout).read(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/replace/']).split('\n')) {
+    const at = line.lastIndexOf(' ')
+    if (at > 0) out[line.slice(0, at)] = line.slice(at + 1)
+  }
+  return out
+}
+
+/** HEAD, las refs vigiladas y las de reemplazo, leídos con las rutas congeladas del checkout. */
+export function readGitState(checkout: FrozenCheckout, watchedRefs: readonly string[], head: GitState['head'] = readHeadState(checkout)): GitState {
+  const refs: Record<string, GitRefState> = {}
+  for (const ref of new Set(watchedRefs)) refs[ref] = readRefState(checkout, ref)
+  return { version: 1, head, refs, replace: readReplaceRefs(checkout) }
+}
+
+/** Estado que Git guarda por checkout; los nombres desconocidos permanecen vigilados. */
+export function isWorktreeStatePath(path: string): boolean {
+  return /^(?:HEAD|ORIG_HEAD|FETCH_HEAD|MERGE_HEAD|AUTO_MERGE|REBASE_HEAD|CHERRY_PICK_HEAD|REVERT_HEAD|BISECT_HEAD|MERGE_AUTOSTASH|MERGE_RR|COMMIT_EDITMSG|MERGE_MSG|MERGE_MODE|SQUASH_MSG|TAG_EDITMSG|config\.worktree|BISECT_LOG|BISECT_NAMES|BISECT_EXPECTED_REV|BISECT_START|BISECT_TERMS|BISECT_ANCESTORS_OK|BISECT_RUN)$/.test(path)
+    || /^(?:rebase-apply|rebase-merge|sequencer|bisect)(?:\/|$)/.test(path)
+    || path === 'info/sparse-checkout'
+}
+
 export interface HarvestFile {
   path: string; from?: string
   status: 'A' | 'M' | 'D' | 'R' | 'T'
@@ -140,7 +224,7 @@ export interface HarvestFile {
 }
 export interface TreeCapture { tree: string; patch: Buffer; files: HarvestFile[] }
 
-export interface Checkout { root: string; gitDir: string }
+export interface Checkout { root: string; gitDir: string; commonDir?: string }
 
 /** Los objetos nuevos de una captura: junto al índice propio, nunca en el repositorio. */
 const scratchObjects = (indexFile: string) => `${indexFile}.objects`
@@ -152,8 +236,8 @@ export function removeIndex(indexFile: string): void {
 }
 
 /** El directorio de objetos del repositorio y los alternativos que declara. */
-function objectDirs(gitDir: string): string[] {
-  const objects = execFileSync('git', ['--git-dir', gitDir, 'rev-parse', '--path-format=absolute', '--git-path', 'objects'], {
+function objectDirs(gitDir: string, commonDir?: string): string[] {
+  const objects = commonDir ? join(commonDir, 'objects') : execFileSync('git', ['--git-dir', gitDir, 'rev-parse', '--path-format=absolute', '--git-path', 'objects'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
   }).trim()
   let alternates: string[] = []
@@ -174,7 +258,8 @@ function objectDirs(gitDir: string): string[] {
 export function indexEnv(c: Checkout, indexFile: string): Record<string, string> {
   return {
     GIT_INDEX_FILE: indexFile, GIT_OBJECT_DIRECTORY: scratchObjects(indexFile),
-    GIT_ALTERNATE_OBJECT_DIRECTORIES: objectDirs(c.gitDir).join(delimiter),
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: objectDirs(c.gitDir, c.commonDir).join(delimiter),
+    ...(c.commonDir ? { GIT_COMMON_DIR: c.commonDir } : {}),
   }
 }
 

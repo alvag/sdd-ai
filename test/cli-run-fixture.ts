@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile, execFileSync, spawnSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,7 +10,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { createRun, writeJsonAtomic } from '../src/runs.ts'
 import { gitDirs } from '../src/git.ts'
 import { codexWriterLaunch } from '../src/workers/codex.ts'
-import { type WriterControl, reserveWriter, runDirIdentity, runInventory, sensitiveInventory, writeControl } from '../src/writer-store.ts'
+import { type WriterControl, readProcess, runDirIdentity, runInventory, sensitiveInventory, writeControl } from '../src/writer-store.ts'
 import { makeFakeBin, makeRepo } from './helpers.ts'
 
 export const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
@@ -68,9 +68,9 @@ export const deliveredIn = (repo: string, id: string) => existsSync(join(repo, '
 
 export const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
-export const storeOf = (repo: string, id: string) => join(repo, '.git', 'sdd-ai', 'runs', id)
+export const storeOf = (repo: string, id: string) => join(gitDirs(repo).gitDir, 'sdd-ai', 'runs', id)
 
-export const lockOf = (repo: string) => join(repo, '.git', 'sdd-ai', 'writer.lock')
+export const lockOf = (repo: string) => join(gitDirs(repo).gitDir, 'sdd-ai', 'checkout.lock')
 
 export const readJsonFile = (file: string) => JSON.parse(readFileSync(file, 'utf8'))
 
@@ -148,13 +148,18 @@ export function deadPid(): number {
  */
 export function prepared(s: WSetup, opts: { spawning?: boolean; group?: object; session?: string } = {}): string {
   const id = `prep-${Math.random().toString(16).slice(2, 8)}`
-  assert.equal(reserveWriter(s.repo, id).ok, true)
+  const checkout = { root: s.repo, ...gitDirs(s.repo) }
+  const seen = readProcess(process.pid)
+  const reservation = { version: 2 as const, domain: 'checkout' as const, path: lockOf(s.repo), token: randomUUID(), id, kind: 'writer' as const,
+    pid: process.pid, lstart: seen && seen !== 'gone' ? seen.lstart : null, checkout }
+  mkdirSync(join(reservation.path, '..'), { recursive: true })
+  writeFileSync(reservation.path, JSON.stringify(reservation), { flag: 'wx' })
   const dir = createRun(s.repo, id)
   writeFileSync(join(dir, 'request.json'), JSON.stringify({ role: 'implement', session: opts.session ?? 's-claude' }))
   writeFileSync(join(dir, 'prompt.md'), 'x')
   const task = { cwd: s.repo, promptFile: join(storeOf(s.repo, id), 'prompt.md'), resultFile: join(storeOf(s.repo, id), 'result.md'), sessionId: 'S' }
   writeControl(s.repo, {
-    id, base: s.base, family: 'codex', prompt: 'x', session: opts.session ?? 's-claude', checkout: { root: s.repo, ...gitDirs(s.repo) },
+    id, base: s.base, family: 'codex', prompt: 'x', session: opts.session ?? 's-claude', checkout, reservation,
     request: { role: 'implement', conductor: { family: 'claude' }, deadline_sec: 60 },
     preLaunch: runInventory(s.repo, id), inventory: sensitiveInventory(s.repo), runDir: runDirIdentity(s.repo, id) ?? { dev: 0, ino: 0 },
     ...(opts.spawning ? { spawning: new Date().toISOString() } : {}), ...(opts.group ? { group: opts.group } : {}),

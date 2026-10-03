@@ -14,7 +14,7 @@ import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
 import { type SkillCheck, doctor } from './doctor.ts'
-import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, repoRoot } from './git.ts'
+import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, readGitState, readHeadState, repoRoot } from './git.ts'
 import { type InitAnswers, applyInit, planInit } from './init.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { cancelNative } from './native-launch.ts'
@@ -77,8 +77,8 @@ import { codexLaunch, codexResume, codexWriterLaunch, withResultFile } from './w
 import { writerEnvelopeBytes, writerPrompt } from './writer.ts'
 import {
   type HarvestRecord, type LaunchFrom, type WriterControl, canWriteStore, captureTreeAtBase, controlUnavailable, freezeHarvest, groupState, harvestTreeHolds, isWriterRun,
-  flowWriterRuns, launchTreeDiff, launchTreeHolds, leaderMatches, readControl, readHarvest, readProcess, readReservation, releaseWriter, reserveWriter, runDirIdentity, runInventory,
-  registryDigest, sensitiveInventory, storeDir, writeControl, writeTakeoverMap, writerLaunchOf, writerLockPath, writerSession,
+  acquireReservation, acquisitionError, ownReservation, controlReservation, controlStore, flowWriterRuns, launchTreeDiff, launchTreeHolds, leaderMatches, processAlive, readControl, readHarvest, releaseAndReport, runDirIdentity, runInventory,
+  registryDigest, sensitiveInventoryV2, storeDir, writeControl, writeTakeoverMap, writerLaunchOf, writerSession,
 } from './writer-store.ts'
 
 type Env = Record<string, string | undefined>
@@ -414,18 +414,8 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
     throw e
   }
   const id = w.id ?? newRunId()
-  const reserved = reserveWriter(root, id)
-  if (!reserved.ok) {
-    throw new SddError('writer_open', `ya hay un writer abierto en este repositorio: ${reserved.holder}`, {
-      next: reserved.commit
-        ? 'espera a que termine sdd commit y vuelve a lanzar el writer'
-        : reserved.branch
-        ? `espera a que termine sdd branch y vuelve a lanzar el writer; si su proceso ya no corre, la reserva quedó huérfana: borra ${writerLockPath(root)}`
-        : reserved.verify
-        ? 'espera a que termine sdd verify, que tiene archivos revertidos para confirmar filas, y vuelve a lanzar el writer'
-        : `espera o recibe esa corrida (./bin/sdd-ai wait ${reserved.holder}) antes de lanzar otro writer`,
-    })
-  }
+  const reserved = acquireReservation(root, id, 'writer')
+  if (!reserved.ok) throw acquisitionError(reserved)
   let launched = false
   try {
     const base = headCommit(root)
@@ -480,9 +470,20 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
     if (!identity) throw new Error(`la corrida ${id} desapareció antes de lanzar`)
     // La sesión de una corrida de cadena: la que reanuda, o la propia si abre una nueva.
     const phase = w.phase?.kind ? { ...w.phase, session_origin: mode === 'resume' && w.chained?.origin ? writerSessionOrigin(root, w.chained.origin) : id } : w.phase
+    const local = reserved.handles.find((h) => h.domain === 'checkout')
+    if (!local) throw new Error(`la reserva de ${id} no trae la del checkout`)
+    const checkout = local.checkout
+    // HEAD se lee una sola vez: de él salen la rama vigilada y el estado congelado.
+    const head = readHeadState(checkout)
+    const watchedRefs = head.target ? [head.target] : []
+    if (phase) {
+      const branch = headerData(readFlow(root, phase.flow).facts.handoffHeader)?.branch
+      if (typeof branch === 'string' && branch) watchedRefs.push(branch.startsWith('refs/') ? branch : `refs/heads/${branch}`)
+    }
     const control: WriterControl = {
-      id, base, family, prompt: w.prompt, checkout: { root, ...gitDirs(root) }, request: w.request,
-      preLaunch: runInventory(root, id), inventory: sensitiveInventory(root), runDir: identity,
+      id, base, family, prompt: w.prompt, checkout, request: w.request,
+      reservation: local, git_state: readGitState(checkout, watchedRefs, head),
+      preLaunch: runInventory(root, id), inventory: sensitiveInventoryV2(root, checkout), runDir: identity,
       ...(w.session ? { session: w.session } : {}), ...(phase ? { phase } : {}),
     }
     writeControl(root, control)
@@ -498,7 +499,7 @@ export async function runWriter(w: WriterLaunch): Promise<Result> {
     launched = true
     return { code: 0, out: { id, via: 'process', family, base, next: `./bin/sdd-ai wait ${id}` } }
   } finally {
-    if (!launched) releaseWriter(root, id)
+    if (!launched) for (const handle of reserved.handles) releaseAndReport(handle)
   }
 }
 
@@ -1627,6 +1628,7 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
   }
 
   if (isWriterRun(root, id)) return waitWriter(root, id, max, env)
+  if (ownReservation(root, 'writer', id)) return releaseOrphan(root, id)
   const dir = runDir(root, id)
   const until = Date.now() + max * 1000
   for (;;) {
@@ -1661,6 +1663,8 @@ async function cancel(args: string[], cwd: string): Promise<Result> {
   if (isWriterRun(root, id)) return cancelWriter(root, id, values['writer-gone'])
   const orphan = orphanEntry(root, id)
   if (orphan) {
+    const launching = ownReservation(root, 'writer', id)
+    if (launching && processAlive(launching.pid, launching.lstart)) return launchingResult(id)
     // El lanzamiento tiene el lock del flujo: al tomarlo, la corrida pudo haber llegado a su control. Una
     // entrada que ya se marcó como fallida no se vuelve a marcar.
     const marked = withFlowLock(root, orphan.flow, () => {
@@ -1672,10 +1676,12 @@ async function cancel(args: string[], cwd: string): Promise<Result> {
       return true
     })
     if (!marked) return cancelWriter(root, id, values['writer-gone'])
-    if (readReservation(root)?.id === id) releaseWriter(root, id)
-    return { code: 0, out: { id, state: 'launch_failed', flow: orphan.flow, next: flowNextOrStatus(root, orphan.flow) } }
+    // La entrada ya quedó marcada: una reserva que no se pudo liberar se informa sin deshacer esa marca.
+    const release = ownReservation(root, 'writer', id) ? releaseOrphan(root, id) : undefined
+    const retained = release && release.out.state !== 'released' ? { release: release.out } : {}
+    return { code: 0, out: { id, state: 'launch_failed', flow: orphan.flow, ...retained, next: flowNextOrStatus(root, orphan.flow) } }
   }
-  if (readReservation(root)?.id === id) return releaseOrphan(root, id)
+  if (ownReservation(root, 'writer', id)) return releaseOrphan(root, id)
   if (values['writer-gone']) throw new SddError('usage', '--writer-gone solo se usa con la corrida de un writer')
   const dir = runDir(root, id)
   if (existsSync(join(dir, 'native.json')) && cancelNative(dir)) return { code: 0, out: { id, state: 'cancelled' } }
@@ -1851,7 +1857,7 @@ function markWriterDelivered(root: string, id: string, state: Status['state'], e
     if (!TERMINAL.has(state) || !c.session || ownerSession(env, c.request.conductor.family) !== c.session) return
     const mark = { round: null, launch: null }
     try {
-      writeJsonAtomic(join(storeDir(root, id), 'delivered.json'), mark)
+      writeJsonAtomic(join(controlStore(root, c), 'delivered.json'), mark)
     } catch {
       // Ningún tramo de la ruta puede ser un enlace que dejó el writer: `.sdd-ai`, `runs` ni la corrida.
       const run = join(root, '.sdd-ai', 'runs', id)
@@ -1865,7 +1871,7 @@ function markWriterDelivered(root: string, id: string, state: Status['state'], e
 
 function writerReport(root: string, id: string, h: HarvestRecord, env: Env): Result {
   const c = readControl(root, id)
-  const s = readStatus(storeDir(root, id))
+  const s = readStatus(controlStore(root, c))
   const out: Record<string, unknown> = { id, state: h.state }
   if (h.reason) out.reason = h.reason
   if (h.detail) out.detail = h.detail
@@ -1914,8 +1920,8 @@ function uncertain(root: string, id: string, reason: string, detail: string): Re
  * registrada, o con el grupo vivo, el cese queda incierto y la reserva sigue tomada.
  */
 async function recoverWriter(root: string, id: string, env: Env): Promise<Result> {
-  if (!canWriteStore(root)) throw controlUnavailable()
   const c = readControl(root, id)
+  if (!canWriteStore(root, c.checkout)) throw controlUnavailable()
   if (!c.spawning) {
     const outcome = launchHolds(root, c)
       ? { state: 'failed' as const, reason: 'supervisor_lost', detail: 'el supervisor terminó antes de lanzar al writer' }
@@ -1936,19 +1942,16 @@ async function recoverWriter(root: string, id: string, env: Env): Promise<Result
 
 /** `wait` de un writer: solo el terminal del almacén lo hace volver, nunca un estado de la corrida visible. */
 async function waitWriter(root: string, id: string, max: number, env: Env): Promise<Result> {
-  const store = storeDir(root, id)
+  const store = controlStore(root, readControl(root, id))
   const until = Date.now() + max * 1000
   for (;;) {
     const h = readHarvest(root, id)
     if (h) {
-      // Una caída entre publicar el registro y liberar deja la reserva tomada: la libera quien lo lee,
-      // si puede escribir el almacén.
-      try {
-        releaseWriter(root, id)
-      } catch {
-        // Dentro del sandbox no se puede: la liberará el próximo que lea con permiso.
-      }
-      return writerReport(root, id, h, env)
+      // Una caída entre publicar el registro y liberar deja la reserva tomada: la libera quien lo lee. Si no
+      // puede (por ejemplo, dentro del sandbox), la entrega sale igual y dice que la reserva quedó retenida.
+      const release = releaseAndReport(controlReservation(readControl(root, id)))
+      const r = writerReport(root, id, h, env)
+      return release.state === 'retained' ? { ...r, out: { ...(r.out as Record<string, unknown>), release } } : r
     }
     const s = readStatus(store)
     if (s.state === 'cessation_uncertain') {
@@ -1981,24 +1984,21 @@ function signalGroup(pgid: number, signal: NodeJS.Signals): void {
  * que el usuario confirmó que el writer ya no corre.
  */
 async function cancelWriter(root: string, id: string, writerGone: boolean): Promise<Result> {
-  const store = storeDir(root, id)
+  const store = controlStore(root, readControl(root, id))
   const done = readHarvest(root, id)
   if (done) {
-    try {
-      releaseWriter(root, id)
-    } catch {
-      // Dentro del sandbox no se puede: la liberará el próximo que lea con permiso.
-    }
-    return { code: 0, out: { id, state: done.state } }
+    // Como en wait: la cosecha ya está publicada, y una reserva que no se pudo liberar se informa.
+    const release = releaseAndReport(controlReservation(readControl(root, id)))
+    return { code: 0, out: { id, state: done.state, ...(release.state === 'retained' ? { release } : {}) } }
   }
-  if (!canWriteStore(root)) throw controlUnavailable()
+  const c = readControl(root, id)
+  if (!canWriteStore(root, c.checkout)) throw controlUnavailable()
   const freeze = async (reason?: string, detail?: string) => {
     const r = await freezeHarvest(root, id, { state: 'cancelled', ...(reason ? { reason } : {}), ...(detail ? { detail } : {}) })
     return { code: 0, out: { id, state: r.state, next: `./bin/sdd-ai wait ${id}` } }
   }
   if (writerGone) return freeze('writer_gone', 'el usuario confirmó que el writer ya no corre')
   writeFileSync(join(store, 'cancel.request'), new Date().toISOString())
-  const c = readControl(root, id)
   const supervisorPid = readStatus(store).supervisor_pid ?? readSupervisorPid(store)
   const supervised = supervisorPid !== undefined && isAlive(supervisorPid)
   const requested = { code: 0, out: { id, state: 'cancel_requested', next: `./bin/sdd-ai wait ${id}` } }
@@ -2037,16 +2037,26 @@ async function cancelWriter(root: string, id: string, writerGone: boolean): Prom
  * checkout que la tomó, y solo si el proceso que la tomó ya no existe o no es el mismo; si sigue vivo,
  * está lanzando y no se toca. Desde otro worktree, la corrida no existe.
  */
-function releaseOrphan(root: string, id: string): Result {
-  const r = readReservation(root)
-  if (!r || r.id !== id) return { code: 0, out: { id, state: 'released' } }
-  if (r.gitDir !== gitDirs(root).gitDir) {
-    throw new SddError('run_not_found', `no existe la corrida ${id} en este checkout`, { next: 'corre el comando desde el checkout que la lanzó' })
+/** Lo que responde una consulta sobre una corrida que `run` todavía está lanzando. */
+const launchingResult = (id: string): Result & { out: { id: string; state: string; [key: string]: unknown } } =>
+  ({ code: 1, out: { id, state: 'launching', next: `run todavía está lanzando ${id}; vuelve a consultar con ./bin/sdd-ai wait ${id}` } })
+
+/**
+ * Libera la reserva de una corrida sin control, la que deja un `run` que murió antes de escribirlo. Si otro `wait` o
+ * `cancel` ya la liberó, el resultado es el mismo: `released`. Una reserva vigente de otra operación no se toca.
+ */
+function releaseOrphan(root: string, id: string): Result & { out: { id: string; state: string; [key: string]: unknown } } {
+  const r = ownReservation(root, 'writer', id)
+  if (!r) return { code: 0, out: { id, state: 'released' } }
+  if (processAlive(r.pid, r.lstart)) return launchingResult(id)
+  // `run` pudo escribir el control y lanzar al writer entre la primera consulta y el cese del lanzador: entonces la
+  // reserva es de un writer vivo y no se toca.
+  if (isWriterRun(root, id)) return { code: 1, out: { id, state: 'launched', next: `./bin/sdd-ai wait ${id}` } }
+  const release = releaseAndReport(r)
+  if (release.state === 'retained') return { code: 1, out: { id, state: 'retained', release } }
+  if (release.state === 'different') {
+    return { code: 0, out: { id, state: 'released', detail: 'la reserva que quedó es de otra operación y no se tocó' } }
   }
-  const seen = readProcess(r.pid)
-  const alive = seen === undefined ? isAlive(r.pid) : seen !== 'gone' && (r.lstart === null || seen.lstart === r.lstart)
-  if (alive) return { code: 1, out: { id, state: 'launching', next: `run todavía está lanzando ${id}; vuelve a consultar con ./bin/sdd-ai wait ${id}` } }
-  releaseWriter(root, id)
   return { code: 0, out: { id, state: 'released' } }
 }
 
@@ -2981,7 +2991,7 @@ function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string)
   // El ensayo de `sdd start` no escribe nada, y la recuperación escribe aun en modo no bloqueante: `sddStart` la corre
   // él mismo, bloqueante, solo con `--apply` y después de validar.
   if (cmd === 'sdd' && rest[0] === 'start') return
-  // El ensayo de branch no escribe: la aplicación recupera después de validar sus bloqueos.
+  // Branch conserva las intenciones de verify: ni su consulta ni su aplicación ejecutan recuperación.
   if (cmd === 'sdd' && rest[0] === 'branch') return
   // Commit se niega ante una restauración pendiente: nunca la ejecuta como efecto previo.
   if (cmd === 'sdd' && rest[0] === 'commit') return

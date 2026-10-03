@@ -10,7 +10,7 @@ import { Rejection } from '../review/admit.ts'
 import { killGroup } from '../supervisor.ts'
 import { type Family, SddError } from '../types.ts'
 import { isTestPath } from '../test-paths.ts'
-import { canWriteStore, controlUnavailable, flowWriterOpen, latestFlowHarvest, recordVerifyGroup, releaseWriter, reserveWriter } from '../writer-store.ts'
+import { type ReservationHandle, acquireReservation, acquisitionError, canWriteStore, controlUnavailable, flowWriterOpen, latestFlowHarvest, liveVerifyGroup, recordVerifyGroup, releaseAndReport } from '../writer-store.ts'
 import { isFlowId } from './id.ts'
 import { criteriaIds, replaceSection, setHeaderStatus } from './markdown.ts'
 import { localIso } from './phase.ts'
@@ -194,24 +194,29 @@ function rowEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * Corre una fila con su argv literal (`shell: false`), desde la raíz del checkout y en un grupo de
- * procesos propio. stdout y stderr se vuelcan a archivos del directorio del recibo mientras corre. Al
- * vencer el tope o con `signal` abortada, termina el grupo: SIGTERM y, si sigue, SIGKILL.
+ * Espera a que el grupo `pgid` no tenga procesos, con un tope: SIGKILL se entrega, pero no al instante. `false`
+ * quiere decir que el cese no quedó acreditado: el grupo seguía al vencer el tope, o `kill` respondió algo distinto
+ * de ESRCH (por ejemplo EPERM). Quien llama conserva entonces la reserva y la intención de restaurar.
  */
-/** Espera a que el grupo `pgid` no tenga procesos, con un tope: SIGKILL se entrega, pero no al instante. */
-async function groupGone(pgid: number): Promise<void> {
+async function groupGone(pgid: number): Promise<boolean> {
   const deadline = Date.now() + GROUP_EXIT_MS
   while (Date.now() < deadline) {
     try {
       process.kill(-pgid, 0)
-    } catch {
-      return
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ESRCH') return true
     }
     await new Promise((r) => setTimeout(r, 10))
   }
+  return false
 }
 
-async function executeRow(root: string, runDir: string, row: ExecutableRow, signal: AbortSignal, prefix: string, holder: string | undefined): Promise<RowExecution> {
+/**
+ * Corre una fila con su argv literal (`shell: false`), desde la raíz del checkout y en un grupo de
+ * procesos propio. stdout y stderr se vuelcan a archivos del directorio del recibo mientras corre. Al
+ * vencer el tope o con `signal` abortada, termina el grupo: SIGTERM y, si sigue, SIGKILL.
+ */
+async function executeRow(root: string, runDir: string, row: ExecutableRow, signal: AbortSignal, prefix: string, holder: string | undefined, handle?: ReservationHandle): Promise<RowExecution> {
   const stdout_file = `${prefix}stdout-${row.id}.log`
   const stderr_file = `${prefix}stderr-${row.id}.log`
   const base = { row: row.id, argv: row.argv, stdout_file, stderr_file }
@@ -232,7 +237,7 @@ async function executeRow(root: string, runDir: string, row: ExecutableRow, sign
     }
   }
   if (signal.aborted) return finish({ exit_code: null, reason: 'interrupted' })
-  return await new Promise<RowExecution>((settle) => {
+  return await new Promise<RowExecution>((settle, reject) => {
     let reason: RowExecution['reason']
     let child: ReturnType<typeof spawn>
     try {
@@ -241,7 +246,7 @@ async function executeRow(root: string, runDir: string, row: ExecutableRow, sign
       settle(finish({ exit_code: null, reason: 'launch_failed', launch_error: (e as NodeJS.ErrnoException).code ?? (e as Error).message }))
       return
     }
-    if (holder !== undefined && child.pid !== undefined) recordVerifyGroup(root, holder, child.pid)
+    if (holder !== undefined && child.pid !== undefined) recordVerifyGroup(root, holder, child.pid, handle)
     const stop = (why: RowExecution['reason']) => {
       if (reason !== undefined || child.pid === undefined) return
       reason = why
@@ -266,8 +271,13 @@ async function executeRow(root: string, runDir: string, row: ExecutableRow, sign
         return
       }
       killGroup(pgid, 'SIGKILL')
-      void groupGone(pgid).then(() => {
-        if (holder !== undefined) recordVerifyGroup(root, holder, null)
+      void groupGone(pgid).then((gone) => {
+        if (!gone) {
+          closeSync(out); closeSync(err)
+          reject(new SddError('verify_in_progress', `la fila sigue en el grupo ${pgid}; se conservan reserva e intención`, { next: `acredita el cese del grupo ${pgid} antes de recuperar verify` }))
+          return
+        }
+        if (holder !== undefined) recordVerifyGroup(root, holder, null, handle)
         settle(finish(r))
       })
     }
@@ -279,12 +289,14 @@ async function executeRow(root: string, runDir: string, row: ExecutableRow, sign
 /**
  * Corre las filas en orden. Un fallo no detiene las demás; con `signal` abortada, la fila en curso termina
  * su grupo y las siguientes quedan `interrupted` sin ejecutarse. Las filas `manual` no llegan acá. Con
- * `holder`, el id de la reserva de verify, cada fila anota su grupo en la reserva mientras corre.
+ * `holder`, el id de la reserva de verify, cada fila anota su grupo en la reserva mientras corre. Con `handle`,
+ * la reserva tomada por el verify, su id manda sobre `holder`: son la misma identidad, y `holder` solo queda para
+ * una reserva del formato anterior, que no tiene handle.
  */
-export async function executeRows(root: string, runDir: string, rows: readonly ExecutableRow[], signal: AbortSignal, prefix = '', holder?: string): Promise<RowExecution[]> {
+export async function executeRows(root: string, runDir: string, rows: readonly ExecutableRow[], signal: AbortSignal, prefix = '', holder?: string, handle?: ReservationHandle): Promise<RowExecution[]> {
   mkdirSync(runDir, { recursive: true })
   const out: RowExecution[] = []
-  for (const row of rows) out.push(await executeRow(root, runDir, row, signal, prefix, holder))
+  for (const row of rows) out.push(await executeRow(root, runDir, row, signal, prefix, handle?.id ?? holder, handle))
   return out
 }
 
@@ -293,6 +305,7 @@ export interface VerifyStart {
   root: string; flow: string; mode: 'final' | 'baseline'; receiptId: string; runDir: string; baseCommit: string
   planFingerprint: string; contract: VerificationContract; specAcs: string[]
   refs: { receipts: VerifyReceiptRef[]; attestations: AttestationRef[] }
+  reservation: ReservationHandle
 }
 
 /** Los pasos desde los que arranca cada modo: la corrida final con la implementación terminada, la base antes del writer. */
@@ -309,18 +322,18 @@ export function prepareVerify(root: string, flow: string, mode: VerifyStart['mod
   if (!canWriteStore(root) || !canWriteVerifyStore(root)) throw controlUnavailable()
   const read = withFlowLock(root, flow, () => verifyPreconditions(root, flow, mode, o.guard))
   const receiptId = newReceiptId()
-  const reserved = reserveWriter(root, receiptId, 'verify')
-  if (!reserved.ok) throw new SddError('writer_open', `ya hay un writer abierto en este repositorio: ${reserved.holder}`, { next: 'espera a que termine y vuelve a correr sdd verify' })
+  const reserved = acquireReservation(root, receiptId, 'verify')
+  if (!reserved.ok) throw acquisitionError(reserved)
   // Entre la comprobación del árbol y la reserva nadie más lanza un writer, pero el conductor puede editar.
   if (mode === 'final' && o.guard) {
     try {
       o.guard('reserved', read.baseCommit)
     } catch (e) {
-      releaseWriter(root, receiptId)
+      releaseAndReport(reserved.handles[0])
       throw e
     }
   }
-  return { root, flow, mode, receiptId, runDir: receiptDir(root, receiptId), ...read }
+  return { root, flow, mode, receiptId, runDir: receiptDir(root, receiptId), ...read, reservation: reserved.handles[0] }
 }
 
 /**
@@ -331,7 +344,7 @@ export function prepareVerify(root: string, flow: string, mode: VerifyStart['mod
 export type TreeGuard = (when: 'locked' | 'reserved', base: string) => void
 
 /** Lo que `prepareVerify` comprueba y lee del flujo. Va dentro de `withFlowLock`. */
-type Preconditions = Omit<VerifyStart, 'root' | 'flow' | 'mode' | 'receiptId' | 'runDir'>
+type Preconditions = Omit<VerifyStart, 'root' | 'flow' | 'mode' | 'receiptId' | 'runDir' | 'reservation'>
 
 function verifyPreconditions(root: string, flow: string, mode: VerifyStart['mode'], guard?: TreeGuard): Preconditions {
   const { facts } = readFlow(root, flow)
@@ -385,7 +398,8 @@ export async function withVerifyReservation<T>(start: VerifyStart, fn: () => Pro
   try {
     return await fn()
   } finally {
-    releaseWriter(start.root, start.receiptId)
+    if (liveVerifyGroup(start.root, start.receiptId, start.reservation) === null) releaseAndReport(start.reservation)
+    else process.stderr.write(`verify_in_progress: se conserva ${start.reservation.path} mientras viva su fila\n`)
   }
 }
 
@@ -554,12 +568,23 @@ export async function confirmRow(start: VerifyStart, row: TestRow, original: Can
   writeRestoreIntent(start.root, intent)
   let changed: string[] = []
   let execution: RowExecution | undefined
+  // Se consulta una sola vez: restaurar y cerrar la intención deciden con la misma respuesta.
+  let groupAlive = false
   try {
     changed = revertPaths(start.root, intent)
-    if (changed.length === 0) [execution] = await executeRows(start.root, start.runDir, [row], signal, 'confirm-', start.receiptId)
+    if (changed.length === 0) [execution] = await executeRows(start.root, start.runDir, [row], signal, 'confirm-', start.receiptId, start.reservation)
   } finally {
-    // Con rutas cambiadas, el revert no tocó ninguna y no hay nada que restaurar.
-    if (changed.length === 0) restorePaths(start.root, intent)
+    // Con rutas cambiadas, el revert no tocó ninguna y no hay nada que restaurar. Con el grupo de la fila
+    // todavía vivo, restaurar podría pisar lo que esa fila sigue escribiendo: la restauración queda para la
+    // recuperación, que la hace después de acreditar el cese.
+    groupAlive = changed.length === 0 && liveVerifyGroup(start.root, start.receiptId, start.reservation) !== null
+    if (changed.length === 0 && !groupAlive) restorePaths(start.root, intent)
+  }
+  // La intención se cierra solo si ya no queda nada por restaurar; si el grupo sigue vivo, se conserva para la
+  // recuperación. Hoy una fila que termina normal ya acreditó el cese de su grupo (executeRow): esto protege
+  // cualquier camino que llegue acá sin haberlo hecho.
+  if (groupAlive) {
+    throw new SddError('verify_in_progress', `la fila ${row.id} dejó su grupo vivo; se conservan reserva e intención`, { next: 'acredita el cese del grupo de la fila antes de recuperar verify' })
   }
   closeRestoreIntent(start.root)
   if (execution === undefined) {
@@ -653,7 +678,7 @@ export async function runBaseline(start: VerifyStart, signal: AbortSignal): Prom
     }
     const { executable } = split(start.contract)
     const measurable = executable.filter((r) => measurableAtBase(start.root, start.baseCommit, r))
-    const executions = await executeRows(start.root, start.runDir, measurable, signal, '', start.receiptId)
+    const executions = await executeRows(start.root, start.runDir, measurable, signal, '', start.receiptId, start.reservation)
     const byRow = new Map(executions.map((e) => [e.row, e]))
     const rows: RowResult[] = start.contract.rows.map((r) => {
       const e = byRow.get(r.id)
@@ -720,7 +745,7 @@ export async function runFinal(start: VerifyStart, signal: AbortSignal): Promise
     const started_at = new Date().toISOString()
     const before = candidateFingerprint(start.root, start.flow, start.baseCommit)
     const { executable, manual } = split(start.contract)
-    const executions = new Map((await executeRows(start.root, start.runDir, executable, signal, '', start.receiptId)).map((e) => [e.row, e]))
+    const executions = new Map((await executeRows(start.root, start.runDir, executable, signal, '', start.receiptId, start.reservation)).map((e) => [e.row, e]))
     const baseline = latestBaseline(start)
     const rows: RowResult[] = []
     for (const row of start.contract.rows) {

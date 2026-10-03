@@ -10,7 +10,8 @@ import {
 } from '../src/sdd/restore.ts'
 import type { TestRow } from '../src/sdd/verification-contract.ts'
 import { SddError } from '../src/types.ts'
-import { readReservation, recordVerifyGroup, releaseOrphanVerifyReservation, reserveWriter, storeRoot } from '../src/writer-store.ts'
+import { acquireReservation, ownReservation, recordVerifyGroup, releaseOrphanVerifyReservation } from '../src/writer-store.ts'
+import { lockOf } from './cli-run-fixture.ts'
 import { makeRepo } from './helpers.ts'
 
 const gitIn = (repo: string, ...args: string[]) =>
@@ -166,24 +167,27 @@ test('un lock de recuperación huérfano no se roba: pide borrarlo a mano', () =
 
 test('la recuperación libera la reserva de una verificación muerta y nunca la de un writer', () => {
   const { repo } = repoWith({ 'a.txt': 'a\n' })
-  const lock = join(storeRoot(repo), 'writer.lock')
+  const lock = lockOf(repo)
   // Una verificación viva conserva su reserva, aunque no haya intención.
-  assert.deepEqual(reserveWriter(repo, '20260929-1500-aaaa', 'verify'), { ok: true })
+  assert.equal(acquireReservation(repo, '20260929-1500-aaaa', 'verify').ok, true)
   recoverPendingRestore(repo, 'blocking')
-  assert.equal(readReservation(repo)?.kind, 'verify')
+  assert.equal(ownReservation(repo)?.kind, 'verify')
   // Muerta, se libera sin intención de por medio.
-  writeFileSync(lock, `${JSON.stringify({ ...readReservation(repo), pid: deadPid(), lstart: null })}\n`)
+  writeFileSync(lock, `${JSON.stringify({ ...ownReservation(repo), pid: deadPid(), lstart: null })}\n`)
   recoverPendingRestore(repo, 'non_blocking')
   assert.equal(existsSync(lock), false)
   // La de un writer, viva o muerta, no se toca.
-  assert.deepEqual(reserveWriter(repo, '20260929-1501-bbbb'), { ok: true })
-  writeFileSync(lock, `${JSON.stringify({ ...readReservation(repo), pid: deadPid(), lstart: null })}\n`)
+  assert.equal(acquireReservation(repo, '20260929-1501-bbbb', 'writer').ok, true)
+  writeFileSync(lock, `${JSON.stringify({ ...ownReservation(repo), pid: deadPid(), lstart: null })}\n`)
   recoverPendingRestore(repo, 'blocking')
-  assert.equal(readReservation(repo)?.id, '20260929-1501-bbbb')
+  assert.equal(ownReservation(repo)?.id, '20260929-1501-bbbb')
   // Con una verificación reservada, otro writer recibe quién la tiene.
   unlinkSync(lock)
-  reserveWriter(repo, '20260929-1502-cccc', 'verify')
-  assert.deepEqual(reserveWriter(repo, '20260929-1503-dddd'), { ok: false, holder: 'la verificación 20260929-1502-cccc', verify: true })
+  assert.equal(acquireReservation(repo, '20260929-1502-cccc', 'verify').ok, true)
+  const refused = acquireReservation(repo, '20260929-1503-dddd', 'writer')
+  assert.equal(refused.ok, false)
+  // El rechazo nombra la verificación que tiene la reserva: su id y su tipo.
+  assert.ok(!refused.ok && 'conflict' in refused && refused.conflict.holder?.id === '20260929-1502-cccc' && refused.conflict.holder.kind === 'verify')
 })
 
 test('el revert no pisa una ruta que cambió después de guardar su contenido, y entonces no toca ninguna', () => {
@@ -212,12 +216,12 @@ function liveGroup(): { pgid: number; stop: () => Promise<void> } {
 test('con el dueño muerto y la fila todavía corriendo en su grupo, ni la reserva ni la restauración se liberan', async () => {
   const { repo, intent } = withIntent()
   revertPaths(repo, intent)
-  const lock = join(storeRoot(repo), 'writer.lock')
-  assert.deepEqual(reserveWriter(repo, intent.receipt, 'verify'), { ok: true })
+  const lock = lockOf(repo)
+  assert.equal(acquireReservation(repo, intent.receipt, 'verify').ok, true)
   const group = liveGroup()
   try {
     recordVerifyGroup(repo, intent.receipt, group.pgid)
-    writeFileSync(lock, `${JSON.stringify({ ...readReservation(repo), pid: deadPid(), lstart: null })}\n`)
+    writeFileSync(lock, `${JSON.stringify({ ...ownReservation(repo), pid: deadPid(), lstart: null })}\n`)
     assert.equal(releaseOrphanVerifyReservation(repo), false)
     assert.deepEqual(recoverPendingRestore(repo, 'non_blocking'), { state: 'in_progress' })
     assert.equal(codeOf(() => recoverPendingRestore(repo, 'blocking')), 'verify_in_progress')
@@ -233,13 +237,13 @@ test('con el dueño muerto y la fila todavía corriendo en su grupo, ni la reser
 
 test('la reserva anota el grupo de la fila en curso y lo quita al terminarla', () => {
   const { repo } = repoWith({ 'a.txt': 'a\n' })
-  reserveWriter(repo, '20260929-1500-aaaa', 'verify')
+  acquireReservation(repo, '20260929-1500-aaaa', 'verify')
   recordVerifyGroup(repo, '20260929-1500-aaaa', 4242)
-  assert.equal(readReservation(repo)?.group, 4242)
+  assert.equal(ownReservation(repo)?.group, 4242)
   // La de otra corrida no se toca.
   recordVerifyGroup(repo, '20260929-1501-bbbb', 99)
-  assert.equal(readReservation(repo)?.group, 4242)
+  assert.equal(ownReservation(repo)?.group, 4242)
   recordVerifyGroup(repo, '20260929-1500-aaaa', null)
-  assert.equal(readReservation(repo)?.group, undefined)
-  assert.equal(readReservation(repo)?.kind, 'verify')
+  assert.equal(ownReservation(repo)?.group, undefined)
+  assert.equal(ownReservation(repo)?.kind, 'verify')
 })

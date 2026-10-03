@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { buildIndex, candidateFingerprint, currentBranch, entryDiff, gitDirs, headCommit, indexEntries, indexEnv } from '../git.ts'
 import { flowReview, flowReviewBacking, reviewStartCommand, shellArg } from '../review/standing.ts'
 import { SddError } from '../types.ts'
-import { flowWriterOpen, readHarvest, readReservation, readTakeoverMap, releaseWriter, reserveWriter, runEntries } from '../writer-store.ts'
+import { type ReservationHandle, acquireReservation, acquisitionError, flowWriterOpen, inspectReservations, readHarvest, readTakeoverMap, releaseAll, reservationError, runEntries } from '../writer-store.ts'
 import { isFlowId } from './id.ts'
 import { readHeader, section, setHeaderStatus } from './markdown.ts'
 import { type CommitDone, type CommitIntent, type CommitRecord, type PhaseRecord, activeRun, implementOf, latestFinalReceipt, readPhaseRecord, withFlowLock, writeCommitRecord } from './phase-state.ts'
@@ -182,12 +182,13 @@ function recognize(root: string, id: string, base: string, head: string, record:
   }
 }
 
-function computeCommit(root: string, id: string, subject: string, o: { own?: string; head?: string } = {}): CommitPlan {
+function computeCommit(root: string, id: string, subject: string, o: { ownHandles?: ReservationHandle[]; head?: string } = {}): CommitPlan {
   const { read, header, base, message } = commitFlow(root, id, subject)
   if (restoreIntentOpen(root)) throw new SddError('restore_pending', 'hay una restauración de verify pendiente', { next: `./bin/sdd-ai sdd status ${id}` })
   const record = readPhaseRecord(root, id)
-  const reservation = readReservation(root)
-  if ((reservation && reservation.id !== o.own) || flowWriterOpen(root, id) || activeRun(root, record)) {
+  const reservation = inspectReservations(root, ['checkout'], o.ownHandles)
+  if (reservation) throw reservationError(reservation)
+  if (flowWriterOpen(root, id) || activeRun(root, record)) {
     throw new SddError('writer_open', 'hay un writer o una verificación en vuelo', { next: 'espera a que termine antes de commitear' })
   }
   const before = indexEntries(root, base, { kind: 'base' })!
@@ -231,7 +232,8 @@ export function planCommit(root: string, id: string, subject: string): Record<st
 function probeGit(root: string): void {
   const { gitDir, commonDir } = gitDirs(root)
   for (const dir of new Set([gitDir, join(commonDir, 'objects'), join(commonDir, 'refs')])) {
-    const probe = join(dir, `sdd-ai-commit-probe-${process.pid}-${randomBytes(4).toString('hex')}`)
+    // El sufijo `.lock` es el de los temporales de Git: la cosecha de un writer de otro checkout no los señala.
+    const probe = join(dir, `sdd-ai-commit-probe-${process.pid}-${randomBytes(4).toString('hex')}.lock`)
     try {
       writeFileSync(probe, '', { flag: 'wx' })
       unlinkSync(probe)
@@ -347,12 +349,12 @@ export function applyCommit(root: string, id: string, subject: string, digest: s
   probeGit(root)
   return withFlowLock(root, id, () => {
     const reservation = `commit-${id}`
-    const reserved = reserveWriter(root, reservation, 'commit')
-    if (!reserved.ok) throw new SddError('writer_open', `el repositorio está reservado por ${reserved.holder}`, { next: 'espera a que termine antes de commitear' })
+    const reserved = acquireReservation(root, reservation, 'commit')
+    if (!reserved.ok) throw acquisitionError(reserved)
     try {
       // El HEAD que fija esta aplicación. Si hay que commitear, es el padre del commit; si ya está hecho, es ese commit.
       const pinned = headCommit(root)!
-      const draft = computeCommit(root, id, subject, { own: reservation, head: pinned })
+      const draft = computeCommit(root, id, subject, { ownHandles: reserved.handles, head: pinned })
       if (digest !== draft.digest) throw new SddError('digest_mismatch', 'el digest no coincide con el ensayo actual', { next: commitCommand(id, subject) })
       if (draft.recognition) {
         finishOrExplain(root, id, subject, pinned, draft.digest, draft.recognition)
@@ -360,7 +362,7 @@ export function applyCommit(root: string, id: string, subject: string, digest: s
       }
       return scratch((dir, index) => commitOnce(root, id, subject, pinned, draft, dir, index))
     } finally {
-      releaseWriter(root, reservation)
+      releaseAll(reserved.handles)
     }
   })
 }

@@ -8,7 +8,7 @@ import { createBranch } from '../src/git.ts'
 import { branchApply } from '../src/sdd/branch.ts'
 import { readHeader } from '../src/sdd/markdown.ts'
 import { readFlow } from '../src/sdd/read.ts'
-import { readReservation, releaseWriter, reserveWriter, storeRoot } from '../src/writer-store.ts'
+import { acquireReservation, ownReservation, releaseReservation, storeRoot } from '../src/writer-store.ts'
 import { SddError } from '../src/types.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
@@ -16,6 +16,11 @@ const scratch: string[] = []
 after(() => { for (const path of scratch) rmSync(path, { recursive: true, force: true }) })
 interface Setup { root: string; repo: string; env: Record<string, string>; id: string; base: string }
 const AT = '2026-10-02T12:00:00.000Z'
+const reserveWriter = (root: string, id: string) => acquireReservation(root, id, 'writer')
+const releaseWriter = (root: string, id: string) => {
+  const h = ownReservation(root, 'writer', id)
+  if (h) releaseReservation(h)
+}
 function put(path: string, body: string): void { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, body) }
 function git(s: Setup, ...args: string[]): string {
   return execFileSync('git', args, { cwd: s.repo, encoding: 'utf8', env: { ...process.env, ...s.env,
@@ -322,7 +327,7 @@ test('sdd branch --apply se puede repetir: no cambia nada, completa el handoff, 
   assert.equal(git(stuck, 'symbolic-ref', '--short', 'HEAD'), 'fix/mi-flujo')
 })
 
-test('con el lock de writer del repositorio tomado, sdd branch --apply no crea la rama y responde writer_open, y --current no se bloquea', () => {
+test('la reserva local excluye crear ramas y la de otro checkout permite aplicar branch', () => {
   const s = setup()
   const worktree = join(s.root, 'linked')
   git(s, 'worktree', 'add', '-b', 'otra', worktree)
@@ -330,12 +335,12 @@ test('con el lock de writer del repositorio tomado, sdd branch --apply no crea l
   config(linked)
   put(handoff(linked), raw(s))
   put(join(linked.repo, '.plans', s.id, 'spec.md'), readFileSync(join(s.repo, '.plans', s.id, 'spec.md'), 'utf8'))
-  assert.deepEqual(reserveWriter(s.repo, 'other'), { ok: true })
+  assert.equal(reserveWriter(linked.repo, 'other').ok, true)
   try {
     assert.ok(exitCodes(cli(linked).out).includes('writer_open'))
     denied(linked, 'writer_open')
     assert.equal(cli(linked, '--apply', '--current').code, 0)
-  } finally { releaseWriter(s.repo, 'other') }
+  } finally { releaseWriter(linked.repo, 'other') }
   assert.equal(reserveWriter(s.repo, 'other').ok, true)
   try {
     assert.equal(cli(linked, '--apply').code, 0)
@@ -357,8 +362,10 @@ test('la rama se crea con la reserva de writer tomada y la reserva se libera al 
     const linked = join(s.root, 'linked')
     git(s, 'worktree', 'add', '-b', 'otra', linked)
     const io = { createBranch(root: string, name: string, start: string) {
-      assert.equal(readReservation(root)?.kind, 'branch')
-      assert.equal(reserveWriter(linked, 'x').ok, false)
+      assert.equal(ownReservation(root)?.kind, 'branch')
+      const other = reserveWriter(linked, 'x')
+      assert.equal(other.ok, true)
+      releaseWriter(linked, 'x')
       if (fail) throw new Error('Git failure')
       createBranch(root, name, start)
     }, switchBranch() { assert.fail('unexpected switch') } }
@@ -368,7 +375,7 @@ test('la rama se crea con la reserva de writer tomada y la reserva se libera al 
       assert.equal(header(s).base_commit, s.base)
       assert.equal(git(s, 'branch', '--list', 'feature/mi-flujo'), '')
     } else assert.equal(branchApply(s.repo, s.id, {}, io).created, true)
-    assert.equal(readReservation(s.repo), undefined)
+    assert.equal(ownReservation(s.repo), undefined)
     if (fail) {
       assert.equal(branchApply(s.repo, s.id, {}).created, true)
       assert.equal(git(s, 'rev-parse', 'HEAD'), s.base)

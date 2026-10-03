@@ -1,30 +1,40 @@
 import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
-  existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, unlinkSync, writeFileSync,
+  closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { type HarvestFile, buildIndex, captureTree, entryDiff, gitDirs, indexEntries, removeIndex } from './git.ts'
+import { type GitState, type HarvestFile, buildIndex, captureTree, entryDiff, gitDirs, indexEntries, isWorktreeStatePath, readHeadState, readRefState, readReplaceRefs, removeIndex } from './git.ts'
 import type { Outcome } from './outcome.ts'
 import { isAlive, readJson, writeJsonAtomic } from './runs.ts'
 import { type Conductor, type Family, type RunState, SddError } from './types.ts'
-import { artifactHash, headerHash, readFlow } from './sdd/read.ts'
+import { LOCK_FILE, artifactHash, headerHash, readFlow } from './sdd/read.ts'
 import { hasEndMark } from './writer.ts'
 
 /**
  * El almacén de control de un writer vive en el directorio de Git, que ningún writer puede escribir: el
  * sandbox de Codex lo protege y Claude en modo restringido lo trata como ruta sensible sin quién
- * apruebe. La reserva es una por repositorio, en el directorio común; el almacén de cada corrida es del
- * checkout que la lanzó.
+ * apruebe. La reserva del checkout protege su árbol y HEAD; la común de refs serializa aplicaciones
+ * de branch y commit. El almacén de cada corrida sigue siendo del checkout que la lanzó.
  */
 export function storeRoot(root: string): string {
   return join(gitDirs(root).commonDir, 'sdd-ai')
 }
 
+/** El almacén de una corrida, resolviendo el directorio de Git de ahora: sirve para encontrar su control. */
 export function storeDir(root: string, id: string): string {
   return join(gitDirs(root).gitDir, 'sdd-ai', 'runs', id)
+}
+
+/**
+ * El almacén de una corrida con el directorio de Git que congeló su control al lanzar: después de leer el control,
+ * nada vuelve a resolver un `.git` que el writer pudo cambiar. Un control del formato anterior no lo trae, y se
+ * resuelve como antes.
+ */
+export function controlStore(root: string, control: Pick<WriterControl, 'id' | 'checkout'>): string {
+  return control.checkout ? join(control.checkout.gitDir, 'sdd-ai', 'runs', control.id) : storeDir(root, control.id)
 }
 
 /** Lo que responde un comando que necesita escribir el almacén y no puede. */
@@ -38,8 +48,8 @@ export function controlUnavailable(): SddError {
  * Si el binario puede escribir la raíz de la reserva y el directorio de los almacenes. Dentro del
  * sandbox de un conductor Codex no puede: `run` falla cerrado y pide escalar.
  */
-export function canWriteStore(root: string): boolean {
-  const { gitDir, commonDir } = gitDirs(root)
+export function canWriteStore(root: string, checkout?: WriterControl['checkout']): boolean {
+  const { gitDir, commonDir } = checkout ?? gitDirs(root)
   for (const dir of [join(commonDir, 'sdd-ai'), join(gitDir, 'sdd-ai', 'runs')]) {
     try {
       mkdirSync(dir, { recursive: true })
@@ -60,54 +70,304 @@ export function canWriteStore(root: string): boolean {
  */
 export interface Reservation { id: string; pid: number; lstart: string | null; gitDir: string; kind?: 'verify' | 'commit' | 'branch'; group?: number }
 
-const lockOf = (root: string) => join(storeRoot(root), 'writer.lock')
+export type ReservationKind = 'writer' | 'verify' | 'branch' | 'commit'
+export type ReservationDomain = 'checkout' | 'refs' | 'legacy'
+export interface ReservationHandle {
+  version: 1 | 2; domain: ReservationDomain; path: string; token?: string
+  id: string; kind: ReservationKind; pid: number; lstart: string | null
+  checkout: { root: string; gitDir: string; commonDir: string }
+  group?: number
+}
+export interface ReservationConflict {
+  domain: ReservationDomain; path: string; holder?: ReservationHandle; unreadable?: boolean
+}
+export interface AbandonedRelease { path: string; pid?: number; lstart?: string | null }
+export type Acquisition = { ok: true; handles: ReservationHandle[] }
+  | { ok: false; conflict: ReservationConflict } | { ok: false; abandoned: AbandonedRelease }
+export type ReleaseResult = { state: 'released' | 'absent' | 'different' }
+  | { state: 'retained'; code: 'release_busy' | 'release_abandoned' | 'release_failed'; path: string; detail: string; next: string }
 
-/** Dónde vive la reserva de writer: en el directorio común de Git, compartido por todos los worktrees. */
-export const writerLockPath = (root: string) => lockOf(root)
+/** Lee solo archivos regulares, sin seguir enlaces ni bloquearse en archivos especiales. */
+function lockJson(file: string): unknown {
+  if (!lstatSync(file).isFile()) throw new Error('la reserva no es un archivo regular')
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error('la reserva no es un archivo regular')
+    return JSON.parse(readFileSync(fd, 'utf8'))
+  } finally { closeSync(fd) }
+}
 
 /**
- * Quién tiene la reserva de writer, o `null` si no la tiene nadie. Un lock que existe y no se puede leer da
- * `'desconocida'` y cuenta como tomado, porque `reserveWriter` también choca con él.
+ * Si la ruta está, o si no se puede acreditar que no está: cualquier error distinto de ENOENT (por ejemplo EACCES)
+ * cuenta como presente, para que una reserva o un mutex que no se pueden leer se conserven.
  */
-export function writerReservation(root: string): string | null {
-  try { lstatSync(lockOf(root)) } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? null : 'desconocida'
+function pathPresent(file: string): boolean {
+  try { lstatSync(file); return true } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false
+    return true
   }
-  return readReservation(root)?.id ?? 'desconocida'
 }
+
+function lockPath(checkout: ReservationHandle['checkout'], domain: ReservationDomain): string {
+  return join(domain === 'checkout' ? checkout.gitDir : checkout.commonDir, 'sdd-ai', `${domain === 'legacy' ? 'writer' : domain}.lock`)
+}
+
+export function legacyHandle(checkout: ReservationHandle['checkout'], id: string, kind: ReservationKind = 'writer'): ReservationHandle {
+  return { version: 1, domain: 'legacy', path: lockPath(checkout, 'legacy'), id, kind, pid: 0, lstart: null, checkout }
+}
+
+function readHandle(path: string, domain: ReservationDomain, checkout: ReservationHandle['checkout']): ReservationHandle | undefined {
+  try {
+    const v = lockJson(path) as ReservationHandle & Reservation
+    if (!v || typeof v.id !== 'string' || !Number.isInteger(v.pid) || v.pid <= 1
+      || (v.lstart !== null && typeof v.lstart !== 'string')) return undefined
+    if (domain === 'legacy') {
+      if (typeof v.gitDir !== 'string' || ![undefined, 'verify', 'branch', 'commit'].includes(v.kind)) return undefined
+      let root = checkout.root
+      if (v.gitDir !== checkout.gitDir) {
+        // El protocolo anterior solo congelaba gitDir: su backlink identifica el checkout enlazado. Sin backlink (un
+        // worktree podado) la raíz no se puede saber: el principal es el padre del directorio común, y para un
+        // enlazado queda su directorio Git. Esa raíz solo nombra al titular en los diagnósticos; las rutas que se
+        // arman con ella (el lock de un flujo) se comprueban antes de mostrarse.
+        try { root = dirname(readFileSync(join(v.gitDir, 'gitdir'), 'utf8').trim()) }
+        catch { root = v.gitDir === checkout.commonDir ? dirname(checkout.commonDir) : v.gitDir }
+      }
+      return { ...legacyHandle({ ...checkout, root, gitDir: v.gitDir }, v.id, v.kind ?? 'writer'), pid: v.pid, lstart: v.lstart,
+        ...(v.group !== undefined ? { group: v.group } : {}) }
+    }
+    if (v.version !== 2 || v.domain !== domain || v.path !== path || typeof v.token !== 'string'
+      || !['writer', 'verify', 'branch', 'commit'].includes(v.kind) || !v.checkout
+      || typeof v.checkout.root !== 'string' || typeof v.checkout.gitDir !== 'string' || typeof v.checkout.commonDir !== 'string'
+      || lockPath(v.checkout, domain) !== path) return undefined
+    return v
+  } catch { return undefined }
+}
+
+function sameReservation(a: ReservationHandle, b: ReservationHandle): boolean {
+  return a.path === b.path && a.version === b.version && a.domain === b.domain && a.id === b.id && a.kind === b.kind
+    && a.checkout.gitDir === b.checkout.gitDir && (a.version === 1 || (a.token === b.token
+      && a.checkout.root === b.checkout.root && a.checkout.commonDir === b.checkout.commonDir && a.pid === b.pid && a.lstart === b.lstart))
+}
+
+export function inspectReservations(root: string, domains: readonly ('checkout' | 'refs')[], ownHandles: readonly ReservationHandle[] = []): ReservationConflict | null {
+  const checkout = { root, ...gitDirs(root) }
+  for (const domain of ['legacy' as const, ...domains]) {
+    const path = lockPath(checkout, domain)
+    if (!pathPresent(path)) continue
+    const holder = readHandle(path, domain, checkout)
+    if (holder && ownHandles.some((own) => sameReservation(holder, own))) continue
+    return { domain, path, ...(holder ? { holder } : { unreadable: true }) }
+  }
+  return null
+}
+
+/**
+ * La reserva de este checkout: la de su `checkout.lock` o, si no hay, el `writer.lock` legacy que tomó este mismo
+ * checkout. Se lee por separado de los conflictos, sin atribuir locks ilegibles.
+ */
+export function ownReservation(root: string, kind?: ReservationKind, id?: string): ReservationHandle | undefined {
+  const checkout = { root, ...gitDirs(root) }
+  for (const domain of ['checkout', 'legacy'] as const) {
+    const handle = readHandle(lockPath(checkout, domain), domain, checkout)
+    if (handle && handle.checkout.gitDir === checkout.gitDir && (!kind || handle.kind === kind) && (!id || handle.id === id)) return handle
+  }
+  return undefined
+}
+
+function releaseOwner(path: string): { pid: number; lstart: string | null } | undefined {
+  try {
+    const owner = lockJson(path) as { pid: number; lstart: string | null }
+    return owner && Number.isInteger(owner.pid) && owner.pid > 1 && (owner.lstart === null || typeof owner.lstart === 'string') ? owner : undefined
+  } catch { return undefined }
+}
+
+function abandonedRelease(path: string): AbandonedRelease | null {
+  if (!pathPresent(path)) return null
+  const owner = releaseOwner(path)
+  if (!owner) return pathPresent(path) ? { path } : null
+  // Abandonado es solo un titular que ya no corre. Sin hora o sin ps no se acredita el cese, y el mutex se trata
+  // como el de un liberador vivo: se espera, y al vencer la espera la reserva queda retenida, no abandonada.
+  return processAlive(owner.pid, owner.lstart) ? null : { path, ...owner }
+}
+
+/** El error de una reserva tomada: su código dice si se espera a un writer o verify, a branch o commit, o a un mutex. */
+export type ReservationError = SddError & { code: 'writer_open' | 'refs_busy' | 'release_abandoned' }
+
+export function reservationError(conflict: ReservationConflict | AbandonedRelease): ReservationError {
+  const fail = (code: ReservationError['code'], message: string, opts: { detail?: string; next?: string }) =>
+    Object.assign(new SddError(code, message, opts), { code })
+  if (!('domain' in conflict)) return fail('release_abandoned', `el mutex de liberación requiere resolución manual: ${conflict.path}`, {
+    detail: `pid: ${conflict.pid ?? 'desconocido'}; no se pudo acreditar un liberador vivo`,
+    next: `comprueba que su proceso ya no corre y borra manualmente ${conflict.path}; después repite el comando`,
+  })
+  const h = conflict.holder
+  if (!h) return fail(conflict.domain === 'refs' ? 'refs_busy' : 'writer_open', `reserva ilegible conservada en ${conflict.path}`, {
+    next: `inspecciona ${conflict.path} y acredita el cese de su operación antes de liberarla manualmente`,
+  })
+  const refs = h.kind === 'branch' || h.kind === 'commit'
+  const paths = refs && h.version === 2 ? ['checkout', 'refs'].flatMap((domain) => {
+    const path = lockPath(h.checkout, domain as 'checkout' | 'refs')
+    const other = readHandle(path, domain as 'checkout' | 'refs', h.checkout)
+    return other && sameReservation(other, { ...h, path, domain: domain as 'checkout' | 'refs' }) ? [path] : []
+  }) : [h.path]
+  const alive = processAlive(h.pid, h.lstart)
+  const observed = h.lstart === null ? undefined : readProcess(h.pid)
+  const uncertain = alive && (h.lstart === null || observed === undefined)
+  // Branch y commit reservan con el id `branch-<flujo>` y `commit-<flujo>` (src/sdd/branch.ts y src/sdd/commit.ts):
+  // de ahí sale el flujo cuyo lock también puede haber quedado. Un id que no siga esa forma no nombra ningún lock.
+  const flow = h.id.startsWith(`${h.kind}-`) ? h.id.slice(h.kind.length + 1) : ''
+  const ancillary = [
+    ...(refs && FLOW_ID.test(flow) ? [join(h.checkout.root, '.plans', flow, LOCK_FILE)] : []),
+    join(h.checkout.gitDir, 'sdd-ai', 'verify', 'restore.lock'),
+  ].filter((path) => pathPresent(path))
+  return fail(refs && h.version === 2 ? 'refs_busy' : 'writer_open',
+    `reserva tomada por ${h.kind} ${h.id}; pid ${h.pid}; checkout ${h.checkout.root}; Git ${h.checkout.gitDir}`, {
+      detail: [...paths, ...(uncertain ? ['no se pudo acreditar la identidad o el cese del proceso titular'] : [])].join('\n'),
+      next: holderNext(h, refs, alive && !uncertain, paths, ancillary),
+    })
+}
+
+/** Un id de flujo válido: el mismo segmento que admite `.plans/<id>/`. */
+const FLOW_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+
+/** Qué hacer ante una reserva tomada, según quién la tiene y si su titular sigue vivo. */
+function holderNext(h: ReservationHandle, refs: boolean, alive: boolean, paths: string[], ancillary: string[]): string {
+  if (refs && alive) return `reintenta cuando termine ${h.kind} ${h.id} en ${h.checkout.root}`
+  if (refs) {
+    const locks = ancillary.length ? ` (${ancillary.join(', ')})` : ''
+    return `comprueba el cese del proceso, hooks e hijos de ${h.kind} ${h.id}; borra manualmente ${paths.join(' y ')}. `
+      + `Revisa por separado los locks de flujo/restauración${locks}, después de acreditar el cese de sus titulares; `
+      + 'limpiar no deshace Git ni completa el flujo. Después repite la aplicación'
+  }
+  if (h.kind === 'verify') return 'espera a que termine verify o ejecuta su recuperación habitual tras el cese de la fila'
+  return `recibe o cancela la corrida desde su checkout: ./bin/sdd-ai wait ${h.id}`
+}
+
+/** Publicación completa y exclusiva: ningún lector ve un JSON a medio escribir. */
+function publishLock(path: string, value: unknown): boolean {
+  const tmp = `${path}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`
+  writeFileSync(tmp, `${JSON.stringify(value)}\n`, { flag: 'wx' })
+  try {
+    linkSync(tmp, path)
+    return true
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+    return false
+  } finally {
+    // El temporal se borra siempre, también si link falló. Si borrarlo falla, la publicación que ya ocurrió no se
+    // deshace: queda un resto inofensivo y el resultado es el de link.
+    try { unlinkSync(tmp) } catch { /* El lock ya está publicado o ya se rechazó. */ }
+  }
+}
+
+/** Cuánto espera un liberador a que otro suelte el mutex de liberación, y cada cuánto vuelve a probar. */
+const RELEASE_WAIT_MS = 5000
+const RELEASE_RETRY_MS = 50
+
+export function releaseReservation(handle: ReservationHandle): ReleaseResult {
+  const mutex = `${handle.path}.release`
+  let acquired = false
+  const retained = (code: 'release_busy' | 'release_abandoned' | 'release_failed', detail: string): ReleaseResult => ({
+    state: 'retained', code, path: mutex, detail,
+    // Sin el mutex tomado, la falla es de escritura (por ejemplo, un sandbox): no hay un mutex que borrar.
+    next: code === 'release_failed' && !acquired
+      ? `conserva ${handle.path}; la liberación queda para un proceso que pueda escribir ${dirname(handle.path)}: repite wait o cancel con ese permiso`
+      : `conserva ${handle.path}; comprueba el cese del liberador antes de borrar manualmente ${mutex}, y repite la liberación habitual`,
+  })
+  const seen = readProcess(process.pid)
+  const owner = { pid: process.pid, lstart: seen && seen !== 'gone' ? seen.lstart : null, token: randomBytes(16).toString('hex') }
+  try {
+    const until = Date.now() + RELEASE_WAIT_MS
+    for (;;) {
+      if (!pathPresent(handle.path)) return { state: 'absent' }
+      if (publishLock(mutex, owner)) { acquired = true; break }
+      if (abandonedRelease(mutex)) return retained('release_abandoned', `mutex abandonado o ilegible: ${mutex}`)
+      if (Date.now() >= until) return retained('release_busy', `otro liberador sigue teniendo ${mutex}`)
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RELEASE_RETRY_MS)
+    }
+    // La relectura y el unlink están bajo el mismo mutex: dos liberadores no pueden borrar una
+    // reserva posterior a la que compararon. Esta garantía requiere inspección de la sección crítica.
+    const current = readHandle(handle.path, handle.domain, handle.checkout)
+    if (!current) return pathPresent(handle.path) ? retained('release_failed', 'reserva ilegible conservada') : { state: 'absent' }
+    if (!sameReservation(current, handle)) return { state: 'different' }
+    try { unlinkSync(handle.path) } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    }
+    return { state: 'released' }
+  } catch (e) { return retained('release_failed', String(e)) } finally {
+    if (acquired) {
+      try {
+        const current = lockJson(mutex) as typeof owner
+        if (current.token === owner.token && current.pid === owner.pid && current.lstart === owner.lstart) unlinkSync(mutex)
+      } catch { /* Un mutex desaparecido ya está liberado; uno alterado se conserva. */ }
+    }
+  }
+}
+
+/** El error de una adquisición rechazada, por una reserva tomada o por un mutex abandonado. */
+export function acquisitionError(a: Exclude<Acquisition, { ok: true }>): ReservationError {
+  return reservationError('conflict' in a ? a.conflict : a.abandoned)
+}
+
+/** Libera los handles de una aplicación en el orden inverso al que se tomaron, sin alterar el arreglo. */
+export function releaseAll(handles: readonly ReservationHandle[]): void {
+  for (const handle of [...handles].reverse()) releaseAndReport(handle)
+}
+
+/** Los finally conservan la entrega y hacen visible una liberación retenida. */
+export function releaseAndReport(handle: ReservationHandle): ReleaseResult {
+  const result = releaseReservation(handle)
+  if (result.state === 'retained') process.stderr.write(`${result.code}: ${result.detail}; ${result.next}\n`)
+  return result
+}
+
+export function acquireReservation(root: string, id: string, kind: ReservationKind): Acquisition {
+  const checkout = { root: realpathSync(root), ...gitDirs(root) }
+  const domains: ('checkout' | 'refs')[] = kind === 'branch' || kind === 'commit' ? ['checkout', 'refs'] : ['checkout']
+  const handles: ReservationHandle[] = []
+  const seen = readProcess(process.pid)
+  const token = randomBytes(24).toString('hex')
+  let success = false
+  try {
+    const legacy = inspectReservations(root, [])
+    if (legacy) return { ok: false, conflict: legacy }
+    for (const domain of domains) {
+      const path = lockPath(checkout, domain)
+      const abandoned = abandonedRelease(`${path}.release`)
+      if (abandoned) return { ok: false, abandoned }
+      mkdirSync(dirname(path), { recursive: true })
+      // lstat no sigue el enlace: un enlace en lugar del directorio tampoco es un directorio.
+      if (!lstatSync(dirname(path)).isDirectory()) throw controlUnavailable()
+      const h: ReservationHandle = { version: 2, domain, token, path, id, kind, pid: process.pid,
+        lstart: seen && seen !== 'gone' ? seen.lstart : null, checkout }
+      // Si el titular libera entre el link fallido y la lectura, no hay a quién nombrar: se vuelve a probar.
+      let taken = false
+      for (let attempt = 0; attempt < 3 && !taken; attempt++) {
+        if (publishLock(path, h)) { taken = true; break }
+        const holder = readHandle(path, domain, checkout)
+        if (holder || pathPresent(path)) return { ok: false, conflict: { domain, path, ...(holder ? { holder } : { unreadable: true }) } }
+      }
+      if (!taken) return { ok: false, conflict: { domain, path, unreadable: true } }
+      handles.push(h)
+    }
+    const legacyAfter = inspectReservations(root, [], handles)
+    if (legacyAfter) return { ok: false, conflict: legacyAfter }
+    success = true
+    return { ok: true, handles }
+  } finally { if (!success) releaseAll(handles) }
+}
+
+export function controlReservation(control: WriterControl): ReservationHandle {
+  return control.reservation ?? legacyHandle(control.checkout, control.id)
+}
+
+const lockOf = (root: string) => join(storeRoot(root), 'writer.lock')
 
 export function readReservation(root: string): Reservation | undefined {
   try {
-    return readJson<Reservation>(lockOf(root))
+    return lockJson(lockOf(root)) as Reservation
   } catch {
     return undefined
-  }
-}
-
-/**
- * Toma la reserva de writer del repositorio. El contenido se escribe en un temporal propio y el lock
- * nace con `link`, que falla si ya existe y lo deja completo desde que aparece.
- */
-export function reserveWriter(root: string, id: string, kind?: 'verify' | 'commit' | 'branch'): { ok: true } | { ok: false; holder: string; verify?: true; commit?: true; branch?: true } {
-  const dir = storeRoot(root)
-  mkdirSync(dir, { recursive: true })
-  const seen = readProcess(process.pid)
-  const mine: Reservation = {
-    id, pid: process.pid, lstart: seen && seen !== 'gone' ? seen.lstart : null, gitDir: gitDirs(root).gitDir, ...(kind ? { kind } : {}),
-  }
-  const tmp = join(dir, `writer.lock.${process.pid}.${randomBytes(4).toString('hex')}`)
-  writeFileSync(tmp, `${JSON.stringify(mine)}\n`)
-  try {
-    linkSync(tmp, lockOf(root))
-    return { ok: true }
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
-    const held = readReservation(root)
-    if (held?.kind === 'branch') return { ok: false, holder: `sdd branch (${held.id})`, branch: true }
-    if (held?.kind === 'commit') return { ok: false, holder: `el commit ${held.id}`, commit: true }
-    return held?.kind === 'verify' ? { ok: false, holder: `la verificación ${held.id}`, verify: true } : { ok: false, holder: held?.id ?? 'desconocida' }
-  } finally {
-    unlinkSync(tmp)
   }
 }
 
@@ -128,11 +388,14 @@ export function processAlive(pid: number, lstart: string | null): boolean {
  * Anota en la reserva de la verificación `id` el grupo de la fila que acaba de lanzar, o lo quita con
  * `null` cuando la fila terminó. La reserva de otra corrida no se toca.
  */
-export function recordVerifyGroup(root: string, id: string, pgid: number | null): void {
-  const r = readReservation(root)
-  if (r?.id !== id || r.kind !== 'verify') return
+export function recordVerifyGroup(root: string, id: string, pgid: number | null, handle?: ReservationHandle): void {
+  const own = handle ?? ownReservation(root, 'verify', id)
+  if (!own) return
+  const current = readHandle(own.path, own.domain, own.checkout)
+  if (!current || !sameReservation(current, own) || current.kind !== 'verify') return
+  const r = lockJson(own.path) as ReservationHandle | Reservation
   const { group: _previous, ...rest } = r
-  writeJsonAtomic(lockOf(root), pgid === null ? rest : { ...rest, group: pgid })
+  writeJsonAtomic(own.path, pgid === null ? rest : { ...rest, group: pgid })
 }
 
 /**
@@ -140,16 +403,27 @@ export function recordVerifyGroup(root: string, id: string, pgid: number | null)
  * con SIGKILL no alcanza a terminar el grupo de su fila, que corre aparte y puede seguir escribiendo en el
  * árbol: mientras viva, ni la reserva ni la restauración se liberan.
  */
-export function liveVerifyGroup(root: string, id: string): number | null {
-  const r = readReservation(root)
-  if (r?.id !== id || r.kind !== 'verify' || r.group === undefined) return null
+export function liveVerifyGroup(root: string, id: string, handle?: ReservationHandle): number | null {
+  const own = handle ?? ownReservation(root, 'verify', id)
+  if (!own) return null
+  const uncertain = (what: string) => new SddError('verify_in_progress', `no se puede acreditar el cese de ${what} registrado en ${own.path}`, {
+    next: `inspecciona ${own.path} y acredita el cese de su fila antes de recuperar la verificación`,
+  })
+  // Una sola lectura: el handle trae el grupo, también el de una reserva legacy.
+  const current = readHandle(own.path, own.domain, own.checkout)
+  if (!current) {
+    if (pathPresent(own.path)) throw uncertain('la fila')
+    return null
+  }
+  if (!sameReservation(current, own) || current.kind !== 'verify') throw uncertain('la fila')
+  if (current.group === undefined) return null
   // `kill(-1)` alcanza a todos los procesos del usuario y `kill(-0)` al grupo propio: nunca se consultan.
-  if (!Number.isInteger(r.group) || r.group <= 1) return null
+  if (!Number.isInteger(current.group) || current.group <= 1) throw uncertain('el grupo')
   try {
-    process.kill(-r.group, 0)
-    return r.group
+    process.kill(-current.group, 0)
+    return current.group
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'ESRCH' ? null : r.group
+    return (e as NodeJS.ErrnoException).code === 'ESRCH' ? null : current.group
   }
 }
 
@@ -158,28 +432,25 @@ export function liveVerifyGroup(root: string, id: string): number | null {
  * si la liberó. Una reserva de writer nunca se toca acá: la resuelven `wait` y `cancel` de su corrida.
  */
 export function releaseOrphanVerifyReservation(root: string): boolean {
-  const r = readReservation(root)
-  if (r?.kind !== 'verify' || processAlive(r.pid, r.lstart) || liveVerifyGroup(root, r.id) !== null) return false
-  try {
-    unlinkSync(lockOf(root))
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+  const checkout = { root, ...gitDirs(root) }
+  // La propia puede ser la legacy: cada reserva se revisa una sola vez.
+  const own = ownReservation(root, 'verify')
+  const legacy = readHandle(lockPath(checkout, 'legacy'), 'legacy', checkout)
+  let released = false
+  for (const h of [own, legacy?.path === own?.path ? undefined : legacy]) {
+    if (!h || h.kind !== 'verify' || processAlive(h.pid, h.lstart) || liveVerifyGroup(root, h.id, h) !== null) continue
+    const result = releaseAndReport(h)
+    if (result.state === 'released') released = true
   }
-  return true
-}
-
-/** Libera la reserva solo si es de esta corrida. */
-export function releaseWriter(root: string, id: string): void {
-  if (readReservation(root)?.id !== id) return
-  try {
-    unlinkSync(lockOf(root))
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
-  }
+  return released
 }
 
 export interface InventoryEntry { type: 'file' | 'dir' | 'link'; mode: number; hash?: string; target?: string }
-export interface Flagged { path: string; before?: InventoryEntry; after?: InventoryEntry }
+/**
+ * Una diferencia de la cosecha. Las físicas traen `before` y `after`; las de significado de HEAD o de una rama
+ * vigilada traen `kind`, `ref`, `ref_before` y `ref_after` en texto, y `error` cuando la lectura falló.
+ */
+export interface Flagged { path: string; before?: InventoryEntry; after?: InventoryEntry; kind?: 'head' | 'ref'; ref?: string; ref_before?: string; ref_after?: string; error?: string }
 /** El grupo de procesos del writer, para acreditar que un grupo vivo sigue siendo el suyo. */
 export interface GroupIdentity { pid: number; pgid: number; lstart: string | null; argvHash: string }
 
@@ -197,6 +468,8 @@ export interface WriterControl {
   /** Cuándo empezó el supervisor a lanzar al writer. */
   spawning?: string
   inventory: Record<string, InventoryEntry>
+  reservation?: ReservationHandle
+  git_state?: GitState
   runDir: { dev: number; ino: number }
   group?: GroupIdentity
   /** Un writer de fase: el flujo, las tasks pendientes y las huellas de sus insumos al lanzar. */
@@ -231,8 +504,9 @@ export interface PhaseControl {
 const controlFile = (root: string, id: string) => join(storeDir(root, id), 'control.json')
 
 export function writeControl(root: string, c: WriterControl): void {
-  mkdirSync(storeDir(root, c.id), { recursive: true })
-  writeJsonAtomic(controlFile(root, c.id), c)
+  const store = controlStore(root, c)
+  mkdirSync(store, { recursive: true })
+  writeJsonAtomic(join(store, 'control.json'), c)
 }
 
 export function readControl(root: string, id: string): WriterControl {
@@ -240,6 +514,7 @@ export function readControl(root: string, id: string): WriterControl {
   if (!existsSync(file)) {
     throw new SddError('run_not_found', `no existe la corrida ${id} en este checkout`, { next: 'revisa el id y corre el comando desde el checkout que la lanzó' })
   }
+  // Una vez leído el control protegido, quien siga con esta corrida usa `controlStore` y no vuelve a resolver .git.
   return readJson<WriterControl>(file)
 }
 
@@ -317,6 +592,96 @@ export function sensitiveInventory(root: string, dirs: { gitDir: string; commonD
   const { gitDir, commonDir } = dirs
   walkInto(out, commonDir, commonDir, GIT_SKIP)
   if (gitDir !== commonDir) walkInto(out, gitDir, gitDir, GIT_SKIP)
+  return out
+}
+
+/** Inventario nuevo: las refs se comparan por significado y el estado ajeno tiene exclusiones cerradas. */
+export function sensitiveInventoryV2(root: string, dirs: { gitDir: string; commonDir: string } = gitDirs(root)): Record<string, InventoryEntry> {
+  const out: Record<string, InventoryEntry> = {}
+  for (const d of ['.claude', '.codex', '.agents']) walkInto(out, join(root, d), d)
+  walkInto(out, join(root, '.sdd-ai'), '.sdd-ai', SDD_SKIP)
+  const dotGit = entryOf(join(root, '.git'))
+  if (dotGit?.type === 'file') out['.git'] = dotGit
+  // Otro checkout puede borrar un directorio de refs mientras se recorre: uno que ya no está no tiene entradas.
+  const list = (dir: string): string[] => {
+    try { return readdirSync(dir) } catch (e) {
+      if (['ENOENT', 'ENOTDIR'].includes((e as NodeJS.ErrnoException).code ?? '')) return []
+      throw e
+    }
+  }
+  const refLinks = (dir: string) => {
+    for (const name of list(dir)) {
+      const path = join(dir, name)
+      const entry = entryOf(path)
+      if (entry?.type === 'link') out[path] = entry
+      else if (entry?.type === 'dir') refLinks(path)
+    }
+  }
+  const visit = (dir: string, base: string, foreign: boolean) => {
+    const top = entryOf(dir)
+    if (!top) return
+    out[dir] = top
+    if (top.type !== 'dir') return
+    for (const name of list(dir)) {
+      const path = join(dir, name)
+      const rel = path.slice(base.length + 1)
+      const entry = entryOf(path)
+      if (!entry) continue
+      const skip = GIT_SKIP.has(rel) || rel === 'refs' || rel.startsWith('refs/') || rel === 'packed-refs'
+        || rel === 'HEAD' || rel === 'gc.log' || rel === 'gc.pid' || rel === 'rr-cache' || rel.endsWith('.lock')
+        || (foreign && isWorktreeStatePath(rel))
+      // Un enlace en una ruta excluida sigue siendo una diferencia estructural sensible.
+      if (skip && entry.type !== 'link') {
+        if (rel === 'refs' && entry.type === 'dir') refLinks(path)
+        continue
+      }
+      out[path] = entry
+      if (entry.type === 'dir') visit(path, base, foreign)
+    }
+  }
+  visit(dirs.commonDir, dirs.commonDir, dirs.gitDir !== dirs.commonDir)
+  if (dirs.gitDir !== dirs.commonDir) visit(dirs.gitDir, dirs.gitDir, false)
+  return out
+}
+
+const headText = (h: GitState['head']) => `${h.target ?? 'detached'} ${h.commit}`
+const refText = (r: GitState['refs'][string]) => r.exists ? `${r.symbolic ? `${r.symbolic} ` : ''}${r.object && r.object !== r.commit ? `${r.object} ` : ''}${r.commit}` : 'absent'
+
+/**
+ * Las diferencias de significado de HEAD y de cada rama vigilada, leídas por separado: una lectura que falla se
+ * publica en su propio recurso, con el error, y nunca pasa por una cosecha íntegra.
+ */
+function semanticDifferences(checkout: WriterControl['checkout'], before: GitState): Flagged[] {
+  const out: Flagged[] = []
+  const unreadable = (path: string, kind: 'head' | 'ref', refBefore: string, e: unknown): Flagged =>
+    ({ path, kind, ref: path, ref_before: refBefore, ref_after: 'unreadable', error: (e as Error).message })
+  try {
+    const head = readHeadState(checkout)
+    if (JSON.stringify(before.head) !== JSON.stringify(head)) out.push({ path: 'HEAD', kind: 'head', ref: 'HEAD', ref_before: headText(before.head), ref_after: headText(head) })
+  } catch (e) {
+    out.push(unreadable('HEAD', 'head', headText(before.head), e))
+  }
+  for (const [ref, state] of Object.entries(before.refs)) {
+    let now: GitState['refs'][string]
+    try {
+      now = readRefState(checkout, ref)
+    } catch (e) {
+      out.push(unreadable(ref, 'ref', refText(state), e))
+      continue
+    }
+    if (JSON.stringify(state) !== JSON.stringify(now)) out.push({ path: ref, kind: 'ref', ref, ref_before: refText(state), ref_after: refText(now) })
+  }
+  if (before.replace) {
+    try {
+      const now = readReplaceRefs(checkout)
+      for (const ref of [...new Set([...Object.keys(before.replace), ...Object.keys(now)])].sort()) {
+        if (before.replace[ref] !== now[ref]) out.push({ path: ref, kind: 'ref', ref, ref_before: before.replace[ref] ?? 'absent', ref_after: now[ref] ?? 'absent' })
+      }
+    } catch (e) {
+      const known = Object.keys(before.replace)
+      out.push(unreadable('refs/replace/', 'ref', known.length ? `${known.length} reemplazos: ${known.join(', ')}` : 'sin reemplazos', e))
+    }
+  }
   return out
 }
 
@@ -493,10 +858,10 @@ function writeAtomic(file: string, data: Buffer | string): void {
   renameSync(tmp, file)
 }
 
-function headOf(gitDir: string): string | undefined {
+function headOf(gitDir: string, commonDir: string): string | undefined {
   try {
     return execFileSync('git', ['--git-dir', gitDir, 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_COMMON_DIR: commonDir },
     }).trim() || undefined
   } catch {
     return undefined
@@ -511,8 +876,11 @@ export function captureTreeAtBase(root: string, id: string): boolean {
   const { checkout, base } = readControl(root, id)
   const scratch = mkdtempSync(join(tmpdir(), 'sdd-ai-index-'))
   try {
-    const tree = buildIndex({ root: checkout.root, gitDir: checkout.gitDir }, base, join(scratch, 'index'))
-    const baseTree = execFileSync('git', ['--git-dir', checkout.gitDir, 'rev-parse', `${base}^{tree}`], { encoding: 'utf8' }).trim()
+    const tree = buildIndex(checkout, base, join(scratch, 'index'))
+    // La misma pareja de directorios congelados que usó buildIndex: los dos leen el mismo almacén de objetos.
+    const baseTree = execFileSync('git', ['--git-dir', checkout.gitDir, 'rev-parse', `${base}^{tree}`], {
+      encoding: 'utf8', env: { ...process.env, GIT_DIR: checkout.gitDir, ...(checkout.commonDir ? { GIT_COMMON_DIR: checkout.commonDir } : {}) },
+    }).trim()
     return tree === baseTree
   } finally {
     rmSync(scratch, { recursive: true, force: true })
@@ -527,7 +895,7 @@ export function harvestTreeHolds(root: string, id: string): boolean {
     const { checkout, base } = readControl(root, id)
     const scratch = mkdtempSync(join(tmpdir(), 'sdd-ai-index-'))
     try {
-      return buildIndex({ root: checkout.root, gitDir: checkout.gitDir }, base, join(scratch, 'index')) === h.tree
+      return buildIndex(checkout, base, join(scratch, 'index')) === h.tree
     } finally {
       rmSync(scratch, { recursive: true, force: true })
     }
@@ -676,10 +1044,10 @@ const CLAIM_WAIT_MS = 120_000
  */
 export async function freezeHarvest(root: string, id: string, outcome: Outcome, report?: string,
   hooks: { beforeRescue?: () => Promise<void> } = {}): Promise<HarvestRecord> {
-  const dir = storeDir(root, id)
   const control = readControl(root, id)
+  const dir = controlStore(root, control)
   const { checkout } = control
-  const release = () => releaseAt(checkout.commonDir, id)
+  const release = () => releaseAndReport(controlReservation(control))
   const until = Date.now() + CLAIM_WAIT_MS
   for (;;) {
     if (existsSync(harvestFile(dir))) {
@@ -704,9 +1072,12 @@ export async function freezeHarvest(root: string, id: string, outcome: Outcome, 
 
   const indexFile = join(dir, 'harvest.index')
   removeIndex(indexFile)
-  const cap = captureTree({ root: checkout.root, gitDir: checkout.gitDir }, control.base, indexFile)
+  const cap = captureTree(checkout, control.base, indexFile)
   removeIndex(indexFile)
-  const flagged = diffInventory(control.inventory, sensitiveInventory(checkout.root, checkout))
+  const flagged = diffInventory(control.inventory, control.git_state ? sensitiveInventoryV2(checkout.root, checkout) : sensitiveInventory(checkout.root, checkout))
+  if (control.git_state) {
+    flagged.push(...semanticDifferences(checkout, control.git_state))
+  }
   const run = runInventory(checkout.root, id)
   const runAltered = diffInventory(control.preLaunch, run)
   // Un directorio reemplazado por otro igual solo se nota en su inodo.
@@ -719,7 +1090,7 @@ export async function freezeHarvest(root: string, id: string, outcome: Outcome, 
   const record: HarvestRecord = {
     state: outcome.state, ...(outcome.reason ? { reason: outcome.reason } : {}), ...(outcome.detail ? { detail: outcome.detail } : {}),
     base: control.base, tree: cap.tree, files: cap.files, patchFile, flagged, runAltered,
-    headMoved: headOf(checkout.gitDir) !== control.base, ...(report !== undefined ? { report } : {}), endMark: hasEndMark(report ?? ''),
+    headMoved: headOf(checkout.gitDir, checkout.commonDir) !== control.base, ...(report !== undefined ? { report } : {}), endMark: hasEndMark(report ?? ''),
     ...(control.phase ? { phase_inputs: phaseInputs(checkout.root, control.phase) } : {}),
     ...(control.phase?.kind ? chainFacts(checkout.root, control, patchFile) : {}),
   }
@@ -738,17 +1109,5 @@ function phaseInputs(root: string, phase: PhaseControl): 'unchanged' | 'changed'
     return same ? 'unchanged' : 'changed'
   } catch {
     return 'changed'
-  }
-}
-
-/** `releaseWriter` con el directorio común registrado, sin volver a resolverlo. */
-function releaseAt(commonDir: string, id: string): void {
-  const lock = join(commonDir, 'sdd-ai', 'writer.lock')
-  try {
-    if (readJson<Reservation>(lock).id !== id) return
-    unlinkSync(lock)
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code
-    if (code !== 'ENOENT') throw e
   }
 }
