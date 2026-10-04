@@ -3,3 +3,6 @@ node_modules/
 .codex/agents/sdd-ai-*.toml
 .claude/skills/sdd-ai/
 .agents/skills/sdd-ai/
+.claude/skills/sdd-ai-mod/
+mods/sdd-ai/.claude-plugin/types/
+mods/sdd-ai/tsconfig.json

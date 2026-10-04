@@ -13,7 +13,8 @@ import { DISPUTE_OPTIONS, type Question, attestQuestion, disputeQuestion, extraO
 import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
-import { type SkillCheck, doctor } from './doctor.ts'
+import { type ModCheck, type SkillCheck, doctor } from './doctor.ts'
+import { MOD_ADOPTION_MESSAGE, modCopy, modInventory } from './mod-copies.ts'
 import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, readGitState, readHeadState, repoRoot } from './git.ts'
 import { type InitAnswers, applyInit, planInit } from './init.ts'
 import { withLock, withLockAsync } from './lock.ts'
@@ -2107,7 +2108,7 @@ function agents(args: string[], env: Env, cwd: string): Result {
   parseArgs({ args: args.slice(1), strict: true, allowPositionals: false, options: {} })
   const root = repoRoot(cwd)
   const { written, removed } = syncAgents(root, PKG_DIR, nativeProfiles(root, env))
-  return { code: 0, out: { written, removed, next: 'reabre la sesión para que el CLI cargue los agentes y la skill' } }
+  return { code: 0, out: { written, removed, next: `reabre la sesión para que el CLI cargue los agentes y la skill. ${MOD_ADOPTION_MESSAGE}` } }
 }
 
 /**
@@ -3019,6 +3020,26 @@ function skillCheck(cwd: string): SkillCheck {
   return { copies: skillCopies(root, PKG_DIR) }
 }
 
+/** La copia del mod del repo donde corre `doctor`, como la de la skill; fuera de un repo no hay copia que revisar. */
+function modCheck(cwd: string): ModCheck {
+  let root: string
+  try {
+    root = repoRoot(cwd)
+  } catch (e) {
+    if (e instanceof SddError && e.code === 'not_a_repo') return { skipped: 'no es un repositorio Git' }
+    throw e
+  }
+  // Sin una fuente del mod legible no hay con qué comparar la copia: es una instalación rota, doctor la informa como
+  // fallo y sigue con lo demás.
+  let inventory: ReturnType<typeof modInventory>
+  try {
+    inventory = modInventory(PKG_DIR)
+  } catch (e) {
+    return { unavailable: `la fuente del mod no se puede leer: ${e instanceof Error ? e.message : String(e)}` }
+  }
+  return { copies: [modCopy(root, inventory)] }
+}
+
 /** `recall` no tiene opciones: todo lo que sigue es el tema, también una palabra que empieza con `-`. */
 function recallCommand(rest: string[], env: Env, cwd: string): Result {
   const topic = (rest[0] === '--' ? rest.slice(1) : rest).join(' ').trim()
@@ -3068,7 +3089,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
       case 'recall': return recallCommand(rest, env, cwd)
       case 'sdd': return await sdd(rest, env, cwd)
       case 'doctor': {
-        const report = doctor(undefined, skillCheck(cwd))
+        const report = doctor(undefined, skillCheck(cwd), modCheck(cwd))
         return { code: report.ok ? 0 : 1, out: report }
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }

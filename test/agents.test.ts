@@ -9,6 +9,8 @@ import {
 } from '../src/agents.ts'
 import { READ_ONLY_ROLES, WEB_ROLES } from '../src/types.ts'
 import { makeRepo } from './helpers.ts'
+import { copyModSource } from './mod-fixture.ts'
+import { MOD_PATH, modInventory } from '../src/mod-copies.ts'
 
 const SOURCE = '---\ndescription: Worker read-only\n---\nLee tu encargo.\n'
 const src = parseAgentSource(SOURCE)
@@ -26,6 +28,7 @@ function makePkg(): string {
   mkdirSync(join(pkg, 'skills', 'sdd-ai'), { recursive: true })
   writeFileSync(join(pkg, 'agents', 'worker.md'), SOURCE)
   writeFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'), '---\nname: sdd-ai\ndescription: x\n---\ncuerpo\n')
+  copyModSource(pkg)
   return pkg
 }
 
@@ -86,12 +89,13 @@ test('el hash cambia si cambia el perfil de cualquier familia', () => {
 test('sync genera un agente por rol de solo lectura y familia', () => {
   const root = mkdtempSync(join(tmpdir(), 'sdd-ai-root-'))
   const p = profiles({ refute: { claude: { model: 'sonnet', effort: 'high' }, codex: { model: 'gpt-6-sol' } } })
-  const { written, removed } = syncAgents(root, makePkg(), p)
+  const pkg = makePkg()
+  const { written, removed } = syncAgents(root, pkg, p)
   const expected = [
     ...READ_ONLY_ROLES.flatMap((r) => [`.claude/agents/sdd-ai-${r}.md`, `.codex/agents/sdd-ai-${r}.toml`]),
     '.claude/skills/sdd-ai/SKILL.md', '.agents/skills/sdd-ai/SKILL.md',
+    ...modInventory(pkg).map((file) => `${MOD_PATH}/${file.path}`),
   ].map((f) => join(root, f))
-  assert.equal(expected.length, 16)
   assert.deepEqual([...written].sort(), [...expected].sort())
   for (const f of expected) assert.equal(existsSync(f), true)
   assert.deepEqual(removed, [])

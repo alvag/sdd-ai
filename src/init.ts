@@ -8,6 +8,7 @@ import { agentName, agentsState, leftoverAgents, skillCopies, syncAgents } from 
 import { parseCrossModel, parseJiraMode } from './config.ts'
 import { type Exec, cliVersion, defaultExec, detectClis, doctor, olderVersion } from './doctor.ts'
 import { gitDirs } from './git.ts'
+import { MOD_ADOPTION_MESSAGE, MOD_PATH, MOD_RUNTIME_FILES, type ModFile, assertModCopyInside, modChanges, modCopy, modInventory } from './mod-copies.ts'
 import { DEFAULT_PROFILES, type WorkersFile, loadCodexCatalog, loadCodexRoot, parseWorkers } from './profiles.ts'
 import { roleProfiles } from './resolve.ts'
 import { type Family, READ_ONLY_ROLES, RETIRED_ROLES, ROLES, type Role, SddError } from './types.ts'
@@ -23,7 +24,7 @@ const IGNORE_PATH = '.sdd-ai/.gitignore'
 /** Las fuentes de las que `agents sync` genera los agentes y las copias de la skill. */
 const AGENT_SOURCES = ['agents/worker.md', 'skills/sdd-ai/SKILL.md']
 /** Lo que tiene todo checkout de sdd-ai: sin esto, los hooks y la skill no tienen a qué llamar. */
-const RUNTIME_FILES = ['bin/sdd-ai', 'bin/sdd-ai-hook', ...AGENT_SOURCES]
+const RUNTIME_FILES = ['bin/sdd-ai', 'bin/sdd-ai-hook', ...AGENT_SOURCES, ...MOD_RUNTIME_FILES]
 const FAMILIES: readonly Family[] = ['claude', 'codex']
 const HOOK_FILES: Record<Family, string> = { claude: '.claude/settings.json', codex: '.codex/hooks.json' }
 /** Los eventos en los que cada CLI tiene que llamar al lanzador. Codex no tiene `PostToolUseFailure`. */
@@ -70,7 +71,8 @@ export interface InitResult {
 }
 
 /** El plan y lo que la aplicación necesita de él. */
-interface Planned { plan: InitPlan; workers: WorkersFile | null }
+/** El plan, los workers y el inventario del mod que lo respaldan: el mismo alimenta la comparación, el digest y la copia. */
+interface Planned { plan: InitPlan; workers: WorkersFile | null; inventory: ModFile[] }
 
 function readText(path: string): string | null {
   try {
@@ -391,7 +393,7 @@ function plansIgnored(root: string): boolean | null {
  * Las copias de agentes y de la skill que `agents sync` cambiaría, desde las fuentes del checkout, y los
  * agentes sobrantes que borraría.
  */
-function agentChanges(root: string, workers: WorkersFile, env: Env): AgentChange[] {
+function agentChanges(root: string, workers: WorkersFile, env: Env, inventory: readonly ModFile[]): AgentChange[] {
   const profiles = roleProfiles(workers, loadCodexRoot(env))
   const out: AgentChange[] = []
   for (const role of READ_ONLY_ROLES) {
@@ -402,6 +404,7 @@ function agentChanges(root: string, workers: WorkersFile, env: Env): AgentChange
   }
   for (const copy of skillCopies(root, root)) if (copy.state !== 'ok') out.push({ path: copy.path, state: copy.state })
   for (const file of leftoverAgents(root)) out.push({ path: relative(root, file), state: 'leftover' })
+  out.push(...modChanges(root, inventory))
   return out
 }
 
@@ -414,6 +417,9 @@ const OLDER_GENERATION = /^(?:Older|Previous generation|Legacy)\b/i
 
 function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): Planned {
   assertCheckout(root)
+  // Una sola lectura de la fuente del mod: la comparación, el digest y la aplicación usan los mismos bytes.
+  const inventory = modInventory(root)
+  assertModCopyInside(root)
   const userSnapshot = readUserConfig(env.HOME ?? homedir())
   const user_config = planUserTelemetry(userSnapshot, answers.telemetry)
   const configText = readText(join(root, CONFIG_PATH))
@@ -473,7 +479,7 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
   const ignoreText = readText(join(root, IGNORE_PATH))
   files.push(ignoreText === null ? { path: IGNORE_PATH, action: 'create', content: '*\n' } : { path: IGNORE_PATH, action: 'unchanged' })
 
-  const agents = workers === null ? [] : agentChanges(root, workers, env)
+  const agents = workers === null ? [] : agentChanges(root, workers, env, inventory)
   const notes: Note[] = [...hookNotes(root)]
   notes.push({ code: 'codex_hooks_approval', detail: 'Codex ejecuta los hooks del proyecto recién después de aprobarlos en /hooks, y vuelve a pedirlo cuando cambian' })
   if (!existsSync(join(root, 'node_modules'))) {
@@ -520,6 +526,7 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
       source_config: sha(sourceConfig), source_workers: sha(sourceWorkers),
       catalog: loaded === null ? null : [...loaded.slugs].sort(), catalog_client: loaded?.clientVersion ?? null, codex_version: codexVersion, detected,
       agent_sources: AGENT_SOURCES.map((rel) => sha(readText(join(root, rel)))), codex_root: loadCodexRoot(env),
+      mod_sources: inventory.map(({ path, sha256 }) => ({ path, sha256 })),
       hooks: FAMILIES.map((f) => sha(readQuiet(join(root, HOOK_FILES[f])))),
     },
     files, agents, notes, user_config,
@@ -538,7 +545,7 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
       { label: 'on', description: 'Una línea privada por intento cerrado.', value: 'on' },
     ],
   })
-  return { plan, workers }
+  return { plan, workers, inventory }
 }
 
 /** El ensayo: el plan completo, sin escribir nada. */
@@ -555,7 +562,7 @@ function writeAtomic(file: string, content: string): void {
 
 /** Valida el digest antes de escribir el checkout; un fallo de preferencia se informa por separado. */
 export function applyInit(root: string, answers: InitAnswers, digest: string, env: Env, o: InitOptions): InitResult {
-  const { plan, workers } = compute(root, answers, env, o)
+  const { plan, workers, inventory } = compute(root, answers, env, o)
   if (plan.digest !== digest) {
     throw new SddError('digest_mismatch', `el plan cambió desde el ensayo: su digest es ${plan.digest}, no ${digest}`, {
       next: `vuelve a ensayar y muéstrale el plan nuevo al usuario: ${o.command()}`,
@@ -568,7 +575,7 @@ export function applyInit(root: string, answers: InitAnswers, digest: string, en
       written.push(f.path)
     }
   }
-  const agents = plan.agents.length > 0 && workers !== null ? syncAgents(root, root, roleProfiles(workers, loadCodexRoot(env))) : null
+  const agents = plan.agents.length > 0 && workers !== null ? syncAgents(root, root, roleProfiles(workers, loadCodexRoot(env)), inventory) : null
   let userWritten = false
   try {
     writeUserTelemetry(plan.user_config)
@@ -580,10 +587,11 @@ export function applyInit(root: string, answers: InitAnswers, digest: string, en
   const closing = [
     `Los perfiles de ${WORKERS_PATH} y las claves de la config que init no pregunta se cambian a mano.`,
     ...(agents === null ? [] : ['Reabre la sesión para que el CLI cargue los agentes y la skill.']),
+    ...(plan.agents.some((change) => change.path.startsWith(`${MOD_PATH}/`)) ? [MOD_ADOPTION_MESSAGE] : []),
   ].join(' ')
   return {
     mode: 'applied', root, written, agents, workers: plan.workers, notes: plan.notes,
     user_config: { path: plan.user_config.path, action: plan.user_config.action, written: userWritten },
-    doctor: doctor(o.exec, { copies: skillCopies(root, root) }), closing,
+    doctor: doctor(o.exec, { copies: skillCopies(root, root) }, { copies: [modCopy(root, inventory)] }), closing,
   }
 }

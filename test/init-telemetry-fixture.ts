@@ -3,11 +3,13 @@ import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { makeFakeBin, makeRepo } from './helpers.ts'
+import { copyModSource } from './mod-fixture.ts'
 
 export function initTelemetryFixture(sharedHome?: string) {
   const root = makeRepo()
   const home = sharedHome ?? realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-init-telemetry-')))
   const source = join(import.meta.dirname, '..')
+  copyModSource(root)
   for (const rel of ['agents/worker.md','skills/sdd-ai/SKILL.md']) {
     mkdirSync(dirname(join(root, rel)), { recursive: true }); copyFileSync(join(source, rel), join(root, rel))
   }

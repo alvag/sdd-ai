@@ -8,6 +8,8 @@ description: Delega una tarea de solo lectura (explorar, buscar, resumir código
 El binario decide qué familia hace el trabajo y por qué vía. Tú escribes el encargo, sigues lo que
 responde y le preguntas al usuario ante cualquier fallo. Todo comando imprime un JSON.
 
+El mod de presentación es exclusivo de Claude Code; consulta `mods/sdd-ai/README.md` desde la raíz del repositorio.
+
 ## 1. Escribe el encargo
 
 Escribe el encargo en un archivo temporal fuera del repositorio. El worker no ve esta conversación:

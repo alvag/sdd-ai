@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { parse } from 'yaml'
+import { type ModFile, assertModCopyInside, modInventory, syncModCopy } from './mod-copies.ts'
 import { type Family, type Profile, READ_ONLY_ROLES, type ReadOnlyRole, SddError, WEB_ROLES } from './types.ts'
 
 export interface AgentSource { description: string; body: string; raw: string }
@@ -118,9 +119,14 @@ function removeLeftovers(root: string): string[] {
   return removed
 }
 
-/** Genera un agente por rol de solo lectura para los dos CLIs, borra los que sobran e instala la skill. */
-export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles): { written: string[]; removed: string[] } {
+/**
+ * Genera un agente por rol de solo lectura para los dos CLIs, borra los que sobran e instala la skill y la copia del mod.
+ * `inventory` es el del mod que ya leyó quien llama (init, el mismo de su digest); sin él, se lee de `pkgDir`.
+ */
+export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles, inventory: readonly ModFile[] = modInventory(pkgDir)): { written: string[]; removed: string[] } {
   const src = readSource(pkgDir)
+  // Antes de escribir nada: la copia del mod no puede salir del checkout.
+  assertModCopyInside(root)
   const written: string[] = []
   for (const role of READ_ONLY_ROLES) {
     for (const family of FAMILIES) {
@@ -136,7 +142,8 @@ export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles)
     copyFileSync(join(pkgDir, 'skills', 'sdd-ai', 'SKILL.md'), dest)
     written.push(dest)
   }
-  return { written, removed }
+  const mod = syncModCopy(root, inventory)
+  return { written: [...written, ...mod.written], removed: [...removed, ...mod.removed] }
 }
 
 /** Una copia instalada de la skill, con su ruta relativa a la raíz del repo. */

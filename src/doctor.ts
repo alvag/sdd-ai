@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process'
 import type { SkillCopy } from './agents.ts'
+import type { ModCopy } from './mod-copies.ts'
 import type { Family, WorkerTask } from './types.ts'
 import { claudeLaunch, claudeResume, claudeReviewLaunch, claudeWriterLaunch } from './workers/claude.ts'
 import { codexLaunch, codexResume, codexReviewLaunch, codexWriterLaunch } from './workers/codex.ts'
@@ -17,6 +18,14 @@ export interface CliReport {
 export type SkillCheck = { copies: SkillCopy[] } | { skipped: string }
 
 type SkillReport = { copies: SkillCopy[]; next?: string } | { skipped: string }
+/**
+ * La copia del mod: comparada con su fuente, omitida fuera de un repo, o `unavailable` si la fuente del mod falta o no
+ * se puede leer, que es una instalación rota y hace fallar `ok` como la falta del runtime en `init`.
+ */
+export type ModCheck = { copies: ModCopy[] } | { skipped: string } | { unavailable: string }
+type ModReport = { copies: ModCopy[]; next?: string } | { skipped: string } | { unavailable: string; next: string }
+/** Lo que recomienda `doctor` ante una copia de la skill o del mod ausente o desactualizada. */
+const SYNC_NEXT = './bin/sdd-ai agents sync'
 
 const SAMPLE: WorkerTask = {
   cwd: '/r', promptFile: '/r/p', resultFile: '/r/o', sessionId: 's', model: 'm', effort: 'high',
@@ -92,9 +101,10 @@ export function cliVersion(exec: Exec, family: Family): string | null {
 
 /**
  * Contrato con los CLIs instalados: están en PATH y aceptan cada flag que emite sdd-ai. Con las copias
- * de la skill, también que coincidan con su fuente.
+ * de la skill y la del mod, también que coincidan con su fuente: una copia ausente o desactualizada hace
+ * fallar `ok` y trae la recomendación de sincronizar.
  */
-export function doctor(exec: Exec = defaultExec, skill?: SkillCheck): { ok: boolean; clis: CliReport[]; skill?: SkillReport } {
+export function doctor(exec: Exec = defaultExec, skill?: SkillCheck, mod?: ModCheck): { ok: boolean; clis: CliReport[]; skill?: SkillReport; mod?: ModReport } {
   const clis = (['claude', 'codex'] as Family[]).map((family): CliReport => {
     const v = exec(family, ['--version'])
     if (v.status === null) return { family, inPath: false, flags: [] }
@@ -109,8 +119,16 @@ export function doctor(exec: Exec = defaultExec, skill?: SkillCheck): { ok: bool
     return report
   })
   const cliOk = clis.every((c) => c.inPath && c.flags.every((f) => f.present))
-  if (!skill) return { ok: cliOk, clis }
-  if ('skipped' in skill) return { ok: cliOk, clis, skill }
-  const skillOk = skill.copies.every((c) => c.state === 'ok')
-  return { ok: cliOk && skillOk, clis, skill: skillOk ? skill : { ...skill, next: './bin/sdd-ai agents sync' } }
+  const skillOk = !skill || 'skipped' in skill || skill.copies.every((c) => c.state === 'ok')
+  const modOk = !mod || 'skipped' in mod || ('copies' in mod && mod.copies.every((c) => c.state === 'ok'))
+  return {
+    ok: cliOk && skillOk && modOk, clis,
+    ...(skill ? { skill: skillOk ? skill : { ...skill, next: SYNC_NEXT } } : {}),
+    ...(mod ? { mod: modReport(mod, modOk) } : {}),
+  }
+}
+
+function modReport(mod: ModCheck, ok: boolean): ModReport {
+  if ('unavailable' in mod) return { ...mod, next: 'restaura mods/sdd-ai en el checkout de sdd-ai (git checkout -- mods/sdd-ai) y repite doctor' }
+  return ok || 'skipped' in mod ? mod : { ...mod, next: SYNC_NEXT }
 }

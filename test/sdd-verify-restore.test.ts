@@ -11,7 +11,7 @@ import { confirmationOutcome, evaluateRow, executeRows, patternMatches, prepareV
 import { type TestRow, admitVerification } from '../src/sdd/verification-contract.ts'
 import { acquireReservation, ownReservation, flowWriterRuns, releaseReservation } from '../src/writer-store.ts'
 import { createHash } from 'node:crypto'
-import { makeRepo } from './helpers.ts'
+import { makeFakeBin, makeRepo } from './helpers.ts'
 import {
   realpathTmp, baseRepo, realTap, TAP_FILES, EXEC, TROW, cmd, RED_ROW, BUILD_ROW, approveAll, verifyFlow, statusOf,
   final, asyncCode, fakeHarvest, cli,
@@ -172,15 +172,20 @@ test('con una verificación en curso, un writer concurrente se niega; y doctor t
   writeFileSync(join(repo, '.sdd-ai', 'config.yml'), 'cross_model:\n  schema_version: 1\n  families: [codex, claude]\n  selection: full\n')
   const encargo = join(realpathTmp(), 'encargo.md')
   writeFileSync(encargo, 'nada\n')
+  // CLIs falsos en el PATH: el verbo comprueba que estén antes de mirar la reserva, y ninguno llega a correr.
+  const bins = realpathTmp()
+  makeFakeBin(bins, 'claude')
+  makeFakeBin(bins, 'codex')
+  const env = { PATH: `${bins}:${process.env.PATH ?? ''}` }
   // Intención abierta con el dueño vivo: el verbo del writer se detiene antes de lanzar.
   const intent = prepareIntent(repo, '20260929-1700-aaaa', base, ['src/a.ts'])
   writeRestoreIntent(repo, intent)
-  assert.equal(cli(repo, {}, 'run', '--role', 'implement', '--prompt-file', encargo).out.code, 'verify_in_progress')
+  assert.equal(cli(repo, env, 'run', '--role', 'implement', '--prompt-file', encargo).out.code, 'verify_in_progress')
   // Sin intención pero con la reserva de la verificación tomada: writer_open.
   closeRestoreIntent(repo)
   const verifying = acquireReservation(repo, '20260929-1700-aaaa', 'verify')
   assert.ok(verifying.ok)
-  assert.equal(cli(repo, {}, 'run', '--role', 'implement', '--prompt-file', encargo).out.code, 'writer_open')
+  assert.equal(cli(repo, env, 'run', '--role', 'implement', '--prompt-file', encargo).out.code, 'writer_open')
   for (const handle of verifying.handles) assert.equal(releaseReservation(handle).state, 'released')
   // Una intención de un dueño muerto la resuelve también doctor.
   writeRestoreIntent(repo, { ...intent, owner_pid: spawnSync(process.execPath, ['-e', '']).pid as number, owner_lstart: null })

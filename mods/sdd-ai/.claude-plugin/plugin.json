@@ -1,0 +1,7 @@
+{
+  "name": "sdd-ai-mod",
+  "version": "0.1.0",
+  "description": "Presentación de las salidas de sdd-ai en la terminal de Claude Code.",
+  "author": { "name": "Max Alva" },
+  "types": "./types/index.d.ts"
+}

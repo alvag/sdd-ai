@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { parse } from 'yaml'
 import { makeFakeBin, makeRepo } from './helpers.ts'
+import { copyModSource } from './mod-fixture.ts'
 
 const ROOT = join(import.meta.dirname, '..')
 const BIN = join(ROOT, 'bin', 'sdd-ai')
@@ -48,6 +49,7 @@ function environment(bins: Array<'claude' | 'codex'>, catalog: Catalog | null, v
 function checkout(o: Options = {}): Checkout {
   const repo = makeRepo()
   if (o.sources !== false) {
+    copyModSource(repo)
     for (const rel of SOURCES) {
       mkdirSync(dirname(join(repo, rel)), { recursive: true })
       copyFileSync(join(ROOT, rel), join(repo, rel))

@@ -12,7 +12,9 @@
   "scripts": {
     "test": "node --import ./test/no-subprocess.ts --test \"test/**/*.test.ts\"",
     "test:unit": "node --import ./test/no-subprocess.ts --test \"test/**/*.unit.test.ts\"",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:mods": "node scripts/mods.mjs test",
+    "typecheck:mods": "node scripts/mods.mjs typecheck"
   },
   "dependencies": {
     "yaml": "^2.9.1"
