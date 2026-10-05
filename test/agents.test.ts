@@ -58,6 +58,13 @@ test('un cuerpo con triple comilla simple no cabe en el TOML', () => {
   assert.throws(() => renderCodexAgent(parseAgentSource(SOURCE.replace('Lee', "'''Lee")), 'explore', {}, 'h1'))
 })
 
+test('una fuente con CRLF da los mismos agentes y el mismo hash que con LF', () => {
+  const crlf = parseAgentSource(SOURCE.replace(/\n/g, '\r\n'))
+  assert.deepEqual(crlf, src)
+  assert.equal(renderClaudeAgent(crlf, 'explore', {}, 'h1'), renderClaudeAgent(src, 'explore', {}, 'h1'))
+  assert.equal(sourceHash(crlf, profiles().explore), sourceHash(src, profiles().explore))
+})
+
 test('una fuente sin description no es válida', () => {
   assert.throws(() => parseAgentSource('---\nname: x\n---\ncuerpo\n'))
 })
