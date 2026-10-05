@@ -9,7 +9,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
 import { type RoleProfiles, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
 import { type Proof, askNext, prove } from './approval/proof.ts'
-import { DISPUTE_OPTIONS, type Question, attestQuestion, disputeQuestion, extraOptions, extraQuestion, gateQuestionFor } from './approval/question.ts'
+import { DISPUTE_OPTIONS, type Question, attestQuestion, disputeQuestion, extraOptions, extraQuestion } from './approval/question.ts'
 import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
@@ -37,8 +37,9 @@ import {
 import { fits, renderMaterial, renderReviewPrompt } from './review/prompt.ts'
 import { type Risk, type RiskRecord, classify, classifyDelta, readRisk } from './review/risk.ts'
 import {
-  checkRunId, createRun, isAlive, markDelivered, newRunId, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic,
+  checkRunId, createRun, isAlive, markDelivered, newRunId, onStatusWritten, ownerSession, readJson, readStatus, runDir, setStatus, writeJsonAtomic,
 } from './runs.ts'
+import { publishNow, publisherKind, requestedClock, requestPublication, runRoot } from './projection.ts'
 import {
   ARTIFACT_NOTE, type ArgvFile, type ExecutionContext, type JobRecord, type PhaseResult, type ReviewJob, type RoundRecord, declaredBatches, jobSummary, settleGroup, supervise,
   writeReceipt,
@@ -69,7 +70,8 @@ import { FILE_NAMES, type FlowRead, LOCK_FILE, artifactHash, bytesHash, flowDir,
 import { recoverPendingRestore } from './sdd/restore.ts'
 import { isFlowId } from './sdd/id.ts'
 import { assertNoBlockers, checkApplyInput, readAntecedents, renderAntecedents, startApply, startChecks, startPreview } from './sdd/start.ts'
-import { type FlowStatus, headerData, resolve as resolveFlow } from './sdd/status.ts'
+import { headerData, resolve as resolveFlow } from './sdd/status.ts'
+import { detailedFlowView, nextOf } from './sdd/view.ts'
 import { type ManualRow, type VerificationRow, readVerification } from './sdd/verification-contract.ts'
 import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal } from './sdd/verify.ts'
 import { type VerifyReceipt, type VerifyReceiptRef, readVerifyReceipt, receiptDir } from './sdd/verify-receipt.ts'
@@ -2186,21 +2188,10 @@ function prune(rest: string[], cwd: string): Result {
 
 const PHASE_STEPS: readonly string[] = ['specify', 'plan', 'tasks', 'implement']
 
-/**
- * El `next` de `sdd status <id>`: en un gate, la pregunta que el conductor le hace al usuario antes de
- * `sdd approve`; en una fase, el comando que la lanza o por qué no hay comando.
- */
-function nextOf(root: string, status: FlowStatus, facts: FlowRead['facts']): Record<string, unknown> {
-  if (status.next.step === 'gate' && status.next.gate !== undefined && status.depth !== null) {
-    return { ...status.next, question: gateQuestionFor(status.id, status.depth, status.next.gate, facts.fingerprints) }
-  }
-  return { ...withPhaseNext(root, status.id, status) }
-}
-
 /** El `next` que daría `sdd status <id>` ahora. */
 function flowNext(root: string, flow: string): Record<string, unknown> {
   const { facts } = readFlow(root, flow)
-  return nextOf(root, resolveFlow(facts), facts)
+  return { ...nextOf(root, resolveFlow(facts), facts) }
 }
 
 /** Lo que `sdd phase` deja en `request.json`: el reintento de una caída se arma con esto. */
@@ -2791,9 +2782,7 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
     if (positionals.length > 1) throw new SddError('usage', 'sdd status recibe un solo id', { next: './bin/sdd-ai sdd status [<id>]' })
     const root = repoRoot(cwd)
     if (positionals.length === 0) return { code: 0, out: { flows: listFlows(root).map((e) => ({ ...e, next: withPhaseNext(root, e.id, e) })) } }
-    const { facts } = readFlow(root, positionals[0])
-    const status = resolveFlow(facts)
-    return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
+    return { code: 0, out: detailedFlowView(root, positionals[0]) }
   }
   if (sub === 'approve') {
     const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { conductor: { type: 'string' } } })
@@ -2910,6 +2899,8 @@ async function sddVerify(args: string[], env: Env, cwd: string): Promise<Result>
   }
   const guard = values.baseline ? undefined : treeGuard(root, id, values.takeover ? { reason: values.reason } : undefined)
   const start = prepareVerify(root, id, values.baseline ? 'baseline' : 'final', guard ? { guard } : {})
+  // La toma ya cerró la cadena del writer y las filas pueden tardar minutos: se publica sin esperarlas.
+  if (values.takeover) requestPublication(root, 'cli:sdd verify --takeover', 'cli')
   const controller = new AbortController()
   const stop = () => controller.abort()
   process.once('SIGINT', stop)
@@ -3074,8 +3065,35 @@ function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string)
   recoverPendingRestore(root, READS(cmd, rest) ? 'non_blocking' : 'blocking')
 }
 
+/**
+ * Cada verbo pide publicar la proyección después de cada `status.json` que escribe y una vez más al terminar,
+ * después de soltar sus locks, también si falló a mitad de camino: así la proyección refleja lo que quedó y la
+ * primera actividad normal adopta los estados existentes. Un repositorio sin `.sdd-ai/` no se toca. Publicar
+ * corre en otro proceso y no cambia la salida, el código ni las decisiones del verbo.
+ */
 export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {
   const [cmd, ...rest] = argv
+  const previous = onStatusWritten((dir) => {
+    const root = runRoot(dir)
+    if (root !== null) requestPublication(root, `status:${cmd}`, 'cli')
+  })
+  try {
+    return await verb(cmd, rest, env, cwd)
+  } finally {
+    onStatusWritten(previous)
+    // El supervisor publica por su cuenta; `doctor` puede correr fuera de un checkout de sdd-ai.
+    if (cmd !== '__supervise' && cmd !== '__publish' && cmd !== 'doctor') {
+      try {
+        const root = repoRoot(cwd)
+        if (existsSync(join(root, '.sdd-ai'))) requestPublication(root, `cli:${[cmd, rest[0]].filter(Boolean).join(' ')}`, 'cli')
+      } catch {
+        // Fuera de un repositorio no hay proyección.
+      }
+    }
+  }
+}
+
+async function verb(cmd: string | undefined, rest: string[], env: Env, cwd: string): Promise<Result> {
   try {
     recoverBeforeVerb(cmd, rest, cwd)
     switch (cmd) {
@@ -3093,6 +3111,12 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
         return { code: report.ok ? 0 : 1, out: report }
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }
+      // Interno: lo lanza `requestPublication` en segundo plano, con la raíz, el origen, el publicador, el momento del
+      // pedido y su reloj monotónico.
+      case '__publish': {
+        if (rest[0]) publishNow(rest[0], rest[1] ?? 'unknown', publisherKind(rest[2]), Number(rest[3]) || Date.now(), requestedClock(rest[4]))
+        return { code: 0, out: {} }
+      }
       default:
         throw new SddError('usage', `comando desconocido: ${cmd ?? ''}`, { next: 'usa init | prune | recall | run | review | wait | cancel | agents sync | sdd start | sdd status | sdd approve | sdd commit | doctor' })
     }

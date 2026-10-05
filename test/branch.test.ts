@@ -36,7 +36,7 @@ function setup(o: { id?: string; approved?: boolean; depth?: string; slug?: stri
   scratch.push(root)
   for (const dir of ['repo', 'bin', 'home']) mkdirSync(join(root, dir))
   symlinkSync(process.execPath, join(root, 'bin', 'node'))
-  const s: Setup = { root, repo: join(root, 'repo'), env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: join(root, 'home') }, id: o.id ?? 'mi-flujo', base: '' }
+  const s: Setup = { root, repo: join(root, 'repo'), env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: join(root, 'home'), SDD_AI_PROJECTION: 'off' }, id: o.id ?? 'mi-flujo', base: '' }
   git(s, 'init', '-q', '-b', 'main')
   put(join(s.repo, 'base.txt'), 'base\n')
   git(s, 'add', 'base.txt')

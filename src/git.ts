@@ -24,9 +24,34 @@ function git(root: string, args: string[]): string {
   })
 }
 
+/**
+ * Las respuestas de Git que no cambian dentro de una misma lectura, mientras dura `withGitMemo`. Fuera de esa
+ * lectura cada llamada pregunta de nuevo, como siempre.
+ */
+let memo: Map<string, unknown> | null = null
+
+/** Corre `fn` resolviendo una sola vez los directorios de Git y el remoto de cada raíz. */
+export function withGitMemo<T>(fn: () => T): T {
+  const outer = memo
+  memo ??= new Map()
+  try {
+    return fn()
+  } finally {
+    memo = outer
+  }
+}
+
+function remembered<T>(key: string, compute: () => T): T {
+  if (memo === null) return compute()
+  if (memo.has(key)) return memo.get(key) as T
+  const value = compute()
+  memo.set(key, value)
+  return value
+}
+
 /** Si el repositorio tiene al menos un remoto configurado. */
 export function hasRemote(root: string): boolean {
-  return git(root, ['remote']).trim() !== ''
+  return remembered(`remote:${root}`, () => git(root, ['remote']).trim() !== '')
 }
 
 /** El commit de `HEAD`, o nada si todavía no hay ninguno. */
@@ -127,8 +152,10 @@ export function switchBranch(root: string, name: string): void {
 
 /** El directorio de Git del checkout y el común, con rutas reales: en un worktree son distintos. */
 export function gitDirs(root: string): { gitDir: string; commonDir: string } {
-  const [gitDir, commonDir] = git(root, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir']).trim().split('\n')
-  return { gitDir: realpathSync(gitDir), commonDir: realpathSync(commonDir) }
+  return remembered(`dirs:${root}`, () => {
+    const [gitDir, commonDir] = git(root, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir']).trim().split('\n')
+    return { gitDir: realpathSync(gitDir), commonDir: realpathSync(commonDir) }
+  })
 }
 
 /**

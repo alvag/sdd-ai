@@ -300,7 +300,7 @@ const DISPATCH = { claude: 'pre-tool-use-agent', codex: 'pre-tool-use-spawn-agen
 const canonical = (file: string) => `Tu encargo está en ${file}. Léelo completo y cúmplelo.`
 
 function sdd(repo: string, cli: Cli, args: string[], session = 's1'): Out {
-  const env: Record<string, string> = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')) }
+  const env: Record<string, string> = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')), SDD_AI_PROJECTION: 'off' }
   if (cli === 'claude') Object.assign(env, { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: session })
   else Object.assign(env, { CODEX_THREAD_ID: 't', CODEX_SESSION_ID: session })
   const r = spawnSync(BIN, args, { cwd: repo, env, encoding: 'utf8' })

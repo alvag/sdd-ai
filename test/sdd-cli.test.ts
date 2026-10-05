@@ -33,7 +33,7 @@ const sessions = new Map<string, Record<string, string>>()
 function envOf(repo: string): Record<string, string> {
   let env = sessions.get(repo)
   if (env === undefined) {
-    env = { HOME: process.env.HOME ?? '', PATH: process.env.PATH ?? '', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: outsideDir() }
+    env = { HOME: process.env.HOME ?? '', PATH: process.env.PATH ?? '', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: outsideDir(), SDD_AI_PROJECTION: 'off' }
     sessions.set(repo, env)
   }
   return env

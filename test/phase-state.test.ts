@@ -97,7 +97,7 @@ test('el registro de fases vive en el flujo, bajo el lock de sdd approve, y la c
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 const sddStatus = (repo: string, ...args: string[]) => {
-  const r = spawnSync(BIN, ['sdd', 'status', ...args], { cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME } })
+  const r = spawnSync(BIN, ['sdd', 'status', ...args], { cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, SDD_AI_PROJECTION: 'off' } })
   return JSON.parse(r.stdout)
 }
 const sessionLine = (repo: string, id: string): string => {

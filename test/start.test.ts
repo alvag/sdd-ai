@@ -34,7 +34,7 @@ function setup(o: { commits?: boolean; codex?: boolean; families?: string } = {}
   for (const path of [s.repo, s.bin, join(root, 'home'), join(root, 'codexhome')]) mkdirSync(path)
   symlinkSync(process.execPath, join(s.bin, 'node'))
   s.env = { PATH: `${s.bin}:/usr/bin:/bin`, HOME: join(root, 'home'), CODEX_HOME: join(root, 'codexhome'),
-    CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 's-start', FAKE_MODE: 'ok-codex' }
+    CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 's-start', FAKE_MODE: 'ok-codex', SDD_AI_PROJECTION: 'off' }
   for (const family of o.codex === false ? ['claude'] : ['claude', 'codex']) {
     put(join(s.bin, family), '#!/bin/sh\nexit 0\n')
     chmodSync(join(s.bin, family), 0o755)

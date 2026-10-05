@@ -77,6 +77,22 @@ export interface AttemptMetrics {
 export type JobProgress =
   | { phase: 'review'; key: string; reviewer: Reviewer; batch: number; index: number; total: number }
   | { phase: 'refutation'; key: string; index: number; total: number }
+/**
+ * Un trabajo lógico `(round, key)` que terminó en un lanzamiento, sin respuestas ni archivos de salida.
+ * `admission` es `null` cuando no se conoce: el trabajo terminó sin una respuesta que admitir o rechazar.
+ */
+export interface LaunchJob {
+  round: number; key: string; launch: number; state: RunState; admission: 'admitted' | 'inadmissible' | null
+}
+/**
+ * El avance del lanzamiento activo de una ronda: los trabajos previstos para este lanzamiento, los conservados
+ * de uno anterior, los terminados en este y el que corre. La refutación es una fase aparte, con su propio plan.
+ */
+export interface LaunchProgress {
+  phase: 'review' | 'refutation'; round: number; launch: number
+  planned: string[]; retained: LaunchJob[]; completed: LaunchJob[]
+  active: { key: string; reviewer: Reviewer | null; batch: number | null } | null
+}
 export interface Status {
   state: RunState; reason?: string; detail?: string
   supervisor_pid?: number; worker_pid?: number; session_id?: string
@@ -87,6 +103,8 @@ export interface Status {
   /** En una revisión, el lanzamiento activo de la ronda y el trabajo que corre. */
   launch?: number
   job?: JobProgress
+  /** En una revisión en curso, el avance real del lanzamiento activo; no está en los formatos anteriores. */
+  progress?: LaunchProgress
 }
 
 export class SddError extends Error {

@@ -87,7 +87,7 @@ test('el texto del writer sigue a implement: con run aceptándolo, el bootstrap 
   const prompt = join(mkdtempSync(join(tmpdir(), 'sdd-ai-prompt-')), 'p.md')
   writeFileSync(prompt, 'Encargo de prueba.\n')
   const r = spawnSync(process.execPath, [BIN, 'run', '--role', 'implement', '--prompt-file', prompt], {
-    cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 's1' },
+    cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 's1', SDD_AI_PROJECTION: 'off' },
   })
   const out = JSON.parse(r.stdout || 'null') as { code?: string } | null
   // run acepta el rol: lo que lo frena en este repo sin commits es la base, no el rol.

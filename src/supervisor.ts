@@ -15,10 +15,12 @@ import {
   type Ledger, type LedgerEntry, type Reviewer, type RoundPlan, type Target, applyRefutation, applyRound, axesOf, byProvenance,
   openLedger, refutationBatch, standing, withProvenance,
 } from './review/ledger.ts'
+import { activate, admissionOf, complete, finishedJob, refutationProgress, reviewProgress } from './review/progress.ts'
 import { REVIEW_PROMPT_BUDGET, closingMessage, fits, renderCorrectionPrompt, renderMaterial, renderRefutePrompt } from './review/prompt.ts'
 import { type RiskRecord, readRisk } from './review/risk.ts'
 import { dirtyPaths, headCommit } from './git.ts'
-import { readJson, setStatus, writeJsonAtomic } from './runs.ts'
+import { heartbeat, requestPublication, runRoot } from './projection.ts'
+import { onStatusWritten, readJson, setStatus, writeJsonAtomic } from './runs.ts'
 import type {
   AttemptKind, AttemptMetrics, Family, LaunchSpec, RejectedField, Resolution, ResumeInfo, RetryInfo, RunState, Status, Usage, WorkerTask,
 } from './types.ts'
@@ -605,7 +607,8 @@ function packRefutation(c: Candidate, contextTexts: Map<string, string>, batch: 
   return { subs, tooLarge, trimmed: true }
 }
 
-interface SubResult { outcome: Parameters<typeof applyRefutation>[1]; record: SubBatchRecord; toolEvents: string[] }
+/** `state` es cómo terminó la sub-tanda como trabajo: `done` solo si su respuesta se admitió. */
+interface SubResult { outcome: Parameters<typeof applyRefutation>[1]; record: SubBatchRecord; toolEvents: string[]; state: RunState }
 
 /**
  * Una sub-tanda en su temporal: un solo intento, sin reanudación ni reintento de perfil, admitido
@@ -616,8 +619,8 @@ async function refuteSub(ctx: RunContext, resolution: Resolution, c: Candidate, 
   j: number, launchN: number, fixSec: number): Promise<SubResult> {
   const { dir, argv } = ctx
   const ids = sub.entries.map((e) => e.id)
-  const failed = (reason: string, toolEvents: string[] = []): SubResult =>
-    ({ outcome: { failed: reason, ids }, record: { ids, paths: sub.paths, outcome: 'inconclusive', reason }, toolEvents })
+  const failed = (reason: string, state: RunState, toolEvents: string[] = []): SubResult =>
+    ({ outcome: { failed: reason, ids }, record: { ids, paths: sub.paths, outcome: 'inconclusive', reason }, toolEvents, state })
   const view = sliceCandidate(c, sub.paths)
   const prefix = `${ctx.tag}-l${launchN}-refute-s${j}`
   const rctx: RunContext = { ...ctx, family: resolution.family, prefix, job: { reviewer: 'refute', batch: j, launch: launchN },
@@ -628,12 +631,12 @@ async function refuteSub(ctx: RunContext, resolution: Resolution, c: Candidate, 
     const launch = reviewLaunch(resolution, promptFile, join(dir, `result${prefix}.md`), scratch, REFUTER_SYSTEM_PROMPT)
     const first = await attempt(rctx, launch, '', Date.now() + argv.deadline_sec * 1000)
     recordAttempt(rctx, 'refutation', '', launch, first)
-    if (first.outcome.state !== 'done') return failed(stateAndReason(first.outcome), first.facts.toolEvents)
+    if (first.outcome.state !== 'done') return failed(stateAndReason(first.outcome), first.outcome.state, first.facts.toolEvents)
     const phase = await admitPhase(rctx, launch, first, fixSec, (t) => admitRefutation(t, view, ids),
       { name: `${prefix}-fix`, suffix: '-fix', kind: 'refutation' })
     const toolEvents = [...first.facts.toolEvents, ...phase.toolEvents]
-    if (!phase.review) return failed(phase.outcome.reason ?? phase.outcome.state, toolEvents)
-    return { outcome: { results: phase.review.results }, record: { ids, paths: sub.paths, outcome: 'admitted' }, toolEvents }
+    if (!phase.review) return failed(phase.outcome.reason ?? phase.outcome.state, phase.outcome.state, toolEvents)
+    return { outcome: { results: phase.review.results }, record: { ids, paths: sub.paths, outcome: 'admitted' }, toolEvents, state: 'done' }
   })
 }
 
@@ -666,6 +669,10 @@ async function refute(ctx: RunContext, c: Candidate, ledger: Ledger, batch: Ledg
     settle({ failed: 'prompt_too_large', ids: [e.id] })
     records.push({ ids: [e.id], paths: [parseLocation(e.location).path], outcome: 'inconclusive', reason: 'prompt_too_large' })
   }
+  const keys = subs.map((_, i) => `refute-s${i + 1}`)
+  // La refutación tiene su propio conjunto previsto: lo que no se lanza porque no entra no es un trabajo.
+  let progress = refutationProgress(ctx.round, launchN, keys)
+  if (subs.length > 0) setStatus(dir, { progress })
   for (const [i, sub] of subs.entries()) {
     const subIds = sub.entries.map((e) => e.id)
     if (cancelled || existsSync(cancelFile)) {
@@ -674,11 +681,15 @@ async function refute(ctx: RunContext, c: Candidate, ledger: Ledger, batch: Ledg
       records.push({ ids: subIds, paths: sub.paths, outcome: 'inconclusive', reason: 'cancelled' })
       continue
     }
-    setStatus(dir, { job: { phase: 'refutation', key: `refute-s${i + 1}`, index: i + 1, total: subs.length } })
+    progress = activate(progress, { key: keys[i], reviewer: null, batch: null })
+    setStatus(dir, { job: { phase: 'refutation', key: keys[i], index: i + 1, total: subs.length }, progress })
     const r = await refuteSub(ctx, resolution, c, contextTexts, sub, i + 1, launchN, fixSec)
     settle(r.outcome)
     records.push(r.record)
     toolEvents.push(...r.toolEvents)
+    progress = complete(progress, { round: ctx.round, key: keys[i], launch: launchN, state: r.state,
+      admission: admissionOf(r.record.outcome === 'admitted', r.record.reason) })
+    setStatus(dir, { progress })
     if (r.record.reason === 'cancelled') cancelled = true
   }
   const admitted = records.filter((r) => r.outcome === 'admitted').length
@@ -830,15 +841,21 @@ async function superviseReview(ctx: RunContext, resumeSec: number): Promise<Stat
   const startedAt = new Date().toISOString()
   const jobs = argv.jobs ?? []
   const records: JobRecord[] = [...(argv.kept ?? [])]
+  // El avance real se cuenta por trabajo lógico, antes de correr nada y después de cada resultado.
+  let progress = reviewProgress(ctx.round, launchN, jobs, argv.kept ?? [])
+  setStatus(dir, { progress })
   let cancelled = false
   for (const [i, job] of jobs.entries()) {
     if (existsSync(cancelFile)) {
       cancelled = true
       break
     }
-    setStatus(dir, { job: { phase: 'review', key: job.key, reviewer: job.reviewer, batch: job.batch, index: i + 1, total: jobs.length } })
+    progress = activate(progress, { key: job.key, reviewer: job.reviewer, batch: job.batch })
+    setStatus(dir, { job: { phase: 'review', key: job.key, reviewer: job.reviewer, batch: job.batch, index: i + 1, total: jobs.length }, progress })
     const record = await runJob(ctx, job, candidate, plan, launchN, resumeSec)
     records.push(record)
+    progress = complete(progress, finishedJob(ctx.round, record))
+    setStatus(dir, { progress })
     if (record.state === 'cancelled') {
       cancelled = true
       break
@@ -875,7 +892,8 @@ async function superviseReview(ctx: RunContext, resumeSec: number): Promise<Stat
     jobs: ordered, ...(refutation ? { refutation } : {}), ...(unverifiable ? { unverifiable } : {}),
   })
   if (existsSync(join(dir, 'ledger.json'))) writeReceipt(dir)
-  const patch: Partial<Status> = { ...outcome, ended_at: new Date().toISOString(), round: ctx.round, job: undefined }
+  // Terminada la ronda, su avance sale del registro que se acaba de agregar y del plan del lanzamiento.
+  const patch: Partial<Status> = { ...outcome, ended_at: new Date().toISOString(), round: ctx.round, job: undefined, progress: undefined }
   const retry = records.findLast((r) => r.retry)?.retry
   const resume = records.findLast((r) => r.resume)?.resume
   if (retry) patch.retry = retry
@@ -886,9 +904,36 @@ async function superviseReview(ctx: RunContext, resumeSec: number): Promise<Stat
 /**
  * Lanza al worker de una corrida preparada, aplica el tope y escribe el estado final. En una revisión,
  * cada lanzamiento de una ronda lee su propio argv (`argv<tag>-l<k>.json`) y recorre sus trabajos.
+ *
+ * Mientras vive, el supervisor pide publicar la proyección después de cada estado que escribe, la renueva
+ * cada `HEARTBEAT_MS` aunque nada cambie y la pide una vez más al terminar. Las pedidas de un mismo tramo
+ * sincrónico salen como una sola. Publicar corre en otro proceso y no toca el resultado de la corrida.
  */
 export async function supervise(dir: string, argvName = 'argv.json'): Promise<Status> {
   const argv = readJson<ArgvFile>(join(dir, argvName))
+  // Un writer corre en su almacén y trae su checkout en el argv; las demás corridas viven en `.sdd-ai/runs/`.
+  const root = argv.root ?? runRoot(dir)
+  let queued = false
+  const publish = (origin: string) => {
+    if (root === null || queued) return
+    queued = true
+    setImmediate(() => {
+      queued = false
+      requestPublication(root, `supervisor:${origin}`, 'supervisor')
+    })
+  }
+  const previous = onStatusWritten(() => publish('status'))
+  const stop = heartbeat(() => publish('heartbeat'))
+  try {
+    return await superviseLaunch(dir, argv)
+  } finally {
+    stop()
+    onStatusWritten(previous)
+    publish('end')
+  }
+}
+
+async function superviseLaunch(dir: string, argv: ArgvFile): Promise<Status> {
   const cancelFile = join(dir, 'cancel.request')
   const ctx: RunContext = {
     dir, family: argv.family, grace: argv.grace_ms ?? 10_000, cancelFile, tag: argv.tag ?? '', round: argv.round ?? 1,

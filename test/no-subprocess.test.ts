@@ -59,6 +59,8 @@ test('telemetryOff permite fijar o retirar el override', () => {
   assert.equal(telemetryOff({ SDD_AI_TELEMETRY: 'on' }).SDD_AI_TELEMETRY, 'on')
   assert.equal(telemetryOff({ SDD_AI_TELEMETRY: 'off' }).SDD_AI_TELEMETRY, 'off')
   assert.equal('SDD_AI_TELEMETRY' in telemetryOff({ SDD_AI_TELEMETRY: undefined }), false)
+  assert.equal(telemetryOff({ HOME: '/tmp/example' }).SDD_AI_PROJECTION, 'off')
+  assert.equal('SDD_AI_PROJECTION' in telemetryOff({ SDD_AI_PROJECTION: undefined }), false)
 })
 
 // Se arman los entornos sin lanzar revisiones: committable usa el de chainSetup, y reviewedFlow, el de reviewedFlowEnv.
@@ -81,7 +83,10 @@ test('las fixtures importables de procesos apagan publicaciones por defecto', ()
     envs.push(track(rounds.env, rounds.repo))
     const reviewed = reviewedFlowEnv()
     envs.push(track(reviewed.env, ...reviewed.dirs))
-    for (const env of envs) assert.equal(env.SDD_AI_TELEMETRY, 'off')
+    for (const env of envs) {
+      assert.equal(env.SDD_AI_TELEMETRY, 'off')
+      assert.equal(env.SDD_AI_PROJECTION, 'off')
+    }
   } finally {
     const tmp = realpathSync(tmpdir())
     for (const dir of temporary) if (dir.startsWith(tmp) || dir.startsWith(tmpdir())) rmSync(dir, { recursive: true, force: true })

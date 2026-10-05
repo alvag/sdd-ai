@@ -8,9 +8,13 @@ import { type GateId, resolve } from '../src/sdd/status.ts'
 
 let fakeBinScript: string | undefined
 
-/** Off por defecto; una clave explícita undefined retira el override del entorno final. */
+/**
+ * Las publicaciones de mejor esfuerzo, la telemetría y la proyección, apagadas por defecto; una clave explícita
+ * undefined retira el override del entorno final.
+ */
 export function telemetryOff(env: Record<string, string | undefined>): Record<string, string> {
-  return Object.fromEntries(Object.entries({ SDD_AI_TELEMETRY: 'off', ...env }).filter((entry): entry is [string, string] => entry[1] !== undefined))
+  return Object.fromEntries(Object.entries({ SDD_AI_TELEMETRY: 'off', SDD_AI_PROJECTION: 'off', ...env })
+    .filter((entry): entry is [string, string] => entry[1] !== undefined))
 }
 
 /**

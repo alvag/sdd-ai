@@ -84,11 +84,26 @@ export function readStatus(dir: string): Status {
   return readJson<Status>(join(dir, 'status.json'))
 }
 
+/** Quien quiera enterarse de cada `status.json` escrito; lo registra el binario al arrancar. */
+let statusWritten: ((dir: string) => void) | null = null
+
+/** Registra quién se entera de cada `status.json` escrito y devuelve al anterior, para restaurarlo. */
+export function onStatusWritten(fn: ((dir: string) => void) | null): ((dir: string) => void) | null {
+  const previous = statusWritten
+  statusWritten = fn
+  return previous
+}
+
 export function setStatus(dir: string, patch: Partial<Status>): Status {
   const file = join(dir, 'status.json')
   const current = existsSync(file) ? readJson<Status>(file) : ({} as Status)
   const next = { ...current, ...patch }
   writeJsonAtomic(file, next)
+  try {
+    statusWritten?.(dir)
+  } catch {
+    // El estado ya quedó escrito: quien se entera no cambia el resultado de quien lo escribió.
+  }
   return next
 }
 

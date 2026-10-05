@@ -574,7 +574,7 @@ export function walkInto(out: Record<string, InventoryEntry>, dir: string, prefi
 }
 
 /** Lo que sdd-ai y Git escriben por su cuenta mientras el writer corre; el almacén, además. */
-const SDD_SKIP = new Set(['runs', 'hooks', 'tmp'])
+const SDD_SKIP = new Set(['runs', 'hooks', 'tmp', 'projection'])
 const GIT_SKIP = new Set(['index', 'objects', 'logs', 'sdd-ai', 'worktrees'])
 
 /**

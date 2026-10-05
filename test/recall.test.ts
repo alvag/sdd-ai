@@ -42,7 +42,7 @@ function setup(withEngram = true): Setup {
   git(s.repo, 'init', '-q', '-b', 'main')
   commit(s, 'Initial')
   symlinkSync(process.execPath, join(s.bin, 'node'))
-  s.env = { PATH: `${s.bin}:/usr/bin:/bin`, HOME: join(root, 'home'), FAKE_ENGRAM: s.map, FAKE_LOG: s.log }
+  s.env = { PATH: `${s.bin}:/usr/bin:/bin`, HOME: join(root, 'home'), FAKE_ENGRAM: s.map, FAKE_LOG: s.log, SDD_AI_PROJECTION: 'off' }
   fake(s, {})
   if (withEngram) {
     const script = join(root, 'fake-engram.cjs')

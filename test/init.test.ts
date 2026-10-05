@@ -42,7 +42,7 @@ function environment(bins: Array<'claude' | 'codex'>, catalog: Catalog | null, v
   for (const b of bins) makeFakeBin(bin, b)
   const codexHome = mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-'))
   if (catalog !== null) writeFileSync(join(codexHome, 'models_cache.json'), JSON.stringify(Array.isArray(catalog) ? { models: catalog.map((slug) => ({ slug })) } : catalog))
-  return { PATH: `${bin}:/usr/bin:/bin`, HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-home-')), CODEX_HOME: codexHome, ...(version ? { FAKE_VERSION: version } : {}) }
+  return { PATH: `${bin}:/usr/bin:/bin`, HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-home-')), CODEX_HOME: codexHome, SDD_AI_PROJECTION: 'off', ...(version ? { FAKE_VERSION: version } : {}) }
 }
 
 /** Un checkout de sdd-ai con commit, sin `.sdd-ai/` salvo lo que se pida. */

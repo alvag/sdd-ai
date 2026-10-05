@@ -7,7 +7,33 @@ import { join, resolve } from 'node:path'
 const REGISTER = './register.tsx'
 /** El marcador del informe de `claude plugin validate` que lista lo que llama cada módulo. */
 const CALLS = 'calls:'
-const ALLOWED = new Set(['$.ui.resolve', '$.state.get', '$.state.set'])
+/**
+ * Las llamadas exactas que admite el registro: dibujar y guardar su estado de presentación; leer la proyección con
+ * `list`, `stat` y `read`; identificar la sesión y su raíz, y sostener el refresco con el reloj. Se comparan por
+ * llamada: otra de la misma familia (`$.fs.write`, `$.fs.exists`, `$.clock.sleep`, `$.session.send`) queda fuera.
+ */
+const ALLOWED = new Set([
+  '$.ui.resolve', '$.state.get', '$.state.set',
+  '$.fs.list', '$.fs.stat', '$.fs.read',
+  '$.session.id', '$.session.root',
+  '$.clock.every', '$.clock.after', '$.clock.now',
+])
+/**
+ * La anotación con la que el informe dice por qué funciones del módulo pasa una llamada hecha fuera de un hook, como en
+ * `$.fs.read (via readProjection)`. No es una llamada: se quita antes de comparar.
+ */
+const VIA = /\s*\(via\b[^)]*\)/g
+/** Las secuencias de escape de la terminal (CSI, OSC y las de dos caracteres) que el motor puede intercalar. */
+const ANSI = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])/g
+/** El diagnóstico del motor cuando una sesión anterior guardó apagado el interruptor de rollout de los mods. */
+const ROLLOUT_SAVED_OFF = 'hooks modules are turned off in this process: the rollout switch was saved off by an earlier session'
+/** La recuperación es manual: refrescar el interruptor llama al modelo, y el script nunca lo hace. */
+const ROLLOUT_RECOVERY = [
+  'Claude Code apagó los módulos de hooks en este proceso porque una sesión anterior guardó apagado su interruptor de rollout.',
+  'Para refrescarlo, ejecuta a mano y con acceso a la red: claude -p --model haiku ok',
+  'Después, vuelve a correr: npm run test:mods',
+  'Este script no lo refresca por su cuenta, porque esa ejecución llama al modelo.',
+].join('\n')
 /**
  * El tope de todo el modo, no de cada paso: los pasos de `test` comparten cuatro minutos, menos que el tope de cinco de
  * V7, así que un paso colgado se corta con un mensaje que lo nombra antes de que lo corte el arnés. El corte llega al
@@ -25,20 +51,44 @@ function remaining(step) {
   return left
 }
 
-function finish(step, result) {
-  if (result.error?.code === 'ETIMEDOUT') throw new Error(`${step} se cortó: agotó el tope de ${BUDGET_MS / 60_000} minutos`)
-  if (result.error) throw result.error
-  if (result.signal) throw new Error(`${step} terminó por la señal ${result.signal}`)
-  if (result.status !== 0) throw new Error(`${step} terminó con código ${result.status}`)
+/**
+ * Reconoce el diagnóstico del interruptor de rollout en la salida de un canal. La terminal puede partirlo en cualquier
+ * punto, incluso dentro de una palabra, y sangrar o colorear cada tramo: se compara sin los escapes ni los espacios.
+ */
+function rolloutSavedOff(output) {
+  const compact = (text) => text.replace(ANSI, '').replace(/\s+/g, '')
+  return compact(output).includes(compact(ROLLOUT_SAVED_OFF))
 }
 
-/** Un paso cuyo informe hay que leer: se captura entero, hasta `CAPTURE_MAX_BYTES`, y se muestra al terminar. */
+/** El error que nombra el paso que falló, o `null` si terminó bien. */
+function failure(step, result) {
+  if (result.error?.code === 'ETIMEDOUT') return new Error(`${step} se cortó: agotó el tope de ${BUDGET_MS / 60_000} minutos`)
+  if (result.error) return result.error
+  if (result.signal) return new Error(`${step} terminó por la señal ${result.signal}`)
+  if (result.status !== 0) return new Error(`${step} terminó con código ${result.status}`)
+  return null
+}
+
+/**
+ * Cierra un paso con el error que lo nombra. Si alguno de sus canales trae el diagnóstico del interruptor de rollout,
+ * el paso falla aunque haya terminado con 0, porque el motor no corrió los módulos, y el error agrega la recuperación.
+ */
+function finish(step, result, outputs = []) {
+  const error = failure(step, result)
+  if (outputs.some(rolloutSavedOff)) throw new Error(`${error?.message ?? `${step} no corrió los módulos de hooks, aunque terminó con código 0`}\n${ROLLOUT_RECOVERY}`)
+  if (error) throw error
+}
+
+/**
+ * Un paso cuya salida hay que leer antes de propagar su fallo: se capturan stdout y stderr enteros, hasta
+ * `CAPTURE_MAX_BYTES`, y se muestran al terminar, tal como llegaron, en su mismo canal.
+ */
 function capture(command, args) {
   const step = [command, ...args].join(' ')
-  const result = spawnSync(command, args, { encoding: 'utf8', maxBuffer: CAPTURE_MAX_BYTES, timeout: remaining(step) })
+  const result = spawnSync(command, args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', maxBuffer: CAPTURE_MAX_BYTES, timeout: remaining(step) })
   if (result.stdout) process.stdout.write(result.stdout)
   if (result.stderr) process.stderr.write(result.stderr)
-  finish(step, result)
+  finish(step, result, [result.stdout ?? '', result.stderr ?? ''])
   return `${result.stdout ?? ''}\n${result.stderr ?? ''}`
 }
 
@@ -50,12 +100,12 @@ function inherit(command, args) {
 
 try {
   if (process.argv[2] === 'test') {
-    const report = capture('claude', ['plugin', 'validate', '--strict', 'mods/sdd-ai']).replace(/\x1b\[[0-9;]*m/g, '')
+    const report = capture('claude', ['plugin', 'validate', '--strict', 'mods/sdd-ai']).replace(ANSI, '')
     // Se revisan las líneas de llamadas de todos los módulos del informe, no solo la del registro: un auxiliar puede
     // traer la suya vacía, pero ninguna llamada.
     const declared = report.split('\n').flatMap((line) => {
       const match = new RegExp(`❯\\s+(\\S+)\\s+${CALLS}(.*)$`).exec(line)
-      return match ? [{ module: match[1], calls: match[2].trim().split(/[\s,]+/).filter(Boolean) }] : []
+      return match ? [{ module: match[1], calls: match[2].replace(VIA, '').trim().split(/[\s,]+/).filter(Boolean) }] : []
     })
     if (!declared.some(({ module }) => module === REGISTER)) throw new Error(`la validación no informa ${CALLS} de ${REGISTER}`)
     for (const { module, calls } of declared) {
@@ -67,7 +117,9 @@ try {
       const forbidden = calls.filter((call) => !ALLOWED.has(call))
       if (forbidden.length) throw new Error(`llamadas no permitidas en ${REGISTER}: ${forbidden.join(', ')}`)
     }
-    inherit('claude', ['plugin', 'test', 'mods/sdd-ai'])
+    // Se captura en vez de heredarse, para buscar el diagnóstico del interruptor antes de propagar el fallo: la salida
+    // se ve al terminar el paso, no mientras corre.
+    capture('claude', ['plugin', 'test', 'mods/sdd-ai'])
   } else if (process.argv[2] === 'typecheck') {
     const copy = resolve('.claude/skills/sdd-ai-mod')
     if (!existsSync(copy)) throw new Error('falta la copia del mod: ejecuta ./bin/sdd-ai agents sync')

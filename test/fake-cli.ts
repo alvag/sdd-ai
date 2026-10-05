@@ -118,7 +118,18 @@ const callCount = () => (process.env.FAKE_CALLS_FILE ? readFileSync(process.env.
  */
 function scripted(): void {
   const answers = JSON.parse(readFileSync(process.env.FAKE_ANSWERS ?? '', 'utf8')) as string[]
-  const answer = answers[callCount() - 1] ?? '__fail__'
+  let answer = answers[callCount() - 1] ?? '__fail__'
+  // Una primera línea `__barrier__ <ruta>` detiene la invocación en un punto conocido: crea `<ruta>.arrived` y
+  // espera `<ruta>.release`, hasta 30 s, antes de responder con el resto. Si nadie la libera, falla sin responder. La
+  // ruta es el resto de la línea, con sus espacios.
+  const gate = /^__barrier__ ([^\n]+)\n/.exec(answer)
+  if (gate) {
+    answer = answer.slice(gate[0].length)
+    writeFileSync(`${gate[1]}.arrived`, String(process.pid))
+    const until = Date.now() + 30_000
+    while (!existsSync(`${gate[1]}.release`) && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20)
+    if (!existsSync(`${gate[1]}.release`)) answer = '__fail__'
+  }
   const codex = args[0] === 'exec'
   if (answer === '__reject_model__' || answer === '__reject_effort__') {
     fail(answer === '__reject_model__' ? codex ? 'codex-modelo-rechazado.jsonl' : 'claude-modelo-rechazado.jsonl' : 'codex-esfuerzo-rechazado.jsonl')

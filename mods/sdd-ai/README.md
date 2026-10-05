@@ -1,9 +1,12 @@
 # sdd-ai-mod
 
-Presentación de las salidas de `sdd-ai` en la terminal de Claude Code. El mod
-observa llamadas Bash y dibuja resúmenes; el binario conserva sus resultados,
-códigos de salida, guardas y decisiones. El mod no ejecuta `next`, no registra
-comandos ni herramientas y no modifica las corridas.
+Presentación de `sdd-ai` en la terminal de Claude Code. El mod observa llamadas
+Bash y dibuja resúmenes de sus salidas, y muestra sobre el prompt una banda de
+una línea con el flujo ligado a la sesión, su paso y la actividad en curso, que
+lee de la proyección que publica el binario (`docs/projection.md`). El binario
+conserva sus resultados, códigos de salida, guardas y decisiones. El mod no
+ejecuta `next`, no registra comandos ni herramientas, no escribe archivos y no
+modifica las corridas.
 
 ## Compatibilidad y estado de comprobación
 
@@ -93,6 +96,52 @@ llamada sale marcada «sin resumen», con el tamaño de la salida guardada, y el
 resultado suelto queda nativo. Pasa con los `review status` de ledgers largos;
 el binario y el modelo siguen recibiendo lo mismo que sin el mod.
 
+## La banda sobre el prompt
+
+En la terminal, el mod dibuja una línea sobre el prompt con:
+
+- el flujo ligado a la sesión y su paso;
+- una actividad de la propia sesión: primero las del flujo ligado (el writer en
+  vuelo, la revisión en ejecución, otro worker y los pendientes, en ese orden) y,
+  si no hay, otra propia con su flujo real. Una revisión muestra su ronda, el
+  revisor y el lote, y su progreso por ronda («base 3/5»); un writer se reconoce
+  como tal, y uno en `cessation_uncertain` se marca como de cese incierto;
+- la antigüedad de la observación, solo si hay una corrida viva y nadie publicó
+  en los últimos 60 segundos.
+
+Sin flujo ligado ni actividad propia, la banda lo dice («sin flujo ligado ni
+actividad en esta sesión»). Si la proyección falta, está corrupta, es de una
+versión que el mod no entiende o su directorio fue alterado, dice que no está
+disponible y por qué; no lo confunde con el estado vacío y no cae a una
+observación anterior.
+Si la lectura no alcanza a leer una observación que otra publicación acaba de
+podar, conserva la última lectura marcada como tal. Lo mismo hace si una lectura
+pasa de 10 segundos, y no empieza otra hasta que esa termine; si mientras tanto
+cambia la sesión o el checkout, retira los datos de la anterior y dice que no
+está disponible hasta que esa lectura termine.
+
+El mod lee la proyección cada segundo, solo dentro de
+`.sdd-ai/projection/live/` del checkout de la sesión, y la banda cambia sin un
+turno nuevo, sin llamar al modelo y sin esperar a `wait`. Cuando la línea no
+cabe, acorta en este orden: el nombre del flujo, la asociación de una actividad
+ajena, el revisor y el lote, y la ronda; el paso, el progreso, la marca de writer
+y la antigüedad no se acortan. Cede el lugar a una encuesta, respeta el plegado
+de la persona y solo se dibuja en la terminal: en el escritorio y en las demás
+superficies, el mod deja ese lugar como está.
+
+La proyección la publica el binario también con Codex como conductor o con el
+mod desactivado; sin el mod, simplemente no hay banda.
+
+### Volver atrás
+
+Para quitar la banda basta con volver a una versión del mod sin ella y correr
+`./bin/sdd-ai agents sync`. Para volver a un binario que no publica la
+proyección hay que borrar además `.sdd-ai/projection/` en cada checkout y
+worktree: si no, un consumidor seguiría mostrando la última observación, que
+puede no tener corridas vivas ni antigüedad que la delate. `sdd commit` no
+admite cuerpo, así que esta instrucción vive acá, en `docs/projection.md` y en el
+handoff del flujo.
+
 ## Desarrollo y comprobaciones
 
 En una versión compatible de Claude Code, desde la raíz del repositorio:
@@ -103,9 +152,20 @@ npm run typecheck:mods
 ```
 
 `test:mods` ejecuta `claude plugin validate --strict mods/sdd-ai`, revisa que
-el informe del módulo solo declare llamadas a `$.ui.resolve`, `$.state.get`
-y `$.state.set`, y después ejecuta `claude plugin test mods/sdd-ai`. Cualquier
-fallo impide completar el script. Para desarrollar se usa el runner del
+el informe declare llamadas solo desde `register.tsx` y solo a `$.ui.resolve`,
+`$.state.get`, `$.state.set`, `$.fs.list`, `$.fs.stat`, `$.fs.read`,
+`$.session.id`, `$.session.root`, `$.clock.every`, `$.clock.after` y
+`$.clock.now`, y después ejecuta `claude plugin test mods/sdd-ai`. La
+comparación es por llamada exacta; la anotación `(via <función>)` con que el
+motor marca una llamada hecha desde un auxiliar no cuenta. Cualquier fallo impide
+completar el script.
+
+Si Claude Code responde que los módulos están apagados porque una sesión
+anterior guardó apagado el interruptor de rollout («hooks modules are turned off
+in this process: the rollout switch was saved off by an earlier session»),
+`test:mods` lo dice y falla sin informar pruebas aprobadas. Se recupera a mano:
+`claude -p --model haiku ok` con acceso a red refresca el interruptor, y después
+se reintenta `npm run test:mods`. El script nunca lo ejecuta por su cuenta. Para desarrollar se usa el runner del
 plugin; no cargues la fuente con `--plugin-dir` en una sesión que ya tenga la
 copia instalada, para evitar dos instancias del mismo mod.
 

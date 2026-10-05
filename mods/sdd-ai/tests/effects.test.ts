@@ -1,12 +1,18 @@
 import type { On, ToolCallResult } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
+import { binding, flowEntry, known, review, SESSION_ROOT, T0, World, writer } from './fixtures/band-world'
 import { domainErrorCapture2_1_288 } from './fixtures/domain-error-2.1.288'
 
 const command = domainErrorCapture2_1_288.command
+/**
+ * Los efectos que el mod nunca produce: registrar comandos o herramientas, avisar, abrir, escribir prompts, archivos o
+ * almacenes, lanzar procesos, ir a la red o al modelo, agregar filas a la conversación o mandar mensajes. Los
+ * temporizadores y el estado de presentación de la banda no están acá: el refresco los usa.
+ */
 const forbidden = [
-  'command.register', 'tool.register', 'clock.after', 'clock.every',
-  'ui.toast', 'ui.status', 'ui.notice', 'ui.open', 'prompt.submit',
-  'fs.write', 'store.set', 'store.delete', 'env.set',
+  'command.register', 'tool.register', 'ui.toast', 'ui.status', 'ui.notice', 'ui.open', 'prompt.submit', 'prompt.fill',
+  'fs.write', 'store.set', 'store.delete', 'env.set', 'process.run', 'http.fetch', 'mcp.call', 'model.complete', 'model.fork',
+  'agent.spawn', 'session.append', 'session.send',
 ] as const
 
 function watchEffects(on: On): string[] {
@@ -126,4 +132,47 @@ test('drawing redrawing and expansion execute no tools or next actions and have 
   expect(effects).toEqual([])
   await single.unmount()
   await group.unmount()
+})
+
+test('the band refresh uses timers and its own presentation state and has no domain effects', async ($, on) => {
+  const effects = watchEffects(on)
+  const world = new World('effects-session')
+  world.install(on)
+  const writes: string[] = []
+  on('state.set', (_$, e, next) => {
+    writes.push(`${e.plugin}.${e.key}`)
+    return next(e)
+  })
+  let tools = 0
+  on('tool.call', () => {
+    tools++
+    return { deny: 'fixture' }
+  })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Text({ children: 'native' }))
+  // El reloj de prueba contesta los temporizadores del refresco: cada período que pasa es una lectura más.
+  const clock = mock.clock(on, { now: T0 + 1_000 })
+  world.publish(100, { flows: [flowEntry('demo')], bindings: [binding(world.session, 'demo')], runs: [review('r1', world.session, { flow: known('demo') })] })
+  const before = JSON.stringify([...world.entries])
+  await $.session.start({ cwd: SESSION_ROOT, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const props = { hasSurvey: false, isWorking: true, maxRows: 4, bodyColumns: 120, scroll: { offset: 0, bodyRows: 4 }, view: {} }
+  const ui = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'AbovePrompt', props })
+  expect((await ui.find({ type: 'Text' }))?.text).toBe('demo · paso implement · revisión · ronda 2 · reliability lote 1 · 3/5')
+  // Varios períodos, una observación nueva con un writer de cese incierto, redibujos y una encuesta.
+  await clock.advance(5_000)
+  world.publish(200, { flows: [flowEntry('demo')], bindings: [binding(world.session, 'demo')], writer: writer('w1', world.session, { state: known('cessation_uncertain'), flow: known('demo') }) })
+  await clock.advance(1_000)
+  expect((await ui.find({ type: 'Text' }))?.text).toBe('demo · paso implement · writer · cese incierto')
+  await ui.redraw({ ...props, hasSurvey: true })
+  await ui.redraw(props)
+  await clock.advance(70_000)
+  expect(world.accesses.filter((access) => access.op === 'stat' && access.path === SESSION_ROOT)).toHaveLength(77)
+  expect(new Set(writes)).toEqual(new Set(['sdd-ai-mod.band']))
+  expect(tools).toBe(0)
+  expect(effects).toEqual([])
+  // El refresco solo lee: lo que había en el checkout sigue igual, salvo lo que publicó el test.
+  world.entries.delete([...world.entries.keys()].find((path) => path.includes('obs-00000000000000000200'))!)
+  expect(JSON.stringify([...world.entries])).toBe(before)
+  expect(world.violations()).toEqual([])
+  await ui.unmount()
 })

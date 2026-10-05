@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { launchState } from './native-launch.ts'
 import { type Ledger, undecided } from './review/ledger.ts'
 import { gitDirs } from './git.ts'
-import { isDelivered, readJson, readStatus } from './runs.ts'
+import { isDelivered, isRunId, readJson, readStatus } from './runs.ts'
 import { type NativeProfile, type RunState, type Status, TERMINAL } from './types.ts'
 
 /**
@@ -30,7 +30,7 @@ interface RunRequest { session?: unknown; kind?: string }
  * Donde viven los almacenes de writer de este checkout; nada si no hay repo. Con `.git` como directorio
  * no hace falta lanzar Git; en un worktree, sí.
  */
-function writersDir(root: string): string | undefined {
+export function writersDir(root: string): string | undefined {
   try {
     const dotGit = join(root, '.git')
     const gitDir = statSync(dotGit).isDirectory() ? dotGit : gitDirs(root).gitDir
@@ -38,6 +38,25 @@ function writersDir(root: string): string | undefined {
   } catch {
     return undefined
   }
+}
+
+export interface LocalRunInventory {
+  ids: string[]; writers: string | undefined; unavailable: ('runs' | 'writers')[]
+}
+
+/** Inventario local sin filtro de sesión; un almacén ilegible no se confunde con uno vacío. */
+export function localRunInventory(root: string): LocalRunInventory {
+  const writers = writersDir(root)
+  const unavailable: LocalRunInventory['unavailable'] = []
+  const list = (path: string | undefined, collection: 'runs' | 'writers'): string[] => {
+    if (path === undefined) { unavailable.push(collection); return [] }
+    try { return readdirSync(path).filter(isRunId) } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') unavailable.push(collection)
+      return []
+    }
+  }
+  const ids = new Set([...list(join(root, '.sdd-ai', 'runs'), 'runs'), ...list(writers, 'writers')])
+  return { ids: [...ids].sort(), writers, unavailable }
 }
 
 /**
@@ -67,7 +86,7 @@ export function openRuns(root: string): OpenRun[] {
  * Lanza si la corrida no se puede leer: quien llama decide qué hacer con una ilegible. `writers` se pasa
  * resuelto cuando se recorren muchas corridas: en un worktree, resolverlo lanza Git.
  */
-export function runOpenness(root: string, id: string, writers: string | undefined = writersDir(root)): Openness | null {
+export function runOpenness(root: string, id: string, writers: string | null | undefined = writersDir(root)): Openness | null {
   const store = writers ? join(writers, id) : undefined
   const dir = join(root, '.sdd-ai', 'runs', id)
   return store && existsSync(join(store, 'control.json')) ? classifyWriter(store, dir, id) : classify(dir, id)

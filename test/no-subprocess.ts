@@ -8,6 +8,9 @@ import { createRequire, syncBuiltinESMExports } from 'node:module'
 
 if (!process.execArgv.includes('--test') && process.argv[1]?.endsWith('.test.ts')) {
   process.env.SDD_AI_TELEMETRY = 'off'
+  // Sin esto, cada invocación del binario en un test lanzaría un proceso que publica la proyección. Las pruebas de la
+  // proyección quitan la variable en los procesos que lanzan.
+  process.env.SDD_AI_PROJECTION = 'off'
 }
 
 if (!process.execArgv.includes('--test') && process.argv[1]?.endsWith('.unit.test.ts')) {

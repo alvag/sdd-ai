@@ -77,7 +77,7 @@ interface Output {
 
 function prune(root: string, ...args: string[]): { code: number | null; out: Output } {
   const r = spawnSync(BIN, ['prune', ...args], {
-    cwd: root, encoding: 'utf8', timeout: 15_000, env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    cwd: root, encoding: 'utf8', timeout: 15_000, env: { PATH: process.env.PATH, HOME: process.env.HOME, SDD_AI_PROJECTION: 'off' },
   })
   assert.ifError(r.error)
   assert.notEqual(r.stdout.trim(), '', r.stderr)

@@ -8,6 +8,7 @@ import { confirm, release, reserve } from './native-launch.ts'
 import { type OpenRun, type OpenState, describe, openRuns, runKey } from './open-runs.ts'
 import { renderBootstrap } from './route.ts'
 import { ensureIgnore, readJson, readStatus, writeJsonAtomic } from './runs.ts'
+import { requestPublication } from './projection.ts'
 import { withPhaseNext } from './sdd/phase-state.ts'
 import { type ListEntry, listFlows, lstatOrNull, readFlow } from './sdd/read.ts'
 import { restoreIntentOpen } from './sdd/restore.ts'
@@ -62,13 +63,18 @@ export function runHook(stdin: string, cli: HookCli): string {
     // El rastro empieza con el primer evento que ve de la sesión, también si abrió antes de los hooks.
     const via = p.hook_event_name === 'SessionStart' ? `SessionStart:${String(p.source)}` : String(p.hook_event_name)
     startTrail(root, p.session_id, via)
-    switch (p.hook_event_name) {
-      case 'SessionStart': return sessionStart(p, root, p.session_id)
-      case 'Stop': return stop(p, root, p.session_id, cli)
-      case 'PreToolUse': return preToolUse(p, root, p.session_id, cli)
-      case 'PostToolUse': return postToolUse(p, root, p.session_id, cli)
-      case 'PostToolUseFailure': return postToolUseFailure(p, root, p.session_id)
-      default: return ''
+    try {
+      switch (p.hook_event_name) {
+        case 'SessionStart': return sessionStart(p, root, p.session_id)
+        case 'Stop': return stop(p, root, p.session_id, cli)
+        case 'PreToolUse': return preToolUse(p, root, p.session_id, cli)
+        case 'PostToolUse': return postToolUse(p, root, p.session_id, cli)
+        case 'PostToolUseFailure': return postToolUseFailure(p, root, p.session_id)
+        default: return ''
+      }
+    } finally {
+      // Lo que dejó el evento (ligas, despachos nativos) se publica en otro proceso, sin cambiar la respuesta del hook.
+      requestPublication(root, `hook:${String(p.hook_event_name)}`, 'hook')
     }
   } catch {
     return ''

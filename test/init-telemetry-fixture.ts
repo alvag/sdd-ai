@@ -20,7 +20,7 @@ export function initTelemetryFixture(sharedHome?: string) {
   makeFakeBin(bin, 'codex'); makeFakeBin(bin, 'claude')
   const codex = join(home, 'codex'); mkdirSync(codex, { recursive: true })
   writeFileSync(join(codex, 'models_cache.json'), JSON.stringify({ models: [{ slug: 'gpt-6.1-sol' }, { slug: 'gpt-6-luna' }] }))
-  const env: Record<string, string> = { HOME: home, PATH: `${bin}:/usr/bin:/bin`, CODEX_HOME: codex, FAKE_VERSION: '1.0.0', SDD_AI_TELEMETRY: 'off' }
+  const env: Record<string, string> = { HOME: home, PATH: `${bin}:/usr/bin:/bin`, CODEX_HOME: codex, FAKE_VERSION: '1.0.0', SDD_AI_TELEMETRY: 'off', SDD_AI_PROJECTION: 'off' }
   const cli = (args: string[], extra: Record<string,string> = {}) => {
     const r = spawnSync(process.execPath, [join(source, 'bin/sdd-ai'), 'init', ...args], { cwd: root, env: { ...env, ...extra }, encoding: 'utf8', timeout: 30_000 })
     return { code: r.status, out: JSON.parse(r.stdout || 'null') as Record<string, any>, stderr: r.stderr }
