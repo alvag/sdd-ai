@@ -18,6 +18,11 @@ Conviene consultarlos antes de rediseñar o investigar algo que puede estar resu
 código cita un motivo que no está escrito. Para el trabajo de código de todos los días, alcanza con
 el fuente y el historial de Git.
 
+Antes de iniciar un flujo, o para revisar algo de los flujos, se consulta el repo hermano `sdd-ai-dev`
+(`../sdd-ai-dev`): `handoff.md`, `roadmap/` y los hallazgos, que son sus issues (`gh issue list -R
+alvag/sdd-ai-dev`). Es el repo de desarrollo de sdd-ai: el binario y la skill no lo conocen. Su `handoff.md`
+dice cómo se edita y cómo se registra un hallazgo.
+
 ## Idioma de los nombres
 
 El código se nombra en inglés y se explica en español. La regla vale también para las specs, los
