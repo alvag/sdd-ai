@@ -25,7 +25,10 @@ function agentPath(root: string, family: Family, role: ReadOnlyRole): string {
   return join(root, AGENT_DIRS[family], `${agentName(role)}${AGENT_EXT[family]}`)
 }
 
-export function parseAgentSource(text: string): AgentSource {
+export function parseAgentSource(crlfText: string): AgentSource {
+  // Un checkout de Windows con core.autocrlf trae la fuente con CRLF. Se lleva a LF para que los
+  // agentes generados y su hash sean los mismos en cualquier sistema.
+  const text = crlfText.replace(/\r\n/g, '\n')
   const m = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/.exec(text)
   if (!m) throw new SddError('agent_source_invalid', 'agents/worker.md no tiene frontmatter')
   const meta = parse(m[1]) as { description?: unknown }
