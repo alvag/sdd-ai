@@ -91,6 +91,10 @@ function render(family: Family, src: AgentSource, role: ReadOnlyRole, profiles: 
   return family === 'claude' ? renderClaudeAgent(src, role, p, hash) : renderCodexAgent(src, role, p, hash)
 }
 
+function toLf(text: string): string {
+  return text.replace(/\r\n/g, '\n')
+}
+
 function readSource(pkgDir: string): AgentSource {
   return parseAgentSource(readFileSync(join(pkgDir, 'agents', 'worker.md'), 'utf8'))
 }
@@ -153,24 +157,27 @@ export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles,
 export interface SkillCopy { path: string; state: 'ok' | 'stale' | 'missing' }
 
 /**
- * Cada copia de la skill frente a su fuente, byte a byte: el conductor lee la copia, así que una
- * fuente editada sin `agents sync` deja al conductor con la versión anterior.
+ * Cada copia de la skill frente a su fuente, byte a byte salvo el fin de línea (un checkout de Windows
+ * con `core.autocrlf` trae CRLF): el conductor lee la copia, así que una fuente editada sin
+ * `agents sync` deja al conductor con la versión anterior.
+ * Se lee en `latin1` para que cada byte sea un carácter y la comparación siga siendo exacta.
  */
 export function skillCopies(root: string, pkgDir: string): SkillCopy[] {
-  const source = readFileSync(join(pkgDir, 'skills', 'sdd-ai', 'SKILL.md'))
+  const source = toLf(readFileSync(join(pkgDir, 'skills', 'sdd-ai', 'SKILL.md'), 'latin1'))
   return SKILL_PATHS.map((path): SkillCopy => {
     const file = join(root, path)
     if (!existsSync(file)) return { path, state: 'missing' }
-    return { path, state: readFileSync(file).equals(source) ? 'ok' : 'stale' }
+    return { path, state: toLf(readFileSync(file, 'latin1')) === source ? 'ok' : 'stale' }
   })
 }
 
 /**
  * Vigente solo si el archivo es exactamente lo que generaría `agents sync` hoy: la marca de hash
- * orienta a quien lo lee, pero una edición a mano puede conservarla.
+ * orienta a quien lo lee, pero una edición a mano puede conservarla. Se ignora la diferencia entre
+ * CRLF y LF, porque un checkout de Windows con `core.autocrlf` trae los agentes con CRLF.
  */
 export function agentsState(root: string, pkgDir: string, family: Family, role: ReadOnlyRole, profiles: RoleProfiles): 'ok' | 'stale' | 'missing' {
   const file = agentPath(root, family, role)
   if (!existsSync(file)) return 'missing'
-  return readFileSync(file, 'utf8') === render(family, readSource(pkgDir), role, profiles) ? 'ok' : 'stale'
+  return toLf(readFileSync(file, 'utf8')) === render(family, readSource(pkgDir), role, profiles) ? 'ok' : 'stale'
 }
