@@ -1,11 +1,14 @@
 import type { FsEntry, FsStat } from 'claude-code'
 import type { NotificationObservation } from './notification'
 import type {
-  BandActivity, BandFlow, BandMemory, BandPresentation, BandSelection, Identity, OpenReason, RunKind, RunState, Unavailable,
+  BandActivity, BandFlow, BandMemory, BandPresentation, BandSelection, FlowDetail, Identity, Observed, OpenReason, ProjectionFlow, ProjectionProgress,
+  ProjectionRun, ProjectionWriter, Reason, RunKind, RunState, SessionSelection, SessionViews, Unavailable,
 } from '../types'
+import type { ProjectionCollection as Collection, ProjectionEntity as Entity } from '../types'
 
 export type {
-  BandActivity, BandFlow, BandMemory, BandPresentation, BandProgress, BandSelection, Identity, OpenReason, RunKind, RunState, Unavailable,
+  BandActivity, BandFlow, BandMemory, BandPresentation, BandProgress, BandSelection, FlowDetail, Identity, Observed, OpenReason, ProjectionFlow,
+  ProjectionProgress, ProjectionRun, ProjectionWriter, Reason, RunKind, RunState, SessionSelection, Unavailable,
 } from '../types'
 
 // Lectura y selección puras de la proyección que publica el binario en `.sdd-ai/projection/live/`. Este módulo no
@@ -33,25 +36,9 @@ export const STALE_AFTER_MS = 60_000
 export const OBSERVATION_NAME = /^obs-(\d{20})-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-(\d+)-([0-9a-f]{32})\.json$/
 const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
-// El subconjunto del contrato que lee el mod. Los campos que no usa no se validan ni se conservan.
-export interface Reason { code: string; detail: string }
-export type Observed<T> = { value: T; reason: null } | { value: null; reason: Reason }
-interface Entity { id: string; availability: 'available' | 'unavailable'; reason: Reason | null }
-interface Collection<T> { availability: 'available' | 'partial' | 'unavailable'; reason: Reason | null; items: T[] }
-export interface ProjectionProgress {
-  phase: 'review' | 'refutation'; round: number; launch: number; retained: number; completed: number; total: number
-  active: Observed<{ key: string; reviewer: Observed<string>; batch: Observed<number> }>
-}
-export interface ProjectionRun extends Entity {
-  kind: Observed<RunKind>; state: Observed<RunState>; open: Observed<OpenReason>; session: Observed<string>; flow: Observed<string>
-  live: Observed<boolean>; progress: Observed<ProjectionProgress>
-  session_family?: Observed<'claude' | 'codex'>
-  delivery?: Observed<{ round: number | null; launch: number | null }>
-}
-export interface ProjectionWriter extends Entity {
-  state: Observed<RunState>; open: Observed<OpenReason>; session: Observed<string>; flow: Observed<string>; live: Observed<boolean>
-}
-export interface ProjectionFlow extends Entity { observed_at: number; status: Observed<string>; view: Observed<{ id: string; next: { step: string; gate: string | null } }> }
+// El subconjunto del contrato que lee el mod está en `types/index.d.ts`, junto a `SessionSelection`, porque el estado
+// del panel lo guarda y el contrato de tipos del mod tiene que ser autocontenido. Los campos que no usa no se validan
+// ni se conservan.
 export interface ProjectionBinding extends Entity { flow: Observed<{ id: string; step: string; gate: string | null; at: string }> }
 export interface ProjectionDocument {
   schema_version: 1; notifications_version?: number; checkout: { id: string; root: string }
@@ -255,7 +242,18 @@ const flow: Parse<ProjectionFlow> = (v, p) => {
   const view = observed((w, q) => {
     const detail = object(w, q)
     const next = object(detail.next, `${q}.next`)
-    return { id: text(detail.id, `${q}.id`), next: { step: text(next.step, `${q}.next.step`), gate: next.gate === undefined ? null : text(next.gate, `${q}.next.gate`) } }
+    const tasks = object(detail.tasks, `${q}.tasks`)
+    const counts = { total: integer(tasks.total, `${q}.tasks.total`), done: integer(tasks.done, `${q}.tasks.done`),
+      pending: integer(tasks.pending, `${q}.tasks.pending`), first_pending: nullableText(tasks.first_pending, `${q}.tasks.first_pending`) }
+    if (counts.total !== counts.done + counts.pending || (counts.pending === 0) !== (counts.first_pending === null)) corrupt(`${q}.tasks`)
+    const gates = array(detail.gates, `${q}.gates`).map((v, i) => {
+      const path = `${q}.gates[${i}]`, gate = object(v, path)
+      return { gate: text(gate.gate, `${path}.gate`),
+        artifacts: array(gate.artifacts, `${path}.artifacts`).map((a, j) => text(a, `${path}.artifacts[${j}]`)),
+        state: oneOf(['pending', 'approved', 'approved_unfingerprinted', 'stale'] as const)(gate.state, `${path}.state`) }
+    })
+    return { id: text(detail.id, `${q}.id`), next: { step: text(next.step, `${q}.next.step`), gate: next.gate === undefined ? null : text(next.gate, `${q}.next.gate`) },
+      gates, tasks: counts, blocked_reasons: array(detail.blocked_reasons, `${q}.blocked_reasons`).map((v, i) => reason(v, `${q}.blocked_reasons[${i}]`)) }
   })(o.view, `${p}.view`)
   if (view.value !== null && view.value.id !== head.id) corrupt(`${p}.view.id`)
   return { ...head, observed_at: integer(o.observed_at, `${p}.observed_at`), status: observed(text)(o.status, `${p}.status`), view }
@@ -358,11 +356,12 @@ const byRank = (a: Candidate, b: Candidate): number => rank(a) - rank(b) || comp
  * corrida sin sesión registrada ni una de otra sesión. Sin liga ni actividad, el estado vacío solo vale si la
  * observación permite afirmarlo.
  */
-export function selectBand(document: ProjectionDocument, session: string): BandSelection {
+function sessionCandidates(document: ProjectionDocument, session: string) {
   const { runs, writer, flows, bindings } = document
   const own = bindings.items.find((item) => item.id === session)
   // Una liga ilegible, o un almacén de ligas no disponible, no permite afirmar que la sesión no tiene flujo.
-  const bindingKnown = bindings.availability !== 'unavailable' && (own === undefined || (own.availability === 'available' && (own.flow.value !== null || own.flow.reason.code === 'unbound')))
+  const bindingKnown = own === undefined ? bindings.availability === 'available'
+    : own.availability === 'available' && (own.flow.value !== null || own.flow.reason.code === 'unbound')
   const bound = own?.availability === 'available' ? own.flow.value : null
   let flowView: BandFlow | null = null
   if (bound) {
@@ -379,6 +378,29 @@ export function selectBand(document: ProjectionDocument, session: string): BandS
   if (protectedWriter && protectedWriter.session.value === session) {
     candidates.push({ run: protectedWriter, writer: true, kind: runs.items.find((item) => item.id === protectedWriter.id)?.kind.value ?? null, progress: null })
   }
+  return { own, bindingKnown, bound, flowView, candidates, protectedWriter }
+}
+
+
+/** Inventario propio completo antes de cualquier recorte de dibujo. */
+export function selectSession(document: ProjectionDocument, session: string): SessionSelection {
+  const { own, bindingKnown, bound, flowView, candidates, protectedWriter } = sessionCandidates(document, session)
+  const unknownKind: Observed<RunKind> = { value: null, reason: { code: 'not_recorded', detail: 'La clase no está registrada.' } }
+  return {
+    binding: { availability: document.bindings.availability, reason: own?.reason ?? own?.flow.reason ?? document.bindings.reason, known: bindingKnown, flow: flowView },
+    flow: bound ? document.flows.items.find((item) => item.id === bound.id) ?? null : null,
+    runs: { availability: document.runs.availability, reason: document.runs.reason,
+      items: candidates.sort(byRank).map((candidate) => ({ run: candidate.run, writer: candidate.writer,
+        kind: document.runs.items.find((run) => run.id === candidate.run.id)?.kind ?? unknownKind })) },
+    omitted: document.runs.items.filter((run) => run.id !== protectedWriter?.id && run.session.value === null).length
+      + (protectedWriter?.session.value === null ? 1 : 0),
+    writerAvailability: document.writer.availability,
+  }
+}
+
+export function selectBand(document: ProjectionDocument, session: string): BandSelection {
+  const { runs, writer } = document
+  const { bindingKnown, bound, flowView, candidates, protectedWriter } = sessionCandidates(document, session)
   const ofFlow = bound ? candidates.filter((candidate) => candidate.run.flow.value === bound.id) : []
   const chosen = (ofFlow.length ? ofFlow : candidates).sort(byRank)[0] ?? null
 
@@ -410,6 +432,17 @@ function activityOf(candidate: Candidate, boundFlow: string | null): BandActivit
  * desaparecían (o `live/` faltaba o estaba vacío) en cada listado, o una lectura trabada que sigue sin terminar.
  */
 export type ReadOutcome = { kind: 'valid'; document: ProjectionDocument } | { kind: 'unavailable'; reason: Unavailable } | { kind: 'exhausted' } | { kind: 'stalled' }
+
+export function refreshViews(outcome: ReadOutcome, identity: Identity, current: SessionViews | undefined, now: number): SessionViews {
+  if (outcome.kind === 'valid') return { identity, observedAt: outcome.document.observation.observed_at, readAt: now,
+    retained: false, selection: selectSession(outcome.document, identity.session) }
+  if (outcome.kind === 'exhausted' || outcome.kind === 'stalled') {
+    if (current?.selection && sameIdentity(current.identity, identity)) return { ...current, readAt: now, retained: true }
+  }
+  const invalid = outcome.kind === 'unavailable' && ['corrupt', 'incompatible_version', 'foreign_checkout', 'link', 'directory', 'not_regular', 'not_directory', 'too_large'].includes(outcome.reason)
+  return { identity, observedAt: null, readAt: now, retained: false, selection: null,
+    unavailable: current && !sameIdentity(current.identity, identity) ? 'identity_changed' : invalid ? 'invalid' : 'projection_unavailable' }
+}
 
 function present(selection: BandSelection, lastRead: boolean, now: number): BandPresentation {
   if (selection.kind === 'unavailable') return { kind: 'unavailable', reason: selection.reason }

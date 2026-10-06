@@ -40,7 +40,10 @@ export const flowEntry = (id: string, step = 'implement'): Json => ({
 export const binding = (session: string, flow: string | null, step = 'specify'): Json => ({
   id: session, availability: 'available', reason: null, flow: flow === null ? unknown('unbound') : known({ id: flow, step, gate: null, at: '2026-10-05T00:00:00.000Z' }),
 })
-export const available = (items: Json[]): Json => ({ availability: 'available', reason: null, items })
+export const available = (items: Json[]): Json => {
+  const partial = items.some(item => item.availability === 'unavailable')
+  return { availability: partial ? 'partial' : 'available', reason: partial ? { code: 'partial', detail: 'Hay entidades ilegibles.' } : null, items }
+}
 
 export interface Parts { runs?: Json[]; writer?: Json | null; flows?: Json[]; bindings?: Json[]; observedAt?: number; root?: string; schemaVersion?: number; notificationsVersion?: number }
 

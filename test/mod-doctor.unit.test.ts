@@ -1,10 +1,47 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { type RoleProfiles, agentCopies, syncAgents } from '../src/agents.ts'
+import { inspectModEngine } from '../src/mod-engine.ts'
+import { READ_ONLY_ROLES } from '../src/types.ts'
 import { type Exec, doctor, emittedFlags } from '../src/doctor.ts'
 import { MOD_PATH, modCopy, modInventory, syncModCopy } from '../src/mod-copies.ts'
+
+test('doctor distingue avisos del API y copias de agentes desactualizadas', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-engine-doctor-'))
+  const pkg = join(import.meta.dirname, '..')
+  const inventory = modInventory(pkg)
+  const profiles = Object.fromEntries(READ_ONLY_ROLES.map((role) => [role, { claude: {}, codex: {} }])) as RoleProfiles
+  const exec: Exec = (name, args) => ({ status: 0, stdout: args.includes('--version') ? '2.1.290' : emittedFlags(name as 'claude' | 'codex', args.includes('resume') ? 'resume' : 'exec').join('\n') })
+  const check = () => doctor(exec, undefined, { copies: [modCopy(root, inventory)] }, inspectModEngine(root), { copies: agentCopies(root, pkg, profiles) })
+  try {
+    assert.equal(check().ok, false)
+    syncModCopy(root, inventory)
+    let report = check()
+    assert.equal(report.ok, true, 'tipos y agentes ausentes solo avisan')
+    assert.ok(report.warnings?.some((w) => w.code === 'mod_engine_types_missing'))
+    assert.equal(report.warnings?.filter((w) => w.code === 'agent_copy_missing').length, READ_ONLY_ROLES.length * 2)
+    const engine = inspectModEngine(root)
+    for (const path of engine.paths) { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, 'engine declaration') }
+    syncAgents(root, pkg, profiles)
+    assert.deepEqual(check().warnings, [])
+    for (const path of engine.paths) assert.equal(readFileSync(path, 'utf8'), 'engine declaration')
+    const copy = agentCopies(root, pkg, profiles)[0]
+    writeFileSync(join(root, copy.path), readFileSync(join(root, copy.path), 'utf8') + '\nold rule\n')
+    report = check()
+    assert.equal(report.ok, true)
+    assert.deepEqual(report.warnings, [{ code: 'agent_copy_stale', message: `El agente ${copy.path} está desactualizado.`, next: './bin/sdd-ai agents sync' }])
+    syncAgents(root, pkg, profiles)
+    assert.deepEqual(check().warnings, [])
+    rmSync(engine.paths[0]); mkdirSync(engine.paths[0])
+    assert.equal(check().ok, true, 'declaración ilegible solo avisa')
+    assert.ok(check().warnings?.some((w) => w.code === 'mod_engine_types_missing'))
+    rmSync(join(root, MOD_PATH), { recursive: true })
+    assert.equal(check().ok, false, 'copia ausente sigue quitando ok')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
 
 test('doctor reports current missing and stale mod copies like skill copies', () => {
   const root = mkdtempSync(join(tmpdir(), 'sdd-ai-mod-doctor-'))

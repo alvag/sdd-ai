@@ -23,7 +23,7 @@ function npmCli(): string | undefined {
 }
 
 /** Las llamadas que hoy admite el registro, tal como las lista `claude plugin validate`. */
-const ADMITTED = ['$.ui.resolve', '$.state.get', '$.state.set', '$.fs.list', '$.fs.stat', '$.fs.read', '$.session.id', '$.session.root', '$.clock.every', '$.clock.after', '$.clock.now', '$.prompt.submit', '$.prompt.read', '$.fs.write', '$.store.get', '$.store.set']
+const ADMITTED = ['$.ui.resolve', '$.state.get', '$.state.set', '$.fs.list', '$.fs.stat', '$.fs.read', '$.session.id', '$.session.root', '$.clock.every', '$.clock.after', '$.clock.now', '$.prompt.submit', '$.prompt.read', '$.fs.write', '$.store.get', '$.store.set', '$.command.register', '$.ui.open', '$.ui.close', '$.ui.panes', '$.env.get']
 const ALLOWED_REPORT = '❯ ./register.tsx hooks: tool.call, ui.render\n❯ ./register.tsx calls: $.ui.resolve, $.state.get, $.state.set'
 /** El diagnóstico del motor cuando una sesión anterior guardó apagado el interruptor de rollout. */
 const ROLLOUT_SAVED_OFF = 'hooks modules are turned off in this process: the rollout switch was saved off by an earlier session'
@@ -80,6 +80,31 @@ function toolingFixture() {
 const VALIDATE = ['plugin', 'validate', '--strict', 'mods/sdd-ai']
 const PLUGIN_TEST = ['plugin', 'test', 'mods/sdd-ai']
 
+test('mod tooling admite solo las capacidades de panel comandos y lectura autorizadas', () => {
+  const { root, calls, testMods } = toolingFixture()
+  const hook = join(root, 'mods/sdd-ai/hooks/register.tsx')
+  const original = readFileSync(hook, 'utf8')
+  try {
+    writeFileSync(hook, `${original}\n// Sonda de la validación estática del fixture.\n$.env.get('HOME'); $.env.get("CLAUDE_CONFIG_DIR");\n`)
+    let result = testMods({ MOD_REPORT: `❯ ./register.tsx calls: ${ADMITTED.join(', ')}` })
+    assert.equal(result.status, 0, result.stderr)
+    assert.deepEqual(calls().map(call => call.args), [VALIDATE, PLUGIN_TEST])
+    for (const argument of ["'PATH'", 'name', "'HOME' + suffix"]) {
+      writeFileSync(hook, `${original}\n$.env.get(${argument});\n`)
+      result = testMods()
+      assert.notEqual(result.status, 0, argument)
+      assert.match(result.stderr, /env\.get/)
+      assert.deepEqual(calls(), [])
+    }
+    writeFileSync(hook, original)
+    for (const call of ['$.env.set', '$.command.run', '$.process.run', '$.http.fetch', '$.model.complete']) {
+      result = testMods({ MOD_REPORT: `❯ ./register.tsx calls: ${[...ADMITTED, call].join(', ')}` })
+      assert.notEqual(result.status, 0, call)
+      assert.deepEqual(calls().map(entry => entry.args), [VALIDATE])
+    }
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test('mod tooling admits notification capabilities and still rejects execution', () => {
   const { root, testMods, calls } = toolingFixture()
   try {
@@ -109,7 +134,7 @@ test('mod scripts propagate failures require generated types and isolate runtime
       { MOD_VALIDATE_EXIT: '4' },
       { MOD_REPORT: '❯ ./register.tsx hooks: tool.call, ui.render' },
       { MOD_REPORT: '❯ ./register.tsx calls: $.prompt.fill' },
-      { MOD_REPORT: '❯ ./register.tsx calls: $.ui.resolve, $.command.register' },
+      { MOD_REPORT: '❯ ./register.tsx calls: $.ui.resolve, $.env.set' },
       // Un auxiliar que declara llamadas también falla, aunque el registro esté en regla.
       { MOD_REPORT: `${ALLOWED_REPORT}\n❯ ./render.tsx calls: $.ui.toast` },
       { MOD_REPORT: '❯ ./register.tsx calls:' },
@@ -180,7 +205,7 @@ test('mod tooling admits exact presentation capabilities and diagnoses saved rol
     // familia admitida, sin llegar al runner.
     const outside = [
       '$.process.run', '$.process.spawn', '$.http.fetch', '$.mcp.call', '$.model.complete', '$.model.fork',
-      '$.prompt.fill', '$.session.send', '$.command.register', '$.command.run', '$.tool.register', '$.tool.call',
+      '$.prompt.fill', '$.session.send', '$.env.set', '$.command.run', '$.tool.register', '$.tool.call',
       '$.agent.spawn', '$.fs.exists', '$.fs.ancestors', '$.clock.sleep', '$.session.cwd', '$.store.delete', '$.ui.status',
     ]
     for (const call of outside) {

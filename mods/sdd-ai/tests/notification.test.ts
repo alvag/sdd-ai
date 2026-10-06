@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 import { RETRY_DELAYS_MS, resultKey, SIGNAL_TTL_MS, SUBMIT_IDLE_TIMEOUT_MS } from '../hooks/notification'
 import { binding, known, REAL_ROOT, T0, unknown } from './fixtures/band-world'
-import { NEVER_EFFECTS } from './fixtures/forbidden-effects'
+import { guardPanelEffects, NEVER_EFFECTS } from './fixtures/forbidden-effects'
 import { NotificationWorld, notificationBarrier, STORE_LIMIT_BYTES } from './fixtures/notification-world'
 
 let sessions = 0
@@ -345,6 +345,7 @@ test('missing corrupt foreign incompatible and retained observations never reque
 })
 
 test('notice effects target only the own signal and complete result keys and never execute commands', async ($, on) => {
+  guardPanelEffects(on)
   const { world, clock } = setup(on)
   const prohibited: string[] = []
   for (const event of [...NEVER_EFFECTS, 'tool.call'] as const) {

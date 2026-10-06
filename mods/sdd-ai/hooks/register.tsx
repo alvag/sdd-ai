@@ -1,16 +1,87 @@
 import type { EngineInterface, MatchedHook, Register, Timer } from 'claude-code'
-import type { BandState, Identity, NotificationAvailability, NotificationCoordinatorState } from '../types'
+import type { BandState, Identity, NotificationAvailability, NotificationCoordinatorState, PersistedCache, PersistedEntry, SessionViews, Summary } from '../types'
 import { bandTree } from './band'
 import { recognizeCommand } from './command'
 import { parseOutput } from './output'
-import { directoryProblem, FLOODED_PAUSE_MS, isAbsence, judgeStat, LIST_ATTEMPTS, listingOf, notificationObservation, parseObservation, projectionPaths, refreshBand, sameIdentity } from './projection'
+import { panelTree, runsTree } from './panel'
+import { eligiblePersisted, lexicalPersistedPath, persistedContentFits, physicalPersistedPath, projectsRoot } from './persisted-output'
+import { directoryProblem, FLOODED_PAUSE_MS, isAbsence, judgeStat, LIST_ATTEMPTS, listingOf, notificationObservation, parseObservation, projectionPaths, refreshBand, refreshViews, sameIdentity } from './projection'
 import type { Lookup, ProjectionDocument, ProjectionRun, ReadOutcome } from './projection'
 import { eligibleResult, evaluateSignal, mayAttempt, mayRecover, OBSERVATION_INTERVAL_MS, resultKey, safeSegment, sameRecipient, selectRecipient, transitionNotification, validNotificationRecord } from './notification'
 import type { NotificationAssociation, NotificationRecord, NotificationSignal, RecipientIdentity, RecipientSelection, RoutingInput, SignalObservation } from './notification'
-import { RESULT_INDENT, UNMEASURED_COLUMNS, groupTree, originalTree, summaryTree, treeFits } from './render'
+import { RESULT_INDENT, UNMEASURED_COLUMNS, groupTree, originalTree, summaryTree, textCost, treeFits } from './render'
 
 /** El estado de la banda: lo escribe solo el refresco y lo lee el dibujo, que así se redibuja con cada cambio. */
 const BAND = { plugin: 'sdd-ai-mod', key: 'band' } as const
+const VIEWS = { plugin: 'sdd-ai-mod', key: 'views' } as const
+const PANEL_ID = 'sdd-panel'
+const RUNS_ID = 'sdd-runs'
+const PERSISTED = { plugin: 'sdd-ai-mod', key: 'persisted' } as const
+const load = `${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`
+const observedCalls = new Map<string, Identity>()
+const persistedAttempts = new Set<string>()
+let persistedCache: PersistedCache = { load, entries: {} }
+let persistedWrites: Promise<void> = Promise.resolve()
+let persistedStarted = false
+function savePersisted($: EngineInterface, id?: string, entry?: PersistedEntry): Promise<void> {
+  if (id !== undefined && entry !== undefined) persistedCache = { load, entries: { ...persistedCache.entries, [id]: entry } }
+  const snapshot = persistedCache
+  const saved = persistedWrites.catch(() => {}).then(async () => {
+    if (id === undefined) {
+      await $.state.set(PERSISTED, snapshot)
+      return
+    }
+    // Compare-and-set: si otra carga escribió entre la lectura y la escritura, la versión ya no coincide y esta
+    // escritura no restaura una caché ajena.
+    const current = await $.state.get(PERSISTED)
+    if (current.value?.load !== load) throw new Error('La caché pertenece a otra carga')
+    const written = await $.state.set(PERSISTED, snapshot, { ifVersion: current.version })
+    if (!written.isSet) throw new Error('Otra carga escribió la caché')
+  })
+  persistedWrites = saved
+  return saved
+}
+function startPersisted($: EngineInterface): void {
+  if (persistedStarted) return
+  persistedStarted = true
+  // Si la inicialización falla, la siguiente llamada la reintenta; los intentos ya consumidos no se repiten.
+  void savePersisted($).catch(() => { persistedStarted = false })
+}
+async function readPersisted($: EngineInterface, id: string, response: unknown): Promise<void> {
+  const eligible = eligiblePersisted(response, observedCalls.has(id))
+  if (!eligible || persistedAttempts.has(id)) return
+  persistedAttempts.add(id)
+  let identity: Identity | undefined
+  try {
+    const original = observedCalls.get(id)!
+    if (original.session !== await $.session.id() || original.root !== await $.session.root()) throw new Error('La llamada pertenece a otra identidad')
+    identity = (await identify($)).identity
+    await savePersisted($, id, { identity, path: eligible.path, status: 'pending' })
+    if (!lexicalPersistedPath(eligible.path)) throw new Error('Forma de ruta no permitida')
+    const config = await $.env.get('CLAUDE_CONFIG_DIR')
+    const root = projectsRoot(config, config ? undefined : await $.env.get('HOME'))
+    if (!root) throw new Error('Directorio de proyectos no disponible')
+    const rootStat = await $.fs.stat(root, { resolve: true })
+    if (rootStat.kind !== 'dir' || !rootStat.realPath?.startsWith('/') || rootStat.realPath.split('/').includes('..')) throw new Error('Raíz real de proyectos no disponible')
+    const fileStat = await $.fs.stat(eligible.path, { resolve: true })
+    if (!physicalPersistedPath(rootStat, fileStat)) throw new Error('Ruta real o tamaño no permitido')
+    const content = await $.fs.read(eligible.path)
+    if (!persistedContentFits(content)) throw new Error('Contenido mayor de 1 MiB')
+    const output = parseOutput(eligible.output, eligible.isErrored, content)
+    if (output.kind !== 'summary' || !sameIdentity(identity, (await identify($)).identity)) throw new Error('Resumen no disponible para esta identidad')
+    await savePersisted($, id, { identity, path: eligible.path, status: 'summary', summary: output.summary, isErrored: eligible.isErrored })
+  } catch {
+    if (identity) await savePersisted($, id, { identity, path: eligible.path, status: 'unavailable' }).catch(() => {})
+  }
+}
+let commands: Promise<void> | null = null
+function registerCommands($: EngineInterface): void {
+  if (commands !== null) return
+  commands = (async () => {
+    await $.command.register({ name: PANEL_ID, description: 'Muestra el flujo y los pendientes de esta sesión.', immediate: true })
+    await $.command.register({ name: RUNS_ID, description: 'Muestra las corridas abiertas de esta sesión.', immediate: true })
+  })().catch(() => { commands = null })
+}
 /** Cada cuánto se relee la proyección: deja margen dentro de los cinco segundos que tiene un cambio para verse. */
 const REFRESH_MS = OBSERVATION_INTERVAL_MS
 /**
@@ -35,6 +106,7 @@ interface Notifier { state: NotificationCoordinatorState; submissions: Map<strin
 let notifier: Notifier | null = null
 
 const observeCall: MatchedHook<'tool.call', { tool: 'Bash' }> = async ($, e, next) => {
+  startPersisted($)
   // La atribución se guarda antes de continuar, así está cuando se dibuja el resultado. Un fallo del reconocimiento o del
   // estado se descarta: un error de la atribución de presentación nunca impide la herramienta. La espera no se acota: la
   // herramienta espera lo que tarde el motor en guardar el estado de la sesión, y el reloj del mod solo sostiene el
@@ -42,18 +114,38 @@ const observeCall: MatchedHook<'tool.call', { tool: 'Bash' }> = async ($, e, nex
   try {
     if (recognizeCommand(e.command).kind === 'recognized') {
       await $.state.set({ plugin: 'sdd-ai-mod', key: 'attribution', id: e.tool_use_id }, { command: e.command })
+      observedCalls.set(e.tool_use_id, { session: await $.session.id(), root: await $.session.root() })
     }
   } catch {
     // Sin atribución, el resultado suelto queda nativo.
   }
-  return next(e)
+  const response = await next(e)
+  if (eligiblePersisted(response, observedCalls.has(e.tool_use_id))) {
+    try { $.clock.after(0, () => { void readPersisted($, e.tool_use_id, response).catch(() => {}) }) } catch { /* Conserva la presentación nativa. */ }
+  }
+  return response
+}
+
+async function currentSummaries($: EngineInterface, calls: readonly { tool_use_id?: string; output?: unknown }[]): Promise<Record<string, Summary>> {
+  const cache = (await $.state.get(PERSISTED)).value
+  if (cache?.load !== load) return {}
+  const session = await $.session.id(), root = await $.session.root()
+  const views = (await $.state.get(VIEWS)).value
+  const paths = new Map(calls.map(call => [call.tool_use_id, eligiblePersisted({ result: call.output }, true)?.path]))
+  return Object.fromEntries(Object.entries(cache.entries).flatMap(([id, entry]) => {
+    const original = observedCalls.get(id)
+    return entry.status === 'summary' && paths.get(id) === entry.path && original?.session === session && original.root === root
+      && (!views || sameIdentity(entry.identity, views.identity)) ? [[id, entry.summary]] : []
+  }))
 }
 
 const renderOutput: MatchedHook<'ui.render', { component: ['ToolGroup', 'ToolResult'] }> = async ($, e, next) => {
   if (e.surface !== 'terminal') return next(e)
   if (e.component === 'ToolGroup') {
     if (e.props.isExpanded) return next(e)
-    const tree = groupTree($.ui.resolve(e), e.props.calls, e.viewport?.columns)
+    let cached: Record<string, Summary> = {}
+    try { cached = await currentSummaries($, e.props.calls) } catch { /* Sin caché válida sigue la presentación anterior. */ }
+    const tree = groupTree($.ui.resolve(e), e.props.calls, 90_000, e.viewport?.columns, cached)
     return tree && treeFits(tree) ? tree : next(e)
   }
   if (e.component === 'ToolResult' && e.props.tool === 'Bash') {
@@ -64,13 +156,40 @@ const renderOutput: MatchedHook<'ui.render', { component: ['ToolGroup', 'ToolRes
       return next(e)
     }
     if (command === undefined) return next(e)
+    let saved: Summary | undefined
+    try { saved = (await currentSummaries($, [e.props]))[e.props.tool_use_id] } catch { /* No recuperar una caché ajena. */ }
+    if (saved) {
+      const ui = $.ui.resolve(e)
+      const { Box } = ui
+      const summary = summaryTree(ui, { summary: saved, command, isErrored: e.props.isErrored,
+        columns: e.viewport?.columns, available: (e.viewport?.columns ?? UNMEASURED_COLUMNS) - RESULT_INDENT }, SAVED_SUMMARY_BUDGET)
+      if (!treeFits(summary)) return next(e)
+      const ref = await next(e)
+      // El API vigente devuelve un árbol; el core puede dejar en él su nodo engine.
+      // Conservarlo entero también respeta un renderer inferior. Admitir la referencia del API anterior.
+      const original = typeof ref === 'number' ? { type: 'engine' as const, ref } : ref
+      return <Box flexDirection="column">{summary}{original}</Box>
+    }
     const output = parseOutput(e.props.output, e.props.isErrored)
     if (output.kind !== 'summary') return next(e)
     const ui = $.ui.resolve(e)
     const { Box } = ui
+    const input = { summary: output.summary, command, isErrored: e.props.isErrored, columns: e.viewport?.columns,
+      available: (e.viewport?.columns ?? UNMEASURED_COLUMNS) - RESULT_INDENT }
+    let original = originalTree(ui, output.original)
+    // Un original que no deja sitio para el resumen mínimo queda en el renderer nativo de debajo.
+    // El resumen conserva su propio presupuesto sin duplicar ese texto en el árbol del mod.
+    let budget = 90_000 - textCost(original)
+    if (textCost(original) + textCost(summaryTree(ui, input, 0)) > 90_000) {
+      const ref = await next(e)
+      original = typeof ref === 'number' ? { type: 'engine' as const, ref } : ref
+      // El motor cuenta el original que dibuja el nodo engine, aunque textCost no lo vea: la misma reserva que una
+      // salida guardada.
+      budget = SAVED_SUMMARY_BUDGET
+    }
     const tree = <Box flexDirection="column">
-      {summaryTree(ui, { summary: output.summary, command, isErrored: e.props.isErrored, columns: e.viewport?.columns, available: (e.viewport?.columns ?? UNMEASURED_COLUMNS) - RESULT_INDENT })}
-      {originalTree(ui, output.original)}
+      {summaryTree(ui, input, budget)}
+      {original}
     </Box>
     // Un resultado que el motor no dibujaría (demasiado texto o caracteres de control) queda nativo, con su
     // salida original completa.
@@ -102,6 +221,8 @@ let startScheduled = false
 
 /** Arranca el refresco si este entorno todavía no lo tiene: nunca hay dos. La primera lectura no espera un período. */
 function startRefresh($: EngineInterface): void {
+  startPersisted($)
+  registerCommands($)
   if (refresh !== null) return
   const own: Refresh = { timer: null, generation: 0, reading: null, pausedUntil: 0, identifying: false, presenting: false, notifying: false }
   refresh = own
@@ -215,6 +336,9 @@ async function presentStalled($: EngineInterface, own: Refresh, reading: Reading
   // La hora de esta presentación, no la del período que la lanzó: la consulta de identidad o el estado pudieron tardar.
   const now = await $.clock.now()
   const { band, memory } = refreshBand({ kind: 'stalled' }, identity, current?.memory ?? null, now)
+  const views = (await $.state.get(VIEWS)).value
+  if (!valid()) return
+  await setViews($, refreshViews({ kind: 'stalled' }, identity, views, now))
   const next: BandState = { identity, presentation: band, memory }
   if (current !== undefined && JSON.stringify(current) === JSON.stringify(next)) return
   if (!valid()) return
@@ -236,6 +360,14 @@ async function identify($: EngineInterface): Promise<{ identity: Identity; rootL
 }
 
 /**
+ * Escribe el detalle de las vistas. Un fallo de esa escritura no frena la banda, que se publica aparte: el panel queda
+ * con su lectura anterior y el ciclo siguiente lo reintenta.
+ */
+async function setViews($: EngineInterface, views: SessionViews): Promise<void> {
+  try { await $.state.set(VIEWS, views) } catch { /* La banda sigue; el próximo ciclo vuelve a escribir. */ }
+}
+
+/**
  * Una lectura completa: la identidad, la proyección y el estado que se dibuja. Al cambiar la sesión o el checkout, los
  * datos anteriores se retiran antes de leer; una respuesta de una generación vieja no se escribe.
  */
@@ -244,6 +376,12 @@ async function refreshOnce($: EngineInterface, own: Refresh, generation: number)
   // Si esta lectura se traba, la banda sabe de qué identidad era.
   if (own.reading?.generation === generation) own.reading.identity = identity
   const current = (await $.state.get(BAND)).value
+  const views = (await $.state.get(VIEWS)).value
+  if (views !== undefined && !sameIdentity(views.identity, identity)) {
+    const readAt = await $.clock.now()
+    if (!stillCurrent(own, generation)) return
+    await setViews($, { identity, observedAt: null, readAt, retained: false, selection: null, unavailable: 'identity_changed' })
+  }
   if (current !== undefined && current.presentation !== null && !sameIdentity(current.identity, identity)) {
     if (!stillCurrent(own, generation)) return
     await $.state.set(BAND, { identity, presentation: null, memory: null })
@@ -251,6 +389,15 @@ async function refreshOnce($: EngineInterface, own: Refresh, generation: number)
   const outcome: ReadOutcome = realRoot !== null ? await readProjection($, realRoot)
     : { kind: 'unavailable', reason: rootLookup.kind === 'failed' ? 'unreadable' : 'missing' }
   if (!stillCurrent(own, generation)) return
+  const checked = (await identify($)).identity
+  if (!stillCurrent(own, generation)) return
+  if (!sameIdentity(checked, identity)) {
+    const readAt = await $.clock.now()
+    if (!stillCurrent(own, generation)) return
+    await $.state.set(BAND, { identity: checked, presentation: null, memory: null })
+    await setViews($, { identity: checked, observedAt: null, readAt, retained: false, selection: null, unavailable: 'identity_changed' })
+    return
+  }
   const now = await $.clock.now()
   // Después de un listado de más de 256 entradas, no se vuelve a listar enseguida: el siguiente publicador lo aparta.
   if (outcome.kind === 'unavailable' && outcome.reason === 'flooded') own.pausedUntil = now + FLOODED_PAUSE_MS
@@ -262,6 +409,8 @@ async function refreshOnce($: EngineInterface, own: Refresh, generation: number)
       .finally(() => { own.notifying = false })
   }
   const { band, memory } = refreshBand(outcome, identity, current?.memory ?? null, now)
+  if (!stillCurrent(own, generation)) return
+  await setViews($, refreshViews(outcome, identity, views, now))
   const next: BandState = { identity, presentation: band, memory }
   if (current !== undefined && JSON.stringify(current) === JSON.stringify(next)) return
   if (!stillCurrent(own, generation)) return
@@ -345,7 +494,39 @@ const renderBand: MatchedHook<'ui.render', { component: 'AbovePrompt' }> = async
   return bandTree($.ui.resolve(e), state.presentation, e.props.bodyColumns) ?? next(e)
 }
 
+/**
+ * El presupuesto del resumen de una salida guardada aparte: el motor cuenta contra el límite de 100 000 caracteres
+ * el original nativo que dibuja el nodo `engine` de debajo (plan, punto 8), así que se le reservan 30 000.
+ */
+const SAVED_SUMMARY_BUDGET = 60_000
+
 export const register: Register = (on) => {
+  on('command.run', { command: [PANEL_ID, RUNS_ID] }, async ($, e) => {
+    startRefresh($)
+    const id = e.command
+    const pane = (await $.ui.panes()).find(pane => pane.id === id)
+    if (pane?.isShown) {
+      await $.ui.close({ id })
+      return {}
+    }
+    // Abrir un id que ya está abierto solo lo retitula: un pane abierto detrás de otro se cierra y se vuelve a abrir
+    // para que quede al frente, sin pedir el teclado.
+    if (pane) await $.ui.close({ id })
+    await $.ui.open({ id, title: id === PANEL_ID ? 'sdd-ai · panel' : 'sdd-ai · corridas', closeOnEscape: true })
+    return {}
+  })
+  on('ui.render', { component: 'Pane' }, async ($, e, next) => {
+    if (e.surface !== 'terminal' || (e.requestId !== PANEL_ID && e.requestId !== RUNS_ID)) return next(e)
+    scheduleStart($)
+    const views = (await $.state.get(VIEWS)).value
+    const now = await $.clock.now()
+    const { Box, Button } = $.ui.resolve(e)
+    const draw = e.requestId === PANEL_ID ? panelTree : runsTree
+    return <Box flexDirection="column">
+      {draw(views, 90_000 - 'Cerrar'.length, e.props.bodyColumns, now)}
+      <Button role="dismiss" onPress={async () => { await $.ui.close({ id: e.requestId! }) }}>Cerrar</Button>
+    </Box>
+  })
   on('session.start', ($, e, next) => {
     // Una sesión nueva, una recarga o la adopción del mod arrancan el refresco; el dibujo lo arranca si esto no pasó.
     if (e.surface === 'terminal') startRefresh($)

@@ -16,8 +16,8 @@ export const MOD_RUNTIME_FILES: readonly string[] = MOD_FIXED_FILES.map((path) =
 export const ENGINE_PATHS: ReadonlySet<string> = new Set(['.claude-plugin/types', 'tsconfig.json'])
 /** El sufijo del temporal con el que se escribe cada archivo de la copia antes de renombrarlo. */
 const TEMPORARY_SUFFIX = '.sdd-ai-tmp'
-// Comprobado con Claude Code 2.1.289: una sesión abierta que ya tenía el mod adopta sola la copia nueva, y
-// /reload-plugins carga la copia también en una sesión que arrancó sin ella, sin duplicar el mod.
+// La adopción automática se observó solo con 2.1.289. En 2.1.290 cambiar o retirar la copia requiere
+// /reload-plugins o una sesión nueva; no se garantiza adopción automática en otras versiones.
 export const MOD_ADOPTION_MESSAGE = 'Para cargar sdd-ai-mod en una sesión de Claude Code ya abierta en este checkout, corre /reload-plugins; una sesión nueva lo carga al arrancar.'
 export interface ModFile { path: string; bytes: Buffer; sha256: string }
 export interface ModCopy { path: string; state: 'ok' | 'missing' | 'stale' }

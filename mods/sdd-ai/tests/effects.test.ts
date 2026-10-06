@@ -2,7 +2,7 @@ import type { On, ToolCallResult } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import { binding, flowEntry, known, review, SESSION_ROOT, T0, World, writer } from './fixtures/band-world'
 import { domainErrorCapture2_1_288 } from './fixtures/domain-error-2.1.288'
-import { NEVER_EFFECTS } from './fixtures/forbidden-effects'
+import { guardPanelEffects, NEVER_EFFECTS } from './fixtures/forbidden-effects'
 
 const command = domainErrorCapture2_1_288.command
 /**
@@ -14,6 +14,7 @@ const command = domainErrorCapture2_1_288.command
 const presentationForbidden = [...NEVER_EFFECTS, 'prompt.submit', 'fs.write', 'store.set'] as const
 
 function watchEffects(on: On): string[] {
+  guardPanelEffects(on)
   const effects: string[] = []
   for (const name of presentationForbidden) on(name, () => {
     effects.push(name)
@@ -164,8 +165,12 @@ test('the band refresh uses timers and its own presentation state and has no dom
   await ui.redraw({ ...props, hasSurvey: true })
   await ui.redraw(props)
   await clock.advance(70_000)
-  expect(world.accesses.filter((access) => access.op === 'stat' && access.path === SESSION_ROOT)).toHaveLength(77)
-  expect(new Set(writes)).toEqual(new Set(['sdd-ai-mod.band']))
+  // Dos consultas de la raíz por lectura: la identidad al empezar y su revalidación antes de aceptar la respuesta, para
+  // que una lectura tardía no restaure los datos de una identidad anterior (AC-7).
+  expect(world.accesses.filter((access) => access.op === 'stat' && access.path === SESSION_ROOT)).toHaveLength(154)
+  // Escribe solo su estado de presentación: la banda, el detalle de las vistas y la caché de salidas guardadas.
+  expect([...new Set(writes)].every((write) => ['sdd-ai-mod.band', 'sdd-ai-mod.views', 'sdd-ai-mod.persisted'].includes(write))).toBe(true)
+  expect(new Set(writes).has('sdd-ai-mod.views')).toBe(true)
   expect(tools).toBe(0)
   expect(effects).toEqual([])
   // El refresco solo lee: lo que había en el checkout sigue igual, salvo lo que publicó el test.

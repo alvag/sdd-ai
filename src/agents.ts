@@ -157,6 +157,16 @@ export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles,
 /** Una copia instalada de la skill, con su ruta relativa a la raíz del repo. */
 export interface SkillCopy { path: string; state: 'ok' | 'stale' | 'missing' }
 
+export interface AgentCopy { path: string; family: Family; role: ReadOnlyRole; state: 'ok' | 'stale' | 'missing' }
+
+/** Comparación completa contra la fuente y el perfil resuelto, igual que el despacho nativo. */
+export function agentCopies(root: string, pkgDir: string, profiles: RoleProfiles): AgentCopy[] {
+  return READ_ONLY_ROLES.flatMap((role) => FAMILIES.map((family) => ({
+    path: join(AGENT_DIRS[family], `${agentName(role)}${AGENT_EXT[family]}`), family, role,
+    state: agentsState(root, pkgDir, family, role, profiles),
+  })))
+}
+
 /**
  * Cada copia de la skill frente a su fuente, byte a byte salvo el fin de línea (un checkout de Windows
  * con `core.autocrlf` trae CRLF): el conductor lee la copia, así que una fuente editada sin

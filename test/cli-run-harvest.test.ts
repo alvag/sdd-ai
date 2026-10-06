@@ -1,3 +1,4 @@
+import { withWorkerPolicy } from '../src/worker-policy.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
@@ -111,7 +112,7 @@ test('--retry de un writer relanza el encargo, el rol, las familias, el perfil y
   assert.equal(again.code, 0, JSON.stringify(again.out))
   assert.equal(cli(s, ['wait', again.out.id, '--max', '20']).out.state, 'done')
   const control = readJsonFile(join(storeOf(s.repo, again.out.id), 'control.json'))
-  assert.equal(control.prompt, 'Encargo de prueba.\n')
+  assert.equal(control.prompt, withWorkerPolicy('Encargo de prueba.\n'))
   assert.deepEqual([control.family, control.request.role, control.request.families, control.request.model, control.request.effort, control.request.deadline_sec],
     ['codex', 'implement', 'codex', 'gpt-x', 'low', 77])
   const sent = readFileSync(prompts, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as string)

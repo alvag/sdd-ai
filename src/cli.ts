@@ -7,14 +7,15 @@ import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
-import { type RoleProfiles, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
+import { type RoleProfiles, agentCopies, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
 import { type Proof, askNext, prove } from './approval/proof.ts'
 import { DISPUTE_OPTIONS, type Question, attestQuestion, disputeQuestion, extraOptions, extraQuestion } from './approval/question.ts'
 import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
-import { type ModCheck, type SkillCheck, doctor } from './doctor.ts'
+import { type AgentCheck, type ModCheck, type SkillCheck, doctor } from './doctor.ts'
 import { MOD_ADOPTION_MESSAGE, modCopy, modInventory } from './mod-copies.ts'
+import { type ModEngineContext, inspectModEngine, modEngineContext } from './mod-engine.ts'
 import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, readGitState, readHeadState, repoRoot } from './git.ts'
 import { type InitAnswers, applyInit, planInit } from './init.ts'
 import { withLock, withLockAsync } from './lock.ts'
@@ -54,7 +55,7 @@ import { applyCommit, planCommit } from './sdd/commit.ts'
 import { approve } from './sdd/approve.ts'
 import { assertBranchApplicable, branchApply, branchPreview } from './sdd/branch.ts'
 import { criteriaIds, taskLines } from './sdd/markdown.ts'
-import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
+import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, phaseTouchesMods, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
 import {
   type ChainClass, type ChainEntry, type ChainTerminal, type PhaseRecord, type RunEntry, type RunKind, activeRun, appendClassification, appendEntry, appendEvent,
   appendReviewRef, closeChain, implementOf, readPhaseRecord, withFlowLock, withPhaseNext, writePhaseRecord,
@@ -81,6 +82,7 @@ import { claudeLaunch, claudeResume, claudeWriterLaunch, withSessionId } from '.
 import { codexLaunch, codexResume, codexWriterLaunch, withResultFile } from './workers/codex.ts'
 import { authorizeTerminalReceipt } from './notification.ts'
 import { writerEnvelopeBytes, writerPrompt } from './writer.ts'
+import { withWorkerPolicy } from './worker-policy.ts'
 import {
   type HarvestRecord, type LaunchFrom, type WriterControl, canWriteStore, captureTreeAtBase, controlUnavailable, freezeHarvest, groupState, harvestTreeHolds, isWriterRun,
   acquireReservation, acquisitionError, ownReservation, controlReservation, controlStore, flowWriterRuns, launchTreeDiff, launchTreeHolds, leaderMatches, processAlive, readControl, readHarvest, releaseAndReport, runDirIdentity, runInventory,
@@ -234,6 +236,7 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
   }
 
   if (values.flow !== undefined) prompt += `\n\n${renderAntecedents(values.flow, readAntecedents(root, values.flow))}`
+  prompt = withWorkerPolicy(prompt)
 
   if (role === 'implement') {
     return await runWriter({
@@ -2410,6 +2413,9 @@ function inheritedProfile(root: string, record: PhaseRecord, origin: string): { 
  */
 async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Promise<Result> {
   const { root, env, id, read, conductor } = p
+  const frozen = frozenInputs(root, read)
+  const engine = phaseEngine(root, 'implement', frozen.text, conductor.family)
+  if (engine) l.prompt += `\n\n${engine.context}\n`
   if (l.mode !== 'initial' && l.origin) {
     const ok = checkResumable(root, env, l.origin, l.mode)
     if (!ok.ok) {
@@ -2444,7 +2450,6 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
     const launched = writerLaunchOf(root, l.origin!)
     resolution = { family: launched?.family ?? readControl(root, l.origin!).family, via: 'process', origin: { model: 'heredado', effort: 'heredado' } }
   }
-  const frozen = frozenInputs(root, read)
   const run = newRunId()
   const at = new Date().toISOString()
   const text = writerPrompt(l.prompt)
@@ -2486,7 +2491,13 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
     throw e
   }
   const out = result.out as Record<string, unknown>
-  return { code: result.code, out: { ...out, flow: id, step: 'implement', kind: l.kind, chain, pending: l.pending } }
+  return { code: result.code, out: { ...out, flow: id, step: 'implement', kind: l.kind, chain, pending: l.pending,
+    ...(engine?.warnings.length ? { warnings: engine.warnings } : {}) } }
+}
+
+/** Preflight informativo antes de crear corrida, reserva o supervisor. */
+function phaseEngine(root: string, step: string, inputs: FrozenInputs, conductor: Family): ModEngineContext | undefined {
+  return phaseTouchesMods(step, inputs) ? modEngineContext(inspectModEngine(root), conductor) : undefined
 }
 
 /**
@@ -2713,6 +2724,8 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   }
   if (context) inputs.context = context.bytes.toString('utf8')
 
+  const engine = phaseEngine(root, doc, inputs, conductor.family)
+
   const families = effectiveFamilies(loadCrossModel(root, FAMILIES.filter((f) => inPath(f, env))).families, values.families ? parseFamiliesFlag(values.families) : undefined)
   const resolution = resolve({ conductor, families, workers: loadWorkers(root), role: doc, flags: {}, codexRoot: loadCodexRoot(env) })
   // Las fases van siempre por proceso: la vía nativa no le devuelve al binario la respuesta del hijo.
@@ -2726,7 +2739,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   const files: Record<string, string | Buffer> = { 'inputs.json': `${JSON.stringify(launch, null, 2)}\n` }
   if (requestFile) files['request.md'] = requestFile.bytes
   if (context) files['context.md'] = context.bytes
-  const prompt = renderPhasePrompt(doc, { id, depth, step: doc }, inputs)
+  const prompt = renderPhasePrompt(doc, { id, depth, step: doc }, inputs, engine?.context)
 
   const started = withFlowLock(root, id, () => {
     // Con el lock tomado, el flujo tiene que ser el que se leyó: si no, la fase ya no es la vigente.
@@ -2750,10 +2763,12 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   if (!started.launched) {
     return {
       code: 1,
-      out: { id: started.id, state: 'launch_failed', reason: 'cli_missing', detail: `${resolution.family} no está en PATH`, fallback: conductor, next: phaseFallbackNext(phaseRequest, conductor) },
+      out: { id: started.id, state: 'launch_failed', reason: 'cli_missing', detail: `${resolution.family} no está en PATH`, fallback: conductor, next: phaseFallbackNext(phaseRequest, conductor),
+        ...(engine?.warnings.length ? { warnings: engine.warnings } : {}) },
     }
   }
-  return { code: 0, out: { id: started.id, via: resolution.via, family: resolution.family, flow: id, step: doc, amended: awaiting !== undefined, next: `./bin/sdd-ai wait ${started.id}` } }
+  return { code: 0, out: { id: started.id, via: resolution.via, family: resolution.family, flow: id, step: doc, amended: awaiting !== undefined, next: `./bin/sdd-ai wait ${started.id}`,
+    ...(engine?.warnings.length ? { warnings: engine.warnings } : {}) } }
 }
 
 /**
@@ -3016,6 +3031,16 @@ function skillCheck(cwd: string): SkillCheck {
   return { copies: skillCopies(root, PKG_DIR) }
 }
 
+function agentCheck(cwd: string, env: Env): AgentCheck {
+  try {
+    const root = repoRoot(cwd)
+    return { copies: agentCopies(root, PKG_DIR, nativeProfiles(root, env)) }
+  } catch (e) {
+    if (e instanceof SddError && e.code === 'not_a_repo') return { skipped: 'no es un repositorio Git' }
+    throw e
+  }
+}
+
 /** La copia del mod del repo donde corre `doctor`, como la de la skill; fuera de un repo no hay copia que revisar. */
 function modCheck(cwd: string): ModCheck {
   let root: string
@@ -3112,7 +3137,11 @@ async function verb(cmd: string | undefined, rest: string[], env: Env, cwd: stri
       case 'recall': return recallCommand(rest, env, cwd)
       case 'sdd': return await sdd(rest, env, cwd)
       case 'doctor': {
-        const report = doctor(undefined, skillCheck(cwd), modCheck(cwd))
+        let engine
+        try { engine = inspectModEngine(repoRoot(cwd)) } catch (e) {
+          if (!(e instanceof SddError && e.code === 'not_a_repo')) throw e
+        }
+        const report = doctor(undefined, skillCheck(cwd), modCheck(cwd), engine, agentCheck(cwd, env))
         return { code: report.ok ? 0 : 1, out: report }
       }
       case '__supervise': return { code: 0, out: await supervise(rest[0], rest[1]) }

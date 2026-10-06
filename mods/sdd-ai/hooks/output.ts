@@ -14,14 +14,17 @@ export function persistedSize(output: unknown): number | undefined {
     : undefined
 }
 
-export function parseOutput(output: unknown, isErrored: boolean): OutputDecision {
+export function parseOutput(output: unknown, isErrored: boolean, completeContent?: string): OutputDecision {
   try {
     // Una interrupción se informa aunque la salida sea demasiado grande para resumirla.
     if (record(output) && output.interrupted === true) return { kind: 'interrupted' }
-    if (persistedSize(output) !== undefined) return { kind: 'native' }
+    if (completeContent === undefined && persistedSize(output) !== undefined) return { kind: 'native' }
     let original: OriginalOutput
     let text: string
-    if (record(output)) {
+    if (completeContent !== undefined) {
+      original = { kind: 'text', text: completeContent }
+      text = completeContent
+    } else if (record(output)) {
       if (typeof output.stdout !== 'string' || (output.stderr !== undefined && typeof output.stderr !== 'string')) return { kind: 'native' }
       original = { kind: 'streams', stdout: output.stdout, stderr: typeof output.stderr === 'string' ? output.stderr : '' }
       text = output.stdout

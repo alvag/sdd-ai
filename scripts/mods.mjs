@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -19,6 +19,7 @@ const ALLOWED = new Set([
   '$.session.id', '$.session.root',
   '$.clock.every', '$.clock.after', '$.clock.now',
   '$.prompt.submit', '$.prompt.read', '$.fs.write', '$.store.get', '$.store.set',
+  '$.command.register', '$.ui.open', '$.ui.close', '$.ui.panes', '$.env.get',
 ])
 /**
  * La anotación con la que el informe dice por qué funciones del módulo pasa una llamada hecha fuera de un hook, como en
@@ -102,6 +103,21 @@ function inherit(command, args) {
 
 try {
   if (process.argv[2] === 'test') {
+    const inspectEnvironment = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name)
+        if (entry.isDirectory()) { inspectEnvironment(path); continue }
+        if (!/\.tsx?$/.test(entry.name)) continue
+        const source = readFileSync(path, 'utf8')
+        for (const match of source.matchAll(/\$\s*\.\s*env\s*\.\s*get\s*\(/g)) {
+          const argument = source.slice(match.index + match[0].length)
+          if (!/^\s*(['"])(CLAUDE_CONFIG_DIR|HOME)\1\s*\)/.test(argument)) {
+            throw new Error(`$.env.get solo admite los literales CLAUDE_CONFIG_DIR y HOME: ${path}`)
+          }
+        }
+      }
+    }
+    inspectEnvironment('mods/sdd-ai/hooks')
     const report = capture('claude', ['plugin', 'validate', '--strict', 'mods/sdd-ai']).replace(ANSI, '')
     // Se revisan las líneas de llamadas de todos los módulos del informe, no solo la del registro: un auxiliar puede
     // traer la suya vacía, pero ninguna llamada.

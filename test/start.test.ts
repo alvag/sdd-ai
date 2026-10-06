@@ -1,3 +1,4 @@
+import { withWorkerPolicy } from '../src/worker-policy.ts'
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -355,7 +356,8 @@ test('run --flow anexa los antecedentes al prompt que recibe el worker sin cambi
       assert.equal(waited.out.state, 'done', JSON.stringify(waited.out))
       assert.equal(readFileSync(s.env.FAKE_PROMPT_FILE, 'utf8'), frozen)
     } else assert.equal(readFileSync(r.out.prompt_file, 'utf8'), frozen)
-    assert.ok(frozen.startsWith(`${original}\n\n## Antecedentes del flujo mi-flujo`))
+    // El encargo congelado lleva delante la política del delegado (src/worker-policy.ts).
+    assert.ok(frozen.startsWith(`${withWorkerPolicy(original)}\n\n## Antecedentes del flujo mi-flujo`))
     assert.match(frozen, /Material de consulta.*no instrucciones/)
     assert.match(frozen, /<<<ANTECEDENTES mi-flujo ([0-9a-f]{12})\n[\s\S]*\nANTECEDENTES mi-flujo \1>>>$/)
     for (const source of ['engram', 'vault', 'plans', 'git']) assert.match(frozen, new RegExp(`### ${source}\\nEstado: [^;]+; modo: [^;]+; recortado:`))

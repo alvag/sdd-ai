@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process'
-import type { SkillCopy } from './agents.ts'
+import type { AgentCopy, SkillCopy } from './agents.ts'
 import type { ModCopy } from './mod-copies.ts'
+import { type ModEngine, type ModEngineWarning, MOD_SYNC_COMMAND, MOD_TYPES_COMMAND } from './mod-engine.ts'
 import type { Family, WorkerTask } from './types.ts'
 import { claudeLaunch, claudeResume, claudeReviewLaunch, claudeWriterLaunch } from './workers/claude.ts'
 import { codexLaunch, codexResume, codexReviewLaunch, codexWriterLaunch } from './workers/codex.ts'
@@ -16,6 +17,7 @@ export interface CliReport {
 
 /** Las copias de la skill del repo, o por qué no se revisaron. */
 export type SkillCheck = { copies: SkillCopy[] } | { skipped: string }
+export type AgentCheck = { copies: AgentCopy[] } | { skipped: string }
 
 type SkillReport = { copies: SkillCopy[]; next?: string } | { skipped: string }
 /**
@@ -104,7 +106,7 @@ export function cliVersion(exec: Exec, family: Family): string | null {
  * de la skill y la del mod, también que coincidan con su fuente: una copia ausente o desactualizada hace
  * fallar `ok` y trae la recomendación de sincronizar.
  */
-export function doctor(exec: Exec = defaultExec, skill?: SkillCheck, mod?: ModCheck): { ok: boolean; clis: CliReport[]; skill?: SkillReport; mod?: ModReport } {
+export function doctor(exec: Exec = defaultExec, skill?: SkillCheck, mod?: ModCheck, engine?: ModEngine, agents?: AgentCheck): { ok: boolean; clis: CliReport[]; skill?: SkillReport; mod?: ModReport; agents?: AgentCheck; warnings?: ModEngineWarning[] } {
   const clis = (['claude', 'codex'] as Family[]).map((family): CliReport => {
     const v = exec(family, ['--version'])
     if (v.status === null) return { family, inPath: false, flags: [] }
@@ -125,6 +127,15 @@ export function doctor(exec: Exec = defaultExec, skill?: SkillCheck, mod?: ModCh
     ok: cliOk && skillOk && modOk, clis,
     ...(skill ? { skill: skillOk ? skill : { ...skill, next: SYNC_NEXT } } : {}),
     ...(mod ? { mod: modReport(mod, modOk) } : {}),
+    ...(agents ? { agents } : {}),
+    ...(engine || agents ? { warnings: [...(!engine || engine.state === 'available' ? [] : [{
+      code: engine.state === 'copy_missing' ? 'mod_copy_missing' : 'mod_engine_types_missing',
+      message: engine.state === 'copy_missing' ? 'Falta la copia del mod en este checkout.' : 'Faltan declaraciones legibles del motor en este checkout.',
+      next: engine.state === 'copy_missing' ? MOD_SYNC_COMMAND : MOD_TYPES_COMMAND,
+    }]), ...(agents && 'copies' in agents ? agents.copies.filter((copy) => copy.state !== 'ok').map((copy) => ({
+      code: copy.state === 'missing' ? 'agent_copy_missing' : 'agent_copy_stale',
+      message: `El agente ${copy.path} está ${copy.state === 'missing' ? 'ausente' : 'desactualizado'}.`, next: SYNC_NEXT,
+    })) : [])] } : {}),
   }
 }
 

@@ -5,7 +5,8 @@ Bash y dibuja resúmenes de sus salidas, y muestra sobre el prompt una banda de
 una línea con el flujo ligado a la sesión, su paso y la actividad en curso, que
 lee de la proyección que publica el binario (`docs/projection.md`). El binario
 conserva sus resultados, códigos de salida, guardas y decisiones. El mod no
-ejecuta `next` ni registra comandos o herramientas. El avisador solicita recepción
+ejecuta los pasos sugeridos ni registra herramientas. `/sdd-panel` y `/sdd-runs`
+consultan la misma proyección sin pedir una respuesta al modelo. El avisador solicita recepción
 mediante `$.prompt.submit`, persiste sus intentos en `$.store` y escribe únicamente
 la señal de vida de su propia sesión; no modifica las corridas ni sus recibos.
 
@@ -15,6 +16,15 @@ Los mods requieren Claude Code **2.1.287 o posterior**. La sonda se validó con
 **2.1.288**, y esta implementación se comprobó con **2.1.289**, la versión
 instalada al implementarla. Lo observado con esas versiones no se extiende a
 otras.
+
+El panel, los comandos, la banda y los resúmenes guardados se comprobaron en vivo
+con **2.1.291** en macOS, siguiendo [`docs/panel-live-check.md`](../../docs/panel-live-check.md):
+panel y lista, su alternancia, Escape, conservación del borrador, refresco, salida
+guardada aparte, banda a 78 columnas, writer real en curso, cese incierto
+(preparado), convivencia con una pregunta, adopción y rollback. El resultado
+individual de una salida guardada con el original nativo debajo no se vio en vivo:
+lo cubre el test del motor. La sonda del formato guardado se observó en una sesión
+iniciada con 2.1.290.
 
 La sonda del aviso se realizó con Claude Code **2.1.289** en macOS y comprobó
 conservación del borrador y ausencia de interrupción. Esa sonda no acredita la
@@ -38,11 +48,22 @@ cuando la familia seleccionada es Codex. La copia contiene el manifiesto,
 
 Una **sesión nueva de Claude Code** en el checkout preparado y de confianza
 carga el mod al arrancar. En una sesión ya abierta, `/reload-plugins` lo carga,
-también si la sesión arrancó antes de que existiera la copia; una sesión que
-ya tenía el mod adopta sola la copia actualizada en cuanto `agents sync` o
-`init` terminan de escribirla. En ningún caso se carga dos veces (comprobado con
-2.1.289). No hace falta cancelar, relanzar ni modificar una corrida viva para
-cambiar su presentación.
+también si la sesión arrancó antes de que existiera la copia. Con **2.1.290**,
+cambiar la copia no basta para adoptarla o descargarla: instalación,
+actualización, desactivación y rollback en una sesión abierta requieren
+`/reload-plugins` o una sesión nueva. Con **2.1.291**, **modificar** una copia ya
+cargada (por ejemplo, con `agents sync` después de actualizar la fuente) se
+recarga sola en la sesión abierta («hooks.json changed — reloaded»), pero
+**agregarla o quitarla** sigue necesitando `/reload-plugins` o una sesión nueva.
+La adopción automática y la ausencia de duplicación observadas con **2.1.289**
+quedan limitadas a esa versión. No se
+garantiza adopción automática en versiones no comprobadas. No hace falta
+cancelar, relanzar ni modificar una corrida viva para cambiar su presentación.
+
+Para desactivar el mod, retira su copia generada y recarga los plugins o abre
+otra sesión. Una sincronización posterior vuelve a instalarla. Para rollback,
+restaura la fuente de la versión elegida, sincroniza y adopta la copia según
+la versión de Claude Code. Ninguna operación entrega resultados ni cambia gates.
 
 Cada checkout o worktree tiene su propia copia. Si `.claude` o `.claude/skills`
 es un enlace que sale del checkout (por ejemplo, a otro worktree), `agents sync`
@@ -137,9 +158,10 @@ El estado de Bash y su código de salida se distinguen del estado publicado
 por el binario. Los mensajes, detalles y pasos siguientes conservan su texto
 completo. Si hay otros campos, el resumen enumera sus nombres.
 
-El ledger conserva todas las entradas y su orden. Desde 80 columnas de terminal
+El ledger conserva el orden y muestra el prefijo de entradas completas que cabe.
+Si se recorta, dice «faltan N entradas; el original las contiene». Desde 80 columnas de terminal
 se presenta como tabla; por debajo, sin ancho medido o sin espacio suficiente
-para la afirmación, utiliza bloques. Solo la afirmación puede recortarse con
+para la afirmación, utiliza bloques. Dentro de una entrada solo la afirmación puede recortarse con
 una elipsis visible. Un ledger vacío indica que no contiene hallazgos; un
 ledger ausente no hace esa afirmación.
 
@@ -163,17 +185,77 @@ El resultado original que recibe Claude permanece intacto.
 
 Claude Code rechaza un dibujo con un texto de más de 10 000 caracteres, con
 más de 100 000 en total o con caracteres de control distintos del tabulador y
-el salto de línea. El mod parte los textos largos en tramos y, si aun así el
-dibujo no entraría (por ejemplo, un original con colores en stderr), deja ese
-resultado o ese grupo en la vista nativa, con la salida completa. Las salidas
-grandes topan antes con el límite del párrafo siguiente.
+el salto de línea. El mod fragmenta cada Text a 8 000 caracteres y reserva
+90 000 para el texto propio. En línea descuenta el coste del original; en grupos
+reserva identificaciones y campos, y reparte el resto entre los ledgers,
+redistribuyendo lo no usado. Si ni todos los campos de un grupo caben, conserva
+resúmenes en orden con el ledger reducido a conteo; las llamadas restantes
+conservan identificación y un aviso cuenta los resúmenes faltantes. Si tampoco
+caben las identificaciones, cuenta las llamadas faltantes. Los caracteres de
+control, incluidos colores en stderr, siguen dejando la presentación nativa.
+El resultado individual de una salida guardada aparte usa **60 000**: el motor
+cuenta contra el límite de 100 000 el original nativo que dibuja el nodo
+`engine` debajo del resumen, así que se le reservan 30 000. Lo midió el test del
+motor; en vivo, con 2.1.291, un resumen de 43 KB se dibujó sin caer a la vista
+nativa. Una celda de ancho fijo de la tabla del ledger cuenta su ancho completo,
+porque el motor cuenta el texto rellenado. Si los campos de un resumen
+individual, sin el ledger, superan solos el presupuesto, se muestran los que
+entran y una línea cuenta los que faltan; el original nativo de debajo los
+conserva todos.
 
-Claude Code guarda aparte la salida de un Bash de más de unos 30 KB y a la
-llamada le deja solo un recorte (comprobado con 2.1.289). Un recorte no es el
-resultado completo, así que el mod no lo resume: en el grupo compacto la
-llamada sale marcada «sin resumen», con el tamaño de la salida guardada, y el
-resultado suelto queda nativo. Pasa con los `review status` de ledgers largos;
-el binario y el modelo siguen recibiendo lo mismo que sin el mod.
+Claude Code guarda aparte salidas grandes de Bash y a la llamada le deja solo
+un recorte (observado desde unos 30 KB con 2.1.289). La sonda en la sesión
+iniciada con 2.1.290 guardó stdout seguido de stderr con salida 0; la salida 3
+quedó en línea y recortada. No se deduce de eso otro formato para errores.
+Un recorte no es el
+resultado completo y no se utiliza como entrada del resumen. Solo las llamadas
+reconocidas y atribuidas por esta carga habilitan un intento de lectura al
+terminar. La raíz es `<CLAUDE_CONFIG_DIR>/projects` o, sin esa variable,
+`<HOME>/.claude/projects`. La ruta absoluta debe terminar en
+`/projects/<proyecto>/<sesión>/tool-results/<archivo>`, sin segmentos `..`.
+Antes de leer se resuelven físicamente raíz y archivo: el archivo regular debe
+quedar bajo la raíz real con esos cuatro segmentos y no superar **1 MiB**.
+Una raíz alcanzada por enlace es válida; un archivo que escapa no lo es. El
+prefijo léxico anterior a `projects` puede tener otra ortografía, pero no evita
+la comprobación física. Persiste la carrera entre stat y read declarada en #110.
+
+El mod lee únicamente la ruta exacta, una vez por llamada, y conserva el resumen
+durante esta carga. No lista proyectos ni busca alternativas. También comprueba
+el tamaño recibido. Un archivo ilegible, denegado, desaparecido, corrupto o con
+stderr pegado que impida admitir el JSON mantiene «sin resumen» y su tamaño en
+el grupo, y el resultado individual nativo. Durante la lectura ocurre lo mismo.
+Las llamadas históricas, ambiguas, ajenas, interrumpidas o todavía en background
+no habilitan lectura. Recargar descarta la caché anterior; después de rollback
+su clave queda sin uso hasta terminar la sesión.
+
+El resumen individual conserva debajo el dibujo original de Claude Code,
+incluido el recorte y la referencia al archivo. El archivo leído no sustituye
+ese dibujo ni la respuesta de Bash. El contenido del resumen coincide con el
+equivalente en línea antes de aplicar los presupuestos de cada sitio. El binario
+y el modelo siguen recibiendo lo mismo que sin el mod.
+
+## Panel y lista inmediata
+
+`/sdd-panel` muestra el flujo ligado, su paso observado, gates, resumen de tasks,
+bloqueos y corridas propias abiertas. `/sdd-runs` se concentra en ese mismo
+inventario: id, clase, ejecución, motivo de apertura, asociación y writer
+protegido, sin duplicarlo. No muestran historial cerrado ni atribuyen corridas
+por coincidir en el flujo. Cuentan las omitidas por falta de atribución y las que
+no entran en el dibujo. Distinguen ausencia conocida, datos parciales,
+indisponibilidad y última lectura retenida; la antigüedad no acredita cierre.
+
+Los estados de gate se muestran literalmente: `pending`, `approved`,
+`approved_unfingerprinted` y `stale`. Los dos últimos no acreditan aprobación
+vigente con huella. Ambos comandos alternan según el registro del motor:
+cierran el pane mostrado o abren/muestran el solicitado. El botón Cerrar y
+Escape usan el cierre del motor. No se solicita foco ni se modifica el borrador.
+Si el motor responde `isPlaced: false`, el pane queda registrado esperando lugar.
+
+El refresco compartido consulta cada segundo, sin un turno nuevo; conserva los
+límites y excepciones del lector de proyección. Estas vistas no entregan
+resultados, aprueban gates, marcan tasks, deciden hallazgos, ligan sesiones,
+cancelan corridas ni ejecutan pasos sugeridos. Cualquier aviso independiente
+conserva su propio funcionamiento.
 
 ## La banda sobre el prompt
 
@@ -199,7 +281,7 @@ pasa de 10 segundos, y no empieza otra hasta que esa termine; si mientras tanto
 cambia la sesión o el checkout, retira los datos de la anterior y dice que no
 está disponible hasta que esa lectura termine.
 
-El mod lee la proyección cada segundo, solo dentro de
+El lector de proyección consulta cada segundo, solo dentro de
 `.sdd-ai/projection/live/` del checkout de la sesión, y la banda cambia sin un
 turno nuevo, sin llamar al modelo y sin esperar a `wait`. Cuando la línea no
 cabe, acorta en este orden: el nombre del flujo, la asociación de una actividad
@@ -214,7 +296,8 @@ mod desactivado; sin el mod, simplemente no hay banda.
 ### Volver atrás
 
 Para quitar la banda basta con volver a una versión del mod sin ella y correr
-`./bin/sdd-ai agents sync`. Para volver a un binario que no publica la
+`./bin/sdd-ai agents sync`, y adoptar la copia según la versión de Claude Code
+(`/reload-plugins` o sesión nueva con 2.1.290 y 2.1.291). Para volver a un binario que no publica la
 proyección hay que borrar además `.sdd-ai/projection/` en cada checkout y
 worktree: si no, un consumidor seguiría mostrando la última observación, que
 puede no tener corridas vivas ni antigüedad que la delate. `sdd commit` no
@@ -234,7 +317,10 @@ npm run typecheck:mods
 el informe declare llamadas solo desde `register.tsx` y solo a `$.ui.resolve`,
 `$.state.get`, `$.state.set`, `$.fs.list`, `$.fs.stat`, `$.fs.read`,
 `$.session.id`, `$.session.root`, `$.clock.every`, `$.clock.after` y
-`$.clock.now`, y después ejecuta `claude plugin test mods/sdd-ai`. La
+`$.clock.now`, `$.prompt.submit`, `$.prompt.read`, `$.fs.write`, `$.store.get`,
+`$.store.set`, `$.command.register`, `$.ui.open`, `$.ui.close`, `$.ui.panes` y
+`$.env.get`, y después ejecuta `claude plugin test mods/sdd-ai`. La fuente limita
+`$.env.get` a los argumentos literales `CLAUDE_CONFIG_DIR` y `HOME`. La
 comparación es por llamada exacta; la anotación `(via <función>)` con que el
 motor marca una llamada hecha desde un auxiliar no cuenta. Cualquier fallo impide
 completar el script.

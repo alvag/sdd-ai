@@ -1,5 +1,8 @@
 export type CommandDecision = { kind: 'recognized'; command: string } | { kind: 'native' }
 export interface Attribution { command: string }
+export type PersistedEntry = { identity: Identity; path: string } & (
+  { status: 'pending' | 'unavailable' } | { status: 'summary'; summary: Summary; isErrored: boolean })
+export interface PersistedCache { load: string; entries: Record<string, PersistedEntry> }
 export interface LedgerRow { id: string; severity: string; reviewer?: string; state: string; claim: string }
 export interface Summary {
   state?: string
@@ -80,12 +83,53 @@ export type BandPresentation =
  */
 export interface BandState { identity: Identity; presentation: BandPresentation | null; memory: BandMemory | null }
 
+/** El subconjunto de la proyección que lee el mod (copia de `src/projection-types.ts`). */
+export interface Reason { code: string; detail: string }
+export type Observed<T> = { value: T; reason: null } | { value: null; reason: Reason }
+export interface ProjectionEntity { id: string; availability: 'available' | 'unavailable'; reason: Reason | null }
+export interface ProjectionCollection<T> { availability: 'available' | 'partial' | 'unavailable'; reason: Reason | null; items: T[] }
+export interface ProjectionProgress {
+  phase: 'review' | 'refutation'; round: number; launch: number; retained: number; completed: number; total: number
+  active: Observed<{ key: string; reviewer: Observed<string>; batch: Observed<number> }>
+}
+export interface ProjectionRun extends ProjectionEntity {
+  kind: Observed<RunKind>; state: Observed<RunState>; open: Observed<OpenReason>; session: Observed<string>; flow: Observed<string>
+  live: Observed<boolean>; progress: Observed<ProjectionProgress>
+  session_family?: Observed<'claude' | 'codex'>
+  delivery?: Observed<{ round: number | null; launch: number | null }>
+}
+export interface ProjectionWriter extends ProjectionEntity {
+  state: Observed<RunState>; open: Observed<OpenReason>; session: Observed<string>; flow: Observed<string>; live: Observed<boolean>
+}
+export interface FlowDetail {
+  id: string; next: { step: string; gate: string | null }
+  gates: { gate: string; artifacts: string[]; state: 'pending' | 'approved' | 'approved_unfingerprinted' | 'stale' }[]
+  tasks: { total: number; done: number; pending: number; first_pending: string | null }
+  blocked_reasons: Reason[]
+}
+export interface ProjectionFlow extends ProjectionEntity { observed_at: number; status: Observed<string>; view: Observed<FlowDetail> }
+
+export interface SessionSelection {
+  binding: { availability: 'available' | 'partial' | 'unavailable'; reason: Reason | null; known: boolean; flow: BandFlow | null }
+  flow: ProjectionFlow | null
+  runs: { availability: 'available' | 'partial' | 'unavailable'; reason: Reason | null; items: { run: ProjectionRun | ProjectionWriter; writer: boolean; kind: Observed<RunKind> }[] }
+  omitted: number
+  writerAvailability: 'available' | 'unavailable'
+}
+
+/** Detalle informativo de la misma lectura que alimenta la banda. */
+export interface SessionViews {
+  identity: Identity; observedAt: number | null; readAt: number; retained: boolean
+  selection: SessionSelection | null
+  unavailable?: 'invalid' | 'identity_changed' | 'projection_unavailable'
+}
+
 /** La generación del avisador sobrevive a recargas y retira la autoridad de una instancia anterior. */
 export interface NotificationCoordinatorState { schema_version: 1; identity: Identity; instance: string; generation: number }
 export interface NotificationAvailability { known: boolean; working: boolean; question: boolean; draft: boolean }
 
 declare module 'claude-code' {
   interface PluginState {
-    'sdd-ai-mod': { attribution: StateFamily<Attribution>; band: BandState; notification: NotificationCoordinatorState }
+    'sdd-ai-mod': { attribution: StateFamily<Attribution>; band: BandState; views: SessionViews; persisted: PersistedCache; notification: NotificationCoordinatorState }
   }
 }

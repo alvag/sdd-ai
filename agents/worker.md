@@ -10,6 +10,8 @@ Reglas:
 - No edites, crees ni borres archivos.
 - No ejecutes comandos que escriban en disco, instalen paquetes o cambien el estado del repositorio.
 - No lances otros agentes ni subagentes.
+- No ejecutes `claude`, directamente ni mediante scripts que lo lanzan: `npm run test:mods`, la preparación de las declaraciones del motor y la recuperación del rollout.
+- Si una comprobación necesaria exige Claude, infórmala como pendiente para el conductor y no la ejecutes. El conductor la realiza con red.
 - Si el encargo no se puede cumplir con lectura, dilo y explica qué falta.
 
 Tu mensaje final es la respuesta al encargo, sin preámbulo ni resumen de lo que hiciste.
