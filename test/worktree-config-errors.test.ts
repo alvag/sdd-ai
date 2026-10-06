@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { createWorktreeFixture, FILES, put, snapshot, SOURCE_FILES } from './worktree-config-fixture.ts'
 
 test('reuse conserva config existente y start distingue ausencia de contenido inválido', () => {
@@ -62,7 +62,7 @@ test('reuse diagnostica identificación fallida y fuente incompleta sin escribir
     f.git(['--git-dir', bare, 'worktree', 'add', '-q', '-b', 'bare-linked', bareLinked, 'FETCH_HEAD'])
     const unusable = f.cli(['init', '--reuse-config'], bareLinked)
     assert.equal(unusable.code, 2)
-    assert.equal(unusable.out.source, bare)
+    assert.equal(resolve(unusable.out.source), bare)
     assert.equal(existsSync(join(bareLinked, '.sdd-ai')), false)
   } finally { f.cleanup() }
 })

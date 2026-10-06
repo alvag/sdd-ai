@@ -1,9 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CONFIG_FILES, reuseWorktreeConfig, type WorktreeConfigDeps } from '../src/worktree-config.ts'
+import { CONFIG_FILES, exclusiveCopy, reuseWorktreeConfig, type WorktreeConfigDeps } from '../src/worktree-config.ts'
 
 const CONFIG = 'cross_model: {schema_version: 1, families: [codex]}\n'
 const WORKERS = 'schema_version: 1\nroles: {}\n'
@@ -51,6 +51,33 @@ test('reuse informa archivos y directorios ilegibles sin comenzar la copia', () 
   }
 })
 
+test('la copia exclusiva rechaza cualquier entrada en el destino sin seguir enlaces, también uno roto', () => {
+  // En Windows COPYFILE_EXCL escribe a través de un enlace roto; la copia exclusiva no debe hacerlo en ningún sistema.
+  for (const kind of ['file', 'directory', 'link', 'broken']) {
+    const f = setup()
+    try {
+      const source = join(f.source, '.sdd-ai', 'config.yml')
+      const destination = join(f.scratch, 'destino')
+      const target = join(f.scratch, 'fuera')
+      if (kind === 'link') writeFileSync(target, 'no modificar')
+      if (kind === 'file') writeFileSync(destination, 'local')
+      else if (kind === 'directory') mkdirSync(destination)
+      else symlinkSync(kind === 'link' ? target : `${target}-missing`, destination)
+      assert.throws(() => exclusiveCopy(source, destination), { code: 'EEXIST' }, kind)
+      if (kind === 'link') assert.equal(readFileSync(target, 'utf8'), 'no modificar')
+      assert.equal(existsSync(`${target}-missing`), false, kind)
+      assert.deepEqual(readdirSync(f.scratch).filter((name) => name.endsWith('.tmp')), [], kind)
+    } finally { f.cleanup() }
+  }
+  const f = setup()
+  try {
+    const destination = join(f.scratch, 'nuevo.yml')
+    exclusiveCopy(join(f.source, '.sdd-ai', 'config.yml'), destination)
+    assert.equal(readFileSync(destination, 'utf8'), CONFIG)
+    assert.equal(lstatSync(destination).nlink, 1)
+  } finally { f.cleanup() }
+})
+
 test('reuse conserva el destino aparecido inmediatamente antes de la copia exclusiva', () => {
   for (const name of CONFIG_FILES) for (const kind of ['valid', 'invalid', 'directory', 'link', 'broken']) {
     const f = setup()
@@ -71,7 +98,7 @@ test('reuse conserva el destino aparecido inmediatamente antes de la copia exclu
             before = { bytes: readFileSync(destination), mtime: lstatSync(destination).mtimeMs }
           }
         }
-        copyFileSync(source, destination, flags)
+        exclusiveCopy(source, destination)
       } })
       const label = `${name}/${kind}: ${JSON.stringify(r.errors)}`
       assert.ok(!r.copied.includes(name), label)
@@ -95,7 +122,7 @@ test('reuse conserva el destino aparecido inmediatamente antes de la copia exclu
     let calls = 0
     const r = reuseWorktreeConfig(f.root, { ...f.deps, copyFile: (source, destination, flags) => {
       calls++
-      copyFileSync(source, destination, flags)
+      exclusiveCopy(source, destination)
       renameSync(join(f.root, '.sdd-ai'), join(f.root, 'saved'))
       symlinkSync(outside, join(f.root, '.sdd-ai'), 'dir')
     } })
@@ -114,7 +141,7 @@ test('reuse reconoce el destino no regular aparecido aunque la copia no responda
       const target = join(f.scratch, 'link-target')
       writeFileSync(target, 'no modificar')
       const r = reuseWorktreeConfig(f.root, { ...f.deps, copyFile: (source, destination, flags) => {
-        if (destination !== path) return copyFileSync(source, destination, flags)
+        if (destination !== path) return exclusiveCopy(source, destination)
         if (kind === 'directory') mkdirSync(destination)
         else symlinkSync(target, destination)
         throw Object.assign(new Error('EPERM: operación no permitida'), { code: 'EPERM' })
@@ -137,7 +164,7 @@ test('reuse reporta la copia parcial y el reintento conserva lo creado y complet
       const r = reuseWorktreeConfig(f.root, { ...f.deps, copyFile: (source, destination, flags) => {
         attempted.push(destination)
         if (attempted.length === failAt + 1) throw denied()
-        copyFileSync(source, destination, flags)
+        exclusiveCopy(source, destination)
       } })
       assert.equal(r.state, failAt === 0 ? 'blocked' : 'partial')
       assert.deepEqual(r.copied, CONFIG_FILES.slice(0, failAt))
@@ -163,7 +190,7 @@ test('reuse reporta la copia parcial y el reintento conserva lo creado y complet
       const failedPath = join(f.root, '.sdd-ai', name)
       const first = reuseWorktreeConfig(f.root, { ...f.deps, copyFile: (source, destination, flags) => {
         if (destination === failedPath) { writeFileSync(destination, '['); throw denied() }
-        copyFileSync(source, destination, flags)
+        exclusiveCopy(source, destination)
       } })
       assert.equal(first.state, 'partial')
       assert.equal(first.errors[0].entry_exists, true)

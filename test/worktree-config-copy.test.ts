@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { prepareIntent, writeRestoreIntent } from '../src/sdd/restore.ts'
 import { gitDirs } from '../src/git.ts'
 import { spawnSync } from 'node:child_process'
@@ -15,7 +15,8 @@ test('reuse copia desde el principal fuera del árbol padre con espacios y Unico
       const r = f.cli(['init', '--reuse-config'])
       assert.equal(r.code, 0, r.stderr)
       assert.equal(r.out.state, 'copied')
-      assert.equal(r.out.source, f.main)
+      // Git informa la ruta con / también en Windows.
+      assert.equal(resolve(r.out.source), f.main)
       assert.deepEqual(r.out.copied, ['.gitignore', 'workers.yml', 'config.yml'])
       for (const name of FILES) assert.equal(readFileSync(join(f.linked, '.sdd-ai', name), 'utf8'), SOURCE_FILES[name])
     } finally { f.cleanup() }

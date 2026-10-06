@@ -53,6 +53,8 @@ export function createWorktreeFixture(): WorktreeFixture {
     PATH: searchPath, HOME: join(scratch, 'home'), USERPROFILE: join(scratch, 'home'), CODEX_HOME: join(scratch, 'codex-home'),
     XDG_CONFIG_HOME: join(scratch, 'xdg-config'), XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(scratch, 'gitconfig'),
+    // Git no busca repositorios por encima del fixture, aunque el temporal del sistema esté dentro de uno.
+    GIT_CEILING_DIRECTORIES: scratch,
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
     SDD_AI_PROJECTION: 'off',
     SDD_AI_TELEMETRY: 'off', NODE_COMPILE_CACHE: join(scratch, 'node-cache'),
@@ -84,7 +86,8 @@ export function createWorktreeFixture(): WorktreeFixture {
   for (const name of FILES) put(join(main, '.sdd-ai', name), SOURCE_FILES[name])
   const request = join(scratch, 'pedido.md')
   put(request, 'Pedido aislado de prueba.\n')
-  return { scratch, main, linked, env, request, bin, git, cli, cleanup: () => rmSync(scratch, { recursive: true, force: true }) }
+  return { scratch, main, linked, env, request, bin, git, cli, // En Windows un hijo recién terminado puede retener la carpeta unos instantes (EPERM).
+    cleanup: () => rmSync(scratch, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) }
 }
 
 /** Registros de un writer vivo; no lanza ningún worker. */

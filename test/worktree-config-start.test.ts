@@ -26,7 +26,10 @@ test('start orienta a reuse y permite arrancar después de copiar sin eliminar o
     assert.ok(f.cli(['sdd', 'start', 'other-flow']).out.blockers.some((b: { code: string }) => b.code === 'family_cli_missing'))
     rmSync(join(f.main, '.sdd-ai'), { recursive: true })
     const principal = f.cli(['sdd', 'start', 'other-flow'], f.main)
-    assert.ok(!JSON.stringify(principal.out.blockers).includes('reuse-config'))
+    // Solo el next: las rutas del JSON pueden contener «reuse-config» por el nombre del checkout.
+    const principalMissing = principal.out.blockers.find((b: { code: string }) => b.code === 'config_missing')
+    assert.ok(principalMissing)
+    assert.doesNotMatch(principalMissing.next, /--reuse-config/)
     put(join(f.linked, '.sdd-ai', 'config.yml'), '')
     assert.equal(f.cli(['sdd', 'start', 'invalid-flow']).out.config.state, 'invalid')
     const config = join(f.linked, '.sdd-ai', 'config.yml')
@@ -36,7 +39,7 @@ test('start orienta a reuse y permite arrancar después de copiar sin eliminar o
     if (denied) {
       const unreadable = f.cli(['sdd', 'start', 'access-flow'])
       assert.equal(unreadable.out.config.state, 'invalid')
-      assert.ok(!JSON.stringify(unreadable.out.blockers).includes('reuse-config'))
+      assert.ok(!unreadable.out.blockers.some((b: { next: string }) => /--reuse-config/.test(b.next)))
     } else t.diagnostic('Permisos reales de start no acreditados: el usuario puede leer modo 000.')
     chmodSync(config, 0o600)
     rmSync(join(f.linked, '.sdd-ai'), { recursive: true })

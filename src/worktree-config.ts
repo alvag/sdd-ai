@@ -1,5 +1,6 @@
-import { constants, copyFileSync, lstatSync, mkdirSync, readFileSync, type Stats } from 'node:fs'
-import { join } from 'node:path'
+import { randomBytes } from 'node:crypto'
+import { closeSync, constants, linkSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, type Stats, writeFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { loadBranchConfig, loadCrossModel, loadDefaultBranch, loadJiraMode, loadVaultPath } from './config.ts'
 import { gitDirs, mainWorktree } from './git.ts'
 import { parseWorkers } from './profiles.ts'
@@ -15,9 +16,24 @@ export interface WorktreeConfigDeps {
   mkdir(path: string): void
   copyFile(source: string, destination: string, flags: number): void
 }
+/**
+ * Copia los bytes a un temporal del mismo directorio y lo enlaza al nombre final, que falla con EEXIST si ya hay
+ * cualquier entrada ahí: nunca pisa ni sigue un enlace. COPYFILE_EXCL no alcanza: en Windows sigue un enlace roto.
+ */
+export function exclusiveCopy(source: string, destination: string): void {
+  const tmp = join(dirname(destination), `.${basename(destination)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`)
+  // Abrirlo con wx fuera del try: si falla, el temporal no es de esta copia y no se borra.
+  const fd = openSync(tmp, 'wx')
+  try {
+    try { writeFileSync(fd, readFileSync(source)) } finally { closeSync(fd) }
+    linkSync(tmp, destination)
+  } finally {
+    rmSync(tmp, { force: true })
+  }
+}
 const DEFAULT_DEPS: WorktreeConfigDeps = {
   gitDirs, mainWorktree, lstat: lstatSync, readFile: (path) => readFileSync(path, 'utf8'),
-  mkdir: mkdirSync, copyFile: copyFileSync,
+  mkdir: mkdirSync, copyFile: (source, destination) => exclusiveCopy(source, destination),
 }
 export interface WorktreeConfigResult {
   state: 'copied' | 'unchanged' | 'blocked' | 'partial'
