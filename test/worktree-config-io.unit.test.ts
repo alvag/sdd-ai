@@ -73,17 +73,18 @@ test('reuse conserva el destino aparecido inmediatamente antes de la copia exclu
         }
         copyFileSync(source, destination, flags)
       } })
-      assert.ok(!r.copied.includes(name))
-      assert.ok(r.preserved.includes(name))
+      const label = `${name}/${kind}: ${JSON.stringify(r.errors)}`
+      assert.ok(!r.copied.includes(name), label)
+      assert.ok(r.preserved.includes(name), label)
       const path = join(f.root, '.sdd-ai', name)
       if (before) { assert.deepEqual(readFileSync(path), before.bytes); assert.equal(lstatSync(path).mtimeMs, before.mtime) }
       assert.equal(readFileSync(target, 'utf8'), 'no modificar')
       const valid = kind === 'valid' || kind === 'invalid' && name === '.gitignore'
-      assert.equal(r.state, valid ? 'copied' : CONFIG_FILES.indexOf(name) === 0 ? 'blocked' : 'partial')
+      assert.equal(r.state, valid ? 'copied' : CONFIG_FILES.indexOf(name) === 0 ? 'blocked' : 'partial', label)
       if (!valid) {
-        assert.equal(calls, CONFIG_FILES.indexOf(name) + 1)
-        assert.equal(r.errors[0].path, path)
-        assert.equal(r.errors[0].entry_exists, true)
+        assert.equal(calls, CONFIG_FILES.indexOf(name) + 1, label)
+        assert.equal(r.errors[0].path, path, label)
+        assert.equal(r.errors[0].entry_exists, true, label)
       }
     } finally { f.cleanup() }
   }
@@ -102,6 +103,30 @@ test('reuse conserva el destino aparecido inmediatamente antes de la copia exclu
     assert.equal(calls, 1)
     assert.equal(existsSync(join(outside, 'workers.yml')), false)
   } finally { f.cleanup() }
+})
+
+test('reuse reconoce el destino no regular aparecido aunque la copia no responda EEXIST, como en Windows', () => {
+  // CopyFileW informa EPERM ante un directorio; la copia nunca crea directorios ni enlaces, así que no son suyos.
+  for (const name of CONFIG_FILES) for (const kind of ['directory', 'link']) {
+    const f = setup()
+    try {
+      const path = join(f.root, '.sdd-ai', name)
+      const target = join(f.scratch, 'link-target')
+      writeFileSync(target, 'no modificar')
+      const r = reuseWorktreeConfig(f.root, { ...f.deps, copyFile: (source, destination, flags) => {
+        if (destination !== path) return copyFileSync(source, destination, flags)
+        if (kind === 'directory') mkdirSync(destination)
+        else symlinkSync(target, destination)
+        throw Object.assign(new Error('EPERM: operación no permitida'), { code: 'EPERM' })
+      } })
+      const label = `${name}/${kind}: ${JSON.stringify(r.errors)}`
+      assert.ok(!r.copied.includes(name), label)
+      assert.ok(r.preserved.includes(name), label)
+      assert.equal(r.errors[0].path, path, label)
+      assert.match(r.errors[0].message, /archivo regular/, label)
+      assert.equal(readFileSync(target, 'utf8'), 'no modificar')
+    } finally { f.cleanup() }
+  }
 })
 
 test('reuse reporta la copia parcial y el reintento conserva lo creado y completa lo ausente', () => {

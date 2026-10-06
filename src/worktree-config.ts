@@ -137,9 +137,12 @@ export function reuseWorktreeConfig(root: string, overrides: Partial<WorktreeCon
         io.copyFile(join(source, '.sdd-ai', name), path, constants.COPYFILE_EXCL)
         result.copied.push(name)
       } catch (e) {
-        if (errno(e) !== 'EEXIST') throw e
+        // La copia solo crea archivos regulares: un directorio o un enlace en el destino apareció durante la
+        // copia aunque el sistema no responda EEXIST (Windows informa EPERM ante un directorio).
+        const appeared = entry(path)
+        if (errno(e) !== 'EEXIST' && !(appeared?.isDirectory() || appeared?.isSymbolicLink())) throw e
         // Un destino aparecido durante la copia se conserva y se juzga como entrada local.
-        if (entry(path)) result.preserved.push(name)
+        if (appeared) result.preserved.push(name)
         regular(path, true)
         validate(root, name)
       }

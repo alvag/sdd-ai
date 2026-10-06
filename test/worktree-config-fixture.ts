@@ -41,8 +41,16 @@ export function createWorktreeFixture(): WorktreeFixture {
   const main = join(scratch, 'principal á', 'repo fuente')
   const linked = join(scratch, 'otro árbol ü', 'worktree enlazado')
   const bin = join(scratch, 'bin')
+  const executable = (name: string) => {
+    const file = (process.env.PATH ?? '').split(delimiter).map((dir) => join(dir, process.platform === 'win32' ? `${name}.exe` : name)).find(existsSync)
+    assert.ok(file, `${name} debe estar disponible para el fixture`)
+    return realpathSync(file)
+  }
+  const realGit = executable('git')
+  // En Windows Git no arranca desde un symlink: busca sus DLL junto a la ruta lanzada (0xC0000135). Va su directorio real.
+  const searchPath = process.platform === 'win32' ? [bin, dirname(realGit)].join(delimiter) : bin
   const env: Record<string, string> = {
-    PATH: bin, HOME: join(scratch, 'home'), USERPROFILE: join(scratch, 'home'), CODEX_HOME: join(scratch, 'codex-home'),
+    PATH: searchPath, HOME: join(scratch, 'home'), USERPROFILE: join(scratch, 'home'), CODEX_HOME: join(scratch, 'codex-home'),
     XDG_CONFIG_HOME: join(scratch, 'xdg-config'), XDG_CACHE_HOME: join(scratch, 'xdg-cache'),
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(scratch, 'gitconfig'),
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
@@ -52,12 +60,7 @@ export function createWorktreeFixture(): WorktreeFixture {
   }
   for (const path of [main, dirname(linked), bin, env.HOME, env.CODEX_HOME, join(scratch, 'vault-local')]) mkdirSync(path, { recursive: true })
   writeFileSync(env.GIT_CONFIG_GLOBAL, '')
-  const executable = (name: string) => {
-    const file = (process.env.PATH ?? '').split(delimiter).map((dir) => join(dir, process.platform === 'win32' ? `${name}.exe` : name)).find(existsSync)
-    assert.ok(file, `${name} debe estar disponible para el fixture`)
-    return realpathSync(file)
-  }
-  symlinkSync(executable('git'), join(bin, process.platform === 'win32' ? 'git.exe' : 'git'))
+  if (process.platform !== 'win32') symlinkSync(realGit, join(bin, 'git'))
   symlinkSync(process.execPath, join(bin, process.platform === 'win32' ? 'node.exe' : 'node'))
   // Solo Codex. Engram y Claude no están en el PATH aislado.
   if (process.platform === 'win32') symlinkSync(process.execPath, join(bin, 'codex.exe'))
@@ -65,7 +68,7 @@ export function createWorktreeFixture(): WorktreeFixture {
     put(join(bin, 'codex'), `#!${process.execPath}\nprocess.exit(0)\n`)
     chmodSync(join(bin, 'codex'), 0o755)
   }
-  const git = (args: string[], cwd = main) => execFileSync(executable('git'), args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+  const git = (args: string[], cwd = main) => execFileSync(realGit, args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
   const cli: WorktreeFixture['cli'] = (args, cwd = linked, overrides = {}) => {
     const childEnv: Record<string, string | undefined> = { ...env, ...overrides }
     for (const key of Object.keys(childEnv)) if (childEnv[key] === undefined) delete childEnv[key]
