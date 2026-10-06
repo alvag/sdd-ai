@@ -42,7 +42,7 @@ export const binding = (session: string, flow: string | null, step = 'specify'):
 })
 export const available = (items: Json[]): Json => ({ availability: 'available', reason: null, items })
 
-export interface Parts { runs?: Json[]; writer?: Json | null; flows?: Json[]; bindings?: Json[]; observedAt?: number; root?: string; schemaVersion?: number }
+export interface Parts { runs?: Json[]; writer?: Json | null; flows?: Json[]; bindings?: Json[]; observedAt?: number; root?: string; schemaVersion?: number; notificationsVersion?: number }
 
 /** El nombre de la observación con ese `m0`, del arranque de las pruebas. */
 export const nameOf = (m0: number, suffix = 'a'): string => `obs-${String(m0).padStart(20, '0')}-${BOOT}-${PID}-${suffix.repeat(32)}.json`
@@ -53,6 +53,7 @@ export function observationText(name: string, parts: Parts = {}): string {
   const observedAt = parts.observedAt ?? T0
   return JSON.stringify({
     schema_version: parts.schemaVersion ?? 1, checkout: { id: 'f'.repeat(64), root: parts.root ?? REAL_ROOT },
+    ...(parts.notificationsVersion === undefined ? {} : { notifications_version: parts.notificationsVersion }),
     observation: { id: name, publisher: { pid: PID, kind: 'cli' }, m0, boot: BOOT, observed_at: observedAt, read_finished_at: observedAt + 5 },
     runs: available(parts.runs ?? []), writer: { availability: 'available', reason: null, item: parts.writer ?? null },
     flows: available(parts.flows ?? []), bindings: available(parts.bindings ?? []), omissions: [],
@@ -60,7 +61,7 @@ export function observationText(name: string, parts: Parts = {}): string {
 }
 
 /** Una entrada del checkout en memoria. `realPath: null` es una ruta que no lleva a ningún lado. */
-export interface Entry { kind: 'file' | 'dir' | 'other'; text?: string; size?: number; isLink?: boolean; realPath?: string | null }
+export interface Entry { kind: 'file' | 'dir' | 'other'; text?: string; size?: number; isLink?: boolean; realPath?: string | null; mtimeMs?: number }
 /** Un acceso del mod. */
 export interface Access { op: 'stat' | 'list' | 'read'; path: string; resolve?: boolean }
 
@@ -124,7 +125,7 @@ export class World {
     if (entry === undefined) return { deny: `ENOENT: no such file or directory, stat '${path}'` }
     const size = entry.size ?? (entry.kind === 'file' ? (entry.text ?? '').length : 0)
     const real = entry.realPath === undefined ? path : entry.realPath
-    return { value: { kind: entry.kind, size, mtimeMs: T0, isLink: entry.isLink ?? false, ...(resolve && real !== null ? { realPath: real } : {}) } }
+    return { value: { kind: entry.kind, size, mtimeMs: entry.mtimeMs ?? T0, isLink: entry.isLink ?? false, ...(resolve && real !== null ? { realPath: real } : {}) } }
   }
 
   private list(path: string): Answer<FsEntry[]> {
@@ -135,7 +136,7 @@ export class World {
     if (entry.kind !== 'dir') return { deny: `ENOTDIR: ${path}` }
     const listed = [...this.entries.entries()].filter(([child]) => parentOf(child) === path).map(([child, value]): FsEntry => {
       const kind = value.isLink ? 'other' : value.kind
-      return { name: baseOf(child), kind, size: kind === 'file' ? (value.size ?? (value.text ?? '').length) : 0, mtimeMs: kind === 'file' ? T0 : 0, isLink: value.isLink ?? false }
+      return { name: baseOf(child), kind, size: kind === 'file' ? (value.size ?? (value.text ?? '').length) : 0, mtimeMs: kind === 'file' ? value.mtimeMs ?? T0 : 0, isLink: value.isLink ?? false }
     })
     return { value: listed }
   }

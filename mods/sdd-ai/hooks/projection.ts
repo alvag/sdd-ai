@@ -1,4 +1,5 @@
 import type { FsEntry, FsStat } from 'claude-code'
+import type { NotificationObservation } from './notification'
 import type {
   BandActivity, BandFlow, BandMemory, BandPresentation, BandSelection, Identity, OpenReason, RunKind, RunState, Unavailable,
 } from '../types'
@@ -44,6 +45,8 @@ export interface ProjectionProgress {
 export interface ProjectionRun extends Entity {
   kind: Observed<RunKind>; state: Observed<RunState>; open: Observed<OpenReason>; session: Observed<string>; flow: Observed<string>
   live: Observed<boolean>; progress: Observed<ProjectionProgress>
+  session_family?: Observed<'claude' | 'codex'>
+  delivery?: Observed<{ round: number | null; launch: number | null }>
 }
 export interface ProjectionWriter extends Entity {
   state: Observed<RunState>; open: Observed<OpenReason>; session: Observed<string>; flow: Observed<string>; live: Observed<boolean>
@@ -51,7 +54,7 @@ export interface ProjectionWriter extends Entity {
 export interface ProjectionFlow extends Entity { observed_at: number; status: Observed<string>; view: Observed<{ id: string; next: { step: string; gate: string | null } }> }
 export interface ProjectionBinding extends Entity { flow: Observed<{ id: string; step: string; gate: string | null; at: string }> }
 export interface ProjectionDocument {
-  schema_version: 1; checkout: { id: string; root: string }
+  schema_version: 1; notifications_version?: number; checkout: { id: string; root: string }
   observation: { id: string; m0: string; boot: string; pid: number; observed_at: number; read_finished_at: number }
   runs: Collection<ProjectionRun>
   writer: { availability: 'available' | 'unavailable'; reason: Reason | null; item: ProjectionWriter | null }
@@ -106,16 +109,22 @@ export function projectionPaths(realRoot: string) {
 export type Lookup<S = FsStat> = { kind: 'found'; stat: S } | { kind: 'absent' } | { kind: 'failed' }
 
 /**
- * El prefijo con que el motor informa un rechazo de `$.fs`: `<plugin>: $.fs.<verbo>: `, el primero del texto. No
- * cruza una comilla: la ruta del motivo va entre comillas, así que el prefijo nunca sale de ella.
+ * El prefijo con que el motor informa un rechazo de `$.fs`, en sus dos formatos: `<plugin>: $.fs.<verbo>: ` y, desde
+ * Claude Code 2.1.289, `<plugin>: $.fs.<verbo>(<ruta>) failed: `. En el segundo la ruta va sin comillas y el motivo
+ * puede repetirla, así que ningún patrón sabe dónde termina: quien conoce la ruta pedida corta justo después de
+ * `(<ruta>) failed: ` (ver `isAbsence`). Sin la ruta, este patrón toma el primer `) failed: ` como respaldo.
  */
-const REJECTION_PREFIX = /^[^']*?: \$\.fs\.\w+: /
+const REJECTION_PREFIX = /^[^']*?: \$\.fs\.\w+(?:: |\(.*?\) failed: )/
 
 /**
  * El motivo de un rechazo de `$.fs` sin código: lo que sigue al prefijo del motor o, sin prefijo, el texto entero. El
  * de una ausencia empieza con el `errno` (`ENOENT: no such file or directory, …`), antes de la ruta.
  */
-function reasonOf(text: string): string {
+function reasonOf(text: string, path?: string): string {
+  // Con la ruta pedida, el corte es exacto: lo que sigue a su primer `(<ruta>) failed: `, aunque la ruta o el motivo
+  // contengan el marcador.
+  const marker = path === undefined ? -1 : text.indexOf(`(${path}) failed: `)
+  if (marker !== -1 && path !== undefined) return text.slice(marker + path.length + '() failed: '.length)
   const prefix = REJECTION_PREFIX.exec(text)
   return prefix === null ? text : text.slice(prefix[0].length)
 }
@@ -125,12 +134,12 @@ function reasonOf(text: string): string {
  * una ausencia. Sin código, solo un motivo que empieza con `ENOENT`: uno dentro de la ruta no cuenta. Cualquier otro
  * rechazo no es una ausencia.
  */
-export function isAbsence(error: unknown): boolean {
-  if (typeof error === 'string') return /^ENOENT\b/.test(reasonOf(error))
+export function isAbsence(error: unknown, path?: string): boolean {
+  if (typeof error === 'string') return /^ENOENT\b/.test(reasonOf(error, path))
   if (typeof error !== 'object' || error === null) return false
   const { code, message } = error as { code?: unknown; message?: unknown }
   if (code !== undefined) return code === 'ENOENT'
-  return typeof message === 'string' && /^ENOENT\b/.test(reasonOf(message))
+  return typeof message === 'string' && /^ENOENT\b/.test(reasonOf(message, path))
 }
 
 /**
@@ -228,7 +237,12 @@ const run: Parse<ProjectionRun> = (v, p) => {
   const o = object(v, p)
   return { ...entity(o, p), kind: observed(oneOf<RunKind>(['worker', 'native', 'review']))(o.kind, `${p}.kind`), state: observed(state)(o.state, `${p}.state`),
     open: observed(open)(o.open, `${p}.open`), session: observed(text)(o.session, `${p}.session`), flow: observed(text)(o.flow, `${p}.flow`),
-    live: observed(flag)(o.live, `${p}.live`), progress: observed(progress)(o.progress, `${p}.progress`) }
+    live: observed(flag)(o.live, `${p}.live`), progress: observed(progress)(o.progress, `${p}.progress`),
+    ...(o.session_family === undefined ? {} : { session_family: observed(oneOf<'claude' | 'codex'>(['claude', 'codex']))(o.session_family, `${p}.session_family`) }),
+    ...(o.delivery === undefined ? {} : { delivery: observed((v, q) => {
+      const d = object(v, q)
+      return { round: d.round === null ? null : integer(d.round, `${q}.round`), launch: d.launch === null ? null : integer(d.launch, `${q}.launch`) }
+    })(o.delivery, `${p}.delivery`) }) }
 }
 const writerItem: Parse<ProjectionWriter> = (v, p) => {
   const o = object(v, p)
@@ -273,15 +287,29 @@ function documentOf(doc: Json, name: string): ProjectionDocument {
   if (writerHead.availability === 'unavailable' && item !== null) corrupt('writer.item')
   array(doc.omissions, 'omissions')
   return {
-    schema_version: SCHEMA_VERSION, checkout: { id: text(checkout.id, 'checkout.id'), root },
+    // Una extensión de avisos ausente o incompatible (también una versión que no es un entero) no invalida la
+    // presentación: solo deja el documento sin avisos.
+    schema_version: SCHEMA_VERSION, ...(doc.notifications_version === 1 ? { notifications_version: 1 } : {}),
+    checkout: { id: text(checkout.id, 'checkout.id'), root },
     observation: { id: name, m0, boot, pid, observed_at: integer(observation.observed_at, 'observation.observed_at'),
       read_finished_at: integer(observation.read_finished_at, 'observation.read_finished_at') },
-    runs: collection(run)(doc.runs, 'runs'), writer: { ...writerHead, item },
+    runs: collection<ProjectionRun>((v, p) => {
+      if (doc.notifications_version === 1) return run(v, p)
+      const { session_family: _family, delivery: _delivery, ...presentation } = object(v, p)
+      return run(presentation, p)
+    })(doc.runs, 'runs'), writer: { ...writerHead, item },
     flows: collection(flow)(doc.flows, 'flows'), bindings: collection(binding)(doc.bindings, 'bindings'),
   }
 }
 
 export type ParsedObservation = { kind: 'valid'; document: ProjectionDocument } | { kind: 'unavailable'; reason: 'corrupt' | 'incompatible_version' | 'foreign_checkout' }
+
+/** Solo se llama con el documento de una lectura valid actual, nunca con la memoria visual retenida. */
+export function notificationObservation(document: ProjectionDocument): NotificationObservation {
+  return { checkout: document.checkout, valid: true, current: true, compatible: document.notifications_version === 1,
+    complete: document.runs.availability === 'available' && document.writer.availability === 'available'
+      && document.flows.availability === 'available' && document.bindings.availability === 'available' }
+}
 
 /**
  * Interpreta el texto de la observación `name`, leída bajo la ruta real `realRoot`. Valida la versión antes que la

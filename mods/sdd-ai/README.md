@@ -5,8 +5,9 @@ Bash y dibuja resúmenes de sus salidas, y muestra sobre el prompt una banda de
 una línea con el flujo ligado a la sesión, su paso y la actividad en curso, que
 lee de la proyección que publica el binario (`docs/projection.md`). El binario
 conserva sus resultados, códigos de salida, guardas y decisiones. El mod no
-ejecuta `next`, no registra comandos ni herramientas, no escribe archivos y no
-modifica las corridas.
+ejecuta `next` ni registra comandos o herramientas. El avisador solicita recepción
+mediante `$.prompt.submit`, persiste sus intentos en `$.store` y escribe únicamente
+la señal de vida de su propia sesión; no modifica las corridas ni sus recibos.
 
 ## Compatibilidad y estado de comprobación
 
@@ -14,6 +15,12 @@ Los mods requieren Claude Code **2.1.287 o posterior**. La sonda se validó con
 **2.1.288**, y esta implementación se comprobó con **2.1.289**, la versión
 instalada al implementarla. Lo observado con esas versiones no se extiende a
 otras.
+
+La sonda del aviso se realizó con Claude Code **2.1.289** en macOS y comprobó
+conservación del borrador y ausencia de interrupción. Esa sonda no acredita la
+integración completa, la prioridad entre sesiones ni la pintura de la banda.
+Las comprobaciones reales pendientes siguen el procedimiento de
+[`docs/notification-live-check.md`](../../docs/notification-live-check.md).
 
 ## Instalación y actualización
 
@@ -49,6 +56,78 @@ copia se conservan y no afectan su vigencia.
 
 `package.json` no declara `files`: sdd-ai se usa desde su checkout. Este mod
 no se distribuye como un plugin instalable independiente.
+
+## Esperar con aviso y recibir el resultado
+
+Con el mod operativo puedes terminar el turno sin `wait` pendiente. El refresco,
+cada **1 s**, considera también resultados terminados antes de instalar o recargar:
+para workers y writers solicita `./bin/sdd-ai wait <id>`; para revisiones,
+`./bin/sdd-ai review status <id>`, identificando ronda y lanzamiento. Fallo,
+cancelación y timeout también pueden avisarse. Progreso, nativas pendientes,
+hallazgos de una revisión ya recibida y `cessation_uncertain` no generan avisos
+terminales. El plegado afecta a la presentación; PromptHint sostiene la adopción
+y observación aun sin banda visible.
+
+El envío espera mientras Claude trabaja, responde una pregunta o tiene texto
+escrito en el prompt. Usa únicamente `{ text }`, con origen de plugin. Una
+solicitud aceptada significa que el aviso ingresó: **no significa resultado
+recibido**. La recepción se registra al obtener la respuesta terminal mediante
+el binario. Los hallazgos de revisión y sus gates siguen pendientes de decisión.
+
+La dueña con señal operativa tiene prioridad aunque esté ocupada. Si no está
+operativa, una nueva sesión de Claude en el mismo checkout puede retomar con
+`./bin/sdd-ai sdd status <flow>`. Debe tener mod con señal vigente y ser la única
+candidata operativa ligada al flujo. Para recuperar manualmente un aviso
+indeterminado o agotado, si no hay candidatas operativas, basta ser la única
+ligada con señal vigente, aun degradada. Sin asociación inequívoca, con varias
+candidatas o con lecturas desconocidas, se conserva el pendiente: consulta desde
+la dueña o resuelve la indisponibilidad/ambigüedad y vuelve a retomar. Nunca se
+elige arbitrariamente una sesión de otro flujo, checkout o worktree.
+
+Si una destinataria aceptó el aviso y desapareció sin recibir, el relevo tiene
+su propia clave y puede avisarse. Se admite un aviso por sesión durante una
+transición; dentro de la misma sesión, una terminación aceptada no se repite
+por redibujos o recargas. Nuevas rondas o lanzamientos vuelven a ser elegibles.
+
+Sin mod operativo, o desde Codex, usa espera activa o consulta manual con esos
+comandos. `Stop` recuerda al cerrar un turno y conserva sus límites de repetición;
+no despierta espontáneamente una sesión inactiva.
+
+## Señal, fallos y rollback del aviso
+
+La señal propia está en `.sdd-ai/hooks/notifications/claude-<session>.json`.
+Contiene versión 1, checkout físico e id, familia, sesión, instancia,
+`operational` y `updated_at`. Tanto `updated_at` como el mtime deben tener menos
+de **5 s**, sin fechas futuras. Enlaces, rutas ajenas, archivos irregulares y
+contenido inválido no acreditan operatividad. Una señal vigente degradada permite
+la recuperación manual legítima, pero no da prioridad ni calla a Stop.
+
+La operatividad requiere observación actual, completa y compatible, identidad y
+persistencia válidas y cobertura de los pendientes de esa sesión. Un pendiente
+sin identidad de entrega, `indeterminate` o `exhausted` mantiene la señal
+degradada hasta su recepción o recuperación de los hechos. Una colección parcial
+puede avisar una corrida propia suficientemente conocida; no sostiene el silencio
+de Stop ni demuestra la unicidad del relevo. La última lectura visual retenida
+no genera nuevos avisos ni renueva operatividad.
+
+Los rechazos confirmados (`drop`) admiten **3 solicitudes**, incluida la inicial,
+con esperas de **30 s** y **60 s** y un nuevo ciclo válido antes de reintentar.
+Mientras queda reintento, la señal puede seguir operativa. Agotado el límite,
+recibe manualmente. Una respuesta indeterminada no se reenvía automáticamente:
+consulta `wait` o `review status`. El plazo de **10 s** solo cuenta tiempo ocioso;
+una respuesta tardía cierra el intento sin habilitar otro envío. Un prepared
+heredado no inició solicitud; un submitting heredado se conserva como indeterminado.
+
+Store dispone de **4 MiB**; una cuota agotada, registro corrupto o fallo de lectura
+o escritura requiere recepción manual. Los registros de aviso no son recibos del
+dominio. La señal no cambia ligas, contadores, hallazgos ni aprobaciones.
+
+Para rollback, desactiva o sustituye el mod y sincroniza la copia con los mecanismos
+existentes. La señal anterior deja de justificar el silencio de Stop en como máximo
+5 s desde la última renovación. No hace falta cancelar corridas, cambiar dueña o
+flujo ni borrar recibos. Si reviertes también el productor, conserva la limpieza
+de `.sdd-ai/projection/` documentada en `docs/projection.md`. Los registros de aviso
+nunca se convierten en entregas durante el rollback.
 
 ## Resúmenes y acceso al original
 
@@ -200,8 +279,9 @@ configuración que consume el script.
 
 El script crea fuera del repositorio una configuración temporal que hereda
 la del motor, incluye únicamente los hooks, tipos propios y tests de la
-fuente, y activa `noEmit`. Usa `tsc` del PATH y elimina el temporal al terminar,
-también ante un fallo. La fuente no lleva `tsconfig.json` ni una declaración
+fuente, y activa `noEmit`. Usa el `tsc` del proyecto (`node_modules/.bin`)
+o, si falta, el del PATH, y elimina el temporal al terminar, también ante un
+fallo. La fuente no lleva `tsconfig.json` ni una declaración
 sustituta del API. Los archivos generados del motor están ignorados por Git.
 
 `npm test` y `npm run typecheck` permanecen separados del plugin y pueden

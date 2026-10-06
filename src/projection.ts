@@ -3,7 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { appendFileSync, closeSync, constants, fchmodSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import type { Stats } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
-import { available, CLAIM_NAME, known, OBSERVATION_NAME, PROJECTION_MAX_BYTES, PROJECTION_MAX_ENTRIES, TEMPORARY_NAME, unknown, validateProjection, validProgress } from './projection-types.ts'
+import { available, CLAIM_NAME, known, NOTIFICATIONS_VERSION, OBSERVATION_NAME, PROJECTION_MAX_BYTES, PROJECTION_MAX_ENTRIES, TEMPORARY_NAME, unknown, validateProjection, validProgress } from './projection-types.ts'
 import type {
   Observed, Projection, ProjectionBinding, ProjectionCollection, ProjectionEntity, ProjectionFlow, ProjectionJob, ProjectionObservation, ProjectionProgress,
   ProjectionRun, ProjectionRunState, ProjectionWriter,
@@ -12,7 +12,7 @@ import { readBinding } from './backstop.ts'
 import { withGitMemo } from './git.ts'
 import { localRunInventory, runOpenness } from './open-runs.ts'
 import { observedProgress } from './review/progress.ts'
-import { readPhaseRecord } from './sdd/phase-state.ts'
+import { associationFor, collectRunAssociations, ownerAssociationSource } from './run-association.ts'
 import { listFlows, readFlow } from './sdd/read.ts'
 import { headerData } from './sdd/status.ts'
 import { detailedFlowView } from './sdd/view.ts'
@@ -556,17 +556,32 @@ export function collectProjection(root: string, observation: ProjectionObservati
   return withGitMemo(() => collectObservation(root, observation))
 }
 
-function collectObservation(root: string, observation: ProjectionObservation): Projection {
-  const document: Projection = { schema_version: 1, checkout: { id: createHash('sha256').update(root).digest('hex'), root }, observation: { ...observation },
-    runs: available([]), writer: { availability: 'available', reason: null, item: null }, flows: available([]), bindings: available([]), omissions: [] }
-  const associations = new Map<string, Set<string>>()
-  const associate = (run: string, flow: string) => {
-    const values = associations.get(run) ?? new Set<string>()
-    values.add(flow); associations.set(run, values)
+/**
+ * La identidad de entrega que publica la proyección. Tiene que coincidir con la que escribe `delivered.json`
+ * (`deliveryOf` en runs.ts: la ronda y el lanzamiento del status, o null):
+ * - un writer protegido no tiene rondas: siempre null y null;
+ * - una revisión necesita los dos contadores; sin ellos, la identidad es desconocida;
+ * - las demás corridas aceptan contadores ausentes (null) o válidos.
+ */
+function deliveryIdentityOf(protectedWriter: boolean, kind: string, round: unknown, launch: unknown): Observed<{ round: number | null; launch: number | null }> {
+  const counter = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+  const optional = (value: unknown): value is number | null | undefined => value === undefined || value === null || counter(value)
+  if (protectedWriter) return known({ round: null, launch: null })
+  if (kind === 'review') {
+    return counter(round) && counter(launch) ? known({ round, launch }) : unknown('delivery_unavailable', 'No se pudo observar la identidad del lanzamiento.')
   }
-  let associationIncomplete = false
+  return optional(round) && optional(launch) ? known({ round: round ?? null, launch: launch ?? null })
+    : unknown('delivery_unavailable', 'No se pudo observar la identidad de entrega.')
+}
+
+function collectObservation(root: string, observation: ProjectionObservation): Projection {
+  const document: Projection = { schema_version: 1, notifications_version: NOTIFICATIONS_VERSION, checkout: { id: createHash('sha256').update(root).digest('hex'), root }, observation: { ...observation },
+    runs: available([]), writer: { availability: 'available', reason: null, item: null }, flows: available([]), bindings: available([]), omissions: [] }
+  let flowEntries: ReturnType<typeof listFlows> | null = null
+  const catalog = (): ReturnType<typeof listFlows> => (flowEntries ??= listFlows(root))
+  const associations = collectRunAssociations(root, catalog)
   try {
-    for (const entry of listFlows(root)) {
+    for (const entry of catalog()) {
       try {
         const read = readFlow(root, entry.id)
         document.flows.items.push({ id: entry.id, availability: 'available', reason: null, observed_at: observation.observed_at,
@@ -575,23 +590,9 @@ function collectObservation(root: string, observation: ProjectionObservation): P
         document.flows.items.push({ id: entry.id, availability: 'unavailable', reason: { code: 'flow_unreadable', detail: 'No se pudo observar el flujo.' },
           observed_at: observation.observed_at, status: unknown('flow_unreadable', 'Estado desconocido.'), view: unknown('flow_unreadable', 'Vista no disponible.') })
       }
-      try {
-        const record = readPhaseRecord(root, entry.id)
-        if (record.last_run) associate(record.last_run.id, entry.id)
-        for (const phase of Object.values(record.phases)) {
-          if (phase.awaiting) associate(phase.awaiting.run, entry.id)
-          if (phase.amended) associate(phase.amended.run, entry.id)
-          if (phase.inline) associate(phase.inline.run, entry.id)
-        }
-        for (const review of record.reviews ?? []) associate(review, entry.id)
-        for (const chain of record.implement?.chains ?? []) for (const link of chain.entries) {
-          if (link.kind !== 'takeover') associate(link.run, entry.id)
-        }
-      } catch { associationIncomplete = true }
     }
     finishCollection(document.flows)
   } catch {
-    associationIncomplete = true
     document.flows = { availability: 'unavailable', reason: { code: 'catalog_unreadable', detail: 'No se pudo observar el catálogo local.' }, items: [] }
   }
 
@@ -630,16 +631,19 @@ function collectObservation(root: string, observation: ProjectionObservation): P
       if (openness === null) continue
       const state = stateValue(harvest?.state ?? status?.state)
       if (!protectedWriter && state.value === null) throw new Error('La corrida no tiene un estado reconocido.')
-      if (protectedWriter) {
-        if (mapValue(owner.phase) && typeof owner.phase.flow === 'string') associate(id, owner.phase.flow)
-      } else if (typeof owner.flow === 'string' && owner.flow !== '') associate(id, owner.flow)
-      const evidence = associations.get(id) ?? new Set<string>()
-      const flow: Observed<string> = evidence.size > 1 ? unknown('association_conflict', 'Los registros atribuyen la corrida a distintos flujos.')
-        : evidence.size === 1 ? known([...evidence][0]) : unknown(associationIncomplete ? 'association_unavailable' : 'not_recorded', 'No hay una asociación disponible con un flujo.')
+      const ownerFlow = protectedWriter ? (mapValue(owner.phase) ? owner.phase.flow : undefined) : owner.flow
+      const association = associationFor(associations, id, ownerAssociationSource(ownerFlow))
+      const flow: Observed<string> = association.kind === 'known' ? known(association.flow)
+        : unknown(association.kind === 'conflict' ? 'association_conflict' : association.kind === 'unknown' ? 'association_unavailable' : 'not_recorded', 'No hay una asociación inequívoca disponible con un flujo.')
       const live = openness.open === 'running' || (protectedWriter && state.value === 'cessation_uncertain')
       const progress = openness.kind === 'review' ? reviewProgressOf(visible, status) : unknown<ProjectionProgress>('not_applicable', 'La corrida no es una revisión.')
+      const request = protectedWriter ? owner.request : owner
+      const conductor = mapValue(request) && mapValue(request.conductor) ? request.conductor : null
+      const session_family: Observed<'claude' | 'codex'> = conductor?.family === 'claude' || conductor?.family === 'codex'
+        ? known(conductor.family) : unknown('owner_family_unavailable', 'No se pudo observar la familia dueña.')
+      const delivery = deliveryIdentityOf(protectedWriter, openness.kind, status?.round, status?.launch)
       const run: ProjectionRun = { id, availability: 'available', reason: null, kind: known(openness.kind), state, open: known(openness.open), session, flow,
-        live: known(live), progress }
+        live: known(live), progress, session_family, delivery }
       document.runs.items.push(run)
       if (protectedWriter && (state.value === null || !TERMINAL.has(state.value))) {
         writers.push({ id, availability: 'available', reason: null, state, open: run.open, session, flow, live: run.live })
@@ -649,7 +653,8 @@ function collectObservation(root: string, observation: ProjectionObservation): P
       document.runs.items.push({ id, availability: 'unavailable', reason: { code: 'run_unreadable', detail: 'No se pudo observar la corrida.' },
         kind: unknown('run_unreadable', 'Clase desconocida.'), state: unknown('run_unreadable', 'Estado desconocido.'), open: unknown('run_unreadable', 'Apertura desconocida.'),
         session: unknown('run_unreadable', 'Sesión desconocida.'), flow: unknown('run_unreadable', 'Asociación desconocida.'),
-        live: unknown('run_unreadable', 'Actividad desconocida.'), progress: unknown('run_unreadable', 'Progreso desconocido.') })
+        live: unknown('run_unreadable', 'Actividad desconocida.'), progress: unknown('run_unreadable', 'Progreso desconocido.'),
+        session_family: unknown('run_unreadable', 'Familia desconocida.'), delivery: unknown('run_unreadable', 'Entrega desconocida.') })
     }
   }
   finishCollection(document.runs)

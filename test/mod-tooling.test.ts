@@ -23,7 +23,7 @@ function npmCli(): string | undefined {
 }
 
 /** Las llamadas que hoy admite el registro, tal como las lista `claude plugin validate`. */
-const ADMITTED = ['$.ui.resolve', '$.state.get', '$.state.set', '$.fs.list', '$.fs.stat', '$.fs.read', '$.session.id', '$.session.root', '$.clock.every', '$.clock.after', '$.clock.now']
+const ADMITTED = ['$.ui.resolve', '$.state.get', '$.state.set', '$.fs.list', '$.fs.stat', '$.fs.read', '$.session.id', '$.session.root', '$.clock.every', '$.clock.after', '$.clock.now', '$.prompt.submit', '$.prompt.read', '$.fs.write', '$.store.get', '$.store.set']
 const ALLOWED_REPORT = '❯ ./register.tsx hooks: tool.call, ui.render\n❯ ./register.tsx calls: $.ui.resolve, $.state.get, $.state.set'
 /** El diagnóstico del motor cuando una sesión anterior guardó apagado el interruptor de rollout. */
 const ROLLOUT_SAVED_OFF = 'hooks modules are turned off in this process: the rollout switch was saved off by an earlier session'
@@ -80,6 +80,20 @@ function toolingFixture() {
 const VALIDATE = ['plugin', 'validate', '--strict', 'mods/sdd-ai']
 const PLUGIN_TEST = ['plugin', 'test', 'mods/sdd-ai']
 
+test('mod tooling admits notification capabilities and still rejects execution', () => {
+  const { root, testMods, calls } = toolingFixture()
+  try {
+    const capabilities = ['$.prompt.submit', '$.prompt.read', '$.fs.write', '$.store.get', '$.store.set']
+    const result = testMods({ MOD_REPORT: `❯ ./register.tsx calls: ${capabilities.map(c => `${c} (via notifyOnce)`).join(', ')}` })
+    assert.equal(result.status, 0, result.stderr)
+    assert.deepEqual(calls().map(c => c.args), [VALIDATE, PLUGIN_TEST])
+    for (const call of ['$.process.run', '$.http.fetch', '$.tool.call', '$.prompt.fill', '$.store.delete', '$.store.keys']) {
+      assert.notEqual(testMods({ MOD_REPORT: `❯ ./register.tsx calls: ${call}` }).status, 0)
+    }
+    assert.notEqual(testMods({ MOD_REPORT: `${ALLOWED_REPORT}\n❯ ./notification.ts calls: $.store.get` }).status, 0)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test('mod scripts propagate failures require generated types and isolate runtimes', () => {
   const { root, source, bin, log, configLog, namedInstall, run, calls } = toolingFixture()
   try {
@@ -94,7 +108,7 @@ test('mod scripts propagate failures require generated types and isolate runtime
     const failures: Record<string, string>[] = [
       { MOD_VALIDATE_EXIT: '4' },
       { MOD_REPORT: '❯ ./register.tsx hooks: tool.call, ui.render' },
-      { MOD_REPORT: '❯ ./register.tsx calls: $.fs.write' },
+      { MOD_REPORT: '❯ ./register.tsx calls: $.prompt.fill' },
       { MOD_REPORT: '❯ ./register.tsx calls: $.ui.resolve, $.command.register' },
       // Un auxiliar que declara llamadas también falla, aunque el registro esté en regla.
       { MOD_REPORT: `${ALLOWED_REPORT}\n❯ ./render.tsx calls: $.ui.toast` },
@@ -165,9 +179,9 @@ test('mod tooling admits exact presentation capabilities and diagnoses saved rol
     // Cada capacidad fuera de la frontera se rechaza por llamada, aunque las demás estén admitidas y aunque sea de una
     // familia admitida, sin llegar al runner.
     const outside = [
-      '$.fs.write', '$.process.run', '$.process.spawn', '$.http.fetch', '$.mcp.call', '$.model.complete', '$.model.fork',
-      '$.prompt.submit', '$.session.send', '$.command.register', '$.command.run', '$.tool.register', '$.tool.call',
-      '$.agent.spawn', '$.fs.exists', '$.fs.ancestors', '$.clock.sleep', '$.session.cwd', '$.store.set', '$.ui.status',
+      '$.process.run', '$.process.spawn', '$.http.fetch', '$.mcp.call', '$.model.complete', '$.model.fork',
+      '$.prompt.fill', '$.session.send', '$.command.register', '$.command.run', '$.tool.register', '$.tool.call',
+      '$.agent.spawn', '$.fs.exists', '$.fs.ancestors', '$.clock.sleep', '$.session.cwd', '$.store.delete', '$.ui.status',
     ]
     for (const call of outside) {
       result = testMods({ MOD_REPORT: `❯ ./register.tsx calls: ${[...ADMITTED, call].join(', ')}` })
@@ -181,9 +195,9 @@ test('mod tooling admits exact presentation capabilities and diagnoses saved rol
     result = testMods({ MOD_REPORT: `❯ ./register.tsx calls: ${[...ADMITTED].sort().map(via).join(', ')}` })
     assert.equal(result.status, 0, result.stderr)
     assert.deepEqual(calls().map((entry) => entry.args), [VALIDATE, PLUGIN_TEST])
-    result = testMods({ MOD_REPORT: `❯ ./register.tsx calls: ${[...ADMITTED.map(via), '$.fs.write (via save)', '$.ui.status (via readProjection, tick)'].join(', ')}` })
+    result = testMods({ MOD_REPORT: `❯ ./register.tsx calls: ${[...ADMITTED.map(via), '$.prompt.fill (via save)', '$.ui.status (via readProjection, tick)'].join(', ')}` })
     assert.notEqual(result.status, 0)
-    assert.ok(result.stderr.includes('llamadas no permitidas en ./register.tsx: $.fs.write, $.ui.status\n'), result.stderr)
+    assert.ok(result.stderr.includes('llamadas no permitidas en ./register.tsx: $.prompt.fill, $.ui.status\n'), result.stderr)
     assert.deepEqual(calls().map((entry) => entry.args), [VALIDATE])
     result = testMods({ MOD_REPORT: `${ALLOWED_REPORT}\n❯ ./band.ts calls: $.fs.read (via readProjection)` })
     assert.notEqual(result.status, 0)

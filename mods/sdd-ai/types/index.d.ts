@@ -80,8 +80,12 @@ export type BandPresentation =
  */
 export interface BandState { identity: Identity; presentation: BandPresentation | null; memory: BandMemory | null }
 
+/** La generación del avisador sobrevive a recargas y retira la autoridad de una instancia anterior. */
+export interface NotificationCoordinatorState { schema_version: 1; identity: Identity; instance: string; generation: number }
+export interface NotificationAvailability { known: boolean; working: boolean; question: boolean; draft: boolean }
+
 declare module 'claude-code' {
   interface PluginState {
-    'sdd-ai-mod': { attribution: StateFamily<Attribution>; band: BandState }
+    'sdd-ai-mod': { attribution: StateFamily<Attribution>; band: BandState; notification: NotificationCoordinatorState }
   }
 }

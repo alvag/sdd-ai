@@ -77,6 +77,7 @@ import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal } from 
 import { type VerifyReceipt, type VerifyReceiptRef, readVerifyReceipt, receiptDir } from './sdd/verify-receipt.ts'
 import { claudeLaunch, claudeResume, claudeWriterLaunch, withSessionId } from './workers/claude.ts'
 import { codexLaunch, codexResume, codexWriterLaunch, withResultFile } from './workers/codex.ts'
+import { authorizeTerminalReceipt } from './notification.ts'
 import { writerEnvelopeBytes, writerPrompt } from './writer.ts'
 import {
   type HarvestRecord, type LaunchFrom, type WriterControl, canWriteStore, captureTreeAtBase, controlUnavailable, freezeHarvest, groupState, harvestTreeHolds, isWriterRun,
@@ -1570,7 +1571,7 @@ async function review(args: string[], env: Env, cwd: string): Promise<Result> {
     const dir = runDir(root, id)
     const s = readStatus(dir)
     const view = reviewView(root, id, dir, s, env)
-    markDelivered(dir, s, env)
+    markDelivered(dir, s, env, (owner) => authorizeTerminalReceipt(root, id, owner, env))
     return view
   }
   throw new SddError('usage', `subcomando desconocido: review ${sub ?? ''}`, { next: 'usa review start | status | decide | round' })
@@ -1601,7 +1602,7 @@ function profileWarnings(s: Status): string[] {
 /** Arma la respuesta de un estado terminal y recién entonces anota la entrega: si armarla falla, no se anota. */
 function report(root: string, id: string, dir: string, s: Status, env: Env): Result {
   const result = reportOf(root, id, dir, s, env)
-  markDelivered(dir, s, env)
+  markDelivered(dir, s, env, (owner) => authorizeTerminalReceipt(root, id, owner, env))
   return result
 }
 
@@ -1891,7 +1892,7 @@ function harvestNext(id: string, h: HarvestRecord, c: WriterControl, failed: str
 }
 
 /**
- * Anota la entrega, solo si la consulta viene de la sesión dueña que guardó el control. Va al almacén;
+ * Anota la entrega si consulta la dueña del control o el relevo autorizado desde el dominio. Va al almacén;
  * si el almacén no se puede escribir, como dentro del sandbox de un conductor Codex, va a la corrida
  * visible. Eso se hace solo con la cosecha ya congelada, cuando el writer dejó de escribir, y solo si
  * su ruta real es la de siempre.
@@ -1899,7 +1900,7 @@ function harvestNext(id: string, h: HarvestRecord, c: WriterControl, failed: str
 function markWriterDelivered(root: string, id: string, state: Status['state'], env: Env): void {
   try {
     const c = readControl(root, id)
-    if (!TERMINAL.has(state) || !c.session || ownerSession(env, c.request.conductor.family) !== c.session) return
+    if (!TERMINAL.has(state) || !c.session || !authorizeTerminalReceipt(root, id, { family: c.request.conductor.family, session: c.session }, env)) return
     const mark = { round: null, launch: null }
     try {
       writeJsonAtomic(join(controlStore(root, c), 'delivered.json'), mark)

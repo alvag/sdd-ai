@@ -13,6 +13,7 @@ import { withPhaseNext } from './sdd/phase-state.ts'
 import { type ListEntry, listFlows, lstatOrNull, readFlow } from './sdd/read.ts'
 import { restoreIntentOpen } from './sdd/restore.ts'
 import { type FlowStatus, type Reason, type Step, headerData, resolve } from './sdd/status.ts'
+import { isNotifierOperational } from './notification.ts'
 import { shellSegments } from './shell.ts'
 import type { NativeProfile } from './types.ts'
 
@@ -185,6 +186,7 @@ function reminded(file: string): Set<string> {
  */
 function stop(p: Payload, root: string, session: string, cli: HookCli): string {
   if (p.stop_hook_active === true) return ''
+  if (cli === 'claude' && isNotifierOperational(root, 'claude', session, Date.now())) return ''
   const reason = [runsReminder(root, session), flowReminder(root, session)].filter(Boolean).join('\n\n')
   if (reason === '') return ''
   return cli === 'claude' ? context('Stop', reason) : JSON.stringify({ decision: 'block', reason })

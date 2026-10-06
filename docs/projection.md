@@ -125,6 +125,33 @@ borra a sí mismo, sin seguirlo, y nunca borra en forma recursiva.
 ninguno deja de publicar por lo que diga una observación existente. Un consumidor que no entiende la versión de la más
 nueva la trata como no disponible hasta la siguiente publicación compatible.
 
+La extensión de avisos usa `notifications_version: 1`, independiente de
+`schema_version`. Cada corrida abierta puede publicar `session_family` y
+`delivery`, ambos con conocimiento explícito. `delivery.value` contiene `round`
+y `launch`; sus null interiores son valores conocidos, distintos del null exterior
+que indica desconocimiento. La identidad procede del estado del lanzamiento, no
+del progreso ni del reloj, y coincide con la utilizada por `delivered.json`.
+Los writers terminales aparecen en `runs` desde su almacén protegido; el campo
+`writer` conserva la representación del writer en vuelo.
+
+Una extensión ausente o incompatible conserva la presentación anterior, pero no
+habilita avisos ni acredita operatividad. Una observación actual parcial solo permite
+avisar entidades propias con hechos suficientes; no demuestra ausencia de otras
+destinatarias. Lecturas retenidas, inválidas o ajenas no generan avisos nuevos.
+
+La asociación corrida–flujo combina request.flow, phase.flow protegido del writer
+y referencias del registro SDD mediante un lector compartido. Dos flujos distintos
+demuestran conflicto; una fuente necesaria ilegible conserva desconocimiento aunque
+haya una referencia legible. El binario usa esas fuentes directamente para autorizar
+recepción: esta proyección sigue siendo informativa y no registra entregas.
+
+El mod publica únicamente su señal en `.sdd-ai/hooks/notifications/`, con vigencia
+inferior a 5 s tanto por fecha declarada como por mtime. Esa señal acredita cobertura
+del mecanismo, no recepción ni liga. Solo Claude con señal operativa vigente calla
+a Stop antes de consumir recordatorios. La recepción continúa mediante `wait` o
+`review status` desde la dueña o el relevo legítimo. El contrato, los reintentos y
+la recuperación están en `mods/sdd-ai/README.md`.
+
 ## Lo que se puede borrar a mano
 
 - `projection/stale-*`: solo aparecen si alguien llenó `live/` con más de 256 entradas.

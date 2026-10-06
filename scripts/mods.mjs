@@ -10,13 +10,15 @@ const CALLS = 'calls:'
 /**
  * Las llamadas exactas que admite el registro: dibujar y guardar su estado de presentación; leer la proyección con
  * `list`, `stat` y `read`; identificar la sesión y su raíz, y sostener el refresco con el reloj. Se comparan por
- * llamada: otra de la misma familia (`$.fs.write`, `$.fs.exists`, `$.clock.sleep`, `$.session.send`) queda fuera.
+ * llamada: otra de la misma familia (`$.fs.exists`, `$.clock.sleep`, `$.session.send`) queda fuera. El avisador
+ * admite lectura del borrador, submit, su señal propia y persistencia; las rutas y momentos se prueban en el motor.
  */
 const ALLOWED = new Set([
   '$.ui.resolve', '$.state.get', '$.state.set',
   '$.fs.list', '$.fs.stat', '$.fs.read',
   '$.session.id', '$.session.root',
   '$.clock.every', '$.clock.after', '$.clock.now',
+  '$.prompt.submit', '$.prompt.read', '$.fs.write', '$.store.get', '$.store.set',
 ])
 /**
  * La anotación con la que el informe dice por qué funciones del módulo pasa una llamada hecha fuera de un hook, como en
@@ -133,7 +135,9 @@ try {
     try {
       const config = join(temporary, 'tsconfig.json')
       writeFileSync(config, JSON.stringify({ extends: join(types, 'tsconfig.json'), compilerOptions: { noEmit: true }, include: ['hooks', 'types', 'tests'].map((dir) => resolve('mods/sdd-ai', dir)) }))
-      inherit('tsc', ['-p', config])
+      // El tsc del proyecto primero: una verificación que corre el script sin npm no tiene node_modules/.bin en el PATH.
+      const local = resolve('node_modules/.bin/tsc')
+      inherit(existsSync(local) ? local : 'tsc', ['-p', config])
     } finally {
       rmSync(temporary, { recursive: true, force: true })
     }

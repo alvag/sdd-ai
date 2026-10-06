@@ -2,22 +2,20 @@ import type { On, ToolCallResult } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import { binding, flowEntry, known, review, SESSION_ROOT, T0, World, writer } from './fixtures/band-world'
 import { domainErrorCapture2_1_288 } from './fixtures/domain-error-2.1.288'
+import { NEVER_EFFECTS } from './fixtures/forbidden-effects'
 
 const command = domainErrorCapture2_1_288.command
 /**
- * Los efectos que el mod nunca produce: registrar comandos o herramientas, avisar, abrir, escribir prompts, archivos o
- * almacenes, lanzar procesos, ir a la red o al modelo, agregar filas a la conversación o mandar mensajes. Los
- * temporizadores y el estado de presentación de la banda no están acá: el refresco los usa.
+ * La frontera completa de la presentación: los efectos que el mod nunca usa más los tres del aviso. Estos casos usan
+ * proyecciones anteriores sin extensión, por eso también exigen ausencia de submit, señal y store. notification.test.ts
+ * observa las rutas, argumentos y momentos autorizados cuando la extensión está presente. El refresco usa temporizadores
+ * y estado de presentación.
  */
-const forbidden = [
-  'command.register', 'tool.register', 'ui.toast', 'ui.status', 'ui.notice', 'ui.open', 'prompt.submit', 'prompt.fill',
-  'fs.write', 'store.set', 'store.delete', 'env.set', 'process.run', 'http.fetch', 'mcp.call', 'model.complete', 'model.fork',
-  'agent.spawn', 'session.append', 'session.send',
-] as const
+const presentationForbidden = [...NEVER_EFFECTS, 'prompt.submit', 'fs.write', 'store.set'] as const
 
 function watchEffects(on: On): string[] {
   const effects: string[] = []
-  for (const name of forbidden) on(name, () => {
+  for (const name of presentationForbidden) on(name, () => {
     effects.push(name)
     throw new Error(`unexpected presentation effect: ${name}`)
   })

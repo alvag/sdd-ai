@@ -111,18 +111,23 @@ interface Delivery { round: number | null; launch: number | null }
 
 const deliveryOf = (s: Status): Delivery => ({ round: s.round ?? null, launch: s.launch ?? null })
 
+/** La dueña de una corrida, tal como la guardó su request. */
+export interface RunOwner { family: Family; session: string }
+
 /**
- * Anota que el conductor dueño ya recibió este estado terminal. Solo lo anota la sesión que creó la
- * corrida, reconocida con la familia guardada: una consulta desde otra sesión no le quita el
- * recordatorio a la dueña. Se guarda la ronda y el lanzamiento para que uno nuevo vuelva a quedar
- * pendiente.
+ * Anota que la dueña o su relevo autorizado recibió el estado terminal. Sin `relay`, conserva la autorización
+ * exclusiva de la dueña; con él, el llamador decide si la sesión actual es el relevo legítimo de esa dueña (la
+ * autorización vive en `notification.ts`, que importa este módulo: se inyecta para no crear un ciclo). La ronda y el
+ * lanzamiento distinguen cada resultado.
  */
-export function markDelivered(dir: string, s: Status, env: Record<string, string | undefined>): void {
+export function markDelivered(dir: string, s: Status, env: Record<string, string | undefined>, relay?: (owner: RunOwner) => boolean): void {
   try {
     if (!TERMINAL.has(s.state)) return
     const request = readJson<{ session?: string; conductor?: Conductor }>(join(dir, 'request.json'))
     if (!request.session || !request.conductor) return
-    if (ownerSession(env, request.conductor.family) !== request.session) return
+    const owner: RunOwner = { family: request.conductor.family, session: request.session }
+    const isOwner = ownerSession(env, owner.family) === owner.session
+    if (!isOwner && (relay === undefined || !relay(owner))) return
     writeJsonAtomic(join(dir, 'delivered.json'), deliveryOf(s))
   } catch {
     // Anotar la entrega nunca impide devolverla: en el peor caso, el recordatorio se repite.

@@ -99,6 +99,44 @@ antes, consérvalo para reintentar.
 En Claude Code, con timeout de Bash de 600000 ms. Si sale con código 3, la corrida sigue viva:
 vuelve a llamar a `wait`. Con código 0, el resultado está en `result`.
 
+Con el mod de Claude operativo puedes terminar el turno sin dejar un `wait` pendiente: al observar una
+terminación sin recibir, pide otro turno con el id y el comando de recepción. Recibe workers y writers
+con `./bin/sdd-ai wait <id>`, y revisiones con `./bin/sdd-ai review status <id>` (también admiten `wait`).
+Un resultado terminal fallido puede recibirse aunque la consulta salga con código 1. El aviso aceptado
+no registra entrega: la registra el binario después de construir la respuesta. Interpretar el resultado,
+decidir hallazgos y aprobar gates siguen siendo acciones posteriores del conductor y de Max.
+
+Sin mod operativo, o desde Codex, conserva la espera activa o consulta manualmente esos comandos.
+`Stop` actúa cuando termina un turno; no despierta espontáneamente una sesión inactiva. Tener instalada
+la copia del mod no prueba operatividad: su señal de vida debe estar vigente y tener `operational: true`.
+Trabajo, preguntas, borrador de Max y banda plegada no desactivan por sí solos el aviso; el envío espera
+a que la sesión esté disponible y el borrador esté vacío.
+
+La dueña operativa tiene prioridad, aunque esté ocupada. Para retomar desde otra sesión de Claude en el
+mismo checkout, ejecuta `./bin/sdd-ai sdd status <flow>`: el hook liga esa sesión al flujo. Solo puede
+recibir como relevo si la dueña está acreditada como no operativa y hay una única candidata operativa
+ligada al flujo. Si ninguna está operativa, la recepción manual sigue disponible para la única ligada
+con señal vigente, incluso degradada. Una sesión sin señal vigente no recibe como relevo.
+
+Con asociación ausente o contradictoria, varias candidatas o lecturas desconocidas, conserva el pendiente:
+la dueña puede consultar manualmente sin mod; para el relevo, recupera las lecturas o resuelve las ligas
+mediante los hooks existentes y vuelve a consultar `sdd status`. No elijas una sesión por proximidad ni
+edites los recibos a mano. Si desaparece la destinataria de un aviso aceptado, la siguiente receptora
+legítima tiene su propia clave de aviso. En una transición puede haber uno por sesión para el mismo
+resultado; una recepción ya registrada es inocua al volver a consultar.
+
+Un rechazo confirmado admite tres solicitudes por resultado y sesión, incluida la inicial: espera 30 s
+antes de la segunda y 60 s antes de la tercera, siempre tras una observación válida. Agotados los intentos
+(`exhausted`), recibe manualmente. Una promesa rechazada, respuesta ilegible, cierre durante el envío o
+10 s de espera ociosa producen `indeterminate`: consulta `wait` o `review status`, sin reenvío ciego.
+El plazo no corre mientras Claude trabaja o espera una pregunta. Una respuesta tardía puede cerrar el
+intento; nunca inicia otro. Con persistencia corrupta o la cuota de store agotada, también recibe manualmente.
+
+La señal vence a los 5 s desde su última renovación, comprobando su fecha y la del archivo. Solo una
+señal vigente operativa calla a `Stop`, sin consumir recordatorios. Al desactivar el mod, dejar de funcionar
+o perder la proyección compatible, esa cobertura deja de justificar el silencio. Sin cobertura, `Stop`
+conserva sus límites anteriores. Instalación, recarga y rollback están en `mods/sdd-ai/README.md`.
+
 Si `wait` trae `warnings`, muéstraselas al usuario. Hay dos casos:
 
 - `retry`: el CLI rechazó el modelo o el esfuerzo pedido y el binario reintentó una sola vez sin ese
@@ -334,7 +372,9 @@ con sus umbrales; esta sección dice cómo.
   hace falta ninguna estructura: el binario lo envuelve en un contrato fijo que le deja leer el
   repositorio, también con el shell, y le prohíbe commitear, tocar esas rutas y ejecutar pruebas, builds
   o comandos que escriban; le pide declarar lo que se desvió y cerrar con `STATUS: done`.
-- **Mientras corre, no edites su árbol.** Espera con `./bin/sdd-ai wait <id>`. Hay una reserva por
+- **Mientras corre, no edites su árbol.** Espera con `./bin/sdd-ai wait <id>` o termina el turno con
+  el mod operativo para recibir su aviso (§3). La reserva sigue tomada hasta el cese comprobado y la
+  cosecha; `cessation_uncertain` no es terminación ni produce aviso terminal. Hay una reserva por
   checkout (`<gitDir>/sdd-ai/checkout.lock`): writer y verify se excluyen allí en ambos sentidos.
   Worktrees distintos admiten writers y verificaciones simultáneos, con controles y recibos locales.
   Antes de trabajar en paralelo, actualiza todos los worktrees con `main`: un binario anterior en
@@ -467,7 +507,8 @@ reglas de la guarda del commit (abajo).
   como dato. En los cuatro casos suma una línea por flujo SDD activo de `.plans/`, con su
   profundidad y su paso siguiente y, en una fase, su comando o por qué no lo hay (§9). Marca el flujo ligado a tu sesión (§9) y muestra un flujo ilegible
   con su motivo. Un directorio sin artefactos no es un flujo y no sale.
-- **`Stop`**: si terminas el turno con corridas propias abiertas, lo reabre una vez con qué corrida,
+- **`Stop`**: con la señal Claude vigente y operativa permanece silencioso sin consumir recordatorios.
+  Sin esa cobertura, si terminas el turno con corridas propias abiertas, lo reabre una vez con qué corrida,
   en qué estado y qué sigue. Una corrida está abierta si:
   - un worker o una revisión siguen corriendo;
   - terminaron y nadie te devolvió su estado (`wait`, `review status` o el propio `run`);

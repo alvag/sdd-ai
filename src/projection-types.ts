@@ -1,5 +1,7 @@
 /** Contrato informativo independiente de los archivos internos y de los lectores del dominio. */
 export const PROJECTION_SCHEMA_VERSION = 1
+/** La versión de la extensión de avisos. Una ausente o distinta deja la proyección sin avisos, nunca inválida. */
+export const NOTIFICATIONS_VERSION = 1
 export const PROJECTION_MAX_BYTES = 4 * 1024 * 1024
 export const PROJECTION_MAX_ENTRIES = 256
 export const OBSERVATION_NAME = /^obs-(\d{20})-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-(\d+)-([0-9a-f]{32})\.json$/
@@ -32,6 +34,8 @@ export interface ProjectionRun extends ProjectionEntity {
   kind: Observed<'worker' | 'native' | 'review'>; state: Observed<ProjectionRunState>
   open: Observed<ProjectionOpenState>; session: Observed<string>; flow: Observed<string>
   live: Observed<boolean>; progress: Observed<ProjectionProgress>
+  session_family?: Observed<'claude' | 'codex'>
+  delivery?: Observed<{ round: number | null; launch: number | null }>
 }
 export interface ProjectionWriter extends ProjectionEntity {
   state: Observed<ProjectionRunState>; open: Observed<ProjectionOpenState>
@@ -56,7 +60,7 @@ export interface ProjectionObservation {
   m0: string; boot: string; observed_at: number; read_finished_at: number
 }
 export interface Projection {
-  schema_version: 1; checkout: { id: string; root: string }; observation: ProjectionObservation
+  schema_version: 1; notifications_version?: number; checkout: { id: string; root: string }; observation: ProjectionObservation
   runs: ProjectionCollection<ProjectionRun>
   writer: { availability: 'available' | 'unavailable'; reason: ProjectionReason | null; item: ProjectionWriter | null }
   flows: ProjectionCollection<ProjectionFlow>; bindings: ProjectionCollection<ProjectionBinding>
@@ -102,8 +106,8 @@ const availability: Check = (v, p) => {
   const o = map(v, p)
   if ((o.availability === 'available') !== (o.reason === null)) fail(`${p}.reason`, 'la disponibilidad y su causa no coinciden')
 }
-const entity = (fields: Record<string, Check>): Check => (v, p) => {
-  object({ ...entityFields, ...fields })(v, p)
+const entity = (fields: Record<string, Check>, optional: readonly string[] = []): Check => (v, p) => {
+  object({ ...entityFields, ...fields }, optional)(v, p)
   availability(v, p)
 }
 const state = oneOf(['launching', 'running', 'done', 'failed', 'launch_failed', 'timeout', 'cancelled', 'delegated', 'unavailable', 'cessation_uncertain'])
@@ -130,7 +134,8 @@ const progress: Check = (v, p) => {
   const active = map(o.active, `${p}.active`).value
   if (active !== null && (!planned.includes(map(active, p).key as string) || seen.has(map(active, p).key as string))) fail(`${p}.active`, 'el trabajo activo debe estar pendiente en el plan')
 }
-const run = entity({ kind: observed(oneOf(['worker', 'native', 'review'])), state: observed(state), open: observed(open), session: observed(text), flow: observed(text), live: observed(boolean), progress: observed(progress) })
+const run = entity({ kind: observed(oneOf(['worker', 'native', 'review'])), state: observed(state), open: observed(open), session: observed(text), flow: observed(text), live: observed(boolean), progress: observed(progress),
+  session_family: observed(oneOf(['claude', 'codex'])), delivery: observed(object({ round: nullable(integer), launch: nullable(integer) })) }, ['session_family', 'delivery'])
 const writer = entity({ state: observed(state), open: observed(open), session: observed(text), flow: observed(text), live: observed(boolean) })
 const question = object({ header: text, question: text, options: list(object({ label: text, description: text })) })
 const paths: Check = (v, p) => { for (const [key, value] of Object.entries(map(v, p))) text(value, `${p}.${key}`) }
@@ -162,7 +167,7 @@ const collection = (check: Check): Check => (v, p) => {
 }
 const decimal: Check = (v, p) => { if (typeof v !== 'string' || !/^\d{20}$/.test(v)) fail(p, 'debe tener 20 dígitos decimales') }
 const boot: Check = (v, p) => { if (typeof v !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(v)) fail(p, 'debe ser el UUID de arranque en minúsculas') }
-const checkDocument = object({ schema_version: oneOf([PROJECTION_SCHEMA_VERSION]), checkout: object({ id: text, root: text }),
+const checkDocument = object({ schema_version: oneOf([PROJECTION_SCHEMA_VERSION]), notifications_version: integer, checkout: object({ id: text, root: text }),
   observation: object({ id: text, publisher: object({ pid: integer, kind: oneOf(['cli', 'hook', 'supervisor', 'unknown']) }), m0: decimal, boot, observed_at: integer, read_finished_at: integer }),
   runs: collection(run), writer: (v, p) => {
     object({ availability: oneOf(['available', 'unavailable']), reason: nullable(reason), item: nullable(writer) })(v, p)
@@ -170,7 +175,7 @@ const checkDocument = object({ schema_version: oneOf([PROJECTION_SCHEMA_VERSION]
     const o = map(v, p)
     if (o.availability === 'unavailable' && o.item !== null) fail(`${p}.item`, 'un writer no disponible no puede presentarse como conocido')
   }, flows: collection(flow), bindings: collection(binding),
-  omissions: list(object({ collection: oneOf(['runs', 'writer', 'flows', 'bindings']), count: integer, reason })) })
+  omissions: list(object({ collection: oneOf(['runs', 'writer', 'flows', 'bindings']), count: integer, reason })) }, ['notifications_version'])
 
 /** Un avance de revisión según el contrato: el recolector degrada solo esa corrida si no lo cumple. */
 export function validProgress(value: unknown): value is ProjectionProgress {
@@ -186,8 +191,25 @@ export function validProgress(value: unknown): value is ProjectionProgress {
 /** Rechaza campos ajenos al contrato, incluidos contenidos de entrada y salida de los workers. */
 export function validateProjection(doc: unknown): { ok: true; document: Projection } | { ok: false; reason: string } {
   try {
-    checkDocument(doc, 'projection')
-    const document = doc as Projection
+    const source = map(doc, 'projection')
+    // Una extensión ausente o incompatible (también una versión que no es un entero) no invalida los hechos del
+    // contrato de presentación: se quita la extensión entera y se valida y devuelve lo que queda, así ningún campo de
+    // la extensión sale sin validar.
+    let checked: unknown = doc
+    if (source.notifications_version !== NOTIFICATIONS_VERSION) {
+      const { notifications_version: _version, ...rest } = source
+      checked = rest
+      if (typeof rest.runs === 'object' && rest.runs !== null && !Array.isArray(rest.runs)) {
+        const runs = rest.runs as Record<string, unknown>
+        if (Array.isArray(runs.items)) checked = { ...rest, runs: { ...runs, items: runs.items.map(item => {
+          if (typeof item !== 'object' || item === null || Array.isArray(item)) return item
+          const { session_family: _family, delivery: _delivery, ...presentation } = item as Record<string, unknown>
+          return presentation
+        }) } }
+      }
+    }
+    checkDocument(checked, 'projection')
+    const document = checked as Projection
     if (!document.checkout.root.startsWith('/')) fail('projection.checkout.root', 'debe ser una ruta absoluta física')
     const match = OBSERVATION_NAME.exec(document.observation.id)
     if (!match || match[1] !== document.observation.m0 || match[2] !== document.observation.boot || Number(match[3]) !== document.observation.publisher.pid) {

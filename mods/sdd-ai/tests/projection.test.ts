@@ -2,7 +2,7 @@ import type { FsEntry, FsStat } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 import {
   directoryProblem, isAbsence, judgeStat, listingOf, MAX_LIVE_ENTRIES, MAX_OBSERVATION_BYTES, newestFirst, observationName, parseObservation,
-  projectionPaths, refreshBand, selectBand, STALE_AFTER_MS,
+  notificationObservation, projectionPaths, refreshBand, selectBand, STALE_AFTER_MS,
 } from '../hooks/projection'
 import type { BandMemory, BandPresentation, BandSelection, Identity, ProjectionDocument } from '../hooks/projection'
 import { BOOT, claimExamples, foreignExamples, observationExamples, OTHER_BOOT, temporaryExamples } from './fixtures/projection-names'
@@ -70,6 +70,29 @@ function document(parts: Parts = {}): ProjectionDocument {
 }
 const band = (parts: Parts, session = SESSION): BandSelection => selectBand(document(parts), session)
 const stat = (overrides: Partial<FsStat> = {}): FsStat => ({ kind: 'file', size: 2048, mtimeMs: T0, isLink: false, realPath: projectionPaths(ROOT).observation(NAME), ...overrides })
+
+test('notification extension preserves old presentation and known null delivery without inferring counters', () => {
+  for (const version of [undefined, 1, 99]) {
+    const source = doc({ runs: available([pending('worker', { session_family: known('claude'), delivery: known({ round: null, launch: null }) })]) })
+    if (version !== undefined) source.notifications_version = version
+    const parsed = parseObservation(JSON.stringify(source), NAME, ROOT)
+    expect(parsed.kind).toBe('valid')
+    if (parsed.kind !== 'valid') throw new Error('fixture ilegible')
+    expect(selectBand(parsed.document, SESSION).kind).toBe('band')
+    expect(notificationObservation(parsed.document).compatible).toBe(version === 1)
+    expect(parsed.document.runs.items[0]?.delivery?.value).toEqual(version === 1 ? { round: null, launch: null } : undefined)
+  }
+  const source = doc({ runs: available([pending('review', { kind: known('review'), delivery: unknown('delivery_unavailable') })]) })
+  source.notifications_version = 1
+  const parsed = parseObservation(JSON.stringify(source), NAME, ROOT)
+  expect(parsed.kind).toBe('valid')
+  if (parsed.kind === 'valid') expect(parsed.document.runs.items[0]?.delivery?.value).toBeNull()
+  const invalid = doc({ runs: available([pending('bad', { delivery: known({ round: -1, launch: null }) })]) })
+  invalid.notifications_version = 1
+  expect(parseObservation(JSON.stringify(invalid), NAME, ROOT)).toEqual({ kind: 'unavailable', reason: 'corrupt' })
+  const partial = document({ runs: { availability: 'partial', reason: { code: 'partial', detail: 'x' }, items: [pending('known')] } })
+  expect(notificationObservation(partial).complete).toBe(false)
+})
 
 test('observation names follow the same examples as the contract', () => {
   for (const example of observationExamples) {
@@ -154,6 +177,18 @@ test('only an ENOENT rejection is an absence', () => {
   expect(isAbsence(new Error("ENOENT: no such file or directory, stat '/x'"))).toBe(true)
   expect(isAbsence(new Error("sdd-ai-mod: $.fs.stat: ENOENT: no such file or directory, stat '/x'"))).toBe(true)
   expect(isAbsence(new Error("sdd-ai-mod: $.fs.list: ENOENT: no such file or directory, scandir '/work/ENOENT/.sdd-ai/projection/live'"))).toBe(true)
+  // El formato que emite Claude Code 2.1.289, visto en la comprobación en vivo de aviso-al-conductor.
+  expect(isAbsence(new Error('sdd-ai-mod: $.fs.stat(/work/.sdd-ai/hooks/notifications) failed: ENOENT'))).toBe(true)
+  expect(isAbsence(new Error('sdd-ai-mod: $.fs.stat(/work/ENOENT) failed: EACCES'))).toBe(false)
+  // Con la ruta pedida el corte es exacto: una ruta con paréntesis o con el marcador no lo corre, aunque el motivo
+  // repita la ruta como los errno de Node.
+  expect(isAbsence(new Error('sdd-ai-mod: $.fs.stat(/work/(x)/y) failed: ENOENT'), '/work/(x)/y')).toBe(true)
+  const tricky = '/work/a) failed: ENOENT'
+  expect(isAbsence(new Error(`sdd-ai-mod: $.fs.stat(${tricky}) failed: EACCES`), tricky)).toBe(false)
+  expect(isAbsence(new Error(`sdd-ai-mod: $.fs.open(${tricky}) failed: EACCES: permission denied, open '${tricky}'`), tricky)).toBe(false)
+  expect(isAbsence(new Error(`sdd-ai-mod: $.fs.open(${tricky}) failed: ENOENT: no such file or directory, open '${tricky}'`), tricky)).toBe(true)
+  // Sin la ruta, el respaldo toma el primer marcador.
+  expect(isAbsence(new Error('sdd-ai-mod: $.fs.stat(/work/(x)/y) failed: ENOENT'))).toBe(true)
   expect(isAbsence(Object.assign(new Error('missing'), { code: 'ENOENT' }))).toBe(true)
   expect(isAbsence('ENOENT')).toBe(true)
   for (const error of [new Error("EACCES: permission denied, stat '/x'"), new Error('EIO: i/o error'), new Error('no implementation for fs.stat'),
