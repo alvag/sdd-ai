@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join, relative } from 'node:path'
+import { dirname, join, relative, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { Scalar, isMap, parse, parseDocument } from 'yaml'
 import { agentName, agentsState, leftoverAgents, skillCopies, syncAgents } from './agents.ts'
@@ -45,6 +45,9 @@ export interface InitOptions {
   exec?: Exec
 }
 type Env = Record<string, string | undefined>
+
+/** La ruta de `file` relativa a la raíz del repo y con `/`, en cualquier sistema. */
+const repoPath = (root: string, file: string): string => relative(root, file).split(sep).join('/')
 
 interface Current { families: Family[]; selection?: string; jira: JiraAnswer }
 interface Resolved { families: Family[]; selection?: string; jira: JiraAnswer }
@@ -403,7 +406,7 @@ function agentChanges(root: string, workers: WorkersFile, env: Env, inventory: r
     }
   }
   for (const copy of skillCopies(root, root)) if (copy.state !== 'ok') out.push({ path: copy.path, state: copy.state })
-  for (const file of leftoverAgents(root)) out.push({ path: relative(root, file), state: 'leftover' })
+  for (const file of leftoverAgents(root)) out.push({ path: repoPath(root, file), state: 'leftover' })
   out.push(...modChanges(root, inventory))
   return out
 }
@@ -575,7 +578,8 @@ export function applyInit(root: string, answers: InitAnswers, digest: string, en
       written.push(f.path)
     }
   }
-  const agents = plan.agents.length > 0 && workers !== null ? syncAgents(root, root, roleProfiles(workers, loadCodexRoot(env)), inventory) : null
+  const synced = plan.agents.length > 0 && workers !== null ? syncAgents(root, root, roleProfiles(workers, loadCodexRoot(env)), inventory) : null
+  const agents = synced === null ? null : { written: synced.written.map((f) => repoPath(root, f)), removed: synced.removed.map((f) => repoPath(root, f)) }
   let userWritten = false
   try {
     writeUserTelemetry(plan.user_config)

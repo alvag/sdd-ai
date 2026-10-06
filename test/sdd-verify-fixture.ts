@@ -209,7 +209,7 @@ export const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 /** Corre el binario con un tope amplio: una corrida final ejecuta las filas y confirma con revert. */
 export function cli(repo: string, env: Record<string, string>, ...args: string[]): { code: number | null; out: Record<string, any> } {
   const { NODE_TEST_CONTEXT: _ctx, ...base } = process.env
-  const r = spawnSync(BIN, args, { cwd: repo, encoding: 'utf8', timeout: 120000, env: telemetryOff({ ...base, ...env }) })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: repo, encoding: 'utf8', timeout: 120000, env: telemetryOff({ ...base, ...env }) })
   return { code: r.status, out: JSON.parse(r.stdout) }
 }
 

@@ -36,7 +36,7 @@ function setup(opts: { families: string; bins: Array<'claude' | 'codex'>; mode?:
 }
 
 function cli(s: Setup, args: string[]) {
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: s.env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: s.env, encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), stderr: r.stderr }
 }
 
@@ -449,20 +449,20 @@ function harvested(s: Setup, script: object): string {
   const env = { ...s.env, FAKE_MODE: 'writer', FAKE_WRITER: JSON.stringify(script), CLAUDE_CODE_SESSION_ID: 's' }
   const prompt = join(mkdtempSync(join(tmpdir(), 'sdd-ai-prompt-')), 'p.md')
   writeFileSync(prompt, 'Encargo.\n')
-  const r = spawnSync(BIN, ['run', '--role', 'implement', '--prompt-file', prompt], { cwd: s.repo, env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, 'run', '--role', 'implement', '--prompt-file', prompt], { cwd: s.repo, env, encoding: 'utf8' })
   const id = JSON.parse(r.stdout).id as string
   assert.ok(id, r.stdout + r.stderr)
   return id
 }
 
 const waitFor = (s: Setup, id: string, env: Record<string, string> = {}) =>
-  JSON.parse(spawnSync(BIN, ['wait', id, '--max', '30'], { cwd: s.repo, env: telemetryOff({ ...s.env, ...env }), encoding: 'utf8' }).stdout)
+  JSON.parse(spawnSync(process.execPath, [BIN, 'wait', id, '--max', '30'], { cwd: s.repo, env: telemetryOff({ ...s.env, ...env }), encoding: 'utf8' }).stdout)
 
 /** Ejecuta un `next` que empieza con `./bin/sdd-ai`. */
 function runNext(s: Setup, next: string, env: Record<string, string> = {}) {
   const cmd = /\.\/bin\/sdd-ai ([^;]+?)(?:\)|$)/.exec(next)?.[1] ?? ''
   const args = cmd.trim().split(/\s+/)
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: telemetryOff({ ...s.env, ...env }), encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: telemetryOff({ ...s.env, ...env }), encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), args }
 }
 
@@ -474,7 +474,7 @@ test('review start --harvest revisa la cosecha con los nuevos y se niega ante ot
   assert.equal(runs(s).length, 1)
   const until = Date.now() + 15_000
   while (!existsSync(join(s.repo, 'nuevo.txt')) && Date.now() < until) spawnSync('sleep', ['0.05'])
-  spawnSync(BIN, ['cancel', id], { cwd: s.repo, env: s.env })
+  spawnSync(process.execPath, [BIN, 'cancel', id], { cwd: s.repo, env: s.env })
   assert.equal(waitFor(s, id).state, 'cancelled')
 
   const r = cli(s, ['review', 'start', '--harvest', id, '--base', s.base, '--author', 'codex'])
@@ -511,7 +511,7 @@ test('--untracked sobrevive a las rondas, a la vigencia y a los next de reinicio
   const scripted = { FAKE_MODE: 'scripted', FAKE_ANSWERS: join(work, 'answers.json'), FAKE_CALLS_FILE: join(work, 'calls') }
   const env = { ...s.env, ...scripted }
   const call = (args: string[]) => {
-    const r = spawnSync(BIN, args, { cwd: s.repo, env, encoding: 'utf8' })
+    const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env, encoding: 'utf8' })
     return { code: r.status, out: JSON.parse(r.stdout || 'null') }
   }
   const start = call(['review', 'start', '--harvest', id, '--base', s.base, '--author', 'codex'])

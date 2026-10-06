@@ -9,6 +9,7 @@ import { withLock } from '../lock.ts'
 import { SddError } from '../types.ts'
 import { ownReservation, inspectReservations, liveVerifyGroup, processAlive, readProcess, releaseOrphanVerifyReservation, reservationError } from '../writer-store.ts'
 import type { TestRow } from './verification-contract.ts'
+import { withDurableWriteError } from './durable.ts'
 import { receiptDir } from './verify-receipt.ts'
 
 // El revert de confirmación de `sdd verify`: devolver a la base las rutas de implementación de una fila,
@@ -85,12 +86,28 @@ export function inspectRevertPaths(root: string, baseCommit: string, row: TestRo
 
 /** Sincroniza las entradas de un directorio: sin esto, un corte puede perder un archivo recién creado o renombrado. */
 function syncDir(dir: string): void {
-  const fd = openSync(dir, 'r')
-  try {
-    fsyncSync(fd)
-  } finally {
-    closeSync(fd)
-  }
+  withDurableWriteError('sincronizar el directorio', dir, () => {
+    let fd: number
+    try {
+      fd = openSync(dir, 'r')
+    } catch (error) {
+      if (dirSyncUnsupported(error)) return
+      throw error
+    }
+    try {
+      fsyncSync(fd)
+    } catch (error) {
+      if (!dirSyncUnsupported(error)) throw error
+    } finally {
+      closeSync(fd)
+    }
+  })
+}
+
+/** En Windows la sincronización de la entrada de un directorio no está garantizada: esos códigos no son un fallo. */
+function dirSyncUnsupported(error: unknown): boolean {
+  const code = (error as { code?: string }).code
+  return process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES' || code === 'EISDIR')
 }
 
 /**
@@ -98,7 +115,7 @@ function syncDir(dir: string): void {
  * primera verificación crea `sdd-ai/verify/`, y un corte no puede perderlo con la intención adentro.
  */
 function durableDir(root: string, dir: string): void {
-  mkdirSync(dir, { recursive: true })
+  withDurableWriteError('crear el directorio', dir, () => mkdirSync(dir, { recursive: true }))
   const top = gitDirs(root).gitDir
   for (let d = dir; ; d = dirname(d)) {
     syncDir(d)
@@ -112,14 +129,26 @@ function durableDir(root: string, dir: string): void {
  */
 function writeSynced(file: string, bytes: Buffer | string): void {
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
-  const fd = openSync(tmp, 'w')
-  try {
-    writeFileSync(fd, bytes)
-    fsyncSync(fd)
-  } finally {
-    closeSync(fd)
-  }
-  renameSync(tmp, file)
+  withDurableWriteError('escribir', file, () => {
+    // Si algo falla antes del renombrado, el temporal no queda junto al destino, que puede estar en el árbol.
+    try {
+      const fd = openSync(tmp, 'w')
+      try {
+        writeFileSync(fd, bytes)
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+      renameSync(tmp, file)
+    } catch (error) {
+      try {
+        rmSync(tmp, { force: true })
+      } catch {
+        // Si el borrado también falla, se informa el error de la escritura, que es la causa.
+      }
+      throw error
+    }
+  })
   syncDir(dirname(file))
 }
 

@@ -134,7 +134,7 @@ withLock(${JSON.stringify(join(s.repo, '.plans', 'f', 'sdd-ai-approvals.lock'))}
     holder.on('exit', (code) => fail(new Error(`el proceso que toma el lock terminó antes de tomarlo (${code})`)))
   })
   const out: Buffer[] = []
-  const cancel = spawn(join(import.meta.dirname, '..', 'bin', 'sdd-ai'), ['cancel', run], { cwd: s.repo, env: s.env })
+  const cancel = spawn(process.execPath, [join(import.meta.dirname, '..', 'bin', 'sdd-ai'), 'cancel', run], { cwd: s.repo, env: s.env })
   cancel.stdout.on('data', (b: Buffer) => out.push(b))
   const exited = new Promise<void>((done) => cancel.on('close', () => done()))
   // Quien espera un lock deja su archivo `<lock>.<pid>.<azar>.tmp` junto a él: cuando aparece el de cancel, ya

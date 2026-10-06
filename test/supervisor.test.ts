@@ -88,16 +88,29 @@ test('Claude que sale limpio sin resultado es failed por empty_result', async ()
   assert.equal(s.reason, 'empty_result')
 })
 
+/** Si el proceso existe: `process.kill(pid, 0)` da vivo salvo con `ESRCH`. */
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+/** Espera hasta 2 s a que ninguno de los PIDs del archivo `pids` (worker e hijo) siga vivo. */
+async function pidsGone(dir: string): Promise<void> {
+  const pids = readFileSync(join(dir, 'pids'), 'utf8').split(',').map(Number)
+  await waitFor(() => (pids.some(alive) ? undefined : true), 2000)
+}
+
 test('el tope mata el grupo', async () => {
   const dir = prepare('claude', 'hang-child', { deadline_sec: 1, grace_ms: 200 })
+  const started = Date.now()
   const s = await supervise(dir)
   assert.equal(s.state, 'timeout')
-  const pids = readFileSync(join(dir, 'pids'), 'utf8')
-  const status = await waitFor(() => {
-    const r = spawnSync('ps', ['-p', pids]).status
-    return r === 1 ? r : undefined
-  }, 2000)
-  assert.equal(status, 1)
+  assert.ok(Date.now() - started < 6000, 'el tope tardó demasiado en terminar al worker')
+  await pidsGone(dir)
 })
 
 test('una cancelación termina en cancelled', async () => {
@@ -105,10 +118,14 @@ test('una cancelación termina en cancelled', async () => {
   const running = supervise(dir)
   const pid = await waitFor(() => (existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined))
   await sleep(300)
+  const requested = Date.now()
   writeFileSync(join(dir, 'cancel.request'), '')
-  process.kill(-pid, 'SIGTERM')
+  // Fuera de Windows, un SIGTERM externo al grupo llega junto con la cancelación; en Windows no hay grupos.
+  if (process.platform !== 'win32') process.kill(-pid, 'SIGTERM')
   const s = await running
   assert.equal(s.state, 'cancelled')
+  assert.ok(Date.now() - requested < 5000, 'la cancelación tardó demasiado')
+  await pidsGone(dir)
 })
 
 test('una cancelación pedida antes de lanzar no llega a lanzar al worker', async () => {
@@ -121,24 +138,26 @@ test('una cancelación pedida antes de lanzar no llega a lanzar al worker', asyn
 
 test('el supervisor atiende una cancelación sin que nadie mate al worker', async () => {
   const dir = prepare('claude', 'hang-child')
-  const started = Date.now()
   const running = supervise(dir)
   await waitFor(() => (existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined))
+  const requested = Date.now()
   writeFileSync(join(dir, 'cancel.request'), '')
   const s = await running
   assert.equal(s.state, 'cancelled')
-  assert.ok(Date.now() - started < 5000, 'la cancelación tardó demasiado')
+  assert.ok(Date.now() - requested < 5000, 'la cancelación tardó demasiado')
+  await pidsGone(dir)
 })
 
 test('una cancelación que el worker ignora termina con SIGKILL tras la gracia', async () => {
   const dir = prepare('claude', 'ignore-term', { grace_ms: 200 })
   const started = Date.now()
   const running = supervise(dir)
-  await waitFor(() => (existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined))
+  const workerPid = await waitFor(() => (existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined))
   writeFileSync(join(dir, 'cancel.request'), '')
   const s = await running
   assert.equal(s.state, 'cancelled')
   assert.ok(Date.now() - started < 5000, 'el worker que ignora SIGTERM siguió vivo')
+  await waitFor(() => (alive(workerPid) ? undefined : true), 2000)
 })
 
 test('un CLI que no existe es launch_failed por cli_missing', async () => {

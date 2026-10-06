@@ -50,7 +50,7 @@ function setup(o: { commits?: boolean; codex?: boolean; families?: string } = {}
   return s
 }
 function cli(s: Setup, args: string[]) {
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: s.env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: s.env, encoding: 'utf8' })
   assert.equal(r.error, undefined)
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), stderr: r.stderr }
 }

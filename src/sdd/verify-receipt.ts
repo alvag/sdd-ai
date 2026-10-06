@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { type CandidateFingerprint, gitDirs } from '../git.ts'
 import { newRunId, writeJsonAtomic } from '../runs.ts'
 import { SddError } from '../types.ts'
+import { withDurableWriteError } from './durable.ts'
 import type { Obligation } from './verification-contract.ts'
 
 // Los recibos de `sdd verify` y las acreditaciones de las filas manuales. Viven en el almacén del
@@ -89,9 +90,11 @@ const attestationFile = (root: string, id: string) => join(verifyRoot(root), 'at
 /** Publica el cuerpo del recibo de forma atómica y devuelve su referencia, con el digest del cuerpo. */
 export function writeVerifyReceipt(root: string, receipt: VerifyReceipt): VerifyReceiptRef {
   const dir = receiptDir(root, receipt.id)
-  mkdirSync(dir, { recursive: true })
   const file = join(dir, 'receipt.json')
-  writeJsonAtomic(file, receipt)
+  withDurableWriteError('publicar el recibo', file, () => {
+    mkdirSync(dir, { recursive: true })
+    writeJsonAtomic(file, receipt)
+  })
   return { id: receipt.id, digest: sha256(readFileSync(file)), mode: receipt.mode }
 }
 

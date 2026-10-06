@@ -303,7 +303,7 @@ function sdd(repo: string, cli: Cli, args: string[], session = 's1'): Out {
   const env: Record<string, string> = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')), SDD_AI_PROJECTION: 'off' }
   if (cli === 'claude') Object.assign(env, { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: session })
   else Object.assign(env, { CODEX_THREAD_ID: 't', CODEX_SESSION_ID: session })
-  const r = spawnSync(BIN, args, { cwd: repo, env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: repo, env, encoding: 'utf8' })
   return JSON.parse(r.stdout) as Out
 }
 
@@ -1362,7 +1362,7 @@ test('sdd phase en subagentes y workers se niega y la sesión del conductor qued
     post(cli, other, './bin/sdd-ai sdd phase f2 --context c.md --families codex --conductor claude --deadline 900')
     assert.deepEqual(bound(other), { id: 'f2', step: 'plan', gate: null }, cli)
   }
-  const worker = spawnSync(BIN, ['sdd', 'phase', 'f1', '--request', 'pedido.md'], { cwd: makeRepo(), encoding: 'utf8', env: { PATH: process.env.PATH, SDD_AI_WORKER: '1' } })
+  const worker = spawnSync(process.execPath, [BIN, 'sdd', 'phase', 'f1', '--request', 'pedido.md'], { cwd: makeRepo(), encoding: 'utf8', env: { PATH: process.env.PATH, SDD_AI_WORKER: '1' } })
   assert.equal(JSON.parse(worker.stdout).code, 'recursion')
 })
 

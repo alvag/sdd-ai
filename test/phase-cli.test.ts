@@ -40,7 +40,7 @@ function setup(opts: { families?: string; bins?: Array<'claude' | 'codex'>; mode
 }
 
 function cli(s: Setup, args: string[], extraEnv: Record<string, string> = {}) {
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: telemetryOff({ ...s.env, ...extraEnv }), encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: telemetryOff({ ...s.env, ...extraEnv }), encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), stderr: r.stderr }
 }
 
@@ -508,7 +508,7 @@ test('sdd phase lanza la fase vigente por proceso y no la lanza si el flujo camb
   const lock = join(s.dir, 'sdd-ai-approvals.lock')
   // Un titular vivo del lock: el verbo lee el flujo y espera, sin robarlo.
   writeFileSync(lock, `${JSON.stringify({ pid: process.pid, lstart: null })}\n`)
-  const child = spawn(BIN, ['sdd', 'phase', 'f'], { cwd: s.repo, env: s.env })
+  const child = spawn(process.execPath, [BIN, 'sdd', 'phase', 'f'], { cwd: s.repo, env: s.env })
   let stdout = ''
   child.stdout.on('data', (b: Buffer) => { stdout += b.toString('utf8') })
   const closed = new Promise<number | null>((done) => child.on('close', done))

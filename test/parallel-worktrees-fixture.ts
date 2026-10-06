@@ -141,7 +141,7 @@ export function parallelFixture(topology: 'main-linked' | 'linked-linked' = 'mai
   }
   const launch = (s: WSetup, args: string[], env: Record<string, string> = {}): ProcessRun => {
     const { NODE_TEST_CONTEXT: _context, ...baseEnv } = process.env
-    const child = spawn(BIN, args, { cwd: s.repo, env: { ...baseEnv, ...s.env, ...env }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(process.execPath, [BIN, ...args], { cwd: s.repo, env: { ...baseEnv, ...s.env, ...env }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''; let stderr = ''
     child.stdout!.on('data', (chunk) => { stdout += String(chunk) })
     child.stderr!.on('data', (chunk) => { stderr += String(chunk) })

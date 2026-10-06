@@ -125,7 +125,7 @@ async function walk(conductor: Conductor, mode: Mode) {
     }
     const results: Array<{ args: string[]; code: number | null; stdout: string; stderr: string }> = []
     const call = (args: string[], extra: Record<string, string> = {}, input?: string) => {
-      const r = spawnSync(BIN, args, { cwd: root, env: { ...env, ...extra }, encoding: 'utf8', input, timeout: 60_000 })
+      const r = spawnSync(process.execPath, [BIN, ...args], { cwd: root, env: { ...env, ...extra }, encoding: 'utf8', input, timeout: 60_000 })
       results.push({ args, code: r.status, stdout: r.stdout, stderr: r.stderr })
       return { code: r.status, out: r.stdout.trim() === '' ? null : JSON.parse(r.stdout) }
     }

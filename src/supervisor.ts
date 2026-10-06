@@ -1,7 +1,7 @@
-import { spawn } from 'node:child_process'
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  closeSync, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, writeSync,
+  appendFileSync, closeSync, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, writeSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
@@ -131,17 +131,44 @@ export function cleanEnv(env: Record<string, string | undefined>): Record<string
   return out
 }
 
+/** Si el proceso lanzado sigue vivo según su propio `ChildProcess`: todavía no emitió su salida. */
+export const childRunning = (c: ChildProcess) => c.exitCode === null && c.signalCode === null
+
+/** `taskkill` por su ruta absoluta: lanzado por nombre, Windows lo buscaría primero en el cwd, que es el repo. */
+const TASKKILL = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
+
+/**
+ * Tope de cada `taskkill`. La llamada es síncrona y la hacen los temporizadores del supervisor y de las filas de
+ * `sdd verify`: en el peor caso bloquea el bucle de eventos hasta este tiempo por etapa (SIGTERM y SIGKILL).
+ */
+const TASKKILL_TIMEOUT_MS = 10_000
+
 /**
  * Señala al grupo solo si todavía existe: un id de grupo no se reutiliza mientras tenga procesos, pero
  * uno vacío sí. Queda la ventana mínima entre la consulta y la señal.
+ *
+ * Cada plataforma ignora un argumento. Fuera de Windows se ignora `alive`. En Windows se ignora `signal`: no
+ * hay grupos ni señal suave, así que SIGTERM y SIGKILL terminan a la fuerza el árbol del PID, y la segunda
+ * etapa de una gracia no hace nada si la primera ya lo terminó. Además, en Windows solo actúa si `alive` (el
+ * proceso sigue vivo según quien lo lanzó), porque un PID que ya salió puede estar reusado: un descendiente
+ * que quedó huérfano no se termina (límite W-2).
+ *
+ * Devuelve la descripción de un `taskkill` que falló o venció su tope, para que quien llama la registre; en otro
+ * caso, `undefined`.
  */
-export function killGroup(pid: number, signal: NodeJS.Signals): void {
+export function killGroup(pid: number, signal: NodeJS.Signals, alive: boolean): string | undefined {
+  if (process.platform === 'win32') {
+    if (!alive) return undefined
+    const r = spawnSync(TASKKILL, ['/T', '/F', '/PID', String(pid)], { stdio: 'ignore', windowsHide: true, timeout: TASKKILL_TIMEOUT_MS })
+    return r.error || r.status !== 0 ? `taskkill /T /F /PID ${pid}: ${r.error?.message ?? `status ${r.status}`}` : undefined
+  }
   try {
     process.kill(-pid, 0)
     process.kill(-pid, signal)
   } catch {
     // El grupo ya no existe.
   }
+  return undefined
 }
 
 const SCRATCH_PREFIX = 'sdd-ai-review-'
@@ -263,17 +290,27 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
       writeSync(stdoutFd, `${line}\n`)
       scanLine(family, facts, line)
     })
+    // Un taskkill que falla en Windows queda anotado en la corrida: el supervisor no tiene otra salida visible.
+    const kill = (signal: NodeJS.Signals) => {
+      const failure = killGroup(pid, signal, childRunning(child))
+      if (failure === undefined) return
+      try {
+        appendFileSync(join(dir, `kill${name}.log`), `${new Date().toISOString()} ${failure}\n`)
+      } catch {
+        // Un log que no se puede escribir no tumba al supervisor: el plazo y la cancelación siguen corriendo.
+      }
+    }
     deadline = setTimeout(() => {
       timedOut = true
-      killGroup(pid, 'SIGTERM')
-      graceTimer = setTimeout(() => killGroup(pid, 'SIGKILL'), grace)
+      kill('SIGTERM')
+      graceTimer = setTimeout(() => kill('SIGKILL'), grace)
     }, Math.max(0, until - Date.now()))
     // `cancel` puede llegar antes de que exista el PID; el pedido en disco es la señal.
     cancelWatch = setInterval(() => {
       if (existsSync(cancelFile)) {
         clearInterval(cancelWatch)
-        killGroup(pid, 'SIGTERM')
-        graceTimer = setTimeout(() => killGroup(pid, 'SIGKILL'), grace)
+        kill('SIGTERM')
+        graceTimer = setTimeout(() => kill('SIGKILL'), grace)
       }
     }, 250)
   }
@@ -286,8 +323,9 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
   if (ctx.writer && !leaderRecorded && child.pid !== undefined) {
     recordGroup(ctx.writer.root, ctx.writer.id, { pid: child.pid, pgid: child.pid, lstart: null, argvHash: '' })
   }
-  // Un nieto que sobrevivió al worker no debe quedar vivo.
-  if (child.pid !== undefined) killGroup(child.pid, 'SIGKILL')
+  // Un nieto que sobrevivió al worker no debe quedar vivo. En Windows no hay grupos y el worker ya salió, así
+  // que esta llamada no hace nada: el nieto huérfano sigue vivo (límite W-2).
+  if (child.pid !== undefined) killGroup(child.pid, 'SIGKILL', childRunning(child))
   for (const fd of [stdinFd, stdoutFd, stderrFd]) closeSync(fd)
 
   const resultFile = resultFileOf(family, launch, dir, name)
@@ -1037,7 +1075,9 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
 
 /**
  * Espera a que el grupo del writer quede vacío, con `SIGKILL` mientras exista, hasta `graceMs`.
- * Devuelve el último estado que vio: solo `gone` acredita el cese.
+ * Devuelve el último estado que vio: solo `gone` acredita el cese. En Windows no mata nada: que `groupState`
+ * dé `alive` no prueba que el PID líder siga siendo el mismo proceso, así que espera la gracia y devuelve el
+ * estado (límite W-2).
  */
 export async function settleGroup(g: GroupIdentity, graceMs: number, state: (g: GroupIdentity) => 'gone' | 'alive' | 'unknown' = groupState):
   Promise<'gone' | 'alive' | 'unknown'> {
@@ -1045,7 +1085,8 @@ export async function settleGroup(g: GroupIdentity, graceMs: number, state: (g: 
   for (;;) {
     const s = state(g)
     if (s === 'gone') return s
-    if (s === 'alive') killGroup(g.pgid, 'SIGKILL')
+    // `alive` en false: en Windows el líder pudo salir y su PID estar reusado; fuera de Windows se ignora.
+    if (s === 'alive') killGroup(g.pgid, 'SIGKILL', false)
     if (Date.now() >= until) return s
     await sleep(100)
   }

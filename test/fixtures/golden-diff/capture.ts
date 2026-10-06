@@ -86,7 +86,7 @@ export function reviewEnv(repo: string, answers: string[]): Record<string, strin
 }
 
 export function cli(repo: string, env: Record<string, string>, args: string[]) {
-  const r = spawnSync(BIN, args, { cwd: repo, env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: repo, env, encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), stderr: r.stderr }
 }
 

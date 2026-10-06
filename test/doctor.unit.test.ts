@@ -98,8 +98,8 @@ test('doctor informa la copia de la skill vieja o ausente con su ruta y agents s
   mkdirSync(join(pkg, 'skills', 'sdd-ai'), { recursive: true })
   writeFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'), 'skill v2\n')
   const repo = mkdtempSync(join(tmpdir(), 'sdd-ai-repo-'))
-  const claudeCopy = join('.claude', 'skills', 'sdd-ai', 'SKILL.md')
-  const agentsCopy = join('.agents', 'skills', 'sdd-ai', 'SKILL.md')
+  const claudeCopy = '.claude/skills/sdd-ai/SKILL.md'
+  const agentsCopy = '.agents/skills/sdd-ai/SKILL.md'
   for (const rel of [claudeCopy, agentsCopy]) {
     mkdirSync(dirname(join(repo, rel)), { recursive: true })
     writeFileSync(join(repo, rel), 'skill v2\n')

@@ -43,9 +43,9 @@ test('review round --extra con el entorno de un worker rechaza con runner_requir
     answerReview(s, id, 'ronda 4', 'Lanzar la ronda 4')
     const before = runState(s, id)
     const worker = { ...s.env, SDD_AI_WORKER: '1' }
-    const extra = JSON.parse(spawnSync(BIN, ['review', 'round', id, '--extra'], { cwd: s.repo, env: worker, encoding: 'utf8' }).stdout)
+    const extra = JSON.parse(spawnSync(process.execPath, [BIN, 'review', 'round', id, '--extra'], { cwd: s.repo, env: worker, encoding: 'utf8' }).stdout)
     assert.equal(extra.code, 'runner_required', JSON.stringify(extra))
-    const plain = JSON.parse(spawnSync(BIN, ['review', 'round', id], { cwd: s.repo, env: worker, encoding: 'utf8' }).stdout)
+    const plain = JSON.parse(spawnSync(process.execPath, [BIN, 'review', 'round', id], { cwd: s.repo, env: worker, encoding: 'utf8' }).stdout)
     assert.equal(plain.code, 'recursion')
     assert.deepEqual(runState(s, id), before)
   }
@@ -54,7 +54,7 @@ test('review round --extra con el entorno de un worker rechaza con runner_requir
 test('review decide y review round --extra aceptan --conductor con las dos señales', () => {
   const both = (s: Setup) => ({ ...s.env, CODEX_THREAD_ID: 't-1', CODEX_SESSION_ID: 'c-1', CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codex-')) })
   const run = (s: Setup, env: Record<string, string>, args: string[]) =>
-    JSON.parse(spawnSync(BIN, args, { cwd: s.repo, env, encoding: 'utf8' }).stdout)
+    JSON.parse(spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env, encoding: 'utf8' }).stdout)
 
   const { s, id } = twoDisputes()
   answerReview(s, id, 'disputa F-1', 'Aceptar el hallazgo')
@@ -136,7 +136,7 @@ test('relanzar la ronda extra reusa la prueba en la misma sesión y pide otra tr
   assert.equal(extraReuse(s.env, undefined, dir, id, 5).reuse, false)
   const other = { ...s.env, CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: mkdtempSync(join(tmpdir(), 'sdd-ai-claude-')) }
   assert.match((extraReuse(other, undefined, dir, id, 4) as { reason: string }).reason, /otra sesión/)
-  assert.equal(JSON.parse(spawnSync(BIN, ['review', 'round', id, '--extra'], { cwd: s.repo, env: other, encoding: 'utf8' }).stdout).code, 'approval_missing')
+  assert.equal(JSON.parse(spawnSync(process.execPath, [BIN, 'review', 'round', id, '--extra'], { cwd: s.repo, env: other, encoding: 'utf8' }).stdout).code, 'approval_missing')
   // Un Dejar posterior la anula: el relanzamiento se rechaza hasta un Lanzar nuevo, que se agrega como otra entrada.
   answerReview(s, id, 'ronda 4', 'Dejar la revisión como está')
   assert.match((extraReuse(s.env, undefined, dir, id, 4) as { reason: string }).reason, /posterior/)
@@ -158,7 +158,7 @@ test('extra-approvals.json registra la ronda antes del lanzamiento', () => {
   touchDiff(s)
   answerReview(s, id, 'ronda 4', 'Lanzar la ronda 4')
   const env = { ...s.env, FAKE_PROBE_FILE: runFile(s, id, 'extra-approvals.json') }
-  const r = spawnSync(BIN, ['review', 'round', id, '--extra'], { cwd: s.repo, env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, 'review', 'round', id, '--extra'], { cwd: s.repo, env, encoding: 'utf8' })
   assert.equal(r.status, 0, r.stdout)
   waitRound(s, id)
   // Una sola invocación del revisor, que ya encontró la prueba de la ronda 4 escrita.
@@ -174,7 +174,7 @@ test('status y wait dicen si el relanzamiento de una ronda extra reusa la prueba
   assert.equal(cli(s, ['review', 'round', id, '--extra']).code, 0)
   waitRound(s, id)
   const nexts = (env: Record<string, string>) => [['review', 'status', id], ['wait', id, '--max', '5']].map((args) => {
-    const r = spawnSync(BIN, args, { cwd: s.repo, env, encoding: 'utf8' })
+    const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env, encoding: 'utf8' })
     const out = JSON.parse(r.stdout)
     assert.equal(out.state, 'unavailable', r.stdout)
     return out.next as string
