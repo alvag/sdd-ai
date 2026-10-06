@@ -44,7 +44,8 @@ export function loadDefaultBranch(root: string): string | null {
   return branchText(readConfigMap(root), 'default_branch', false)
 }
 
-const CONFIG_PATH = join('.sdd-ai', 'config.yml')
+// Ruta del repo con `/`, como sale en los mensajes; para el sistema de archivos se resuelve con join(root, CONFIG_PATH).
+const CONFIG_PATH = '.sdd-ai/config.yml'
 
 function suggestBlock(present: Family[]): string {
   const families = present.length > 0 ? present : (['claude', 'codex'] as Family[])

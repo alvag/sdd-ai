@@ -1,7 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { resolve } from 'node:path'
 import { bindingCommand, commitTargets, invokesBinding } from '../src/commands.ts'
 import { shellPipelines } from '../src/shell.ts'
+
+const W = resolve('/w')
 
 test('bindingCommand reconoce las formas del binario solo en el primer tramo', () => {
   const binds: [string, 'status' | 'approve' | 'phase'][] = [
@@ -59,31 +62,31 @@ test('commitTargets encuentra git commit con -C, -c, asignaciones, subcapas y en
     'git add . & git commit',
     'x | git commit',
   ]
-  for (const command of commands) assert.deepEqual(commitTargets(command, '/w'), [{ dir: '/w' }], command)
-  assert.deepEqual(commitTargets('git -C /r commit && git commit', '/w'), [{ dir: '/r' }, { dir: '/w' }])
+  for (const command of commands) assert.deepEqual(commitTargets(command, W), [{ dir: W }], command)
+  assert.deepEqual(commitTargets('git -C /r commit && git commit', W), [{ dir: resolve('/r') }, { dir: W }])
 })
 
 test('el destino: -C absoluto, cd o pushd previo desconocido, relativo al cwd, no literal desconocido', () => {
   const cases: [string, unknown][] = [
-    ['git -C /r commit', { dir: '/r' }],
-    ['cd /r1 && git -C /r2 commit', { dir: '/r2' }],
+    ['git -C /r commit', { dir: resolve('/r') }],
+    ['cd /r1 && git -C /r2 commit', { dir: resolve('/r2') }],
     ['cd /r && git -C . commit', { unknown: true }],
     ['cd /r && git commit', { unknown: true }],
     ['pushd /r; git commit', { unknown: true }],
-    ['git -C sub commit', { dir: '/w/sub' }],
-    ['git -C /r -C sub commit', { dir: '/r/sub' }],
+    ['git -C sub commit', { dir: resolve(W, 'sub') }],
+    ['git -C /r -C sub commit', { dir: resolve('/r', 'sub') }],
     ['git -C $X commit', { unknown: true }],
     ['git -C ~/r commit', { unknown: true }],
     ['git --git-dir=/r/.git commit', { unknown: true }],
     ['git --git-dir /r/.git commit', { unknown: true }],
     ['git --work-tree=/r commit', { unknown: true }],
   ]
-  for (const [command, target] of cases) assert.deepEqual(commitTargets(command, '/w'), [target], command)
+  for (const [command, target] of cases) assert.deepEqual(commitTargets(command, W), [target], command)
 })
 
 test('no son commits git log --grep commit, echo git commit ni git commit-tree', () => {
   for (const command of ['git log --grep commit', 'echo git commit', 'git commit-tree', 'echo "a; git commit"']) {
-    assert.deepEqual(commitTargets(command, '/w'), [], command)
+    assert.deepEqual(commitTargets(command, W), [], command)
   }
 })
 

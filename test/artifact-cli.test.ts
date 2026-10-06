@@ -50,7 +50,7 @@ function setup(answers: string[], o: { single?: boolean } = {}): Setup {
 }
 
 function cli(s: Setup, args: string[]) {
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: s.env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: s.env, encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), stderr: r.stderr }
 }
 

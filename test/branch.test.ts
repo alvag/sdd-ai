@@ -56,7 +56,7 @@ function approval(s: Setup, at = AT): void {
   put(join(s.repo, '.plans', s.id, 'sdd-ai-approvals.json'), JSON.stringify({ schema_version: 1, approvals: [{ gate: 'spec', depth: 'normal', fingerprint, previous: {}, at }] }))
 }
 function cli(s: Setup, ...flags: string[]) {
-  const r = spawnSync(BIN, ['sdd', 'branch', s.id, ...flags], { cwd: s.repo, env: s.env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, 'sdd', 'branch', s.id, ...flags], { cwd: s.repo, env: s.env, encoding: 'utf8' })
   assert.equal(r.error, undefined)
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), stderr: r.stderr }
 }

@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { delimiter, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
@@ -7,7 +7,7 @@ import { ATTEST_OPTIONS, attestQuestion } from '../approval/question.ts'
 import { type Proof, prove } from '../approval/proof.ts'
 import { type CandidateFingerprint, candidateFingerprint, dirtyPaths, harvestTreeWithout } from '../git.ts'
 import { Rejection } from '../review/admit.ts'
-import { killGroup } from '../supervisor.ts'
+import { childRunning, killGroup } from '../supervisor.ts'
 import { type Family, SddError } from '../types.ts'
 import { isTestPath } from '../test-paths.ts'
 import { type ReservationHandle, acquireReservation, acquisitionError, canWriteStore, controlUnavailable, flowWriterOpen, latestFlowHarvest, liveVerifyGroup, recordVerifyGroup, releaseAndReport } from '../writer-store.ts'
@@ -247,11 +247,21 @@ async function executeRow(root: string, runDir: string, row: ExecutableRow, sign
       return
     }
     if (holder !== undefined && child.pid !== undefined) recordVerifyGroup(root, holder, child.pid, handle)
+    // Un taskkill que falla en Windows queda en su propio archivo: no se toca la salida de la fila, cuyo sha256 va al recibo.
+    const kill = (pid: number, sig: NodeJS.Signals) => {
+      const failure = killGroup(pid, sig, childRunning(child))
+      if (failure === undefined) return
+      try {
+        appendFileSync(join(runDir, `kill-${row.id}.log`), `${new Date().toISOString()} ${failure}\n`)
+      } catch {
+        // Un registro que no se puede escribir no corta la fila.
+      }
+    }
     const stop = (why: RowExecution['reason']) => {
       if (reason !== undefined || child.pid === undefined) return
       reason = why
-      killGroup(child.pid, 'SIGTERM')
-      setTimeout(() => child.pid !== undefined && killGroup(child.pid, 'SIGKILL'), KILL_GRACE_MS).unref()
+      kill(child.pid, 'SIGTERM')
+      setTimeout(() => child.pid !== undefined && kill(child.pid, 'SIGKILL'), KILL_GRACE_MS).unref()
     }
     const timer = setTimeout(() => stop('timeout'), row.timeout_ms)
     const onAbort = () => stop('interrupted')
@@ -270,7 +280,8 @@ async function executeRow(root: string, runDir: string, row: ExecutableRow, sign
         settle(finish(r))
         return
       }
-      killGroup(pgid, 'SIGKILL')
+      // En Windows la fila ya salió y esta llamada no hace nada: lo que dejó corriendo sigue vivo (límite W-2).
+      kill(pgid, 'SIGKILL')
       void groupGone(pgid).then((gone) => {
         if (!gone) {
           closeSync(out); closeSync(err)

@@ -72,7 +72,7 @@ function checkout(o: Options = {}): Checkout {
 type Out = Record<string, any>
 
 function cli(c: Checkout, args: string[], cwd = c.repo): { code: number | null; out: Out } {
-  const r = spawnSync(BIN, args, { cwd, env: c.env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd, env: c.env, encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null') as Out }
 }
 
@@ -437,7 +437,7 @@ test('init --apply crea el gitignore, sincroniza los agentes y trae el reporte d
   const again = initAndApply(c)
   assert.deepEqual(again.dry.agents, [{ path: '.claude/agents/sdd-ai-viejo.md', state: 'leftover' }])
   assert.equal(again.applied.code, 0, JSON.stringify(again.applied.out))
-  assert.deepEqual(again.applied.out.agents.removed, [leftover])
+  assert.deepEqual(again.applied.out.agents.removed, ['.claude/agents/sdd-ai-viejo.md'])
   assert.equal(existsSync(leftover), false)
 })
 

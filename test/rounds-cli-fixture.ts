@@ -57,7 +57,7 @@ export function setup(answers: string[]): Setup {
 }
 
 export function cli(s: Setup, args: string[]) {
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: s.env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: s.env, encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), stderr: r.stderr }
 }
 
@@ -159,7 +159,7 @@ export const unresolved = nextRound([{ id: 'F-1', answer: 'unresolved', evidence
 /** Corre el CLI sin esperar: dos de estos compiten por la misma revisión. */
 export function cliAsync(s: Setup, args: string[], env: Record<string, string> = s.env): Promise<{ code: number | null; out: any }> {
   return new Promise((done) => {
-    const child = spawn(BIN, args, { cwd: s.repo, env })
+    const child = spawn(process.execPath, [BIN, ...args], { cwd: s.repo, env })
     let stdout = ''
     child.stdout.on('data', (b: Buffer) => { stdout += b.toString('utf8') })
     child.on('close', (code) => done({ code, out: JSON.parse(stdout || 'null') }))

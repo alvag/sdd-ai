@@ -74,7 +74,7 @@ setTimeout(() => {
   return s
 }
 function cli(s: Setup, args: string[], extra: Record<string, string> = {}) {
-  const result = spawnSync(BIN, args, { cwd: s.repo, env: { ...s.env, ...extra }, encoding: 'utf8' })
+  const result = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: { ...s.env, ...extra }, encoding: 'utf8' })
   assert.equal(result.error, undefined)
   return { code: result.status, out: JSON.parse(result.stdout), stderr: result.stderr }
 }

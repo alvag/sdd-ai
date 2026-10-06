@@ -14,8 +14,9 @@ const MARK = `${MARK_TAG} · no editar a mano · sdd-ai-hash:`
 const FAMILIES: readonly Family[] = ['claude', 'codex']
 const AGENT_DIRS: Record<Family, string> = { claude: join('.claude', 'agents'), codex: join('.codex', 'agents') }
 const AGENT_EXT: Record<Family, string> = { claude: '.md', codex: '.toml' }
-// Claude Code descubre skills en .claude/skills; Codex, en .agents/skills del repo.
-const SKILL_PATHS = [join('.claude', 'skills', 'sdd-ai', 'SKILL.md'), join('.agents', 'skills', 'sdd-ai', 'SKILL.md')]
+// Claude Code descubre skills en .claude/skills; Codex, en .agents/skills del repo. Son rutas del repo con `/`,
+// que salen así en init y doctor; para el sistema de archivos se resuelven con join(root, path).
+const SKILL_PATHS = ['.claude/skills/sdd-ai/SKILL.md', '.agents/skills/sdd-ai/SKILL.md']
 
 export function agentName(role: ReadOnlyRole): string {
   return `sdd-ai-${role}`

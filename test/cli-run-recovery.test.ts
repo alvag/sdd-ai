@@ -169,7 +169,7 @@ test('implement con --conductor y sin variables de sesión se despacha, sin sesi
   const env = { ...s.env }
   delete env.CLAUDECODE
   delete env.CLAUDE_CODE_SESSION_ID
-  const r = spawnSync(BIN, ['run', '--role', 'implement', '--prompt-file', s.prompt, '--conductor', 'claude'], { cwd: s.repo, env, encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, 'run', '--role', 'implement', '--prompt-file', s.prompt, '--conductor', 'claude'], { cwd: s.repo, env, encoding: 'utf8' })
   const out = JSON.parse(r.stdout || 'null')
   assert.equal(r.status, 0, r.stdout + r.stderr)
   assert.deepEqual([out.via, out.family], ['process', 'claude'])

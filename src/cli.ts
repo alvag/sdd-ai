@@ -1,10 +1,10 @@
 import { type SpawnOptions, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
+  closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, delimiter, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
 import { type RoleProfiles, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
@@ -18,6 +18,7 @@ import { MOD_ADOPTION_MESSAGE, modCopy, modInventory } from './mod-copies.ts'
 import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, readGitState, readHeadState, repoRoot } from './git.ts'
 import { type InitAnswers, applyInit, planInit } from './init.ts'
 import { withLock, withLockAsync } from './lock.ts'
+import { inPath } from './cli-path.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { DEFAULT_KEEP_DAYS, type EntryKind, applyPrune, planPrune, pruneContext } from './prune.ts'
@@ -67,13 +68,14 @@ import {
 } from './sdd/chain-facts.ts'
 import { freezeLaunch } from './sdd/publish.ts'
 import { FILE_NAMES, type FlowRead, LOCK_FILE, artifactHash, bytesHash, flowDir, headerHash, listFlows, readFlow } from './sdd/read.ts'
-import { recoverPendingRestore } from './sdd/restore.ts'
+import { recoverPendingRestore, restoreIntentOpen } from './sdd/restore.ts'
 import { isFlowId } from './sdd/id.ts'
 import { assertNoBlockers, checkApplyInput, readAntecedents, renderAntecedents, startApply, startChecks, startPreview } from './sdd/start.ts'
 import { headerData, resolve as resolveFlow } from './sdd/status.ts'
 import { detailedFlowView, nextOf } from './sdd/view.ts'
 import { type ManualRow, type VerificationRow, readVerification } from './sdd/verification-contract.ts'
 import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal } from './sdd/verify.ts'
+import { DurableWriteError } from './sdd/durable.ts'
 import { type VerifyReceipt, type VerifyReceiptRef, readVerifyReceipt, receiptDir } from './sdd/verify-receipt.ts'
 import { claudeLaunch, claudeResume, claudeWriterLaunch, withSessionId } from './workers/claude.ts'
 import { codexLaunch, codexResume, codexWriterLaunch, withResultFile } from './workers/codex.ts'
@@ -97,19 +99,6 @@ const ROUND_CAP = 3
 /** Tope por defecto de `wait`, por debajo del timeout del shell de cada conductor. */
 export function defaultWaitMax(conductor: Family): number {
   return conductor === 'codex' ? 100 : 540
-}
-
-function inPath(cmd: string, env: Env): boolean {
-  for (const dir of (env.PATH ?? '').split(delimiter)) {
-    if (!dir) continue
-    try {
-      accessSync(join(dir, cmd), constants.X_OK)
-      return true
-    } catch {
-      // Sigue con el próximo directorio.
-    }
-  }
-  return false
 }
 
 function definedEnv(env: Env): Record<string, string> {
@@ -2922,10 +2911,25 @@ async function sddVerify(args: string[], env: Env, cwd: string): Promise<Result>
     const pending = start.contract.rows.filter((r): r is ManualRow => r.kind === 'manual' && receipt.rows.find((x) => x.row === r.id)?.outcome !== 'passed')
     const questions = pending.map((r) => ({ row: r.id, question: attestQuestion(id, r.id, r.observation, receipt.after, receipt.plan_fingerprint) }))
     return { code: 0, out: { ...receiptSummary(receipt, ref), projection, ...(questions.length > 0 ? { questions } : {}), next: flowNext(root, id) } }
+  } catch (error) {
+    throw durableFailure(error, root, id)
   } finally {
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
   }
+}
+
+/** Un fallo de la escritura durable sale con `code` y `next`; la intención ya publicada la resuelve el comando siguiente. */
+function durableFailure(error: unknown, root: string, id: string): unknown {
+  if (!(error instanceof DurableWriteError)) return error
+  let open = false
+  try {
+    open = restoreIntentOpen(root)
+  } catch {
+    // Con el disco fallando, la consulta también puede fallar: no se pierde el error de la escritura.
+  }
+  const published = open ? '; la intención de restaurar ya se publicó: la resuelve el binario al arrancar el comando siguiente' : ''
+  return new SddError('durable_write_failed', error.message + published, { next: `./bin/sdd-ai sdd verify ${id}` })
 }
 
 /**

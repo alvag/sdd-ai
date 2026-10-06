@@ -85,7 +85,7 @@ test('de dos run implement simultáneos queda una sola corrida', async () => {
   for (let round = 0; round < 5; round++) {
     const s = writerSetup()
     const launch = () => new Promise<{ code: number | null; out: { id?: string; code?: string } }>((res) => {
-      const child = spawn(BIN, ['run', '--role', 'implement', '--prompt-file', s.prompt], { cwd: s.repo, env: s.env })
+      const child = spawn(process.execPath, [BIN, 'run', '--role', 'implement', '--prompt-file', s.prompt], { cwd: s.repo, env: s.env })
       let out = ''
       child.stdout.on('data', (d) => { out += d })
       child.on('close', (code) => res({ code, out: JSON.parse(out || 'null') }))

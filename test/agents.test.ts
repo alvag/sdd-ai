@@ -115,7 +115,7 @@ test('sync genera un agente por rol de solo lectura y familia', () => {
 
 test('agents sync no genera sdd-ai-implement', () => {
   const repo = makeRepo()
-  const r = spawnSync(join(import.meta.dirname, '..', 'bin', 'sdd-ai'), ['agents', 'sync'], {
+  const r = spawnSync(process.execPath, [join(import.meta.dirname, '..', 'bin', 'sdd-ai'), 'agents', 'sync'], {
     cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')), SDD_AI_PROJECTION: 'off' },
   })
   assert.equal(r.status, 0, r.stderr)
@@ -129,7 +129,7 @@ test('agents sync rechaza un flag desconocido o un posicional sobrante sin tocar
   const repo = makeRepo()
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')), SDD_AI_PROJECTION: 'off' }
   const sync = (...extra: string[]) => {
-    const r = spawnSync(join(import.meta.dirname, '..', 'bin', 'sdd-ai'), ['agents', 'sync', ...extra], { cwd: repo, encoding: 'utf8', env })
+    const r = spawnSync(process.execPath, [join(import.meta.dirname, '..', 'bin', 'sdd-ai'), 'agents', 'sync', ...extra], { cwd: repo, encoding: 'utf8', env })
     return { code: r.status, out: JSON.parse(r.stdout) }
   }
   assert.equal(sync().code, 0)

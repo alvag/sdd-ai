@@ -42,7 +42,7 @@ const answer = (repo: string, id: string, gate: string) => answerGate(repo, envO
 
 /** Corre `sdd-ai sdd …` con un tope de 5 s: un comando que abre un FIFO para leer se cuelga y no llega a responder. */
 function sdd(repo: string, ...args: string[]): Out {
-  const r = spawnSync(BIN, ['sdd', ...args], { cwd: repo, encoding: 'utf8', timeout: 5000, env: envOf(repo) })
+  const r = spawnSync(process.execPath, [BIN, 'sdd', ...args], { cwd: repo, encoding: 'utf8', timeout: 5000, env: envOf(repo) })
   assert.equal(r.error, undefined, `sdd ${args.join(' ')}: ${String(r.error)}`)
   return { code: r.status, out: JSON.parse(r.stdout) }
 }
@@ -247,7 +247,7 @@ const corta = (status: string, spec = '- AC-1: algo observable.', tasks = '- [ ]
 /** Lanza `sdd approve` sin esperar: dos de estos compiten por el mismo flujo. */
 function approveAsync(repo: string, gate: string): Promise<Out> {
   return new Promise((done) => {
-    const child = spawn(BIN, ['sdd', 'approve', 'f', gate], { cwd: repo, env: envOf(repo) })
+    const child = spawn(process.execPath, [BIN, 'sdd', 'approve', 'f', gate], { cwd: repo, env: envOf(repo) })
     let stdout = ''
     child.stdout.on('data', (b: Buffer) => { stdout += b.toString('utf8') })
     child.on('close', (code) => done({ code, out: JSON.parse(stdout) }))
@@ -613,7 +613,7 @@ test('approve con el entorno de un worker rechaza con runner_required', () => {
   const repo = makeRepo()
   const dir = completa(repo, 'f', 'planned')
   answer(repo, 'f', 'spec')
-  const r = spawnSync(BIN, ['sdd', 'approve', 'f', 'spec'], { cwd: repo, encoding: 'utf8', timeout: 5000, env: { ...envOf(repo), SDD_AI_WORKER: '1' } })
+  const r = spawnSync(process.execPath, [BIN, 'sdd', 'approve', 'f', 'spec'], { cwd: repo, encoding: 'utf8', timeout: 5000, env: { ...envOf(repo), SDD_AI_WORKER: '1' } })
   const out = JSON.parse(r.stdout)
   assert.equal(r.status, 2)
   assert.equal(out.code, 'runner_required')
@@ -630,7 +630,7 @@ test('sdd approve --conductor elige la sesión cuando están las dos señales', 
   const q = gateQuestionFor('f', 'completa', 'spec', facts.fingerprints)
   writeCodexRollout(codexHome, 'c-1', [codexItem('AgentMessage', renderForText(q)), codexItem('UserMessage', 'Aprobar', { id: 'um-1' })])
   const run = (...extra: string[]) => {
-    const r = spawnSync(BIN, ['sdd', 'approve', 'f', 'spec', ...extra], { cwd: repo, encoding: 'utf8', timeout: 5000, env })
+    const r = spawnSync(process.execPath, [BIN, 'sdd', 'approve', 'f', 'spec', ...extra], { cwd: repo, encoding: 'utf8', timeout: 5000, env })
     return { code: r.status, out: JSON.parse(r.stdout) }
   }
   assert.equal(run().out.code, 'conductor_unknown')

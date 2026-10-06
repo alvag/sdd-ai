@@ -168,7 +168,7 @@ export function chainSetup(o: { families?: string; bins?: Array<'claude' | 'code
 /** Corre el binario en el repo del escenario y devuelve su código y su JSON. */
 export function runBin(s: ChainSetup, args: string[], extra: Record<string, string> = {}): { code: number | null; out: any; stderr: string } {
   // Con tope: un comando que se cuelga hace fallar la prueba en vez de colgarla.
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: { ...s.env, ...extra }, encoding: 'utf8', timeout: 120_000 })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: { ...s.env, ...extra }, encoding: 'utf8', timeout: 120_000 })
   let out: unknown = null
   try {
     out = JSON.parse(r.stdout || 'null')

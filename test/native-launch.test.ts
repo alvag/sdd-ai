@@ -69,7 +69,7 @@ test('cancel descarta una nativa sin tocar procesos', () => {
     return dir
   }
   const cancel = (id: string) => {
-    const r = spawnSync(BIN, ['cancel', id], { cwd: repo, encoding: 'utf8' })
+    const r = spawnSync(process.execPath, [BIN, 'cancel', id], { cwd: repo, encoding: 'utf8' })
     return { code: r.status, out: JSON.parse(r.stdout || 'null') }
   }
 

@@ -82,7 +82,7 @@ test('normal activity adopts historical state without delivery ownership or auth
     assert.equal(existsSync(join(root, '.sdd-ai', 'projection')), false, 'el checkout empieza sin proyección')
 
     const env = { PATH: process.env.PATH ?? '', HOME: f.scratch, CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'session-c' }
-    const call = (args: string[], input?: string) => spawnSync(BIN, args, { cwd: root, env, encoding: 'utf8', input, timeout: 60_000 })
+    const call = (args: string[], input?: string) => spawnSync(process.execPath, [BIN, ...args], { cwd: root, env, encoding: 'utf8', input, timeout: 60_000 })
 
     // La primera actividad normal, un verbo de lectura, adopta todo lo que había.
     const status = call(['sdd', 'status', 'alpha'])

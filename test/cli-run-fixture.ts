@@ -43,7 +43,7 @@ export function setup(opts: { families?: string; bins?: Array<'claude' | 'codex'
 
 export function cli(s: Setup, args: string[], extraEnv: Record<string, string> = {}) {
   const started = Date.now()
-  const r = spawnSync(BIN, args, { cwd: s.repo, env: telemetryOff({ SDD_AI_TELEMETRY: s.env.SDD_AI_TELEMETRY, ...s.env, ...extraEnv }), encoding: 'utf8' })
+  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: s.repo, env: telemetryOff({ SDD_AI_TELEMETRY: s.env.SDD_AI_TELEMETRY, ...s.env, ...extraEnv }), encoding: 'utf8' })
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), ms: Date.now() - started, stderr: r.stderr }
 }
 
