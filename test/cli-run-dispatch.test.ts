@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { readStatus } from '../src/runs.ts'
 import { READ_ONLY_ROLES, TERMINAL } from '../src/types.ts'
+import { withWorkerPolicy } from '../src/worker-policy.ts'
 import { type Setup, setup, cli, pick, nativeOf, AS_CODEX, runsIn, requestOf } from './cli-run-fixture.ts'
 
 test('run por proceso responde en menos de 1 s', () => {
@@ -53,7 +54,7 @@ test('vía nativa: sin agentes sincronizados es agents_stale; tras sync, delegat
   const r = cli(s, ['run', '--prompt-file', s.prompt])
   assert.equal(r.code, 0)
   assert.deepEqual([r.out.via, r.out.family, r.out.agent], ['native', 'claude', 'sdd-ai-explore'])
-  assert.equal(readFileSync(r.out.prompt_file, 'utf8'), readFileSync(s.prompt, 'utf8'))
+  assert.equal(readFileSync(r.out.prompt_file, 'utf8'), withWorkerPolicy(readFileSync(s.prompt, 'utf8')))
   assert.equal(readStatus(join(s.repo, '.sdd-ai', 'runs', r.out.id)).state, 'delegated')
 })
 

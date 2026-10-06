@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -143,14 +143,20 @@ export function projectionBarrier(path: string) {
  * atiende un pedido con ese reloj, como `__publish`: reserva o cede. Con `systemBoot`, usa el arranque real de la
  * máquina, el mismo que un `__publish` lanzado aparte.
  */
-export function publicationScript(root: string, source: string, options: { barrier?: string; stage?: ProjectionStage; offset?: string; m0?: string; requested?: bigint; systemBoot?: boolean } = {}): string {
-  return `import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+export function publicationScript(root: string, source: string, options: { barrier?: string; stage?: ProjectionStage; offset?: string; m0?: string; requested?: bigint; systemBoot?: boolean; measure?: string } = {}): string {
+  return `import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
     import { publishProjection } from ${JSON.stringify(new URL('../src/projection.ts', import.meta.url).href)};
     import { projectionDocument, projectionRun, TEST_BOOT } from ${JSON.stringify(import.meta.url)};
     const root = ${JSON.stringify(root)}, source = ${JSON.stringify(source)};
     const barrier = ${JSON.stringify(options.barrier ?? null)}, offset = ${JSON.stringify(options.offset ?? null)};
     const fixed = ${JSON.stringify(options.m0 ?? null)};
     const requested = ${JSON.stringify(options.requested?.toString() ?? null)};
+    const measure = ${JSON.stringify(options.measure ?? null)};
+    const trace = (event, detail = {}) => {
+      if (measure) appendFileSync(measure + '.trace.jsonl', JSON.stringify({ event, pid: process.pid,
+        at: Date.now(), monotonic: process.hrtime.bigint().toString(), requested, ...detail }) + '\\n');
+    };
+    trace('holder_started');
     let tick = fixed === null ? 0n : BigInt(fixed) - 2n;
     const result = publishProjection(root, (root, observation) => {
       const document = projectionDocument(root, observation);
@@ -159,6 +165,7 @@ export function publicationScript(root: string, source: string, options: { barri
     }, { ...(${options.systemBoot === true} ? {} : { boot: () => TEST_BOOT }), ...(requested === null ? {} : { requested: BigInt(requested) }),
       monotonic: () => fixed === null ? process.hrtime.bigint() + (offset ? BigInt(readFileSync(offset, 'utf8')) : 0n) : ++tick,
       stage: (stage, context) => {
+        trace('holder_' + stage, context);
         if (barrier && context.attempt === 1 && stage === ${JSON.stringify(options.stage ?? 'observed')}) {
           writeFileSync(barrier + '.arrived', String(process.pid));
           const until = Date.now() + 30000;
@@ -166,11 +173,19 @@ export function publicationScript(root: string, source: string, options: { barri
             if (Date.now() > until) throw new Error('barrera vencida');
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
           }
+          trace('holder_released');
         }
       }
     });
+    trace('holder_finished', result);
     console.log(JSON.stringify(result));
     if (result.kind !== 'published') process.exitCode = 1;`
+}
+
+/** Misma escala monotónica que los hijos; no es un acuse ni interviene en la barrera. */
+export function publicationTrace(measure: string, event: string, detail: object = {}): void {
+  appendFileSync(`${measure}.trace.jsonl`, JSON.stringify({ event, pid: process.pid, at: Date.now(),
+    monotonic: process.hrtime.bigint().toString(), ...detail }) + '\n')
 }
 
 /** Lector del contrato para las pruebas: no consulta request, status, ledger ni control. */

@@ -1,14 +1,14 @@
 import { mock, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import fs, { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, watch, writeFileSync } from 'node:fs'
+import fs, { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { publishNow, publishProjection, readBootId, systemBootId } from '../src/projection.ts'
 import type { ProjectionPublicationOptions } from '../src/projection.ts'
 import { CLAIM_NAME, OBSERVATION_NAME, validateProjection } from '../src/projection-types.ts'
-import { fixtureJson, latestProjection, observation, OTHER_BOOT, projectionDocument, projectionFixture, projectionRun, publicationScript, TEST_BOOT, TEST_TIME } from './projection-fixture.ts'
+import { fixtureJson, latestProjection, observation, OTHER_BOOT, projectionDocument, projectionFixture, projectionRun, publicationScript, publicationTrace, TEST_BOOT, TEST_TIME } from './projection-fixture.ts'
 
 type Fixture = ReturnType<typeof projectionFixture>
 const live = (f: Fixture) => join(f.root, '.sdd-ai', 'projection', 'live')
@@ -585,10 +585,12 @@ const measured = (file: string) => readFileSync(file, 'utf8').trim().split('\n')
 
 /** Un `sdd-ai __publish` aparte, como el que lanza `requestPublication`, que anota su resultado en `measure`. */
 function publishProcess(root: string, requested: bigint, measure: string): Promise<{ code: number | null; stderr: string }> {
+  publicationTrace(measure, 'request_created', { requested: requested.toString() })
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [BIN, '__publish', root, 'test', 'cli', String(Date.now()), String(requested)], {
       cwd: root, stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, SDD_AI_PROJECTION_MEASURE: measure },
     })
+    publicationTrace(measure, 'request_spawned', { child: child.pid, requested: requested.toString() })
     let stderr = ''
     child.stderr!.on('data', (chunk) => { stderr += String(chunk) })
     const timeout = setTimeout(() => child.kill('SIGKILL'), 30000)
@@ -785,29 +787,36 @@ test('publishers of one request read the sources once by yielding to a live clai
 })
 
 /**
- * Observa `live/` desde ahora para saber cuándo quedaron en la cola los pedidos que esperan a la reserva `holder`: cada
- * uno pone su reserva, la vuelve a borrar sin leer y espera. Si el sistema no informa esas reservas fugaces, sigue a los
- * 2 s, cuando ya esperan desde hace rato.
+ * Espera los acuses de procesos que devolvieron `queued` para `holder`, después de retirar su reserva.
+ * No infiere entrada en cola a partir de archivos fugaces ni da por cumplida la barrera al vencer un plazo.
  */
-function queueWatch(f: Fixture, holder: string) {
-  const seen = new Set<string>()
-  const watcher = watch(live(f), (_event, name) => {
-    if (name !== null && name !== holder && CLAIM_NAME.test(name)) seen.add(name)
-  })
+function queueWatch(f: Fixture, holder: string, measure: string) {
   return {
     async queued(count: number) {
-      const until = Date.now() + 2000
-      while (Date.now() < until && !(seen.size >= count && claims(f).length === 1)) await sleep(10)
+      const until = Date.now() + 10000
+      for (;;) {
+        const trace = `${measure}.trace.jsonl`
+        // Solo líneas completas: un hijo puede estar agregando la última mientras el padre lee.
+        const lines = existsSync(trace) ? readFileSync(trace, 'utf8').split('\n').slice(0, -1) : []
+        const acknowledgements = new Set(lines.map((line) => JSON.parse(line))
+          .filter((line) => line.event === 'queued' && line.id === holder).map((line) => line.pid))
+        if (acknowledgements.size === count) {
+          publicationTrace(measure, 'queue_acknowledged', { expected: count, processes: [...acknowledgements], claims: claims(f) })
+          return
+        }
+        if (Date.now() >= until) throw new Error(`faltan acuses queued: ${acknowledgements.size}/${count}`)
+        await sleep(10)
+      }
     },
-    close() { watcher.close() },
+    close() {},
   }
 }
 
 /** Un publicador detenido en `claimed`: decidió leer y tiene su reserva puesta, con el arranque real de la máquina. */
-async function heldReader(f: Fixture, name: string) {
+async function heldReader(f: Fixture, name: string, measure?: string) {
   const source = join(f.scratch, 'source.json'); fixtureJson(source, ['old'])
   const barrier = f.barrier(name)
-  const reader = f.start(publicationScript(f.root, source, { barrier: barrier.path, stage: 'claimed', requested: process.hrtime.bigint(), systemBoot: true }))
+  const reader = f.start(publicationScript(f.root, source, { barrier: barrier.path, stage: 'claimed', requested: process.hrtime.bigint(), systemBoot: true, measure }))
   await barrier.arrived()
   const [claim, ...rest] = claims(f)
   assert.ok(claim); assert.deepEqual(rest, [])
@@ -846,13 +855,13 @@ test('requests made while an earlier reader works wait in a queue instead of rea
     } finally { f.dispose() }
   })
 
-  await t.test('three requests after a reader stopped in claimed wait for it and then only one of them reads', async () => {
+  await t.test('three requests after a reader stopped in claimed wait for it and then only one of them reads', async (t) => {
     const f = projectionFixture()
+    const measure = join(f.scratch, 'measure.jsonl')
     let watcher: ReturnType<typeof queueWatch> | undefined
     try {
-      const { reader, barrier, claim } = await heldReader(f, 'reading')
-      watcher = queueWatch(f, claim)
-      const measure = join(f.scratch, 'measure.jsonl')
+      const { reader, barrier, claim } = await heldReader(f, 'reading', measure)
+      watcher = queueWatch(f, claim, measure)
       const requests: ReturnType<typeof publishProcess>[] = []
       for (const change of ['change-1', 'change-2', 'change-3']) {
         f.run(change)
@@ -864,6 +873,7 @@ test('requests made while an earlier reader works wait in a queue instead of rea
       assert.equal(readdirSync(live(f)).some((name) => OBSERVATION_NAME.test(name)), false)
       assert.equal(existsSync(measure), false)
       const released = process.hrtime.bigint()
+      publicationTrace(measure, 'holder_release_requested', { id: claim })
       barrier.release()
       const done = await reader.done
       assert.equal(done.code, 0, done.stderr)
@@ -880,7 +890,12 @@ test('requests made while an earlier reader works wait in a queue instead of rea
       }
       assert.deepEqual(ids(f)?.sort(), ['change-1', 'change-2', 'change-3'])
       assert.deepEqual(claims(f), [])
-    } finally { watcher?.close(); f.dispose() }
+    } finally {
+      // Emitir incluso en rojo antes de borrar el fixture: el conductor conserva la traza en el reporte TAP.
+      watcher?.close()
+      if (existsSync(`${measure}.trace.jsonl`)) t.diagnostic(readFileSync(`${measure}.trace.jsonl`, 'utf8'))
+      f.dispose()
+    }
   })
 
   await t.test('a request waiting for a reader that does not finish within five seconds reads anyway', async () => {
@@ -911,8 +926,8 @@ test('requests made while an earlier reader works wait in a queue instead of rea
     let watcher: ReturnType<typeof queueWatch> | undefined
     try {
       const { reader, claim } = await heldReader(f, 'dying')
-      watcher = queueWatch(f, claim)
       const measure = join(f.scratch, 'measure.jsonl')
+      watcher = queueWatch(f, claim, measure)
       f.run('after-death')
       const request = publishProcess(f.root, process.hrtime.bigint(), measure)
       await watcher.queued(1)

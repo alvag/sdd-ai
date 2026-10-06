@@ -1,7 +1,7 @@
 import type { On, RenderPropsOf, ToolGroupCall } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 import { parseOutput } from '../hooks/output'
-import { chunks, summaryTree, treeFits } from '../hooks/render'
+import { chunks, summaryTree, textCost, treeFits } from '../hooks/render'
 import { domainErrorCapture2_1_288 } from './fixtures/domain-error-2.1.288'
 import { domainErrorCapture2_1_289 } from './fixtures/domain-error-2.1.289'
 import { domainErrorCaptures, reviewStatusCaptures, statusCaptures } from './fixtures/binary-outputs'
@@ -327,7 +327,7 @@ test('derived missing reviewer remains missing', async ($, on) => {
 test('small available width uses blocks even at 80 terminal columns', async ($, on) => {
   const parsed = parseOutput(JSON.stringify(derivedReview), false)
   if (parsed.kind !== 'summary') throw new Error('expected summary')
-  on('ui.render', { component: 'ToolResult' }, ($, e) => summaryTree($.ui.resolve({ surface: 'terminal', component: e.component }), { summary: parsed.summary, command, isErrored: false, columns: 80, available: 55 }))
+  on('ui.render', { component: 'ToolResult' }, ($, e) => summaryTree($.ui.resolve({ surface: 'terminal', component: e.component }), { summary: parsed.summary, command, isErrored: false, columns: 80, available: 55 }, 90000))
   const narrow = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'ToolResult', props: { tool: 'Read', tool_use_id: 'small-width-fixture', output: '', isErrored: false } })
   expect(await narrow.find({ key: 'ledger-blocks' })).toBeTruthy()
   expect(await narrow.find({ key: 'ledger-table' })).toBe(undefined)
@@ -471,7 +471,8 @@ test('unrelated groups and nonterminal surfaces continue with original props', a
   await $.tool.call({ tool: 'Bash', tool_use_id: 'desktop', command })
   const desktopProps = { tool: 'Bash', tool_use_id: 'desktop', output: '{"state":"done"}', isErrored: false }
   const desktop = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'desktop', component: 'ToolResult', props: desktopProps })
-  expect(received.at(-1)).toMatchObject({ surface: 'desktop', props: desktopProps })
+  // Escribir la caché de salidas guardadas redibuja el grupo de la terminal: se busca el último dibujo de escritorio.
+  expect(received.filter((item) => (item as { surface?: string }).surface === 'desktop').at(-1)).toMatchObject({ surface: 'desktop', props: desktopProps })
   expect(await desktop.find(NATIVE)).toBeTruthy()
   const desktopGroup = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'desktop', component: 'ToolGroup', props: group([call('{}')]) })
   expect(await desktopGroup.find(NATIVE)).toBeTruthy()
@@ -513,16 +514,63 @@ test('long originals are drawn whole in pieces below the summary', async ($, on)
   await ui.unmount()
 })
 
-test('results the engine would refuse stay native while the compact group summarizes them', async ($, on) => {
+test('an individual oversized message keeps the field prefix and the complete native original', async ($, on) => {
+  const received = native(on)
+  on('tool.call', { tool: 'Bash' }, () => ({ deny: 'fixture' }))
+  const id = 'oversized-message'
+  const source = {
+    state: 'blocked', code: 'gate_pending',
+    message: 'El original conserva este mensaje completo. '.repeat(4000),
+    detail: 'Detalle después del mensaje.', next: 'Revisa el gate.',
+  }
+  const output = JSON.stringify(source)
+  await $.tool.call({ tool: 'Bash', tool_use_id: id, command })
+  const props = { tool: 'Bash', tool_use_id: id, output, isErrored: false }
+  const ui = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'ToolResult', viewport: viewport(166), props })
+  const texts = (await ui.findAll({ type: 'Text' })).map(entry => entry.text)
+  const originalIndex = texts.findIndex(text => text.startsWith('native:'))
+  expect(originalIndex).toBeGreaterThan(-1)
+  const expectedFields = ['state', 'code'] as const
+  const missing = Object.keys(source).length - expectedFields.length
+  expect(texts.slice(0, originalIndex)).toEqual([
+    `sdd-ai: ${command}`, ...expectedFields.map(key => `${key}: ${source[key]}`),
+    `faltan ${missing} campos; el original los contiene`,
+  ])
+  expect(textCost(await ui.drawn())).toBeLessThanOrEqual(90000)
+  expect(texts.slice(0, originalIndex).every(text => text.length <= 8000)).toBe(true)
+  // El nativo de prueba dibuja solo una muestra; comprobar que recibe el original íntegro.
+  expect(received).toHaveLength(1)
+  expect(received[0]).toMatchObject({ component: 'ToolResult', props })
+  await ui.redraw()
+  expect(received.at(-1)).toMatchObject({ props })
+  await ui.unmount()
+})
+
+test('extreme groups retain call identifications and count summaries that cannot fit', async ($, on) => {
+  const received = native(on)
+  const outputs = Array.from({ length: 10 }, (_, index) => JSON.stringify({ state: `entry-${index} ${'x'.repeat(18000)}`, ledger: [{ id: `F-${index}`, severity: 'BUG', state: 'abierto', claim: 'Hallazgo' }] }))
+  const ui = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'ToolGroup', viewport: viewport(166), props: group(outputs.map(output => call(output))) })
+  const texts = (await ui.findAll({ type: 'Text' })).map(item => item.text)
+  expect(textCost(await ui.drawn())).toBeLessThanOrEqual(90000)
+  expect(texts.filter(text => text.startsWith('sdd-ai: ')).length).toBe(10)
+  const summaries = texts.filter(text => text.startsWith('state: entry-'))
+  expect(summaries.length).toBe(4)
+  expect(texts.includes('faltan 6 resúmenes en el grupo')).toBe(true)
+  expect(texts.filter(text => text === 'faltan 1 entradas; el original las contiene').length).toBe(4)
+  expect(texts.every(text => text.length <= 8000)).toBe(true)
+  expect(received).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('control characters stay native while oversized compact ledgers use counted prefixes', async ($, on) => {
   const received = native(on)
   on('tool.call', { tool: 'Bash' }, () => ({ deny: 'fixture' }))
   const id = 'oversized'
   await $.tool.call({ tool: 'Bash', tool_use_id: id, command })
-  // Derivadas: el ledger de una revisión real repetido. Con 120 entradas el resumen entra pero el resultado
-  // suelto, que suma el original, pasa de 100 000 caracteres de texto; con 300 tampoco entra el grupo.
+  // El ledger grande se prueba en el grupo; el fixture individual en línea conserva el límite de 30 KB.
   const review = (length: number) => `${JSON.stringify({ ...derivedReview, ledger: Array.from({ length }, (_, index) => ({ ...capturedRow, id: `F-${index + 1}` })) })}\n`
   const withControl = { stdout: '{"state":"done"}\n', stderr: 'aviso \u001b[31mrojo\u001b[0m\n' }
-  for (const output of [review(120), withControl]) {
+  for (const output of [withControl]) {
     const props = { tool: 'Bash', tool_use_id: id, output, isErrored: false }
     const single = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'ToolResult', viewport: viewport(166), props })
     expect(await single.find(NATIVE)).toBeTruthy()
@@ -534,8 +582,12 @@ test('results the engine would refuse stay native while the compact group summar
   expect(await grouped.find({ text: 'F-120' })).toBeTruthy()
   const tooLarge = group([call(review(300))])
   await grouped.redraw(tooLarge)
-  expect(await grouped.find(NATIVE)).toBeTruthy()
-  expect(received.at(-1)).toMatchObject({ props: tooLarge })
+  expect(await grouped.find(NATIVE)).toBe(undefined)
+  const drawn = await grouped.findAll({ type: 'Text' })
+  const ids = drawn.map(entry => entry.text).filter(text => /^F-\d+$/.test(text))
+  expect(ids.length).toBeLessThan(300)
+  for (let index = 0; index < ids.length; index++) expect(ids[index]).toBe(`F-${index + 1}`)
+  expect(drawn.some(entry => entry.text === `faltan ${300 - ids.length} entradas; el original las contiene`)).toBe(true)
   await grouped.unmount()
 })
 

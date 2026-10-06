@@ -67,6 +67,11 @@ antes, consérvalo para reintentar.
   demás roles la búsqueda se apaga solo por instrucción. Si hace falta garantizarlo, conviene la vía
   `process`.
 - En los dos, el mensaje es: `Tu encargo está en <prompt_file>. Léelo completo y cúmplelo.`
+- El encargo leído por todo subagente nativo debe prohibir ejecutar `claude`, directamente
+  o mediante scripts que lo lanzan: `npm run test:mods`, la preparación de las declaraciones
+  del motor y la recuperación del rollout. Si una comprobación necesaria exige Claude, el
+  delegado la informa como pendiente para el conductor y no la ejecuta. El conductor la
+  realiza con red; no la vuelve a delegar.
 - Si la respuesta trae `model` o `effort`, pásalos a la herramienta: en Codex, `model` y
   `reasoning_effort` de `spawn_agent`; en Claude Code, `model` del `Agent` con el alias que
   corresponda (`opus`, `sonnet`, `haiku` o `fable`).

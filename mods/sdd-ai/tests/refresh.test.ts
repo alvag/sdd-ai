@@ -1,5 +1,7 @@
 import type { On, RenderPropsOf } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
+import { stateRecorder } from './fixtures/presentation-engine'
+import type { SessionViews } from '../types'
 import type { Engine, MockClock } from 'claude-code/testing'
 import { displayWidth } from '../hooks/band'
 import {
@@ -32,7 +34,7 @@ function setup(on: On, clockOn: (on: On) => On = (inner) => inner) {
 
 type Mounted = { find: (query: { type: string }) => Promise<{ text: string } | undefined>; drawn: () => Promise<unknown> }
 const shown = async (ui: Mounted): Promise<string | undefined> => (await ui.find({ type: 'Text' }))?.text
-/** Las consultas de identidad: una por lectura y, mientras una lectura sigue trabada, una por período. */
+/** Las consultas de identidad: antes y después de leer; si sigue trabada, una por período. */
 const reads = (world: World) => world.accesses.filter((access) => access.op === 'stat' && access.path === world.sessionRoot).length
 /** Las lecturas que llegaron a listar `live/`. */
 const listings = (world: World) => world.accesses.filter((access) => access.op === 'list').length
@@ -83,23 +85,43 @@ async function start($: Engine, clock: MockClock): Promise<void> {
 }
 
 test('the band starts with the session and redraws by itself when the projection changes', async ($, on) => {
+  const viewsState = stateRecorder<SessionViews>(on, 'views')
   const { world, clock, noise } = setup(on)
   world.publish(100, bound(world))
   await start($, clock)
   const ui = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
   expect(await shown(ui)).toBe(REVIEW_LINE)
   // Una sola línea: un Text que se trunca en vez de partirse.
+  expect(viewsState.value()).toMatchObject({
+    identity: { session: world.session, root: REAL_ROOT }, observedAt: T0, readAt: T0 + 1000, retained: false,
+    selection: { binding: { flow: { id: 'demo', step: 'implement' } }, runs: { items: [{ run: { id: 'r1' } }] } },
+  })
   expect(await ui.drawn()).toMatchObject({ type: 'Text', props: { wrap: 'truncate-end' } })
   // Otro proceso publica: la banda cambia en el período siguiente, sin redibujar a mano ni turnos nuevos.
   world.publish(200, { ...bound(world), runs: [], writer: writer('w1', world.session, { state: known('cessation_uncertain'), open: known('undelivered'), flow: known('demo') }) })
   await clock.advance(1_000)
   expect(await shown(ui)).toBe('demo · paso implement · writer · cese incierto')
-  expect(reads(world)).toBe(2)
+  expect(viewsState.value()?.selection?.runs.items.map(item => item.run.id)).toEqual(['w1'])
+  expect(reads(world)).toBe(4)
   // Mientras nada cambia, la banda tampoco: no hay avance por el paso del tiempo.
   await clock.advance(5_000)
   expect(await shown(ui)).toBe('demo · paso implement · writer · cese incierto')
   expect(noise).toEqual([])
   expect(world.violations()).toEqual([])
+  await ui.unmount()
+})
+
+test('a refused write of the detailed views never stops the band from updating', async ($, on) => {
+  stateRecorder<SessionViews>(on, 'views', { deny: () => true })
+  const { world, clock, noise } = setup(on)
+  world.publish(100, bound(world))
+  await start($, clock)
+  const ui = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
+  expect(await shown(ui)).toBe(REVIEW_LINE)
+  world.publish(200, { ...bound(world), runs: [], writer: writer('w1', world.session, { state: known('cessation_uncertain'), open: known('undelivered'), flow: known('demo') }) })
+  await clock.advance(1_000)
+  expect(await shown(ui)).toBe('demo · paso implement · writer · cese incierto')
+  expect(noise).toEqual([])
   await ui.unmount()
 })
 
@@ -110,15 +132,15 @@ test('a session that adopts the mod already open starts the refresh from the ban
   const ui = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
   await clock.settle()
   expect(await shown(ui)).toBe(REVIEW_LINE)
-  expect(reads(world)).toBe(1)
+  expect(reads(world)).toBe(2)
   // Un `session.start` posterior, otro dibujo y otro sitio no arrancan un segundo refresco.
   await start($, clock)
   await ui.redraw()
   const other = await $.ui.mount({ plugin: 'sdd-ai-mod', surface: 'terminal', component: 'AbovePrompt', props: PROPS })
   await clock.settle()
-  expect(reads(world)).toBe(1)
+  expect(reads(world)).toBe(2)
   await clock.advance(3_000)
-  expect(reads(world)).toBe(4)
+  expect(reads(world)).toBe(8)
   expect(await shown(other)).toBe(REVIEW_LINE)
   expect(noise).toEqual([])
   expect(world.violations()).toEqual([])
@@ -127,6 +149,7 @@ test('a session that adopts the mod already open starts the refresh from the ban
 })
 
 test('a new session id or root retires the data of the previous identity before reading', async ($, on) => {
+  const viewsState = stateRecorder<SessionViews>(on, 'views')
   const { world, clock } = setup(on)
   const first = world.session
   const second = `${first}-cleared`
@@ -144,10 +167,14 @@ test('a new session id or root retires the data of the previous identity before 
   world.session = second
   await clock.advance(1_000)
   expect(await shown(ui)).toBe(NATIVE)
+  expect(viewsState.value()).toEqual({
+    identity: { session: second, root: REAL_ROOT }, observedAt: null, readAt: T0 + 2000, retained: false, selection: null, unavailable: 'identity_changed',
+  })
   world.hold = null
   release()
   await clock.settle()
   expect(await shown(ui)).toBe('other · paso specify · writer · en curso')
+  expect(viewsState.value()?.identity.session).toBe(second)
   // Otra raíz con `live/` vacío: se agotan los intentos y no hay una última lectura de esta identidad que conservar.
   world.checkout('/work/second', '/private/work/second')
   world.sessionRoot = '/work/second'
@@ -164,6 +191,25 @@ test('a new session id or root retires the data of the previous identity before 
   expect(await shown(ui)).toBe('other · paso specify · writer · en curso')
   expect(world.violations()).toEqual([])
   await ui.unmount()
+})
+
+test('a response completed after a session change cannot restore the previous detailed identity', async ($, on) => {
+  const viewsState = stateRecorder<SessionViews>(on, 'views')
+  const { world, clock } = setup(on)
+  const first = world.session
+  world.publish(100, bound(world))
+  await start($, clock)
+  const stuck = stallReadOf(world, world.publish(200, bound(world)))
+  await clock.advance(1000)
+  world.session = `${first}-new`
+  stuck.release()
+  await clock.settle()
+  expect(viewsState.value()).toEqual({
+    identity: { session: world.session, root: REAL_ROOT }, observedAt: null, readAt: T0 + 2000, retained: false, selection: null, unavailable: 'identity_changed',
+  })
+  await clock.advance(1000)
+  expect(viewsState.value()?.selection?.runs.items).toEqual([])
+  expect(world.violations()).toEqual([])
 })
 
 test('a stalled read is never joined by another and stops the previous read from passing as current', async ($, on) => {
@@ -220,6 +266,7 @@ test('a first read that never finishes leaves the band unavailable and starts no
 })
 
 test('a new session during a stalled read retires the previous data at once and the next read is of the new one', async ($, on) => {
+  const viewsState = stateRecorder<SessionViews>(on, 'views')
   const { world, clock } = setup(on)
   const first = world.session
   const second = `${first}-cleared`
@@ -234,6 +281,7 @@ test('a new session during a stalled read retires the previous data at once and 
   const stuck = stallReadOf(world, world.publish(200, parts))
   await clock.advance(11_000)
   expect(await shown(ui)).toBe(`${REVIEW_LINE} · última lectura`)
+  expect(viewsState.value()).toMatchObject({ identity: { session: first, root: REAL_ROOT }, retained: true, observedAt: T0 })
   // Un `/clear` mientras la lectura sigue trabada: el período siguiente consulta la identidad y retira los datos y la
   // memoria de la sesión anterior, sin arrancar otra lectura.
   world.session = second
@@ -241,6 +289,7 @@ test('a new session during a stalled read retires the previous data at once and 
   await clock.advance(1_000)
   expect(reads(world) - identities).toBe(1)
   expect(await shown(ui)).toBe('sdd-ai: no disponible · sin proyección')
+  expect(viewsState.value()).toMatchObject({ identity: { session: second, root: REAL_ROOT }, selection: null, observedAt: null, retained: false, unavailable: 'identity_changed' })
   await clock.advance(5_000)
   expect(await shown(ui)).toBe('sdd-ai: no disponible · sin proyección')
   expect(listings(world)).toBe(2)
@@ -250,6 +299,7 @@ test('a new session during a stalled read retires the previous data at once and 
   stuck.release()
   await clock.settle()
   expect(await shown(ui)).toBe('sdd-ai: no disponible · sin proyección')
+  expect(viewsState.value()?.identity.session).toBe(second)
   await clock.advance(1_000)
   expect(await shown(ui)).toBe('other · paso specify · writer · en curso')
   expect(world.violations()).toEqual([])

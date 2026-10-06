@@ -1,4 +1,5 @@
 import { SddError } from '../types.ts'
+import { WORKER_POLICY } from '../worker-policy.ts'
 import { WRITER_END_MARK } from '../writer.ts'
 import { implementReportFormat } from './phase.ts'
 import type { Chain, ChainClass, ChainEntry, ChainTerminal, Classification, ImplementRecord, RunEntry, RunKind } from './phase-state.ts'
@@ -170,6 +171,7 @@ function fixRow(r: FixRowInput, tail: number | null): string {
 
 function fixText(input: FixPromptInput, tail: number | null): string {
   return [
+    WORKER_POLICY,
     `# Corrección del flujo ${input.flow}`,
     `Esta es una corrección de tu trabajo anterior en esta misma sesión. \`sdd verify\` corrió el contrato de verificación sobre el candidato acumulado (recibo ${input.receipt}) y estas filas quedaron rojas por un defecto de implementación. Corrígelas todas en esta corrida, sobre el árbol que dejaste, sin rehacer lo que ya estaba bien.`,
     'No cambies una prueba para que pase: si crees que la prueba o su fila están mal, no la toques y dilo en `deviation`.',
@@ -208,6 +210,7 @@ export function renderFixPrompt(input: FixPromptInput, budget: number): { prompt
 /** El encargo de una continuación que reanuda la sesión: solo las tasks que siguen, con el formato del reporte. */
 export function renderContinuationPrompt(flow: string, left: readonly string[]): string {
   return [
+    WORKER_POLICY,
     `# Continuación del flujo ${flow}`,
     `Esta es la continuación de tu trabajo anterior en esta misma sesión, sobre el árbol que dejaste. Sigue con las tasks que quedaron pendientes: ${left.join(', ')}. Lo que ya terminaste no se rehace. Una task que no termines va con \`completion: pending\`; no marques las tasks, eso lo hace el conductor.`,
     implementReportFormat(),
@@ -219,6 +222,7 @@ export function renderContinuationPrompt(flow: string, left: readonly string[]):
 export function renderResumePrompt(flow: string, run: string, contract: 'implement' | 'fix', ids: readonly string[]): string {
   const what = contract === 'fix' ? `las filas ${ids.join(', ')}` : `las tasks ${ids.join(', ')}`
   return [
+    WORKER_POLICY,
     `# Reanudación del flujo ${flow}`,
     `Tu corrida anterior (${run}) se cortó antes de cerrar su reporte. Retoma el mismo encargo en esta sesión, sobre el árbol que dejaste, sin rehacer lo que ya quedó hecho.`,
     `Cierra con el mismo contrato de \`${contract}\` que pedía ese encargo, con una entrada por cada una de ${what}, antes de la línea \`${WRITER_END_MARK}\`.`,

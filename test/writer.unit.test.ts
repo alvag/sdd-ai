@@ -1,6 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { WRITER_END_MARK, hasEndMark, writerEnvelopeBytes, writerPrompt } from '../src/writer.ts'
+import { WORKER_POLICY, withWorkerPolicy } from '../src/worker-policy.ts'
+
+test('el writer conserva la política una sola vez y el material intacto', () => {
+  for (const encargo of ['material\n', withWorkerPolicy('material\n')]) {
+    const prompt = writerPrompt(encargo)
+    assert.equal(prompt.split(WORKER_POLICY).length - 1, 1)
+    // La política va al tope del prompt, por encima de las reglas fijas, y no dentro del encargo del conductor.
+    assert.ok(prompt.startsWith(WORKER_POLICY))
+    assert.ok(prompt.includes('<<<ENCARGO\nmaterial\n\nENCARGO>>>'))
+  }
+})
 
 test('el contrato envuelve el encargo con las reglas fijas y la marca de fin, sin exigir secciones', () => {
   const encargo = 'Agrega un saludo en src/a.ts.\nSin más detalles.'

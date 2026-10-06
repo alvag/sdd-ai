@@ -2,7 +2,7 @@ import type { FsEntry, FsStat } from 'claude-code'
 import { expect, test } from 'claude-code/testing'
 import {
   directoryProblem, isAbsence, judgeStat, listingOf, MAX_LIVE_ENTRIES, MAX_OBSERVATION_BYTES, newestFirst, observationName, parseObservation,
-  notificationObservation, projectionPaths, refreshBand, selectBand, STALE_AFTER_MS,
+  notificationObservation, projectionPaths, refreshBand, refreshViews, selectBand, selectSession, STALE_AFTER_MS,
 } from '../hooks/projection'
 import type { BandMemory, BandPresentation, BandSelection, Identity, ProjectionDocument } from '../hooks/projection'
 import { BOOT, claimExamples, foreignExamples, observationExamples, OTHER_BOOT, temporaryExamples } from './fixtures/projection-names'
@@ -70,6 +70,54 @@ function document(parts: Parts = {}): ProjectionDocument {
 }
 const band = (parts: Parts, session = SESSION): BandSelection => selectBand(document(parts), session)
 const stat = (overrides: Partial<FsStat> = {}): FsStat => ({ kind: 'file', size: 2048, mtimeMs: T0, isLink: false, realPath: projectionPaths(ROOT).observation(NAME), ...overrides })
+
+test('session selection preserves published gates tasks blockers and every own open run', () => {
+  const gates = ['pending', 'approved', 'approved_unfingerprinted', 'stale'].map((state, i) => ({ gate: `gate-${i}`, state, artifacts: ['spec.md'] }))
+  const detail = { id: 'demo', gates, tasks: { total: 3, done: 1, pending: 2, first_pending: 'T2' }, next: { step: 'implement' }, blocked_reasons: [{ code: 'gate_pending', detail: 'falta aprobación' }] }
+  const parsed = document({ flows: available([{ ...flowEntry('demo'), view: known(detail) }]), bindings: available([binding(SESSION, 'demo')]),
+    runs: available([
+      run('writer', { kind: known('worker') }),
+      review('review', { flow: known('other-flow') }),
+      run('native', { kind: known('native'), state: known('delegated'), open: known('native_pending') }),
+      pending('result'), pending('unconfirmed', { kind: known('native'), open: known('native_unconfirmed') }),
+      pending('findings', { kind: known('review'), open: known('review_pending') }),
+      run('foreign', { session: known(OTHER_SESSION) }), run('unattributed', { session: unknown('not_recorded') }),
+    ]), writer: { availability: 'available', reason: null, item: writer('writer') } })
+  const selection = selectSession(parsed, SESSION)
+  expect(selection.flow?.view.value).toEqual({ ...detail, next: { step: 'implement', gate: null } })
+  expect(selection.runs.items.map(item => item.run.id)).toEqual(['writer', 'review', 'findings', 'native', 'result', 'unconfirmed'])
+  expect(selection.runs.items.filter(item => item.writer).map(item => item.run.id)).toEqual(['writer'])
+  expect(selection.runs.items.find(item => item.run.id === 'review')?.run.flow.value).toBe('other-flow')
+  expect(selection.omitted).toBe(1)
+  const foreignWriter = { ...parsed, writer: { ...parsed.writer, item: { ...parsed.writer.item!, session: known(OTHER_SESSION) } } }
+  expect(selectSession(foreignWriter, SESSION).runs.items.some(item => item.run.id === 'writer')).toBe(false)
+})
+
+test('session detail distinguishes unknown binding flow partial inventory and invalid task counts', () => {
+  const partial = { availability: 'partial', reason: { code: 'partial', detail: 'Inventario incompleto.' }, items: [] }
+  expect(selectSession(document({ bindings: partial, runs: partial }), SESSION).binding.known).toBe(false)
+  expect(selectSession(document(), SESSION).binding.known).toBe(true)
+  const unavailableFlow = { ...flowEntry('demo'), availability: 'unavailable', reason: { code: 'flow_unreadable', detail: 'Ilegible.' }, view: unknown('flow_unreadable') }
+  const selection = selectSession(document({ bindings: available([binding(SESSION, 'demo')]), flows: available([unavailableFlow]) }), SESSION)
+  expect(selection.binding.flow?.id).toBe('demo')
+  expect(selection.flow?.view.reason?.code).toBe('flow_unreadable')
+  for (const tasks of [{ total: 3, done: 2, pending: 2, first_pending: 'T2' }, { total: 0, done: 0, pending: 0, first_pending: 'T1' }]) {
+    const source = doc({ flows: available([{ ...flowEntry('demo'), view: known({ id: 'demo', gates: [], tasks, next: { step: 'implement' }, blocked_reasons: [] }) }]) })
+    expect(parseObservation(JSON.stringify(source), NAME, ROOT).kind).toBe('unavailable')
+  }
+})
+
+test('detailed memory retains only the current identity and clears invalid observations', () => {
+  const current = refreshViews({ kind: 'valid', document: document({ runs: available([pending('result')]) }) }, IDENTITY, undefined, T0 + 10)
+  expect(current).toMatchObject({ identity: IDENTITY, observedAt: T0, readAt: T0 + 10, retained: false })
+  for (const kind of ['stalled', 'exhausted'] as const) {
+    expect(refreshViews({ kind }, IDENTITY, current, T0 + 20)).toMatchObject({ retained: true, readAt: T0 + 20, observedAt: T0 })
+    const identity = { ...IDENTITY, session: OTHER_SESSION }
+    expect(refreshViews({ kind }, identity, current, T0 + 20)).toEqual({ identity, observedAt: null, readAt: T0 + 20, retained: false, selection: null, unavailable: 'identity_changed' })
+  }
+  expect(refreshViews({ kind: 'unavailable', reason: 'corrupt' }, IDENTITY, current, T0 + 30))
+    .toEqual({ identity: IDENTITY, observedAt: null, readAt: T0 + 30, retained: false, selection: null, unavailable: 'invalid' })
+})
 
 test('notification extension preserves old presentation and known null delivery without inferring counters', () => {
   for (const version of [undefined, 1, 99]) {
@@ -217,7 +265,9 @@ test('a valid observation of this checkout is parsed with the fields the band us
   expect(parsed.kind).toBe('valid')
   if (parsed.kind !== 'valid') return
   expect(parsed.document.observation).toEqual({ id: NAME, m0: stamp(100), boot: BOOT, pid: PID, observed_at: T0, read_finished_at: T0 + 5 })
-  expect(parsed.document.flows.items[0]?.view.value).toEqual({ id: 'demo', next: { step: 'gate', gate: 'spec' } })
+  // La vista del flujo conserva también gates, tasks y bloqueos, que usa el panel.
+  expect(parsed.document.flows.items[0]?.view.value).toEqual({ id: 'demo', next: { step: 'gate', gate: 'spec' }, gates: [],
+    tasks: { total: 3, done: 1, pending: 2, first_pending: 'T2 — tarea' }, blocked_reasons: [] })
   expect(parsed.document.runs.items[0]?.progress.value).toMatchObject({ phase: 'review', round: 2, launch: 2, retained: 1, completed: 1, total: 4 })
 })
 

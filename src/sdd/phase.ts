@@ -1,4 +1,5 @@
 import { parse } from 'yaml'
+import { WORKER_POLICY } from '../worker-policy.ts'
 import { type Admission, Rejection, admitWith, extractObjects } from '../review/admit.ts'
 import { ARTIFACT_MANDATES } from '../review/artifact-prompt.ts'
 import { WRITER_END_MARK, hasEndMark } from '../writer.ts'
@@ -49,6 +50,14 @@ export interface FlowData { id: string; depth: 'normal' | 'completa'; step: Phas
 /** Los insumos de cada fase; `context` se suma solo en una ampliación. */
 export const PHASE_INPUTS: Record<PhaseStep, readonly (keyof FrozenInputs)[]> = {
   specify: ['request'], plan: ['spec'], tasks: ['spec', 'plan'], implement: ['spec', 'plan', 'tasks'],
+}
+
+/** El alcance sale solo de los insumos congelados de la fase, nunca del pedido de otra fase. */
+export function phaseTouchesMods(step: string, inputs: FrozenInputs): boolean {
+  if (step !== 'plan' && step !== 'tasks' && step !== 'implement') return false
+  const names = [...PHASE_INPUTS[step], ...(step === 'plan' ? ['context' as const] : [])]
+  // Una ruta relativa con «./» delante nombra los mismos archivos.
+  return names.some((name) => /(?:^|[\s`"'(])(?:\.\/)?(?:mods\/|\.claude\/skills\/sdd-ai-mod\/)/m.test(inputs[name] ?? ''))
 }
 
 const block = (name: string, text: string) => [`<<<${name}`, text, `${name}>>>`].join('\n')
@@ -153,14 +162,16 @@ ${m.quality}`
  * El encargo de una fase: una plantilla por fase con los insumos congelados entre marcas. Dos flujos con
  * los mismos insumos reciben el mismo prompt salvo los datos del flujo.
  */
-export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: FrozenInputs): string {
+export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: FrozenInputs, engineContext?: string): string {
   const parts = [
+    WORKER_POLICY,
     `# Encargo de la fase ${step} del flujo ${flow.id}`,
     `Eres el worker de la fase ${step} de un flujo SDD en profundidad ${flow.depth}. ${TASK_OF[step](flow)}`,
     SOURCES,
     '## Insumos',
     ...PHASE_INPUTS[step].map((name) => block(`INSUMO ${name}`, inputs[name] ?? '')),
   ]
+  if (engineContext !== undefined) parts.push(engineContext)
   if (inputs.context !== undefined) {
     parts.push('## Ampliación', 'Tu primera corrida devolvió preguntas o faltantes; el conductor agregó esto para contestarlos.', block('CONTEXTO ampliación', inputs.context))
   }

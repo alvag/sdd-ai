@@ -4,19 +4,25 @@ import { cpSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { freeze, readContext } from '../src/review/candidate.ts'
 import { renderReviewPrompt } from '../src/review/prompt.ts'
+import { WORKER_POLICY } from '../src/worker-policy.ts'
 import { GOLDEN_DIR, RELAUNCH_ANSWERS, cli, goldenRepo, reviewEnv, roundTwo } from './fixtures/golden-diff/capture.ts'
 
 const golden = (name: string) => readFileSync(join(GOLDEN_DIR, name), 'utf8')
+/** El prompt de revisión de 4a95927 con la política del delegado delante de «## Acceso», donde la pone `access`. */
+const withPolicy = (prompt: string) => prompt.replace('## Acceso\n', `${WORKER_POLICY}\n\n## Acceso\n`)
 
-test('el prompt de ronda 1, el de ronda N y el hash de un diff son byte a byte los del golden de 4a95927', () => {
+test('el prompt de ronda 1, el de ronda N y el hash de un diff son los del golden de 4a95927 con la política del delegado', () => {
   const { repo, base } = goldenRepo()
   const c = freeze(repo, { base, context: [] })
   assert.equal(`${c.hash}\n`, golden('hash.txt'))
-  assert.equal(renderReviewPrompt(c, readContext(repo, c)), golden('prompt-r1.md'))
-  assert.equal(roundTwo(repo, base, c.hash), golden('prompt-rN.md'))
+  assert.equal(renderReviewPrompt(c, readContext(repo, c)), withPolicy(golden('prompt-r1.md')))
+  assert.equal(roundTwo(repo, base, c.hash), withPolicy(golden('prompt-rN.md')))
 })
 
-test('una corrida vieja incompleta relanzada conserva su trabajo admitido con el mismo prompt_sha256 y no lo vuelve a lanzar', () => {
+// Con la política del delegado, los prompts de una revisión anterior a ella cambian de hash: relanzarla vuelve a lanzar
+// también el trabajo que tenía admitido. Decisión de Max (panel-y-comandos): el resultado es correcto y solo afecta a
+// revisiones en curso durante la actualización. La conservación con el mismo prompt la cubre rounds-cli-relaunch.
+test('una corrida vieja incompleta, anterior a la política del delegado, relanzada vuelve a lanzar todo su trabajo', () => {
   const old = JSON.parse(golden('run-old.json')) as { id: string; repo: string }
   const { repo } = goldenRepo()
   const env = reviewEnv(repo, RELAUNCH_ANSWERS)
@@ -33,11 +39,10 @@ test('una corrida vieja incompleta relanzada conserva su trabajo admitido con el
 
   const r = cli(repo, env, ['review', 'round', old.id])
   assert.equal(r.code, 0, JSON.stringify(r.out))
-  assert.deepEqual([r.out.round, r.out.launch, r.out.kept], [1, 2, ['base-b1', 'resilience-b1', 'reliability-b1', 'readability-b1']])
-  const argv = JSON.parse(readFileSync(join(dir, 'argv-l2.json'), 'utf8')) as { jobs: Array<{ key: string }>; kept: Array<{ key: string; prompt_sha256: string }> }
-  assert.deepEqual(argv.jobs.map((j) => j.key), ['risk-b1'])
-  assert.deepEqual(new Map(argv.kept.map((j) => [j.key, j.prompt_sha256])), admitted)
-  const w = cli(repo, env, ['wait', old.id, '--max', '20'])
-  assert.equal(w.out.state, 'done', JSON.stringify(w.out))
-  assert.equal(readFileSync(env.FAKE_CALLS_FILE, 'utf8').trim().split('\n').length, 1)
+  assert.deepEqual([r.out.round, r.out.launch, r.out.kept], [1, 2, undefined])
+  const argv = JSON.parse(readFileSync(join(dir, 'argv-l2.json'), 'utf8')) as { jobs: Array<{ key: string }>; kept?: Array<{ key: string; prompt_sha256: string }> }
+  assert.deepEqual(argv.jobs.map((j) => j.key).sort(), ['base-b1', 'readability-b1', 'reliability-b1', 'resilience-b1', 'risk-b1'])
+  // El trabajo admitido antes ya no se conserva: su hash no coincide con el del prompt nuevo.
+  assert.deepEqual(argv.kept ?? [], [])
+  void admitted
 })
