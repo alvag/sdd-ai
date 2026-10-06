@@ -18,10 +18,33 @@ Conviene consultarlos antes de rediseñar o investigar algo que puede estar resu
 código cita un motivo que no está escrito. Para el trabajo de código de todos los días, alcanza con
 el fuente y el historial de Git.
 
-Antes de iniciar un flujo, o para revisar algo de los flujos, se consulta el repo hermano `sdd-ai-dev`
-(`../sdd-ai-dev`): `handoff.md`, `roadmap/` y los hallazgos, que son sus issues (`gh issue list -R
-alvag/sdd-ai-dev`). Es el repo de desarrollo de sdd-ai: el binario y la skill no lo conocen. Su `handoff.md`
-dice cómo se edita y cómo se registra un hallazgo.
+Antes de iniciar un flujo, o para revisar algo de los flujos, se consultan los antecedentes del repo
+hermano `sdd-ai-dev` (`../sdd-ai-dev`): `handoff.md`, `roadmap/` y sus issues (`gh issue list -R
+alvag/sdd-ai-dev`). Es el repo de desarrollo de sdd-ai: el binario y la skill no lo conocen. Sus
+documentos pueden estar atrasados, y no se usa como segundo backlog: si contradicen lo que sigue,
+se señala el conflicto en lugar de cambiar archivos en silencio.
+
+## Hallazgos y paquetes
+
+- **Hallazgos nuevos:** todos se registran como issues abiertos en `alvag/sdd-ai`, pendientes del
+  triage de Hermes. No se crean issues nuevos en `alvag/sdd-ai-dev`.
+- **Issues heredados de `alvag/sdd-ai-dev`:** se resuelven allí, sin migrarlos automáticamente a
+  `alvag/sdd-ai`.
+- **Qué registra el agente:** el problema, lo esperado y lo observado, la reproducción, la evidencia
+  relevante, el commit, el runtime y el SO, la sesión o el paquete de origen y las relaciones que
+  conozca, sin secretos. No asigna prioridad definitiva ni conductor, y no implementa el hallazgo
+  por su cuenta.
+- **Qué hace Hermes:** analiza duplicados, relaciones, impacto, alcance y prioridad; clasifica y
+  etiqueta verificando las etiquetas existentes; agrupa el hallazgo en un paquete nuevo o en uno
+  existente que todavía no fue tomado, y asigna el host (Mac o Windows) y el conductor (Claude o
+  Codex).
+- **Coordinación:** los paquetes se coordinan en TaskView, proyecto `sdd-ai` (goal 3), no en otro
+  documento de backlog en GitHub.
+- **Paquetes tomados:** no se amplían en silencio. Un hallazgo nuevo va a un seguimiento aparte o
+  pide una decisión explícita de alcance.
+- **Gates:** crear un issue o asignar un paquete no autoriza implementar, cerrar ni publicar. Las
+  decisiones de producto y los gates humanos de SDD siguen siendo de Max, y una tarjeta asignada
+  o completada no los sustituye.
 
 ## Idioma de los nombres
 
