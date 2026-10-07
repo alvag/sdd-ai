@@ -4,12 +4,12 @@ import {
   closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { type GitState, type HarvestFile, buildIndex, captureTree, entryDiff, gitDirs, indexEntries, isWorktreeStatePath, readHeadState, readRefState, readReplaceRefs, removeIndex } from './git.ts'
 import type { Outcome } from './outcome.ts'
 import { isAlive, readJson, writeJsonAtomic } from './runs.ts'
-import { type Conductor, type Family, type RunState, SddError } from './types.ts'
+import { type Conductor, type Family, type RunState, SddError, TERMINAL } from './types.ts'
 import { LOCK_FILE, artifactHash, headerHash, readFlow } from './sdd/read.ts'
 import { hasEndMark } from './writer.ts'
 
@@ -786,15 +786,111 @@ export function readHarvest(root: string, id: string): HarvestRecord | undefined
   return existsSync(file) ? readJson<HarvestRecord>(file) : undefined
 }
 
+/** Un impedimento de lectura conserva la ruta que no pudo comprobarse. */
+export function activityUnknown(path: string, cause: unknown): SddError {
+  return new SddError('activity_unknown', 'no se puede descartar actividad del flujo', {
+    detail: `${path}: ${cause instanceof SddError && cause.detail ? cause.detail : cause instanceof Error ? cause.message : String(cause)}`,
+    next: `restablece la lectura de ${path}, o recibe o cancela la corrida, y repite sdd approve`,
+  })
+}
+
+/** Solo ENOENT acredita ausencia; no abre enlaces ni archivos especiales. */
+export function activityPath(path: string, directory = false, list = true): boolean {
+  try {
+    const st = lstatSync(path)
+    if (st.isSymbolicLink() || !(directory ? st.isDirectory() : st.isFile())) throw new Error('ruta especial o enlace')
+    if (directory && list) readdirSync(path)
+    return true
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw activityUnknown(path, e)
+  }
+}
+
+/** Lee JSON regular sin seguir enlaces ni bloquearse si el archivo cambió por una ruta especial. */
+export function readActivityJson<T>(path: string): T {
+  let fd: number | undefined
+  try {
+    if (!activityPath(path)) throw new Error('el archivo desapareció durante la comprobación')
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    if (!fstatSync(fd).isFile()) throw new Error('ruta especial')
+    return JSON.parse(readFileSync(fd, 'utf8')) as T
+  } catch (e) {
+    if (e instanceof SddError && e.code === 'activity_unknown') throw e
+    throw activityUnknown(path, e)
+  } finally { if (fd !== undefined) closeSync(fd) }
+}
+
+/**
+ * El control de la entrada `runDir` del almacén, leído en modo estricto. `null` si la entrada no es un
+ * writer (no es un directorio o no tiene control.json). Un control ilegible, o una fase sin flujo, lanza
+ * `activity_unknown`: no se puede decidir a qué flujo pertenece.
+ */
+function strictControl(runDir: string): WriterControl | null {
+  let st
+  try {
+    st = lstatSync(runDir)
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw activityUnknown(runDir, e)
+  }
+  // Un archivo suelto no es un writer; un enlace o una ruta especial no deja afirmar que no lo sea.
+  if (st.isFile()) return null
+  activityPath(runDir, true)
+  const file = join(runDir, 'control.json')
+  if (!activityPath(file)) return null
+  const c = readActivityJson<WriterControl>(file)
+  if (!c || typeof c !== 'object') throw activityUnknown(file, 'el control no es un objeto')
+  if (c.id !== basename(runDir)) throw activityUnknown(file, 'el id del control no es el de su entrada')
+  if (c.phase !== undefined && (!c.phase || typeof c.phase.flow !== 'string')) throw activityUnknown(file, 'pertenencia indeterminable')
+  return c
+}
+
+/**
+ * Si el writer `c`, leído de la entrada `runDir`, sigue abierto en modo estricto: sin cosecha, con una
+ * cosecha no comprobable o con su grupo vivo. La cosecha se busca en la entrada recorrida, no en una ruta
+ * que se derive del contenido del control.
+ */
+function strictWriterOpen(runDir: string, c: WriterControl): boolean {
+  const file = join(runDir, 'harvest.json')
+  if (!activityPath(file)) return true
+  const h = readActivityJson<HarvestRecord>(file)
+  if (!h || typeof h !== 'object' || !TERMINAL.has(h.state) || typeof h.tree !== 'string' || !Array.isArray(h.files)) {
+    throw activityUnknown(file, 'cosecha no comprobable')
+  }
+  return c.group !== undefined && groupState(c.group) !== 'gone'
+}
+
+/**
+ * Si el writer `id` sigue abierto, en modo estricto. `null` si no hay un writer con ese id en el almacén:
+ * quien pregunta decide si eso es ausencia.
+ */
+export function writerRunOpenStrict(root: string, id: string): boolean | null {
+  const store = storeDir(root, id)
+  activityPath(dirname(dirname(store)), true)
+  const c = strictControl(store)
+  return c === null ? null : strictWriterOpen(store, c)
+}
+
 /**
  * Los writers de este checkout que lanzó la fase implement de `flow`, del más viejo al más nuevo. Un
  * writer relanzado con `run --retry` no guarda `phase` y no se atribuye al flujo.
  */
-export function flowWriterRuns(root: string, flow: string): WriterControl[] {
+export function flowWriterRuns(root: string, flow: string, strict = false): WriterControl[] {
   const dir = join(gitDirs(root).gitDir, 'sdd-ai', 'runs')
-  if (!existsSync(dir)) return []
+  if (strict && !activityPath(dirname(dir), true)) return []
+  if (strict ? !activityPath(dir, true) : !existsSync(dir)) return []
   const out: WriterControl[] = []
-  for (const id of readdirSync(dir)) {
+  let ids: string[]
+  try { ids = readdirSync(dir) } catch (e) { if (strict) throw activityUnknown(dir, e); throw e }
+  for (const id of ids) {
+    if (strict) {
+      // Como en el camino normal, un writer es una entrada con control.json, y el flujo sale de su fase:
+      // lo legible y ajeno se omite. Solo un control que no se puede leer deja la pertenencia sin decidir.
+      const c = strictControl(join(dir, id))
+      if (c !== null && c.phase?.flow === flow) out.push(c)
+      continue
+    }
     if (!isWriterRun(root, id)) continue
     const c = readControl(root, id)
     if (c.phase?.flow === flow) out.push(c)
@@ -812,8 +908,12 @@ export function latestFlowHarvest(root: string, flow: string): { run: string; ha
 }
 
 /** Si alguno de los writers del flujo sigue abierto: sin cosecha congelada o con su grupo de procesos vivo. */
-export function flowWriterOpen(root: string, flow: string): string | null {
-  for (const c of flowWriterRuns(root, flow)) {
+export function flowWriterOpen(root: string, flow: string, strict = false): string | null {
+  for (const c of flowWriterRuns(root, flow, strict)) {
+    if (strict) {
+      if (strictWriterOpen(storeDir(root, c.id), c)) return c.id
+      continue
+    }
     if (!readHarvest(root, c.id)) return c.id
     if (c.group && groupState(c.group) !== 'gone') return c.id
   }

@@ -76,7 +76,7 @@ export interface FlowStatus {
 export interface MissingPart { step: 'specify' | 'plan' | 'tasks'; name: string }
 
 /** Desde qué `status` del plan el header da por aprobado cada gate. `spec` vale además con `spec_approved_at`. */
-const ACCREDITED_FROM: Record<GateId, PlanStatus> = {
+export const ACCREDITED_FROM: Record<GateId, PlanStatus> = {
   spec: 'planned', plan: 'plan-approved', tasks: 'tasks-ready', 'plan-tasks': 'tasks-ready', single: 'tasks-ready',
 }
 const STEP_OF: Record<Artifact, MissingPart['step']> = { spec: 'specify', plan: 'plan', tasks: 'tasks' }

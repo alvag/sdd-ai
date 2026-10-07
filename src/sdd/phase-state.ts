@@ -3,8 +3,8 @@ import { join } from 'node:path'
 import { dirtyPaths } from '../git.ts'
 import { withLock } from '../lock.ts'
 import { isRunId, readStatus, writeJsonAtomic } from '../runs.ts'
-import { type Family, SddError, TERMINAL } from '../types.ts'
-import { harvestTreeHolds, isWriterRun, readControl, readHarvest } from '../writer-store.ts'
+import { type Family, type RunState, SddError, TERMINAL } from '../types.ts'
+import { activityPath, activityUnknown, harvestTreeHolds, isWriterRun, readActivityJson, readControl, readHarvest, writerRunOpenStrict } from '../writer-store.ts'
 import type { DocumentStep, PhaseStep } from './phase.ts'
 import { LOCK_FILE, flowDir, lstatOrNull, pathInvalid, readFlow } from './read.ts'
 import { type FlowStatus, type Next, headerData } from './status.ts'
@@ -93,15 +93,30 @@ function invalid(id: string, why: string): SddError {
 }
 
 /** El registro de fases del flujo; uno vacío si todavía no existe. Un registro con otra forma es un error. */
-export function readPhaseRecord(root: string, id: string): PhaseRecord {
+export function readPhaseRecord(root: string, id: string, strict = false): PhaseRecord {
+  if (!strict) return readPhaseRecordFile(root, id, false)
+  // En modo estricto, solo ENOENT es «sin registro»; cualquier otro impedimento de lectura es actividad incierta.
+  const file = join(flowDir(root, id), PHASES_FILE)
+  try {
+    if (!activityPath(file)) return { schema_version: 1, last_run: null, phases: {} }
+    return readPhaseRecordFile(root, id, true)
+  } catch (e) {
+    if (e instanceof SddError && e.code === 'activity_unknown') throw e
+    throw activityUnknown(file, e)
+  }
+}
+
+/** Lee y valida el registro de fases; con `strict`, el JSON se lee sin seguir enlaces ni abrir rutas especiales. */
+function readPhaseRecordFile(root: string, id: string, strict: boolean): PhaseRecord {
   const file = join(flowDir(root, id), PHASES_FILE)
   const st = lstatOrNull(file)
   if (st === null) return { schema_version: 1, last_run: null, phases: {} }
   if (st.isSymbolicLink()) throw pathInvalid(`.plans/${id}/${PHASES_FILE}`, 'es un enlace simbólico')
   let data: unknown
   try {
-    data = JSON.parse(readFileSync(file, 'utf8'))
+    data = strict ? readActivityJson(file) : JSON.parse(readFileSync(file, 'utf8'))
   } catch (e) {
+    if (strict && e instanceof SddError && e.code === 'activity_unknown') throw e
     throw invalid(id, (e as Error).message)
   }
   if (!isRecord(data) || data.schema_version !== 1) throw invalid(id, 'schema_version no es 1')
@@ -391,7 +406,19 @@ export function writePhaseRecord(root: string, id: string, r: PhaseRecord): void
  * Si una corrida sigue sin terminal: una de proceso por su `status.json`, un writer por su cosecha. Una
  * corrida que ya no está en disco no está activa.
  */
-function runActive(root: string, run: string): boolean {
+function runActive(root: string, run: string, strict = false): boolean {
+  if (strict) {
+    // Un writer de fase: activo si ese writer sigue abierto, como en el camino normal pero sin tomar una
+    // lectura fallida por ausencia.
+    const writer = writerRunOpenStrict(root, run)
+    if (writer !== null) return writer
+    // Una corrida de proceso. Una que ya no está en disco no está activa: solo ENOENT acredita la ausencia.
+    const file = join(root, '.sdd-ai', 'runs', run, 'status.json')
+    if (!activityPath(file)) return false
+    const status = readActivityJson<{ state?: unknown }>(file)
+    if (!status || typeof status.state !== 'string') throw activityUnknown(file, 'el estado de la corrida no es legible')
+    return !TERMINAL.has(status.state as RunState)
+  }
   if (isWriterRun(root, run)) return readHarvest(root, run) === undefined
   const dir = join(root, '.sdd-ai', 'runs', run)
   if (!existsSync(join(dir, 'status.json'))) return false
@@ -403,8 +430,8 @@ function runActive(root: string, run: string): boolean {
 }
 
 /** La corrida de fase del flujo que todavía no terminó, o `null`. */
-export function activeRun(root: string, r: PhaseRecord): string | null {
-  return r.last_run !== null && runActive(root, r.last_run.id) ? r.last_run.id : null
+export function activeRun(root: string, r: PhaseRecord, strict = false): string | null {
+  return r.last_run !== null && runActive(root, r.last_run.id, strict) ? r.last_run.id : null
 }
 
 /** Lo que `phaseNext` mira fuera del registro; las pruebas lo reemplazan. */

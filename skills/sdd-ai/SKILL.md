@@ -661,7 +661,8 @@ busques un rodeo, como otro agente, otro nombre o lanzar el CLI a mano.
 `sdd status` calcula el estado de un flujo de `.plans/<id>/` desde sus archivos, en solo lectura: su
 profundidad, sus gates, sus tasks, el paso siguiente y lo que lo bloquea. `sdd approve` registra la
 aprobación de un gate con la huella de sus artefactos y la de los gates anteriores: si después
-cambian, `status` devuelve el flujo a ese gate.
+cambian, `status` devuelve el flujo a ese gate. Tras registrar, `approve` sincroniza por defecto los
+headers existentes; no depende de una edición posterior de `sdd-flow`.
 
 ```
 ./bin/sdd-ai sdd start <id> [--topic <tema>] [--base-branch <rama>]
@@ -693,8 +694,32 @@ cambian, `status` devuelve el flujo a ese gate.
   `next.question` cuando `next.step` es `gate`. La pregunta lleva un código atado a las huellas de ese
   gate y de los anteriores: si un artefacto cambia después de la respuesta, hay que volver a
   preguntar. Registra solo si la última respuesta a esa pregunta es `Aprobar`, y cada respuesta sirve
-  una vez. Se corre antes de actualizar el header que pide `sdd-flow`. Los gates son `single` en
+  una vez para una decisión nueva. Los gates son `single` en
   `corta`, `spec` y `plan-tasks` en `normal`, y `spec`, `plan` y `tasks` en `completa`.
+- **Los headers se sincronizan después del registro.** `spec` escribe en el handoff existente
+  `spec_approved_at` con el ISO completo, exactamente igual al `at` registrado. `plan` avanza el
+  plan a `plan-approved`; `single`, `plan-tasks` y `tasks`, a `tasks-ready`. También completa los
+  campos atrasados de gates anteriores con aprobación vigente y probada, nunca de posteriores.
+  El `status` solo avanza: conserva `implementing`, `verified` y los estados siguientes, sin
+  acreditar verificación ni cierre. No crea headers ausentes o vacíos ni repara headers inválidos,
+  no cambia los cuerpos y no concede `gate_status` ni un gate externo.
+- **Recuperación obligatoria.** Repite `sdd approve <id> <gate>` si su última entrada sigue vigente
+  y tiene `proof`: completa los campos pendientes sin pregunta nueva, sin consumir otra respuesta,
+  sin duplicar la entrada y sin cambiar su fecha. Si ya coincide todo, no escribe. Si venció o
+  falta `proof`, exige una respuesta nueva a la pregunta canónica. Un header y un reintento nunca
+  sustituyen la prueba humana. Reaprobar la spec no renueva los gates dependientes vencidos:
+  cada uno requiere su propia respuesta, y conserva `header_ahead` hasta su reaprobación.
+- **Actividad incompatible.** Antes de escribir, `phase_running` o `writer_open` nombran la corrida
+  que debe recibirse con `wait`; `activity_unknown` identifica la ruta y la causa que impiden
+  descartar actividad. Restablece su lectura, o recibe o cancela la corrida, y repite el verbo.
+  El rechazo anterior al registro no consume la respuesta; si las huellas no cambiaron, sirve al
+  reintentar. La recuperación aplica los mismos controles y restricciones de ejecutor.
+- **Sincronización pendiente.** Una operación parcial devuelve exit code **3**, `state: sync_pending`,
+  `code: approval_sync_pending` y `approval_registered: true`. `pending_headers` enumera `path`,
+  `field`, `expected` y `current`; `status` trae el estado releído o `null`. Sigue `recovery_command`,
+  que repite el mismo verbo y conserva `--conductor`. No reviertas el registro ni los headers ya
+  completados. Una lista vacía puede significar que falta confirmar el resultado: lee `detail`.
+  Si las huellas cambiaron antes del reintento, vuelve al gate humano.
 - **`sdd-flow` pide el "aprobado" a su manera.** Cuando el usuario aprueba en su gate, hazle además la
   pregunta canónica antes de `sdd approve`: el "aprobado" escrito no es una respuesta a esa pregunta.
 - **Cómo se hace la pregunta canónica**, para un gate, una disputa o la ronda extra:
@@ -826,7 +851,8 @@ completa. En corta, lo corre justo después de `sdd start`, antes de `specify`: 
 incluso con bloqueos. Informa el nombre y sus partes, HEAD, la base congelada y su punta local,
 las salidas con sus bloqueos, `recommended`, `ask` y `next`. Se pregunta al usuario solo si `ask`
 no está vacía: `exit` pide elegir la salida y `base_advanced` avisa que la base avanzó. Sin motivos,
-se aplica la recomendación; los gates siguen siendo humanos y `sdd approve` solo registra.
+se aplica la recomendación; los gates siguen siendo humanos y `sdd approve` registra y sincroniza
+los headers existentes conforme a §9.
 
 - **`new`**, con `--apply`, crea una rama desde `origin_sha` y cambia a ella. El nombre sale de
   `branch_format` (por defecto `{type}/{ticket}-{slug}`), `--prefix` o `branch_prefix`, y si faltan,
