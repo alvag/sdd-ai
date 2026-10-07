@@ -1,3 +1,4 @@
+import { type FindingsChannel, findingsInstructions } from './findings.ts'
 import { type SpawnOptions, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -7,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
-import { type RoleProfiles, agentCopies, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
+import { agentCopies, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
 import { type Proof, askNext, prove } from './approval/proof.ts'
 import { DISPUTE_OPTIONS, type Question, attestQuestion, disputeQuestion, extraOptions, extraQuestion } from './approval/question.ts'
 import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
@@ -18,13 +19,14 @@ import { MOD_ADOPTION_MESSAGE, modCopy, modInventory } from './mod-copies.ts'
 import { type ModEngineContext, inspectModEngine, modEngineContext } from './mod-engine.ts'
 import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, readGitState, readHeadState, repoRoot } from './git.ts'
 import { type InitAnswers, applyInit, planInit } from './init.ts'
+import { reuseWorktreeConfig } from './worktree-config.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { inPath } from './cli-path.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { DEFAULT_KEEP_DAYS, type EntryKind, applyPrune, planPrune, pruneContext } from './prune.ts'
 import { RECALL_NEXT, recall } from './recall.ts'
-import { roleProfiles, resolve } from './resolve.ts'
+import { nativeProfiles, resolve } from './resolve.ts'
 import { renderArtifactMaterial, renderArtifactPrompt, renderArtifactRoundPrompt } from './review/artifact-prompt.ts'
 import {
   type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, readMaterial, validateArtifactArgs,
@@ -53,6 +55,7 @@ import {
 import { type Freshness, type ReviewRequest, REVIEW_LOCK, converged, freshness, untrackedOf } from './review/standing.ts'
 import { applyCommit, planCommit } from './sdd/commit.ts'
 import { approve } from './sdd/approve.ts'
+import { type ApproveDeps, ApprovalSyncPending } from './sdd/approve-sync.ts'
 import { assertBranchApplicable, branchApply, branchPreview } from './sdd/branch.ts'
 import { criteriaIds, taskLines } from './sdd/markdown.ts'
 import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, phaseTouchesMods, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
@@ -105,10 +108,6 @@ export function defaultWaitMax(conductor: Family): number {
 
 function definedEnv(env: Env): Record<string, string> {
   return Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined))
-}
-
-function nativeProfiles(root: string, env: Env): RoleProfiles {
-  return roleProfiles(loadWorkers(root), loadCodexRoot(env))
 }
 
 /** La caída propone la familia, el modelo y el esfuerzo del conductor; el usuario decide. */
@@ -235,7 +234,13 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
     throw new SddError('usage', 'falta el encargo', { next: 'pasa --prompt-file <archivo> o --retry <id>' })
   }
 
-  if (values.flow !== undefined) prompt += `\n\n${renderAntecedents(values.flow, readAntecedents(root, values.flow))}`
+  const findingsReport = !values.retry && ['explore', 'investigate', 'counter-plan', 'debate', 'design-review'].includes(role)
+    ? findingsInstructions('run') : undefined
+  if (values.flow !== undefined) {
+    const antecedents = renderAntecedents(values.flow, readAntecedents(root, values.flow))
+    // Conserva el encabezado inicial y el cierre de los antecedentes; las instrucciones quedan fuera del material delimitado.
+    prompt += `\n\n${findingsReport ? antecedents.replace('\n\n', `\n\n${findingsReport}\n\n`) : antecedents}`
+  } else if (findingsReport) prompt += `\n\n${findingsReport}`
   prompt = withWorkerPolicy(prompt)
 
   if (role === 'implement') {
@@ -1612,6 +1617,7 @@ function phaseView(root: string, id: string, dir: string, s: Status, req: PhaseR
     const p = readJson<PhaseResult>(file)
     out.outcome = p.outcome
     if (p.artifact) out.artifact = p.artifact
+    for (const key of ['findings', 'findings_rejected', 'findings_missing'] as const) if (key in p) out[key] = p[key]
     out.assumptions = p.assumptions
     if (p.outcome !== 'published') Object.assign(out, { blocking_questions: p.blocking_questions, missing_context: p.missing_context })
     if (p.cause) out.cause = p.cause
@@ -1777,7 +1783,7 @@ function chainLaunchFailed(root: string, c: WriterControl, detail: string): void
 const launchHolds = (root: string, c: WriterControl) => (c.phase?.launch_from ? launchTreeHolds(root, c) : captureTreeAtBase(root, c.id))
 
 /** Lo que la cosecha de un writer de fase dice de su contrato. */
-interface PhaseContract { admitted: boolean; cause?: string; missing_context: string[] }
+interface PhaseContract extends FindingsChannel { admitted: boolean; cause?: string; missing_context: string[] }
 
 /**
  * El contrato del reporte de un writer de fase, contra lo que congeló al lanzar. Sin corrección. Un `fix`
@@ -1787,9 +1793,12 @@ interface PhaseContract { admitted: boolean; cause?: string; missing_context: st
 function phaseContract(h: HarvestRecord, phase: NonNullable<WriterControl['phase']>): PhaseContract {
   const report = h.report ?? ''
   const a = phase.kind === 'fix'
-    ? admitFix(report, (phase.fix?.rows ?? []).map((r) => r.id))
-    : admitImplement(report, phase.pending, { explicit: phase.kind !== undefined })
-  if (a.kind === 'admitted') return { admitted: true, missing_context: a.review.missing_context }
+    ? admitFix(report, (phase.fix?.rows ?? []).map((r) => r.id), { findings: phase.findings })
+    : admitImplement(report, phase.pending, { explicit: phase.kind !== undefined, findings: phase.findings })
+  if (a.kind === 'admitted') return { admitted: true, missing_context: a.review.missing_context,
+    ...('findings' in a.review ? { findings: a.review.findings } : {}),
+    ...('findings_rejected' in a.review ? { findings_rejected: a.review.findings_rejected } : {}),
+    ...('findings_missing' in a.review ? { findings_missing: a.review.findings_missing } : {}) }
   return { admitted: false, cause: a.kind === 'inadmissible' ? a.error : a.reason, missing_context: [] }
 }
 
@@ -1933,6 +1942,7 @@ function writerReport(root: string, id: string, h: HarvestRecord, env: Env): Res
     : harvestNext(id, h, c, failed)
   if (c.phase && contract) {
     out.contract = contract
+    for (const key of ['findings', 'findings_rejected', 'findings_missing'] as const) if (key in contract) out[key] = contract[key]
     try {
       out.flow_next = flowNext(root, c.phase.flow)
     } catch (e) {
@@ -2106,15 +2116,26 @@ function agents(args: string[], env: Env, cwd: string): Result {
   return { code: 0, out: { written, removed, next: `reabre la sesión para que el CLI cargue los agentes y la skill. ${MOD_ADOPTION_MESSAGE}` } }
 }
 
+function checkoutBin(root: string): string {
+  return realpathSync(PKG_DIR) === realpathSync(root) ? './bin/sdd-ai' : `node ${shellArg(BIN_PATH)}`
+}
+
 /**
  * `init` prepara el checkout: sin `--apply`, un ensayo que no escribe; con `--apply`, el plan de ese
- * ensayo, atado a su digest.
+ * ensayo, atado a su digest. `--reuse-config` ejecuta únicamente la copia directa.
  */
 function init(args: string[], env: Env, cwd: string): Result {
   const { values } = parseArgs({
     args, strict: true, allowPositionals: false,
-    options: { apply: { type: 'boolean' }, digest: { type: 'string' }, families: { type: 'string' }, jira: { type: 'string' }, from: { type: 'string' }, telemetry: { type: 'string' } },
+    options: { 'reuse-config': { type: 'boolean' }, apply: { type: 'boolean' }, digest: { type: 'string' }, families: { type: 'string' }, jira: { type: 'string' }, from: { type: 'string' }, telemetry: { type: 'string' } },
   })
+  if (values['reuse-config']) {
+    if (Object.keys(values).some((key) => key !== 'reuse-config')) throw new SddError('usage', '--reuse-config no admite flags de preparación general')
+    let root: string
+    try { root = repoRoot(cwd) } catch { root = cwd }
+    const out = reuseWorktreeConfig(root)
+    return { code: out.state === 'copied' || out.state === 'unchanged' ? 0 : 2, out }
+  }
   const answers: InitAnswers = {}
   if (values.telemetry !== undefined) {
     if (values.telemetry !== 'on' && values.telemetry !== 'off') throw new SddError('usage', '--telemetry tiene que ser on u off')
@@ -2128,7 +2149,7 @@ function init(args: string[], env: Env, cwd: string): Result {
   if (values.from !== undefined) answers.from = resolvePath(cwd, values.from)
   const root = repoRoot(cwd)
   // Un worktree sin node_modules se prepara con el binario de otro checkout: los comandos lo nombran.
-  const bin = realpathSync(PKG_DIR) === realpathSync(root) ? './bin/sdd-ai' : `node ${shellArg(BIN_PATH)}`
+  const bin = checkoutBin(root)
   const flags: string[] = []
   if (answers.families !== undefined) flags.push('--families', answers.families.join(','))
   if (answers.jira !== undefined) flags.push('--jira', answers.jira)
@@ -2474,7 +2495,10 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
     rmSync(promptDir, { recursive: true, force: true })
     throw e
   }
+  // Una reanudación conserva incluso la ausencia de la marca del contrato de origen.
+  const findings = l.resumes ? readControl(root, l.resumes).phase?.findings : true
   const phase: NonNullable<WriterControl['phase']> = {
+    ...(findings === undefined ? {} : { findings }),
     flow: id, pending: l.pending, inputs: frozen.hashes, handoff_header: headerHash(read.facts.handoffHeader),
     kind: l.kind, chain, parent: l.parent, ...(l.launchFrom ? { launch_from: l.launchFrom } : {}), ...(l.resumes ? { resumes: l.resumes } : {}),
     ...(l.fix ? { fix: l.fix } : {}), registry: registryDigest(root, id),
@@ -2754,7 +2778,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     }
     const s = startProcessRun({
       root, env, resolution, prompt, request: { ...phaseRequest }, deadline, conductor, files,
-      argvExtra: { kind: 'phase', phase: { ...launch, root, ...(criteria ? { criteria } : {}) } },
+      argvExtra: { kind: 'phase', phase: { ...launch, root, findings: true, ...(criteria ? { criteria } : {}) } },
     })
     const phases: PhaseRecord['phases'] = awaiting ? { ...rec.phases, [doc]: { ...entry, amended: { run: s.id, consumed: false } } } : rec.phases
     writePhaseRecord(root, id, { ...rec, last_run: { id: s.id, step: doc }, phases })
@@ -2773,10 +2797,10 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
 
 /**
  * El estado de los flujos SDD de `.plans/`. `status` solo lee y sale con 0 aunque el flujo esté
- * bloqueado; `approve` registra la aprobación de un gate y responde el estado nuevo; `phase` lanza la
+ * bloqueado; `approve` registra o recupera la aprobación y sincroniza sus headers; `phase` lanza la
  * fase del flujo en un worker.
  */
-async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
+async function sdd(args: string[], env: Env, cwd: string, deps?: { approve?: ApproveDeps }): Promise<Result> {
   const [sub, ...rest] = args
   if (sub === 'start') return sddStart(rest, env, cwd)
   if (sub === 'branch') return sddBranch(rest, env, cwd)
@@ -2793,9 +2817,14 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
     const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { conductor: { type: 'string' } } })
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
     const root = repoRoot(cwd)
-    const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor))
-    const { facts } = readFlow(root, status.id)
-    return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
+    try {
+      const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor), deps?.approve)
+      const { facts } = readFlow(root, status.id)
+      return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
+    } catch (e) {
+      if (e instanceof ApprovalSyncPending) return { code: 3, out: e.result }
+      throw e
+    }
   }
   if (sub === 'verify') return sddVerify(rest, env, cwd)
   throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd start <id> | ./bin/sdd-ai sdd branch <id> [--apply [--current | --prefix <p>] [--refreeze]] | ./bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id> | ./bin/sdd-ai sdd commit <id> --subject <asunto> [--apply --digest <d>]' })
@@ -2814,7 +2843,8 @@ function sddStart(args: string[], env: Env, cwd: string): Result {
     if (values[flag] !== undefined) throw new SddError('usage', `--${flag} solo va con --apply`, { next: 'quita los flags de aplicación para el ensayo, o agrega --apply' })
   }
   const root = repoRoot(cwd)
-  const deps = { env, hasCli: (family: Family) => inPath(family, env) }
+  const bin = checkoutBin(root)
+  const deps = { env, hasCli: (family: Family) => inPath(family, env), initCommand: `${bin} init`, reuseConfigCommand: `${bin} init --reuse-config` }
   const options = { topic: values.topic, baseBranch: values['base-branch'] }
   if (!values.apply) return { code: 0, out: startPreview(root, positionals[0], options, deps) }
   const input = { ...options, depth: values.depth, risk: values.risk, changeType: values['change-type'],
@@ -3074,10 +3104,14 @@ const READS = (cmd: string | undefined, rest: string[]) =>
 
 /**
  * La entrada común recupera una restauración interrumpida de `sdd verify`, salvo en start, branch
- * y commit. start --apply y branch --apply recuperan después de validar; commit nunca recupera.
+ * y commit, y en init --reuse-config. start --apply y branch --apply recuperan después de validar; commit nunca recupera.
  * El supervisor interno tampoco la corre: es parte de una corrida en curso.
  */
+const reusesConfig = (cmd: string | undefined, rest: string[]) => cmd === 'init' && rest.some((arg) => arg === '--reuse-config' || arg.startsWith('--reuse-config='))
+
 function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string): void {
+  // La copia directa tampoco recupera, incluso cuando su combinación de flags es inválida.
+  if (reusesConfig(cmd, rest)) return
   // El ensayo de `sdd start` no escribe nada, y la recuperación escribe aun en modo no bloqueante: `sddStart` la corre
   // él mismo, bloqueante, solo con `--apply` y después de validar.
   if (cmd === 'sdd' && rest[0] === 'start') return
@@ -3099,20 +3133,22 @@ function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string)
  * Cada verbo pide publicar la proyección después de cada `status.json` que escribe y una vez más al terminar,
  * después de soltar sus locks, también si falló a mitad de camino: así la proyección refleja lo que quedó y la
  * primera actividad normal adopta los estados existentes. Un repositorio sin `.sdd-ai/` no se toca. Publicar
- * corre en otro proceso y no cambia la salida, el código ni las decisiones del verbo.
+ * corre en otro proceso y no cambia la salida, el código ni las decisiones del verbo. init --reuse-config
+ * no pide publicación, tampoco después de errores de uso.
  */
-export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {
+export async function main(argv: string[], env: Env, cwd: string, deps?: { approve?: ApproveDeps }): Promise<Result> {
   const [cmd, ...rest] = argv
   const previous = onStatusWritten((dir) => {
+    if (reusesConfig(cmd, rest)) return
     const root = runRoot(dir)
     if (root !== null) requestPublication(root, `status:${cmd}`, 'cli')
   })
   try {
-    return await verb(cmd, rest, env, cwd)
+    return await verb(cmd, rest, env, cwd, deps)
   } finally {
     onStatusWritten(previous)
-    // El supervisor publica por su cuenta; `doctor` puede correr fuera de un checkout de sdd-ai.
-    if (cmd !== '__supervise' && cmd !== '__publish' && cmd !== 'doctor') {
+    // El supervisor publica por su cuenta; doctor puede correr fuera de un checkout; la copia directa no publica.
+    if (!reusesConfig(cmd, rest) && cmd !== '__supervise' && cmd !== '__publish' && cmd !== 'doctor') {
       try {
         const root = repoRoot(cwd)
         if (existsSync(join(root, '.sdd-ai'))) requestPublication(root, `cli:${[cmd, rest[0]].filter(Boolean).join(' ')}`, 'cli')
@@ -3123,7 +3159,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
   }
 }
 
-async function verb(cmd: string | undefined, rest: string[], env: Env, cwd: string): Promise<Result> {
+async function verb(cmd: string | undefined, rest: string[], env: Env, cwd: string, deps?: { approve?: ApproveDeps }): Promise<Result> {
   try {
     recoverBeforeVerb(cmd, rest, cwd)
     switch (cmd) {
@@ -3135,7 +3171,7 @@ async function verb(cmd: string | undefined, rest: string[], env: Env, cwd: stri
       case 'init': return init(rest, env, cwd)
       case 'prune': return prune(rest, cwd)
       case 'recall': return recallCommand(rest, env, cwd)
-      case 'sdd': return await sdd(rest, env, cwd)
+      case 'sdd': return await sdd(rest, env, cwd, deps)
       case 'doctor': {
         let engine
         try { engine = inspectModEngine(repoRoot(cwd)) } catch (e) {

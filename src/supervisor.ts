@@ -1,3 +1,4 @@
+import { type FindingsChannel } from './findings.ts'
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -61,7 +62,7 @@ export interface ArgvFile {
   resume_sec?: number
   kind?: 'run' | 'review' | 'writer' | 'phase'
   /** Una corrida de fase: lo que congeló al lanzarse, la raíz del repo y, en `tasks`, los criterios de la spec. */
-  phase?: FrozenLaunch & { root: string; criteria?: string[] }
+  phase?: FrozenLaunch & { root: string; criteria?: string[]; findings?: boolean }
   /** Un writer: la raíz del checkout que lo lanzó y su corrida. El supervisor corre en su almacén. */
   root?: string
   id?: string
@@ -996,7 +997,7 @@ async function superviseLaunch(dir: string, argv: ArgvFile): Promise<Status> {
 }
 
 /** Lo que una corrida de fase deja en `phase.json`: la salida, el artefacto y lo que el gate necesita. */
-export interface PhaseResult {
+export interface PhaseResult extends FindingsChannel {
   outcome: 'published' | 'awaiting_context' | 'closed_inline' | 'not_published' | 'not_admitted'
   artifact?: string; assumptions: string[]; blocking_questions: string[]; missing_context: string[]; cause?: string
 }
@@ -1034,11 +1035,11 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
     const detail = admitted.outcome.detail ?? admitted.outcome.reason ?? admitted.outcome.state
     return finish({ ...outcomeFields(admitted.outcome), ...extras }, admitted.outcome.state === 'cancelled' ? undefined : { outcome: 'not_admitted', ...empty, cause: detail })
   }
-  const c = admitted.review
+  const c = { ...admitted.review, ...(phase.findings && !('findings' in admitted.review) ? { findings_missing: true } : {}) }
   writeJsonAtomic(join(dir, 'contract.json'), c)
   // Un cancel que llegó mientras se admitía corta antes de escribir nada en el flujo.
   if (existsSync(cancelFile)) return finish({ state: 'cancelled', ...extras })
-  const lists = { assumptions: c.assumptions, blocking_questions: c.blocking_questions, missing_context: c.missing_context }
+  const lists = { ...('findings' in c ? { findings: c.findings } : {}), ...('findings_rejected' in c ? { findings_rejected: c.findings_rejected } : {}), ...('findings_missing' in c ? { findings_missing: c.findings_missing } : {}), assumptions: c.assumptions, blocking_questions: c.blocking_questions, missing_context: c.missing_context }
   const step = phase.step
 
   if (c.blocking_questions.length > 0 || c.missing_context.length > 0) {

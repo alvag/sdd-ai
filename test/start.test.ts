@@ -130,7 +130,8 @@ test('el ensayo muestra las claves de config que sdd-ai usa con lo que implican,
   const missing = preview(s)
   assert.equal(missing.code, 0)
   assert.equal(missing.out.blockers[0].code, 'config_missing')
-  assert.equal(missing.out.next, './bin/sdd-ai init')
+  // El repo del test no es el checkout de sdd-ai: start nombra el binario que corre, como init.
+  assert.ok(missing.out.next.startsWith('node ') && missing.out.next.includes(BIN) && missing.out.next.endsWith(' init'), missing.out.next)
   for (const [families, extra] of [['[]', ''], ['[claude]', 'jira_approval: {mode: maybe}\n']]) {
     configure(s, families, extra)
     assert.equal(preview(s).out.blockers[0].code, 'config_invalid')
@@ -173,7 +174,7 @@ test('con .plans/<id>/ con contenido el ensayo bloquea con flow_exists y --apply
   assert.equal(preview(s).out.flow.state, 'empty')
   assert.deepEqual(preview(s).out.blockers, [])
   assert.equal(apply(s).code, 0)
-  assert.deepEqual(readdirSync(dir).sort(), ['antecedentes.json', 'handoff.md', 'pedido.md'])
+  assert.deepEqual(readdirSync(dir).sort(), ['antecedentes.json', 'hallazgos.md', 'handoff.md', 'pedido.md'])
   const invalid = setup()
   symlinkSync(s.repo, join(invalid.repo, '.plans'))
   assert.equal(preview(invalid).out.blockers[0].code, 'path_invalid')
@@ -264,7 +265,7 @@ test('--apply escribe pedido.md igual al archivo, antecedentes.json de recall y 
   assert.equal(r.code, 0, JSON.stringify(r.out))
   const dir = join(s.repo, '.plans', 'mi-flujo')
   assert.deepEqual(readFileSync(join(dir, 'pedido.md')), readFileSync(s.request))
-  assert.deepEqual(r.out.created.sort(), ['antecedentes.json', 'handoff.md', 'pedido.md'].map((name) => `.plans/mi-flujo/${name}`))
+  assert.deepEqual(r.out.created.sort(), ['antecedentes.json', 'hallazgos.md', 'handoff.md', 'pedido.md'].map((name) => `.plans/mi-flujo/${name}`))
   const antecedents = JSON.parse(readFileSync(join(dir, 'antecedentes.json'), 'utf8'))
   assert.deepEqual(Object.keys(antecedents.sources), ['engram', 'vault', 'plans', 'git'])
   const header = readHeader(readFileSync(join(dir, 'handoff.md'), 'utf8'))

@@ -1,9 +1,10 @@
+import { renderFindingsTemplate } from '../findings.ts'
 import { randomBytes } from 'node:crypto'
 import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { stringify } from 'yaml'
 import { type CrossModel, DEFAULT_BRANCH_FORMAT, loadBranchConfig, loadCrossModel, loadDefaultBranch, loadJiraMode, loadVaultPath, readConfigMap } from '../config.ts'
-import { branchCommit, currentBranch, headCommit, mainWorktree } from '../git.ts'
+import { branchCommit, currentBranch, gitDirs, headCommit, mainWorktree } from '../git.ts'
 import { type RecallResult, RECALL_NEXT, recall } from '../recall.ts'
 import { ensureIgnore } from '../runs.ts'
 import { type Family, SddError } from '../types.ts'
@@ -13,7 +14,10 @@ import { flowDir } from './read.ts'
 export const DEPTHS = ['corta', 'normal', 'completa'] as const
 export const RISKS = ['low', 'high', 'unknown'] as const
 export const CHANGE_TYPES = ['feat', 'fix', 'refactor', 'chore', 'docs', 'test', 'perf'] as const
-export interface StartDeps { env: Record<string, string | undefined>; hasCli: (family: Family) => boolean }
+export interface StartDeps {
+  env: Record<string, string | undefined>; hasCli: (family: Family) => boolean
+  initCommand?: string; reuseConfigCommand?: string; flowFilesIo?: FlowFilesIo
+}
 export type BlockerCode = 'config_missing' | 'config_invalid' | 'family_cli_missing' | 'flow_exists' | 'path_invalid'
   | 'head_unknown' | 'base_branch_unknown'
 export interface Blocker { code: BlockerCode; detail: string; next: string }
@@ -37,6 +41,21 @@ const CONFIG_INVALID_NEXT = `corrige ${CONFIG_PATH} según el detalle y vuelve a
 const messageOf = (e: unknown) => e instanceof Error ? e.message : String(e)
 const statusNext = (id: string) => `./bin/sdd-ai sdd status ${id}`
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+function configPathState(root: string): { missing: boolean; error?: string } {
+  const inspect = (path: string) => {
+    try { return lstatSync(path) } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw e
+    }
+  }
+  try {
+    const dir = inspect(join(root, '.sdd-ai'))
+    if (dir && (dir.isSymbolicLink() || !dir.isDirectory())) throw new Error('.sdd-ai requiere un directorio real, sin enlaces')
+    const file = dir ? inspect(join(root, CONFIG_PATH)) : undefined
+    if (file && (file.isSymbolicLink() || !file.isFile())) throw new Error(`${CONFIG_PATH} requiere un archivo regular, sin enlaces`)
+    return { missing: !file }
+  } catch (e) { return { missing: false, error: messageOf(e) } }
+}
 function checkId(id: string): void {
   if (!isFlowId(id)) throw new SddError('usage', `el id de flujo no es válido: ${id}`, {
     next: 'usa un solo segmento de 1 a 128 letras, dígitos, ., _ y -, distinto de . y ..',
@@ -118,26 +137,46 @@ function loadOrBlock<T>(load: () => T, fallback: T, config: ConfigView, blockers
 }
 
 /** El config, las familias, el directorio del flujo y la base, con sus bloqueos. No corre `recall` ni escribe nada. */
-export function startChecks(root: string, id: string, o: { baseBranch?: string }, deps: Pick<StartDeps, 'hasCli'>): StartChecks {
+export function startChecks(root: string, id: string, o: { baseBranch?: string }, deps: Pick<StartDeps, 'hasCli' | 'initCommand' | 'reuseConfigCommand'>): StartChecks {
   checkId(id)
   const blockers: Blocker[] = []
   const config: ConfigView = { path: CONFIG_PATH, state: 'ok', used: [], unused: [] }
   let cross: CrossModel | undefined
+  let physicalMissing = false
+  let unsafe = false
   try {
-    cross = loadCrossModel(root)
+    const physical = configPathState(root)
+    if (physical.error) {
+      unsafe = true
+      throw new SddError('config_invalid', physical.error)
+    }
+    physicalMissing = physical.missing
+    try { cross = loadCrossModel(root) } catch (e) {
+      if (!(e instanceof SddError)) throw new SddError('config_invalid', messageOf(e))
+      throw e
+    }
   } catch (e) {
     if (!(e instanceof SddError) || (e.code !== 'config_missing' && e.code !== 'config_invalid')) throw e
-    config.state = e.code === 'config_missing' ? 'missing' : 'invalid'
+    const missing = e.code === 'config_missing' && physicalMissing
+    config.state = missing ? 'missing' : 'invalid'
     config.detail = [e.message, e.detail].filter(Boolean).join(': ')
-    blockers.push({ code: e.code, detail: config.detail, next: e.code === 'config_missing' ? './bin/sdd-ai init' : CONFIG_INVALID_NEXT })
+    let next = CONFIG_INVALID_NEXT
+    if (missing) {
+      next = deps.initCommand ?? './bin/sdd-ai init'
+      try {
+        const dirs = gitDirs(root)
+        if (dirs.gitDir !== dirs.commonDir) next = deps.reuseConfigCommand ?? './bin/sdd-ai init --reuse-config'
+      } catch { /* Sin identificación Git no se ofrece herencia. */ }
+    }
+    blockers.push({ code: missing ? 'config_missing' : 'config_invalid', detail: config.detail, next })
   }
   config.used.push({ key: 'cross_model', value: cross ? { families: cross.families, selection: cross.selection ?? null } : null,
     means: cross ? `Workers de las familias ${cross.families.join(', ')}; selección ${cross.selection ?? 'no declarada'}.` : config.detail ?? '' })
-  const declared = configValues(root)
+  const declared = unsafe ? {} : configValues(root)
   const keys = Object.keys(declared)
   config.unused = keys.filter((key) => !['cross_model', 'jira_approval', 'knowledge-vault', 'branch_format', 'branch_prefix', 'default_branch'].includes(key))
-  const branch = loadOrBlock(() => loadBranchConfig(root), { format: DEFAULT_BRANCH_FORMAT, prefix: null }, config, blockers)
-  const base = loadOrBlock(() => loadDefaultBranch(root), null, config, blockers)
+  const branch = loadOrBlock(() => unsafe ? { format: DEFAULT_BRANCH_FORMAT, prefix: null } : loadBranchConfig(root), { format: DEFAULT_BRANCH_FORMAT, prefix: null }, config, blockers)
+  const base = loadOrBlock(() => unsafe ? null : loadDefaultBranch(root), null, config, blockers)
   const defaultBranch = base.value
   config.used.push(
     { key: 'branch_format', value: declared.branch_format ?? null, means: branch.error ?? (keys.includes('branch_format')
@@ -147,7 +186,7 @@ export function startChecks(root: string, id: string, o: { baseBranch?: string }
     { key: 'default_branch', value: declared.default_branch ?? null, means: base.error ?? (defaultBranch
       ? `sdd start toma ${defaultBranch} como base si no se pasa --base-branch.` : 'sdd start toma la rama actual como base si no se pasa --base-branch.') },
   )
-  const jira = loadJiraMode(root)
+  const jira = unsafe ? { mode: 'off' as const } : loadJiraMode(root)
   config.used.push({ key: 'jira_approval.mode', value: jira.mode, means: jira.mode === 'invalid' ? jira.detail
     : jira.mode === 'on' ? 'La spec necesita aprobación externa en Jira.' : 'La spec no necesita aprobación externa en Jira.' })
   // Con artefactos, `sdd status` bloquea un Jira inválido: el flujo no llegaría a `specify`.
@@ -156,7 +195,7 @@ export function startChecks(root: string, id: string, o: { baseBranch?: string }
     config.detail = jira.detail
     blockers.push({ code: 'config_invalid', detail: jira.detail, next: CONFIG_INVALID_NEXT })
   }
-  const vault = loadVaultPath(root)
+  const vault = unsafe ? { kind: 'none' as const } : loadVaultPath(root)
   config.used.push({ key: 'knowledge-vault.path_vault', value: vault.kind === 'path' ? vault.path : null,
     means: vault.kind === 'path' ? `recall busca en el vault ${vault.path}.` : vault.kind === 'none' ? 'La fuente vault queda not_configured.' : vault.detail })
   const families = (cross?.families ?? []).map((family) => ({ family, cli: deps.hasCli(family) }))
@@ -194,7 +233,17 @@ export function assertNoBlockers(blockers: Blocker[]): void {
 export function startPreview(root: string, id: string, o: { topic?: string; baseBranch?: string }, deps: StartDeps): StartPreview {
   const checks = startChecks(root, id, o, deps)
   const topic = o.topic ?? id.replace(/-/g, ' ')
-  const antecedents = { ...recall(root, topic, { env: deps.env }), next: RECALL_NEXT }
+  // Recall también carga config para el vault: no debe atravesar una ruta rechazada por start.
+  const physical = configPathState(root)
+  const recalled: RecallResult = physical.error ? {
+    topic, terms: [], sources: {
+      engram: { status: 'unavailable', reason: physical.error, truncated: false, hits: [] },
+      vault: { status: 'error', reason: physical.error, truncated: false, flows: [] },
+      plans: { status: 'error', reason: physical.error, present: false, truncated: false, groups: [] },
+      git: { status: 'error', reason: physical.error, truncated: false, commits: [] },
+    },
+  } : recall(root, topic, { env: deps.env })
+  const antecedents = { ...recalled, next: RECALL_NEXT }
   const next = checks.blockers[0]?.next ?? `./bin/sdd-ai sdd start ${id}${o.topic !== undefined ? ` --topic ${quote(o.topic)}` : ''}` +
     `${o.baseBranch !== undefined ? ` --base-branch ${quote(o.baseBranch)}` : ''} --apply --depth <corta|normal|completa> --risk <low|high|unknown> ` +
     '--change-type <tipo> --request <archivo>'
@@ -266,8 +315,8 @@ export function startApply(root: string, id: string, input: StartInput, deps: St
     ...preview.families.map((f) => `- ${f.family}: CLI ${f.cli ? 'presente' : 'ausente'}.`), '', '## Antecedentes',
     'El detalle está en antecedentes.json.', ...Object.entries(antecedents).map(([source, s]) => `- ${source}: ${s.status}, ${s.count} aciertos, recortado: ${s.truncated}.`), ''].join('\n')
   const files = { 'pedido.md': valid.request, 'antecedentes.json': `${JSON.stringify(preview.antecedents, null, 2)}\n`,
-    'handoff.md': `---\n${stringify(handoff)}---\n\n${body}` }
-  writeFlowFiles(root, id, files)
+    'handoff.md': `---\n${stringify(handoff)}---\n\n${body}`, 'hallazgos.md': renderFindingsTemplate(id) }
+  writeFlowFiles(root, id, files, deps.flowFilesIo)
   return { state: 'ok', id, created: Object.keys(files).map((name) => `.plans/${id}/${name}`), handoff, antecedents,
     next: `./bin/sdd-ai sdd phase ${id} --request .plans/${id}/pedido.md` }
 }

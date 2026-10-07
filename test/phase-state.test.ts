@@ -102,7 +102,8 @@ const sddStatus = (repo: string, ...args: string[]) => {
 }
 const sessionLine = (repo: string, id: string): string => {
   const out = JSON.parse(runHook(JSON.stringify(payload('claude', 'session-start', { cwd: repo, session_id: 's1', source: 'startup' })), 'claude'))
-  const block = String(out.hookSpecificOutput.additionalContext).split('\n\n').at(-1) ?? ''
+  // El aviso de copias puede ir después de los flujos: se busca el bloque de flujos por su encabezado.
+  const block = String(out.hookSpecificOutput.additionalContext).split('\n\n').find((b) => b.startsWith('Flujos SDD')) ?? ''
   return block.split('\n').find((l) => l.startsWith(`- ${id} `)) ?? ''
 }
 

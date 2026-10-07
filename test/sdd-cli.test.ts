@@ -20,7 +20,9 @@ const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 const SPEC = '# Spec\n\n- **AC-1:** algo observable. (pedido)\n'
 const plan = (status: string, depth = 'completa') => `---\nid: f\nprofundidad: ${depth}\nstatus: ${status}\n---\n\n# Plan\n\n## Enfoque\n\nDirecto.\n`
 const TASKS = '# Tasks\n\n- [x] **T1 — primera** · cubre: AC-1\n- [ ] **T2 — segunda** · cubre: AC-1\n'
-const handoff = (depth = 'completa') => `---\nphase: implementing\nprofundidad: ${depth}\nspec_approved_at: 2026-09-27T18:31:17-05:00\n---\n\n# Handoff\n`
+/** La fecha que trae el handoff de los fixtures; `approve` la reemplaza por el `at` de la aprobación registrada. */
+const HANDOFF_SPEC_APPROVED_AT = '2026-09-27T18:31:17-05:00'
+const handoff = (depth = 'completa') => `---\nphase: implementing\nprofundidad: ${depth}\nspec_approved_at: ${HANDOFF_SPEC_APPROVED_AT}\n---\n\n# Handoff\n`
 
 interface Out { code: number | null; out: Record<string, any> }
 
@@ -258,7 +260,8 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
   const repo = makeRepo()
   const dir = completa(repo, 'f', 'planned')
   const artifacts = ['spec.md', 'plan.md', 'tasks.md', 'handoff.md']
-  const before = artifacts.map((n) => `${readFileSync(join(dir, n), 'utf8')} ${lstatSync(join(dir, n)).mtimeMs}`)
+  const read = (n: string) => ({ text: readFileSync(join(dir, n), 'utf8'), mtime: lstatSync(join(dir, n)).mtimeMs })
+  const before = Object.fromEntries(artifacts.map((n) => [n, read(n)]))
 
   answer(repo, 'f', 'spec')
   const spec = sdd(repo, 'approve', 'f', 'spec')
@@ -280,7 +283,7 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
   const plan = sdd(repo, 'approve', 'f', 'plan')
   assert.equal(plan.code, 0, JSON.stringify(plan.out))
   assert.deepEqual(gateStates(plan.out), { spec: 'approved', plan: 'approved', tasks: 'pending' })
-  assert.ok(plan.out.notes.some((n: { code: string }) => n.code === 'header_behind'))
+  assert.ok(!plan.out.notes.some((n: { code: string }) => n.code === 'header_behind'))
   const second = registry(dir).approvals[1]
   assert.equal(second.gate, 'plan')
   assert.deepEqual(second.previous, { spec: first.fingerprint })
@@ -288,7 +291,10 @@ test('approve registra el gate con su huella y las de los anteriores y responde 
   assert.equal(typeof plan.out.next.question?.question, 'string')
   assert.deepEqual(sdd(repo, 'status', 'f').out, plan.out)
 
-  assert.deepEqual(artifacts.map((n) => `${readFileSync(join(dir, n), 'utf8')} ${lstatSync(join(dir, n)).mtimeMs}`), before)
+  // La spec y las tasks no se tocan; approve solo sincroniza el status del plan y la fecha del handoff.
+  for (const name of ['spec.md', 'tasks.md']) assert.deepEqual(read(name), before[name])
+  assert.equal(read('plan.md').text, before['plan.md'].text.replace('status: planned', 'status: plan-approved'))
+  assert.equal(read('handoff.md').text, before['handoff.md'].text.replace(`spec_approved_at: ${HANDOFF_SPEC_APPROVED_AT}`, `spec_approved_at: ${first.at}`))
   assert.equal(existsSync(join(dir, LOCK)), false)
 })
 
@@ -692,7 +698,8 @@ test('una respuesta posterior a la lectura, también una que llega antes de la e
   const [entry] = registry(dir).approvals
   assert.equal(entry.gate, 'spec')
   assert.notEqual(entry.proof.ref.split(':')[0], 'tu-late')
-  assert.throws(() => approve(repo, 'f', 'spec', new Date(), readFlow, prove, env), (e: unknown) => e instanceof SddError && e.code === 'approval_contradicted')
+  assert.equal(approve(repo, 'f', 'spec', new Date(), readFlow, prove, env).gates[0].state, 'approved')
+  assert.deepEqual(registry(dir).approvals, [entry])
 })
 
 test('una respuesta a la huella anterior no aprueba la actual', () => {
@@ -714,10 +721,12 @@ test('una prueba usada rechaza con approval_reused', () => {
   assert.equal(sdd(repo, 'approve', 'f', 'spec').code, 0)
   writeFileSync(join(dir, 'spec.md'), SPEC.replace('algo observable', 'algo distinto'))
   assert.equal(gateStates(sdd(repo, 'status', 'f').out).spec, 'stale')
+  answer(repo, 'f', 'spec')
+  assert.equal(sdd(repo, 'approve', 'f', 'spec').code, 0)
   writeFileSync(join(dir, 'spec.md'), SPEC)
   const r = sdd(repo, 'approve', 'f', 'spec')
   assert.equal(r.out.code, 'approval_reused', JSON.stringify(r.out))
-  assert.equal(registry(dir).approvals.length, 1)
+  assert.equal(registry(dir).approvals.length, 2)
 })
 
 test('la entrada registrada trae proof con runner, source, ref, session y answered_at', () => {

@@ -4,12 +4,13 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
-  type RoleProfiles, agentsState, parseAgentSource, renderClaudeAgent, renderCodexAgent, skillCopies, sourceHash, syncAgents,
+  type RoleProfiles, agentCopy, agentCopies, agentsState, readSource, readSkillSource, skillCopy, parseAgentSource, renderClaudeAgent, renderCodexAgent, skillCopies, sourceHash, syncAgents,
 } from '../src/agents.ts'
 import { READ_ONLY_ROLES, type Family } from '../src/types.ts'
 import { copyModSource } from './mod-fixture.ts'
 
 const repo = join(import.meta.dirname, '..')
+
 const FAMILIES: readonly Family[] = ['claude', 'codex']
 
 function profiles(): RoleProfiles {
@@ -170,4 +171,48 @@ test('agents sync sigue escribiendo agentes con LF y copias de la skill iguales 
   } finally {
     for (const dir of [root, pkg, root2]) rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('los helpers individuales conservan estados, orden y errores de las inspecciones agregadas', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-agent-helpers-'))
+  const pkg = mkdtempSync(join(tmpdir(), 'sdd-ai-agent-source-'))
+  try {
+    for (const family of FAMILIES) assert.equal(agentsState(root, pkg, family, 'explore', profiles()), 'missing')
+    syncAgents(root, repo, profiles())
+    const source = readSource(repo)
+    const expected = agentCopies(root, repo, profiles())
+    assert.deepEqual(expected, READ_ONLY_ROLES.flatMap((role) => FAMILIES.map((family) => agentCopy(root, family, role, profiles(), source))))
+    assert.deepEqual(skillCopies(root, repo), FAMILIES.map((family) => skillCopy(root, family, readSkillSource(repo))))
+    const file = agentFile(root, 'claude', 'explore')
+    writeFileSync(file, readFileSync(file, 'utf8') + '\neditado')
+    assert.equal(agentCopy(root, 'claude', 'explore', profiles(), source).state, 'stale')
+    rmSync(file)
+    assert.equal(agentCopy(root, 'claude', 'explore', profiles(), () => { throw new Error('fuente no debe leerse') }).state, 'missing')
+    mkdirSync(file)
+    let read = false
+    assert.throws(() => agentCopy(root, 'claude', 'explore', profiles(), () => { read = true; return source }), /EISDIR/)
+    assert.equal(read, false, 'la copia se lee antes de obtener la fuente')
+    assert.throws(() => agentsState(root, pkg, 'claude', 'explore', profiles()), /EISDIR/)
+    assert.throws(() => skillCopies(root, pkg), /ENOENT/, 'la fuente de skill se lee antes de comprobar las copias')
+    const skill = join(root, CLAUDE_COPY)
+    rmSync(skill); mkdirSync(skill)
+    assert.throws(() => skillCopy(root, 'claude', readSkillSource(repo)), /EISDIR/)
+    assert.throws(() => skillCopies(root, repo), /EISDIR/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(pkg, { recursive: true, force: true })
+  }
+})
+
+test('los agentes generados piden reportar hallazgos solo cuando el encargo lo pida y prohíben escribir el registro', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-findings-agents-'))
+  try {
+    syncAgents(root, repo, profiles())
+    for (const role of READ_ONLY_ROLES) for (const family of FAMILIES) {
+      const generated = readFileSync(agentFile(root, family, role), 'utf8')
+      assert.ok(generated.includes('Reporta hallazgos solo cuando el encargo lo pida'), `${family} ${role}`)
+      assert.ok(generated.includes('Nunca escribas hallazgos.md ni respaldos del flujo'), `${family} ${role}`)
+      assert.ok(generated.includes('respeta los esquemas cerrados sin añadir claves ni prosa'), `${family} ${role}`)
+    }
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })
