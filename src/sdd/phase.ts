@@ -1,3 +1,4 @@
+import { type FindingReport, type FindingRejection, type FindingsChannel, findingsInstructions } from '../findings.ts'
 import { parse } from 'yaml'
 import { WORKER_POLICY } from '../worker-policy.ts'
 import { type Admission, Rejection, admitWith, extractObjects } from '../review/admit.ts'
@@ -13,23 +14,23 @@ import { type VerificationContract, admitVerification, renderVerification, round
 export type PhaseStep = 'specify' | 'plan' | 'tasks' | 'implement'
 export type DocumentStep = Exclude<PhaseStep, 'implement'>
 
-export interface SpecifyContract {
+export interface SpecifyContract extends FindingsChannel {
   phase: 'specify'; known_facts: { fact: string; pointer: string }[]
   assumptions: string[]; blocking_questions: string[]; missing_context: string[]
   acceptance_criteria: { id: string; text: string; authority: string; verification: string }[]
   problem: string; background: string; scope: string
 }
-export interface PlanContract {
+export interface PlanContract extends FindingsChannel {
   phase: 'plan'; assumptions: string[]; blocking_questions: string[]; missing_context: string[]
   approach: string; decisions: string; files: string; verification: VerificationContract
 }
-export interface TasksContract {
+export interface TasksContract extends FindingsChannel {
   phase: 'tasks'; assumptions: string[]; blocking_questions: string[]; missing_context: string[]
   tasks: { id: string; title: string; covers: string[]; pattern: string; test: string; files: string[]; steps: string[] }[]
 }
 /** Si la task quedó hecha entera o sin terminar, según el writer. La prosa del reporte no cuenta. */
 export type Completion = 'done' | 'pending'
-export interface ImplementContract {
+export interface ImplementContract extends FindingsChannel {
   phase: 'implement'; missing_context: string[]
   tasks: { id: string; change_kind: 'defect' | 'behavior_change' | 'refactor'; changed: string
     deviation: { what: string; why: string } | null; check: string
@@ -37,7 +38,7 @@ export interface ImplementContract {
     completion?: Completion }[]
 }
 /** El contrato de una corrida de corrección: una entrada por fila roja enviada, y solo esas. */
-export interface FixContract {
+export interface FixContract extends FindingsChannel {
   phase: 'fix'; missing_context: string[]
   rows: { id: string; changed: string; deviation: { what: string; why: string } | null }[]
 }
@@ -87,6 +88,7 @@ const TASK_OF: Record<PhaseStep, (f: FlowData) => string> = {
 
 const SCHEMA: Record<PhaseStep, string> = {
   specify: `{
+  "findings": [],
   "phase": "specify",
   "known_facts": [{ "fact": "<lo que el código muestra>", "pointer": "<ruta:línea>" }],
   "assumptions": ["<supuesto>"],
@@ -100,6 +102,7 @@ const SCHEMA: Record<PhaseStep, string> = {
 - \`acceptance_criteria\` tiene al menos un criterio; sus ids son \`AC-<n>\` y no se repiten. La autoridad es exactamente una de las cuatro: de dónde sale lo que el criterio exige.
 - ${PROSE}`,
   plan: `{
+  "findings": [],
   "phase": "plan",
   "assumptions": ["<supuesto>"],
   "blocking_questions": ["<pregunta para el usuario>"],
@@ -123,6 +126,7 @@ const SCHEMA: Record<PhaseStep, string> = {
 - \`approach\`, \`files\` y \`verification\` no pueden ir vacíos; \`decisions\` puede decir "ninguno".
 - ${PROSE} El header de \`plan.md\` lo arma sdd-ai.`,
   tasks: `{
+  "findings": [],
   "phase": "tasks",
   "assumptions": ["<supuesto>"],
   "blocking_questions": ["<pregunta para el usuario>"],
@@ -132,6 +136,7 @@ const SCHEMA: Record<PhaseStep, string> = {
 - Hay al menos una task; sus ids son \`T<n>\` y no se repiten. Cada task cubre al menos un criterio de la spec, y cada criterio de la spec lo cubre al menos una task.
 - \`pattern\`, \`test\`, \`files\` y \`steps\` no pueden ir vacíos. Un paso no lleva checkboxes.`,
   implement: `{
+  "findings": [],
   "phase": "implement",
   "missing_context": ["<lo que faltó para terminar>"],
   "tasks": [{ "id": "T<n>", "completion": "done" | "pending", "change_kind": "defect" | "behavior_change" | "refactor", "changed": "<qué cambió; en una task pending, qué quedó hecho y qué no>", "deviation": { "what": "<en qué te desviaste del plan>", "why": "<por qué>" } | null, "check": "<la fila de ## Verification que la demuestra>" }]
@@ -147,7 +152,7 @@ Tu reporte trae un único objeto JSON con la clave \`"phase": "implement"\` y ex
 
 /** El formato del reporte de `implement`, para el encargo de una continuación o un bloque que reanuda la sesión. */
 export function implementReportFormat(): string {
-  return `${IMPLEMENT_OUTPUT}\n\n## Esquema\n${SCHEMA.implement}`
+  return `${IMPLEMENT_OUTPUT}\n\n## Esquema\n${SCHEMA.implement}\n\n${findingsInstructions('phase')}`
 }
 
 function mandates(step: DocumentStep): string {
@@ -177,6 +182,7 @@ export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: Froze
   }
   if (step !== 'implement') parts.push(mandates(step), OUTPUT(step), `## Esquema\n${SCHEMA[step]}\n${LISTS}`)
   else parts.push(IMPLEMENT_OUTPUT, `## Esquema\n${SCHEMA.implement}`)
+  parts.push(findingsInstructions('phase'))
   return `${parts.join('\n\n')}\n`
 }
 
@@ -216,6 +222,35 @@ function texts(v: unknown, field: string, o: { min?: number } = {}): string[] {
   return v.map((x, i) => text(x, `${field}[${i}]`))
 }
 
+/** Un canal mal formado no invalida el contrato de la fase. */
+export function admitFindings(value: unknown): { findings: FindingReport[]; rejected: FindingRejection[] } {
+  const findings: FindingReport[] = []
+  const rejected: FindingRejection[] = []
+  const nullable = (v: unknown, field: string): string | null => v === null ? null : text(v, field, { empty: true })
+  if (!Array.isArray(value)) return { findings, rejected: [{ index: null, raw: value, error: 'findings tiene que ser una lista' }] }
+  value.forEach((raw, index) => {
+    try {
+      if (!isMap(raw)) throw new Rejection('el hallazgo tiene que ser un objeto')
+      keysOf(raw, ['problem', 'location', 'expected', 'observed', 'evidence', 'impact', 'moment', 'stage', 'context'], 'el hallazgo')
+      if (!isMap(raw.context)) throw new Rejection('context tiene que ser un objeto')
+      keysOf(raw.context, ['commit', 'runtime', 'os', 'session', 'run', 'package'], 'context')
+      const c = raw.context
+      findings.push({ problem: text(raw.problem, 'problem'), evidence: texts(raw.evidence, 'evidence', { min: 1 }),
+        location: nullable(raw.location, 'location'), expected: nullable(raw.expected, 'expected'), observed: nullable(raw.observed, 'observed'),
+        impact: nullable(raw.impact, 'impact'), moment: nullable(raw.moment, 'moment'), stage: nullable(raw.stage, 'stage'),
+        context: { commit: nullable(c.commit, 'context.commit'), runtime: nullable(c.runtime, 'context.runtime'), os: nullable(c.os, 'context.os'),
+          session: nullable(c.session, 'context.session'), run: nullable(c.run, 'context.run'), package: nullable(c.package, 'context.package') } })
+    } catch (e) { rejected.push({ index, raw, error: e instanceof Error ? e.message : String(e) }) }
+  })
+  return { findings, rejected }
+}
+
+function findingsOf(raw: Record<string, unknown>): FindingsChannel {
+  if (!('findings' in raw)) return {}
+  const { findings, rejected } = admitFindings(raw.findings)
+  return { findings, ...(rejected.length ? { findings_rejected: rejected } : {}) }
+}
+
 function prose(v: unknown, field: string, reserved: readonly string[], o: { empty?: boolean } = {}): string {
   const s = text(v, field, o)
   const problems = proseProblems(s, reserved)
@@ -227,7 +262,7 @@ function prose(v: unknown, field: string, reserved: readonly string[], o: { empt
 function contract(raw: Record<string, unknown>, step: PhaseStep, keys: readonly string[]): Record<string, unknown> {
   const { next: _next, ...rest } = raw
   if (rest.phase !== step) throw new Rejection(`phase tiene que ser ${JSON.stringify(step)} y es ${JSON.stringify(rest.phase)}`)
-  keysOf(rest, keys, 'el contrato')
+  keysOf(rest, 'findings' in rest ? [...keys, 'findings'] : keys, 'el contrato')
   return rest
 }
 
@@ -262,7 +297,7 @@ function checkSpecify(raw: Record<string, unknown>): Admission<SpecifyContract> 
     return { id, text: text(a.text, `${where}.text`), authority, verification: text(a.verification, `${where}.verification`) }
   })
   return admitted({
-    phase: 'specify', known_facts,
+    phase: 'specify', known_facts, ...findingsOf(c),
     assumptions: texts(c.assumptions, 'assumptions'), blocking_questions: texts(c.blocking_questions, 'blocking_questions'),
     missing_context: texts(c.missing_context, 'missing_context'), acceptance_criteria,
     problem: prose(c.problem, 'problem', SPEC_RESERVED), background: prose(c.background, 'background', SPEC_RESERVED),
@@ -273,7 +308,7 @@ function checkSpecify(raw: Record<string, unknown>): Admission<SpecifyContract> 
 function checkPlan(raw: Record<string, unknown>, criteria: readonly string[]): Admission<PlanContract> {
   const c = contract(raw, 'plan', ['phase', ...LIST_KEYS, 'approach', 'decisions', 'files', 'verification'])
   return admitted({
-    phase: 'plan',
+    phase: 'plan', ...findingsOf(c),
     assumptions: texts(c.assumptions, 'assumptions'), blocking_questions: texts(c.blocking_questions, 'blocking_questions'),
     missing_context: texts(c.missing_context, 'missing_context'),
     approach: prose(c.approach, 'approach', PLAN_RESERVED), decisions: prose(c.decisions, 'decisions', PLAN_RESERVED, { empty: true }),
@@ -410,7 +445,7 @@ function checkTasks(raw: Record<string, unknown>, criteria: readonly string[]): 
   })
   for (const ac of criteria) if (!tasks.some((t) => t.covers.includes(ac))) throw new Rejection(`el criterio ${ac} de la spec no lo cubre ninguna task`)
   const review: TasksContract = {
-    phase: 'tasks', assumptions: texts(c.assumptions, 'assumptions'), blocking_questions: texts(c.blocking_questions, 'blocking_questions'),
+    phase: 'tasks', ...findingsOf(c), assumptions: texts(c.assumptions, 'assumptions'), blocking_questions: texts(c.blocking_questions, 'blocking_questions'),
     missing_context: texts(c.missing_context, 'missing_context'), tasks,
   }
   try {
@@ -478,7 +513,7 @@ function checkImplement(raw: Record<string, unknown>, pending: readonly string[]
       deviation: deviationOf(t.deviation, where), check: text(t.check, `${where}.check`), ...(completion === undefined ? {} : { completion }),
     }
   })
-  return { phase: 'implement', missing_context: texts(c.missing_context, 'missing_context'), tasks }
+  return { phase: 'implement', ...findingsOf(c), missing_context: texts(c.missing_context, 'missing_context'), tasks }
 }
 
 function deviationOf(v: unknown, where: string): { what: string; why: string } | null {
@@ -510,16 +545,16 @@ function admitReport<T>(report: string, check: (raw: Record<string, unknown>) =>
  * El contrato de `implement` del reporte del writer, con una entrada por task pendiente y solo esas. Con
  * `explicit`, cada entrada declara su `completion`; sin él, se admite el contrato anterior, que no la trae.
  */
-export function admitImplement(report: string, pending: readonly string[], o: { explicit?: boolean } = {}): Admission<ImplementContract> {
-  return admitReport(report, (raw) => checkImplement(raw, pending, o.explicit ?? false))
+export function admitImplement(report: string, pending: readonly string[], o: { explicit?: boolean; findings?: boolean } = {}): Admission<ImplementContract> {
+  return admitReport(report, (raw) => ({ ...checkImplement(raw, pending, o.explicit ?? false), ...(o.findings && !('findings' in raw) ? { findings_missing: true } : {}) }))
 }
 
 /** El contrato de un `fix`: una entrada por cada fila enviada al writer, y solo esas. */
-export function admitFix(report: string, rows: readonly string[]): Admission<FixContract> {
+export function admitFix(report: string, rows: readonly string[], o: { findings?: boolean } = {}): Admission<FixContract> {
   return admitReport(report, (raw) => {
     const { next: _next, ...c } = raw
     if (c.phase !== 'fix') throw new Rejection(`phase tiene que ser "fix" y es ${JSON.stringify(c.phase)}`)
-    keysOf(c, ['phase', 'missing_context', 'rows'], 'el contrato')
+    keysOf(c, ['phase', 'missing_context', 'rows', ...('findings' in c ? ['findings'] : [])], 'el contrato')
     if (!Array.isArray(c.rows)) throw new Rejection('rows tiene que ser una lista')
     const seen = new Set<string>()
     const out = c.rows.map((r, i) => {
@@ -533,6 +568,6 @@ export function admitFix(report: string, rows: readonly string[]): Admission<Fix
       return { id, changed: text(r.changed, `${where}.changed`), deviation: deviationOf(r.deviation, where) }
     })
     for (const id of rows) if (!seen.has(id)) throw new Rejection(`la fila enviada ${id} no tiene entrada`)
-    return { phase: 'fix', missing_context: texts(c.missing_context, 'missing_context'), rows: out } satisfies FixContract
+    return { phase: 'fix', ...findingsOf(c), ...(o.findings && !('findings' in c) ? { findings_missing: true } : {}), missing_context: texts(c.missing_context, 'missing_context'), rows: out } satisfies FixContract
   })
 }

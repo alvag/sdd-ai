@@ -203,3 +203,16 @@ test('los helpers individuales conservan estados, orden y errores de las inspecc
     rmSync(pkg, { recursive: true, force: true })
   }
 })
+
+test('los agentes generados piden reportar hallazgos solo cuando el encargo lo pida y prohíben escribir el registro', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-findings-agents-'))
+  try {
+    syncAgents(root, repo, profiles())
+    for (const role of READ_ONLY_ROLES) for (const family of FAMILIES) {
+      const generated = readFileSync(agentFile(root, family, role), 'utf8')
+      assert.ok(generated.includes('Reporta hallazgos solo cuando el encargo lo pida'), `${family} ${role}`)
+      assert.ok(generated.includes('Nunca escribas hallazgos.md ni respaldos del flujo'), `${family} ${role}`)
+      assert.ok(generated.includes('respeta los esquemas cerrados sin añadir claves ni prosa'), `${family} ${role}`)
+    }
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})

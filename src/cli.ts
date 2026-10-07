@@ -1,3 +1,4 @@
+import { type FindingsChannel, findingsInstructions } from './findings.ts'
 import { type SpawnOptions, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -232,7 +233,13 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
     throw new SddError('usage', 'falta el encargo', { next: 'pasa --prompt-file <archivo> o --retry <id>' })
   }
 
-  if (values.flow !== undefined) prompt += `\n\n${renderAntecedents(values.flow, readAntecedents(root, values.flow))}`
+  const findingsReport = !values.retry && ['explore', 'investigate', 'counter-plan', 'debate', 'design-review'].includes(role)
+    ? findingsInstructions('run') : undefined
+  if (values.flow !== undefined) {
+    const antecedents = renderAntecedents(values.flow, readAntecedents(root, values.flow))
+    // Conserva el encabezado inicial y el cierre de los antecedentes; las instrucciones quedan fuera del material delimitado.
+    prompt += `\n\n${findingsReport ? antecedents.replace('\n\n', `\n\n${findingsReport}\n\n`) : antecedents}`
+  } else if (findingsReport) prompt += `\n\n${findingsReport}`
   prompt = withWorkerPolicy(prompt)
 
   if (role === 'implement') {
@@ -1609,6 +1616,7 @@ function phaseView(root: string, id: string, dir: string, s: Status, req: PhaseR
     const p = readJson<PhaseResult>(file)
     out.outcome = p.outcome
     if (p.artifact) out.artifact = p.artifact
+    for (const key of ['findings', 'findings_rejected', 'findings_missing'] as const) if (key in p) out[key] = p[key]
     out.assumptions = p.assumptions
     if (p.outcome !== 'published') Object.assign(out, { blocking_questions: p.blocking_questions, missing_context: p.missing_context })
     if (p.cause) out.cause = p.cause
@@ -1774,7 +1782,7 @@ function chainLaunchFailed(root: string, c: WriterControl, detail: string): void
 const launchHolds = (root: string, c: WriterControl) => (c.phase?.launch_from ? launchTreeHolds(root, c) : captureTreeAtBase(root, c.id))
 
 /** Lo que la cosecha de un writer de fase dice de su contrato. */
-interface PhaseContract { admitted: boolean; cause?: string; missing_context: string[] }
+interface PhaseContract extends FindingsChannel { admitted: boolean; cause?: string; missing_context: string[] }
 
 /**
  * El contrato del reporte de un writer de fase, contra lo que congeló al lanzar. Sin corrección. Un `fix`
@@ -1784,9 +1792,12 @@ interface PhaseContract { admitted: boolean; cause?: string; missing_context: st
 function phaseContract(h: HarvestRecord, phase: NonNullable<WriterControl['phase']>): PhaseContract {
   const report = h.report ?? ''
   const a = phase.kind === 'fix'
-    ? admitFix(report, (phase.fix?.rows ?? []).map((r) => r.id))
-    : admitImplement(report, phase.pending, { explicit: phase.kind !== undefined })
-  if (a.kind === 'admitted') return { admitted: true, missing_context: a.review.missing_context }
+    ? admitFix(report, (phase.fix?.rows ?? []).map((r) => r.id), { findings: phase.findings })
+    : admitImplement(report, phase.pending, { explicit: phase.kind !== undefined, findings: phase.findings })
+  if (a.kind === 'admitted') return { admitted: true, missing_context: a.review.missing_context,
+    ...('findings' in a.review ? { findings: a.review.findings } : {}),
+    ...('findings_rejected' in a.review ? { findings_rejected: a.review.findings_rejected } : {}),
+    ...('findings_missing' in a.review ? { findings_missing: a.review.findings_missing } : {}) }
   return { admitted: false, cause: a.kind === 'inadmissible' ? a.error : a.reason, missing_context: [] }
 }
 
@@ -1930,6 +1941,7 @@ function writerReport(root: string, id: string, h: HarvestRecord, env: Env): Res
     : harvestNext(id, h, c, failed)
   if (c.phase && contract) {
     out.contract = contract
+    for (const key of ['findings', 'findings_rejected', 'findings_missing'] as const) if (key in contract) out[key] = contract[key]
     try {
       out.flow_next = flowNext(root, c.phase.flow)
     } catch (e) {
@@ -2482,7 +2494,10 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
     rmSync(promptDir, { recursive: true, force: true })
     throw e
   }
+  // Una reanudación conserva incluso la ausencia de la marca del contrato de origen.
+  const findings = l.resumes ? readControl(root, l.resumes).phase?.findings : true
   const phase: NonNullable<WriterControl['phase']> = {
+    ...(findings === undefined ? {} : { findings }),
     flow: id, pending: l.pending, inputs: frozen.hashes, handoff_header: headerHash(read.facts.handoffHeader),
     kind: l.kind, chain, parent: l.parent, ...(l.launchFrom ? { launch_from: l.launchFrom } : {}), ...(l.resumes ? { resumes: l.resumes } : {}),
     ...(l.fix ? { fix: l.fix } : {}), registry: registryDigest(root, id),
@@ -2762,7 +2777,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     }
     const s = startProcessRun({
       root, env, resolution, prompt, request: { ...phaseRequest }, deadline, conductor, files,
-      argvExtra: { kind: 'phase', phase: { ...launch, root, ...(criteria ? { criteria } : {}) } },
+      argvExtra: { kind: 'phase', phase: { ...launch, root, findings: true, ...(criteria ? { criteria } : {}) } },
     })
     const phases: PhaseRecord['phases'] = awaiting ? { ...rec.phases, [doc]: { ...entry, amended: { run: s.id, consumed: false } } } : rec.phases
     writePhaseRecord(root, id, { ...rec, last_run: { id: s.id, step: doc }, phases })
