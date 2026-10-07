@@ -14,7 +14,7 @@ import { type ListEntry, listFlows, lstatOrNull, readFlow } from './sdd/read.ts'
 import { restoreIntentOpen } from './sdd/restore.ts'
 import { type FlowStatus, type Reason, type Step, headerData, resolve } from './sdd/status.ts'
 import { isNotifierOperational } from './notification.ts'
-import { shellSegments } from './shell.ts'
+import { commandSegments } from './shell.ts'
 import { SESSION_SYNC_HEADER, renderSessionSync } from './session-start-sync.ts'
 import type { NativeProfile } from './types.ts'
 
@@ -264,10 +264,14 @@ const SPAWN_AGENT_V2 = 'collaborationspawn_agent'
 const DISPATCH_TOOLS = new Set(['Agent', 'spawn_agent', SPAWN_AGENT_V2])
 const AGENT_PREFIX = 'sdd-ai-'
 /**
- * Una cita del encargo de una corrida. `prompt.md.bak` o `prompt.md/otra` no cuentan; un punto que
- * cierra la oración sí, como en el mensaje canónico.
+ * Una cita del encargo de una corrida, con cualquier separador (`/`, `\` o mezclados). `prompt.md.bak`,
+ * `prompt.md/otra` o `prompt.md\otra` no cuentan; un punto que cierra la oración sí, como en el
+ * mensaje canónico.
  */
-const CITATION = /\.sdd-ai\/runs\/([^/\s"'`]+)\/prompt\.md(?![\w/-]|\.[\w/-])/g
+const CITATION = /\.sdd-ai[\\/]runs[\\/]([^\\/\s"'`]+)[\\/]prompt\.md(?![\w\\/-]|\.[\w\\/-])/g
+
+/** La plataforma del proceso decide cómo se leen los comandos; nunca el payload. */
+const PLATFORM = process.platform
 
 type Input = Record<string, unknown>
 
@@ -515,7 +519,7 @@ function guardShell(p: Payload): string {
   if (typeof p.agent_id !== 'string' || p.agent_id === '') return ''
   const command = isRecord(p.tool_input) ? p.tool_input.command : undefined
   if (typeof command !== 'string') return ''
-  const denied = shellSegments(command).filter(invokesConductorCommand)
+  const denied = commandSegments(command, PLATFORM).filter(invokesConductorCommand)
   if (denied.length === 0) return ''
   // `sdd approve` nombra además `runner_required`, el mismo código con que la prueba niega a un worker.
   const approves = denied.some((segment) => /\bsdd\s+approve\b/.test(segment))
@@ -556,7 +560,7 @@ function jiraDenial(jira: JiraMode): string {
 export function guardCommit(p: Payload, root: string, session: string | null): string {
   const command = isRecord(p.tool_input) ? p.tool_input.command : undefined
   if (typeof command !== 'string' || typeof p.cwd !== 'string') return ''
-  const targets = commitTargets(command, p.cwd)
+  const targets = commitTargets(command, p.cwd, PLATFORM)
   if (targets.length === 0) return ''
   try {
     const here = realpathSync(root)
@@ -566,7 +570,7 @@ export function guardCommit(p: Payload, root: string, session: string | null): s
     if (restoreIntentOpen(root)) {
       return deny('sdd verify dejó una restauración pendiente y el árbol puede tener archivos revertidos: corre ./bin/sdd-ai sdd status para que se resuelva, y después el commit')
     }
-    if (invokesBinding(command)) {
+    if (invokesBinding(command, PLATFORM)) {
       return deny('este comando liga un flujo y hace git commit en la misma cadena: corre sdd status o sdd approve y el commit por separado, ' +
         'porque el commit no se puede decidir con una liga que todavía no existe')
     }
