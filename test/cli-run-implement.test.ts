@@ -110,7 +110,8 @@ test('sdd phase en implement lanza un writer con las tasks congeladas y la cosec
   assert.deepEqual([control.phase.flow, control.phase.pending], ['f', ['T2', 'T3']])
   const w = cli(s, ['wait', r.out.id, '--max', '30'])
   assert.equal(w.code, 0, JSON.stringify(w.out))
-  assert.deepEqual(w.out.contract, { admitted: true, missing_context: [] })
+  // El writer nuevo lleva la marca findings y su reporte no trae la clave: se admite igual y se señala la ausencia.
+  assert.deepEqual(w.out.contract, { admitted: true, missing_context: [], findings_missing: true })
   // Con todas las tasks hechas, la cadena va a verify: la revisión viene después, con el verde.
   assert.match(w.out.next, /sdd verify f/)
   assert.doesNotMatch(w.out.next, /review start/)
