@@ -24,7 +24,12 @@ export const DEFAULT_PROFILES: Readonly<Record<Role, Record<Family, { model: str
 }
 
 const PORTABLE: readonly string[] = ['bajo', 'medio', 'alto', 'muy_alto', 'maximo']
-const WORKERS_PATH = join('.sdd-ai', 'workers.yml')
+export const WORKERS_PATH = join('.sdd-ai', 'workers.yml')
+
+/** La carpeta de configuración de Codex: `CODEX_HOME` o `~/.codex`. */
+export function codexHome(env: Record<string, string | undefined>): string {
+  return env.CODEX_HOME || join(homedir(), '.codex')
+}
 
 function isMap(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -132,7 +137,7 @@ export function readCodexRoot(text: string): Profile {
 }
 
 export function loadCodexRoot(env: Record<string, string | undefined>): Profile {
-  const home = env.CODEX_HOME || join(homedir(), '.codex')
+  const home = codexHome(env)
   try {
     return readCodexRoot(readFileSync(join(home, 'config.toml'), 'utf8'))
   } catch (e) {
@@ -145,7 +150,7 @@ export interface CodexCatalog { slugs: Set<string>; clientVersion: string | null
 
 /** Catálogo local de Codex, incluidos los modelos ocultos, con descripciones y versión del cliente; su ausencia no es un error. */
 export function loadCodexCatalog(env: Record<string, string | undefined>): CodexCatalog | null {
-  const home = env.CODEX_HOME || join(homedir(), '.codex')
+  const home = codexHome(env)
   try {
     const value: unknown = JSON.parse(readFileSync(join(home, 'models_cache.json'), 'utf8'))
     if (typeof value !== 'object' || value === null || !Array.isArray((value as { models?: unknown }).models)) return null

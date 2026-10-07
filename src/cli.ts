@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { parseArgs } from 'node:util'
-import { type RoleProfiles, agentCopies, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
+import { agentCopies, agentName, agentsState, skillCopies, syncAgents } from './agents.ts'
 import { type Proof, askNext, prove } from './approval/proof.ts'
 import { DISPUTE_OPTIONS, type Question, attestQuestion, disputeQuestion, extraOptions, extraQuestion } from './approval/question.ts'
 import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './approval/session.ts'
@@ -26,7 +26,7 @@ import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { DEFAULT_KEEP_DAYS, type EntryKind, applyPrune, planPrune, pruneContext } from './prune.ts'
 import { RECALL_NEXT, recall } from './recall.ts'
-import { roleProfiles, resolve } from './resolve.ts'
+import { nativeProfiles, resolve } from './resolve.ts'
 import { renderArtifactMaterial, renderArtifactPrompt, renderArtifactRoundPrompt } from './review/artifact-prompt.ts'
 import {
   type ArtifactSelection, artifactDelta, freezeArtifact, inputsUnchanged, isArtifact, readMaterial, validateArtifactArgs,
@@ -107,10 +107,6 @@ export function defaultWaitMax(conductor: Family): number {
 
 function definedEnv(env: Env): Record<string, string> {
   return Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => e[1] !== undefined))
-}
-
-function nativeProfiles(root: string, env: Env): RoleProfiles {
-  return roleProfiles(loadWorkers(root), loadCodexRoot(env))
 }
 
 /** La caída propone la familia, el modelo y el esfuerzo del conductor; el usuario decide. */
