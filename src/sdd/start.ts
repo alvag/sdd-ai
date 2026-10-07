@@ -1,3 +1,4 @@
+import { renderFindingsTemplate } from '../findings.ts'
 import { randomBytes } from 'node:crypto'
 import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -15,7 +16,7 @@ export const RISKS = ['low', 'high', 'unknown'] as const
 export const CHANGE_TYPES = ['feat', 'fix', 'refactor', 'chore', 'docs', 'test', 'perf'] as const
 export interface StartDeps {
   env: Record<string, string | undefined>; hasCli: (family: Family) => boolean
-  initCommand?: string; reuseConfigCommand?: string
+  initCommand?: string; reuseConfigCommand?: string; flowFilesIo?: FlowFilesIo
 }
 export type BlockerCode = 'config_missing' | 'config_invalid' | 'family_cli_missing' | 'flow_exists' | 'path_invalid'
   | 'head_unknown' | 'base_branch_unknown'
@@ -314,8 +315,8 @@ export function startApply(root: string, id: string, input: StartInput, deps: St
     ...preview.families.map((f) => `- ${f.family}: CLI ${f.cli ? 'presente' : 'ausente'}.`), '', '## Antecedentes',
     'El detalle está en antecedentes.json.', ...Object.entries(antecedents).map(([source, s]) => `- ${source}: ${s.status}, ${s.count} aciertos, recortado: ${s.truncated}.`), ''].join('\n')
   const files = { 'pedido.md': valid.request, 'antecedentes.json': `${JSON.stringify(preview.antecedents, null, 2)}\n`,
-    'handoff.md': `---\n${stringify(handoff)}---\n\n${body}` }
-  writeFlowFiles(root, id, files)
+    'handoff.md': `---\n${stringify(handoff)}---\n\n${body}`, 'hallazgos.md': renderFindingsTemplate(id) }
+  writeFlowFiles(root, id, files, deps.flowFilesIo)
   return { state: 'ok', id, created: Object.keys(files).map((name) => `.plans/${id}/${name}`), handoff, antecedents,
     next: `./bin/sdd-ai sdd phase ${id} --request .plans/${id}/pedido.md` }
 }

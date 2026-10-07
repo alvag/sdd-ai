@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { findingsInstructions } from '../src/findings.ts'
 import { WORKER_POLICY } from '../src/worker-policy.ts'
 import { chainFlow, chainSetup, fakePrompts, runBin } from './helpers.ts'
 import { implReport, promptFile } from './chain-cli-fixture.ts'
@@ -58,7 +59,10 @@ test('run phase y review despachan la prevención y sync renueva agentes antiguo
   assert.equal(delegated.out.via, 'native')
   const dispatched = readFileSync(delegated.out.prompt_file, 'utf8')
   assert.equal(dispatched.split(WORKER_POLICY).length - 1, 1)
-  assert.ok(dispatched.endsWith(readFileSync(native.prompt, 'utf8')))
+  // El encargo sigue entero y una sola vez; detrás va el reporte de hallazgos que run anexa a explore.
+  const original = readFileSync(native.prompt, 'utf8')
+  assert.equal(dispatched.split(original).length - 1, 1)
+  assert.ok(dispatched.endsWith(`${original}\n\n${findingsInstructions('run')}`))
   const nativeRetry = nativeSetup({ families: '[codex]' })
   const failed = nativeCli(nativeRetry, ['run', '--prompt-file', nativeRetry.prompt])
   assert.equal(failed.out.reason, 'cli_missing')

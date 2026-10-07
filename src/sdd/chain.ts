@@ -1,3 +1,4 @@
+import { findingsInstructions } from '../findings.ts'
 import { SddError } from '../types.ts'
 import { WORKER_POLICY } from '../worker-policy.ts'
 import { WRITER_END_MARK } from '../writer.ts'
@@ -178,9 +179,10 @@ function fixText(input: FixPromptInput, tail: number | null): string {
     `Si necesitas releer los insumos: spec en \`${input.paths.spec}\`, plan en \`${input.paths.plan}\`, tasks en \`${input.paths.tasks}\`.`,
     '## Filas rojas',
     ...input.rows.map((r) => fixRow(r, tail)),
+    findingsInstructions('phase'),
     '## Formato del reporte',
     `Tu reporte trae un único objeto JSON con la clave \`"phase": "fix"\` y exactamente estas claves, antes de la línea \`${WRITER_END_MARK}\`:`,
-    '```json\n{ "phase": "fix", "missing_context": ["<lo que faltó>"], "rows": [{ "id": "V<n>", "changed": "<qué cambiaste>", "deviation": { "what": "<en qué te desviaste>", "why": "<por qué>" } | null }] }\n```',
+    '```json\n{ "phase": "fix", "findings": [], "missing_context": ["<lo que faltó>"], "rows": [{ "id": "V<n>", "changed": "<qué cambiaste>", "deviation": { "what": "<en qué te desviaste>", "why": "<por qué>" } | null }] }\n```',
     `- Una entrada por cada fila de esta lista (${input.rows.map((r) => r.id).join(', ')}), y solo esas.`,
     '- `missing_context` es obligatorio aunque vaya vacío.',
   ].join('\n\n') + '\n'
