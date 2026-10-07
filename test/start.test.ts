@@ -130,7 +130,8 @@ test('el ensayo muestra las claves de config que sdd-ai usa con lo que implican,
   const missing = preview(s)
   assert.equal(missing.code, 0)
   assert.equal(missing.out.blockers[0].code, 'config_missing')
-  assert.equal(missing.out.next, './bin/sdd-ai init')
+  // El repo del test no es el checkout de sdd-ai: start nombra el binario que corre, como init.
+  assert.ok(missing.out.next.startsWith('node ') && missing.out.next.includes(BIN) && missing.out.next.endsWith(' init'), missing.out.next)
   for (const [families, extra] of [['[]', ''], ['[claude]', 'jira_approval: {mode: maybe}\n']]) {
     configure(s, families, extra)
     assert.equal(preview(s).out.blockers[0].code, 'config_invalid')

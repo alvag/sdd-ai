@@ -977,7 +977,7 @@ Cada bloqueo del ensayo tiene un `next`. Con bloqueos, `--apply` se niega sin es
 
 | Bloqueo | Qué hacer |
 |---|---|
-| `config_missing` | Correr `./bin/sdd-ai init`. |
+| `config_missing` | Config físicamente ausente: en un worktree enlazado, correr el comando `init --reuse-config` indicado; fuera de él, `init` general. El comando usa el binario disponible del paquete. |
 | `config_invalid` | Corregir `.sdd-ai/config.yml` según el detalle y repetir el ensayo; también bloquea Jira inválido. |
 | `family_cli_missing` | Instalar el CLI nombrado, o quitar esa familia de `cross_model.families`, y repetir el ensayo. |
 | `flow_exists` | Consultar `./bin/sdd-ai sdd status <id>`; no se adopta un directorio con contenido. |
@@ -1309,6 +1309,51 @@ Los temporales van fuera del repositorio. Si hay sobrantes en `.sdd-ai/tmp/`, `p
 entrada por antigüedad y conserva las recientes; no vacía el directorio entero.
 
 ## 11. Preparar el checkout: `init`
+
+### Copia directa en un worktree: `init --reuse-config`
+
+Si falta `.sdd-ai/config.yml` en un worktree enlazado, ejecuta:
+
+```sh
+./bin/sdd-ai init --reuse-config
+# Desde un worktree sin node_modules, usa el binario de otro checkout:
+node '<ruta-del-checkout>/bin/sdd-ai' init --reuse-config
+```
+
+La invocación explícita ejecuta la copia sin ensayo previo, digest ni confirmación interactiva propia.
+No admite `--apply`, `--digest`, `--families`, `--jira`, `--from`, `--telemetry` ni argumentos posicionales.
+Git identifica el checkout principal aunque esté fuera del árbol padre del worktree. Fuera de un
+worktree enlazado se rechaza la operación; preparar configuración nueva es una elección separada.
+
+Solo copia `.sdd-ai/.gitignore`, `.sdd-ai/workers.yml` y `.sdd-ai/config.yml`, literalmente, sin
+normalizar YAML, fusionar perfiles ni consultar catálogos. La fuente debe tener los tres archivos
+regulares, legibles y configuración y workers válidos. Se rechazan enlaces válidos o rotos,
+entradas no regulares, directorios `.sdd-ai` simbólicos y errores de acceso antes de comenzar.
+Los archivos locales regulares se conservan con sus bytes y fechas; workers locales inválidos
+bloquean la copia. Si config local ya existe, se valida y no se completa ningún otro archivo:
+un config vacío, inválido o sin cross_model necesita corrección explícita, no reutilización.
+
+El resultado trae `state`, `root`, `source` (null si no se consultó), `copied`, `preserved`, `pending`
+y `errors` con `code`, `path` y `message`. Los nombres en las listas son relativos a `.sdd-ai`.
+Código 0 corresponde a `copied` o `unchanged`; código 2 a `blocked` o `partial`.
+La copia usa creación exclusiva, incluso si un destino aparece concurrentemente, y escribe en orden
+`.gitignore`, `workers.yml`, `config.yml`. Un fallo detiene los archivos posteriores: `copied`
+contiene solo copias completadas, `pending` solo archivos confirmados ausentes y el error de copia
+incluye `entry_exists` (null cuando no se pudo inspeccionar). No hay rollback del conjunto.
+Repite el mismo comando para completar solo lo ausente; una entrada incompleta que exista se
+conserva y exige corrección explícita. Repetir una copia completa válida no escribe.
+
+No copia runs, projection, hooks, locks, tmp ni otro estado; tampoco recupera restauraciones,
+adopta o cancela corridas, publica proyección, sincroniza agentes, instala dependencias ni cambia
+preferencias. Copiar no inicia ni aprueba un flujo. Después, repite `sdd start`: los bloqueos
+independientes, como CLI ausente o flujo con contenido, siguen vigentes. Un archivo existente
+inválido se presenta como `config_invalid`, aunque el loader interno use `config_missing`.
+
+Las rutas se resuelven con Git y utilidades nativas. La revisión de rutas Windows no acredita una
+ejecución allí: Windows queda pendiente hasta una prueba real. La prueba de Orca en macOS también
+requiere evidencia del conductor; los fixtures de Git no demuestran pertenencia a Orca.
+
+### Preparación general
 
 `init` deja listo un checkout de sdd-ai:
 - escribe `.sdd-ai/config.yml` y `.sdd-ai/workers.yml`;

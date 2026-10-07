@@ -19,6 +19,7 @@ import { MOD_ADOPTION_MESSAGE, modCopy, modInventory } from './mod-copies.ts'
 import { type ModEngineContext, inspectModEngine, modEngineContext } from './mod-engine.ts'
 import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, readGitState, readHeadState, repoRoot } from './git.ts'
 import { type InitAnswers, applyInit, planInit } from './init.ts'
+import { reuseWorktreeConfig } from './worktree-config.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { inPath } from './cli-path.ts'
 import { cancelNative } from './native-launch.ts'
@@ -2118,15 +2119,26 @@ function agents(args: string[], env: Env, cwd: string): Result {
   return { code: 0, out: { written, removed, next: `reabre la sesión para que el CLI cargue los agentes y la skill. ${MOD_ADOPTION_MESSAGE}` } }
 }
 
+function checkoutBin(root: string): string {
+  return realpathSync(PKG_DIR) === realpathSync(root) ? './bin/sdd-ai' : `node ${shellArg(BIN_PATH)}`
+}
+
 /**
  * `init` prepara el checkout: sin `--apply`, un ensayo que no escribe; con `--apply`, el plan de ese
- * ensayo, atado a su digest.
+ * ensayo, atado a su digest. `--reuse-config` ejecuta únicamente la copia directa.
  */
 function init(args: string[], env: Env, cwd: string): Result {
   const { values } = parseArgs({
     args, strict: true, allowPositionals: false,
-    options: { apply: { type: 'boolean' }, digest: { type: 'string' }, families: { type: 'string' }, jira: { type: 'string' }, from: { type: 'string' }, telemetry: { type: 'string' } },
+    options: { 'reuse-config': { type: 'boolean' }, apply: { type: 'boolean' }, digest: { type: 'string' }, families: { type: 'string' }, jira: { type: 'string' }, from: { type: 'string' }, telemetry: { type: 'string' } },
   })
+  if (values['reuse-config']) {
+    if (Object.keys(values).some((key) => key !== 'reuse-config')) throw new SddError('usage', '--reuse-config no admite flags de preparación general')
+    let root: string
+    try { root = repoRoot(cwd) } catch { root = cwd }
+    const out = reuseWorktreeConfig(root)
+    return { code: out.state === 'copied' || out.state === 'unchanged' ? 0 : 2, out }
+  }
   const answers: InitAnswers = {}
   if (values.telemetry !== undefined) {
     if (values.telemetry !== 'on' && values.telemetry !== 'off') throw new SddError('usage', '--telemetry tiene que ser on u off')
@@ -2140,7 +2152,7 @@ function init(args: string[], env: Env, cwd: string): Result {
   if (values.from !== undefined) answers.from = resolvePath(cwd, values.from)
   const root = repoRoot(cwd)
   // Un worktree sin node_modules se prepara con el binario de otro checkout: los comandos lo nombran.
-  const bin = realpathSync(PKG_DIR) === realpathSync(root) ? './bin/sdd-ai' : `node ${shellArg(BIN_PATH)}`
+  const bin = checkoutBin(root)
   const flags: string[] = []
   if (answers.families !== undefined) flags.push('--families', answers.families.join(','))
   if (answers.jira !== undefined) flags.push('--jira', answers.jira)
@@ -2829,7 +2841,8 @@ function sddStart(args: string[], env: Env, cwd: string): Result {
     if (values[flag] !== undefined) throw new SddError('usage', `--${flag} solo va con --apply`, { next: 'quita los flags de aplicación para el ensayo, o agrega --apply' })
   }
   const root = repoRoot(cwd)
-  const deps = { env, hasCli: (family: Family) => inPath(family, env) }
+  const bin = checkoutBin(root)
+  const deps = { env, hasCli: (family: Family) => inPath(family, env), initCommand: `${bin} init`, reuseConfigCommand: `${bin} init --reuse-config` }
   const options = { topic: values.topic, baseBranch: values['base-branch'] }
   if (!values.apply) return { code: 0, out: startPreview(root, positionals[0], options, deps) }
   const input = { ...options, depth: values.depth, risk: values.risk, changeType: values['change-type'],
@@ -3089,10 +3102,14 @@ const READS = (cmd: string | undefined, rest: string[]) =>
 
 /**
  * La entrada común recupera una restauración interrumpida de `sdd verify`, salvo en start, branch
- * y commit. start --apply y branch --apply recuperan después de validar; commit nunca recupera.
+ * y commit, y en init --reuse-config. start --apply y branch --apply recuperan después de validar; commit nunca recupera.
  * El supervisor interno tampoco la corre: es parte de una corrida en curso.
  */
+const reusesConfig = (cmd: string | undefined, rest: string[]) => cmd === 'init' && rest.some((arg) => arg === '--reuse-config' || arg.startsWith('--reuse-config='))
+
 function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string): void {
+  // La copia directa tampoco recupera, incluso cuando su combinación de flags es inválida.
+  if (reusesConfig(cmd, rest)) return
   // El ensayo de `sdd start` no escribe nada, y la recuperación escribe aun en modo no bloqueante: `sddStart` la corre
   // él mismo, bloqueante, solo con `--apply` y después de validar.
   if (cmd === 'sdd' && rest[0] === 'start') return
@@ -3114,11 +3131,13 @@ function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string)
  * Cada verbo pide publicar la proyección después de cada `status.json` que escribe y una vez más al terminar,
  * después de soltar sus locks, también si falló a mitad de camino: así la proyección refleja lo que quedó y la
  * primera actividad normal adopta los estados existentes. Un repositorio sin `.sdd-ai/` no se toca. Publicar
- * corre en otro proceso y no cambia la salida, el código ni las decisiones del verbo.
+ * corre en otro proceso y no cambia la salida, el código ni las decisiones del verbo. init --reuse-config
+ * no pide publicación, tampoco después de errores de uso.
  */
 export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {
   const [cmd, ...rest] = argv
   const previous = onStatusWritten((dir) => {
+    if (reusesConfig(cmd, rest)) return
     const root = runRoot(dir)
     if (root !== null) requestPublication(root, `status:${cmd}`, 'cli')
   })
@@ -3126,8 +3145,8 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
     return await verb(cmd, rest, env, cwd)
   } finally {
     onStatusWritten(previous)
-    // El supervisor publica por su cuenta; `doctor` puede correr fuera de un checkout de sdd-ai.
-    if (cmd !== '__supervise' && cmd !== '__publish' && cmd !== 'doctor') {
+    // El supervisor publica por su cuenta; doctor puede correr fuera de un checkout; la copia directa no publica.
+    if (!reusesConfig(cmd, rest) && cmd !== '__supervise' && cmd !== '__publish' && cmd !== 'doctor') {
       try {
         const root = repoRoot(cwd)
         if (existsSync(join(root, '.sdd-ai'))) requestPublication(root, `cli:${[cmd, rest[0]].filter(Boolean).join(' ')}`, 'cli')
