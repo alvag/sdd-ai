@@ -15,6 +15,7 @@ import { restoreIntentOpen } from './sdd/restore.ts'
 import { type FlowStatus, type Reason, type Step, headerData, resolve } from './sdd/status.ts'
 import { isNotifierOperational } from './notification.ts'
 import { shellSegments } from './shell.ts'
+import { SESSION_SYNC_HEADER, renderSessionSync } from './session-start-sync.ts'
 import type { NativeProfile } from './types.ts'
 
 export type HookCli = 'claude' | 'codex'
@@ -66,7 +67,7 @@ export function runHook(stdin: string, cli: HookCli): string {
     startTrail(root, p.session_id, via)
     try {
       switch (p.hook_event_name) {
-        case 'SessionStart': return sessionStart(p, root, p.session_id)
+        case 'SessionStart': return sessionStart(p, root, p.session_id, cli)
         case 'Stop': return stop(p, root, p.session_id, cli)
         case 'PreToolUse': return preToolUse(p, root, p.session_id, cli)
         case 'PostToolUse': return postToolUse(p, root, p.session_id, cli)
@@ -97,11 +98,19 @@ function context(event: string, additionalContext: string): string {
 }
 
 /**
- * El bootstrap de la ruta directa, seguido de la lista de corridas y la de flujos, en una sola salida.
+ * El bootstrap de la ruta directa, las listas de corridas y flujos y el aviso de copias, en una sola salida.
  * Una sesión bifurcada hereda el contexto de la original y no recibe nada.
  */
-function sessionStart(p: Payload, root: string, session: string): string {
-  const text = [bootstrap(p, root, session), runList(p, root, session), flowList(p, root, session)].filter(Boolean).join('\n\n')
+function sessionStart(p: Payload, root: string, session: string, cli: HookCli): string {
+  let sync = ''
+  if (typeof p.source === 'string' && FLOW_SOURCES.includes(p.source)) {
+    try {
+      sync = renderSessionSync(root, join(import.meta.dirname, '..'), cli, process.env)
+    } catch (error) {
+      sync = `${SESSION_SYNC_HEADER}\nNo se pudo comprobar las copias (${errorText(error)}). Comunica esta limitación al usuario.`
+    }
+  }
+  const text = [bootstrap(p, root, session), runList(p, root, session), flowList(p, root, session), sync].filter(Boolean).join('\n\n')
   return text === '' ? '' : context('SessionStart', text)
 }
 

@@ -1,4 +1,4 @@
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
@@ -15,12 +15,33 @@ import { resolve } from '../src/sdd/status.ts'
 import type { Status } from '../src/types.ts'
 import { checkOutput, payload } from './hook-contract.ts'
 import { makeRepo } from './helpers.ts'
+import { PACKAGE_ROOT, excludeCopies, installCurrentCopies, isolatedEnv } from './session-start-sync-fixture.ts'
+
+const profileHome = mkdtempSync(join(tmpdir(), 'sdd-ai-hook-profiles-'))
+const previousCodexHome = process.env.CODEX_HOME
+const profileEnv = isolatedEnv(profileHome)
+process.env.CODEX_HOME = profileEnv.CODEX_HOME
+const preparedCopies = new Set<string>()
+function prepareCopies(repo: string): void {
+  if (preparedCopies.has(repo)) return
+  // Un repo que ya corrió agents sync con el binario conserva sus copias: pisarlas con otros perfiles las deja stale.
+  if (existsSync(join(repo, '.claude', 'agents'))) return
+  excludeCopies(repo)
+  installCurrentCopies(repo, PACKAGE_ROOT, profileEnv)
+  preparedCopies.add(repo)
+}
+after(() => {
+  if (previousCodexHome === undefined) delete process.env.CODEX_HOME
+  else process.env.CODEX_HOME = previousCodexHome
+  rmSync(profileHome, { recursive: true, force: true })
+})
 
 const CLIS = ['claude', 'codex'] as const
 type Cli = typeof CLIS[number]
 
 /** Una corrida con dueño `s1` salvo que se diga otro; `session: null` la deja sin dueño. */
 function makeRun(repo: string, id: string, status: Status, o: { session?: string | null; review?: boolean; native?: boolean } = {}): string {
+  prepareCopies(repo)
   const dir = createRun(repo, id)
   const request: Record<string, unknown> = { conductor: { family: 'claude' }, role: 'explore' }
   if (o.session !== null) request.session = o.session ?? 's1'
@@ -128,6 +149,7 @@ test('sin corridas abiertas SessionStart solo trae el bootstrap', () => {
   for (const cli of CLIS) {
     const empty = makeRepo()
     mkdirSync(join(empty, '.sdd-ai'))
+    prepareCopies(empty)
     assert.equal(text(fire(cli, 'session-start', empty, { session_id: 's1', source: 'resume' })), renderBootstrap())
     const repo = makeRepo()
     const done: Status = { state: 'done' }
@@ -164,6 +186,7 @@ test('SessionStart startup, clear y compact anteponen el bootstrap a la lista de
     for (const source of ['startup', 'clear', 'compact']) {
       const empty = makeRepo()
       mkdirSync(join(empty, '.sdd-ai'))
+      prepareCopies(empty)
       const alone = fire(cli, 'session-start', empty, { session_id: 's1', source })
       assert.deepEqual(checkOutput(cli, 'SessionStart', alone), [], `${cli} ${source}`)
       assert.equal(text(alone), renderBootstrap())
@@ -185,6 +208,7 @@ test('SessionStart resume entrega el bootstrap según la regla de la sonda, sin 
   for (const cli of CLIS) {
     const repo = makeRepo()
     mkdirSync(join(repo, '.sdd-ai'))
+    prepareCopies(repo)
     assert.equal(text(fire(cli, 'session-start', repo, { session_id: 's1', source: 'startup' })), renderBootstrap())
     // La sesión retomada conserva el contexto del arranque: no se repite.
     assert.equal(fire(cli, 'session-start', repo, { session_id: 's1', source: 'resume' }), '')
@@ -209,6 +233,7 @@ test('sin .sdd-ai SessionStart sigue callando', () => {
 test('sin la guarda, un SessionStart de Codex con transcript_path null recibe el bootstrap', () => {
   const repo = makeRepo()
   mkdirSync(join(repo, '.sdd-ai'))
+  prepareCopies(repo)
   assert.equal(text(fire('codex', 'session-start', repo, { session_id: 's1', source: 'startup', transcript_path: null })), renderBootstrap())
 })
 
@@ -788,6 +813,7 @@ function writeFlow(repo: string, id: string, o: FlowShape = {}): void {
 function flowRepo(jira?: 'on' | 'off' | 'invalid'): string {
   const repo = makeRepo()
   mkdirSync(join(repo, '.sdd-ai'))
+  prepareCopies(repo)
   if (jira) writeFileSync(join(repo, '.sdd-ai', 'config.yml'), `jira_approval:\n  mode: ${jira === 'invalid' ? 'true' : `"${jira}"`}\n`)
   return repo
 }

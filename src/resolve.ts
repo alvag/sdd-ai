@@ -1,5 +1,5 @@
 import type { RoleProfiles } from './agents.ts'
-import type { WorkersFile } from './profiles.ts'
+import { type WorkersFile, loadWorkers, loadCodexRoot } from './profiles.ts'
 import {
   type Conductor, type Effort, type Family, type Origin, type Profile, type Resolution, type Role,
   READ_ONLY_ROLES, opposite, toNativeEffort,
@@ -69,4 +69,9 @@ export function roleProfiles(workers: WorkersFile | null, codexRoot: Profile): R
     claude: nativeProfile('claude', role, workers, codexRoot),
     codex: nativeProfile('codex', role, workers, codexRoot),
   }])) as RoleProfiles
+}
+
+/** Los mismos perfiles del worktree y del entorno para el despacho y las inspecciones. */
+export function nativeProfiles(root: string, env: Record<string, string | undefined>): RoleProfiles {
+  return roleProfiles(loadWorkers(root), loadCodexRoot(env))
 }

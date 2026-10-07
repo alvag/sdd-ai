@@ -22,8 +22,18 @@ export function agentName(role: ReadOnlyRole): string {
   return `sdd-ai-${role}`
 }
 
+/** La ruta de un agente generado, relativa a la raíz del checkout. */
+export function agentRelPath(family: Family, role: ReadOnlyRole): string {
+  return join(AGENT_DIRS[family], `${agentName(role)}${AGENT_EXT[family]}`)
+}
+
+/** La ruta de la copia de la skill de una familia, relativa a la raíz del checkout. */
+export function skillRelPath(family: Family): string {
+  return SKILL_PATHS[family === 'claude' ? 0 : 1]
+}
+
 function agentPath(root: string, family: Family, role: ReadOnlyRole): string {
-  return join(root, AGENT_DIRS[family], `${agentName(role)}${AGENT_EXT[family]}`)
+  return join(root, agentRelPath(family, role))
 }
 
 export function parseAgentSource(crlfText: string): AgentSource {
@@ -86,7 +96,7 @@ export function renderCodexAgent(src: AgentSource, role: ReadOnlyRole, p: Profil
   return lines.join('\n')
 }
 
-function render(family: Family, src: AgentSource, role: ReadOnlyRole, profiles: RoleProfiles): string {
+export function renderAgent(family: Family, src: AgentSource, role: ReadOnlyRole, profiles: RoleProfiles): string {
   const hash = sourceHash(src, profiles[role])
   const p = profiles[role][family]
   return family === 'claude' ? renderClaudeAgent(src, role, p, hash) : renderCodexAgent(src, role, p, hash)
@@ -96,7 +106,7 @@ function toLf(text: string): string {
   return text.replace(/\r\n/g, '\n')
 }
 
-function readSource(pkgDir: string): AgentSource {
+export function readSource(pkgDir: string): AgentSource {
   return parseAgentSource(readFileSync(join(pkgDir, 'agents', 'worker.md'), 'utf8'))
 }
 
@@ -139,7 +149,7 @@ export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles,
   for (const role of READ_ONLY_ROLES) {
     for (const family of FAMILIES) {
       const file = agentPath(root, family, role)
-      write(file, render(family, src, role, profiles))
+      write(file, renderAgent(family, src, role, profiles))
       written.push(file)
     }
   }
@@ -159,10 +169,31 @@ export interface SkillCopy { path: string; state: 'ok' | 'stale' | 'missing' }
 
 export interface AgentCopy { path: string; family: Family; role: ReadOnlyRole; state: 'ok' | 'stale' | 'missing' }
 
+/** Lee primero la copia; la fuente diferida conserva el orden de errores del despacho. */
+export function agentCopy(root: string, family: Family, role: ReadOnlyRole, profiles: RoleProfiles, source: AgentSource | (() => AgentSource)): AgentCopy {
+  const path = agentRelPath(family, role)
+  const file = join(root, path)
+  if (!existsSync(file)) return { path, family, role, state: 'missing' }
+  const actual = toLf(readFileSync(file, 'utf8'))
+  const src = typeof source === 'function' ? source() : source
+  return { path, family, role, state: actual === renderAgent(family, src, role, profiles) ? 'ok' : 'stale' }
+}
+
+export function readSkillSource(pkgDir: string): string {
+  return toLf(readFileSync(join(pkgDir, 'skills', 'sdd-ai', 'SKILL.md'), 'latin1'))
+}
+
+export function skillCopy(root: string, family: Family, source: string): SkillCopy {
+  const path = skillRelPath(family)
+  const file = join(root, path)
+  if (!existsSync(file)) return { path, state: 'missing' }
+  return { path, state: toLf(readFileSync(file, 'latin1')) === source ? 'ok' : 'stale' }
+}
+
 /** Comparación completa contra la fuente y el perfil resuelto, igual que el despacho nativo. */
 export function agentCopies(root: string, pkgDir: string, profiles: RoleProfiles): AgentCopy[] {
   return READ_ONLY_ROLES.flatMap((role) => FAMILIES.map((family) => ({
-    path: join(AGENT_DIRS[family], `${agentName(role)}${AGENT_EXT[family]}`), family, role,
+    path: agentRelPath(family, role), family, role,
     state: agentsState(root, pkgDir, family, role, profiles),
   })))
 }
@@ -174,12 +205,8 @@ export function agentCopies(root: string, pkgDir: string, profiles: RoleProfiles
  * Se lee en `latin1` para que cada byte sea un carácter y la comparación siga siendo exacta.
  */
 export function skillCopies(root: string, pkgDir: string): SkillCopy[] {
-  const source = toLf(readFileSync(join(pkgDir, 'skills', 'sdd-ai', 'SKILL.md'), 'latin1'))
-  return SKILL_PATHS.map((path): SkillCopy => {
-    const file = join(root, path)
-    if (!existsSync(file)) return { path, state: 'missing' }
-    return { path, state: toLf(readFileSync(file, 'latin1')) === source ? 'ok' : 'stale' }
-  })
+  const source = readSkillSource(pkgDir)
+  return FAMILIES.map((family) => skillCopy(root, family, source))
 }
 
 /**
@@ -188,7 +215,6 @@ export function skillCopies(root: string, pkgDir: string): SkillCopy[] {
  * CRLF y LF, porque un checkout de Windows con `core.autocrlf` trae los agentes con CRLF.
  */
 export function agentsState(root: string, pkgDir: string, family: Family, role: ReadOnlyRole, profiles: RoleProfiles): 'ok' | 'stale' | 'missing' {
-  const file = agentPath(root, family, role)
-  if (!existsSync(file)) return 'missing'
-  return toLf(readFileSync(file, 'utf8')) === render(family, readSource(pkgDir), role, profiles) ? 'ok' : 'stale'
+  // agentCopy devuelve 'missing' sin leer la fuente: la copia se lee antes que la fuente, como siempre.
+  return agentCopy(root, family, role, profiles, () => readSource(pkgDir)).state
 }
