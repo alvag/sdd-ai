@@ -55,6 +55,7 @@ import {
 import { type Freshness, type ReviewRequest, REVIEW_LOCK, converged, freshness, untrackedOf } from './review/standing.ts'
 import { applyCommit, planCommit } from './sdd/commit.ts'
 import { approve } from './sdd/approve.ts'
+import { type ApproveDeps, ApprovalSyncPending } from './sdd/approve-sync.ts'
 import { assertBranchApplicable, branchApply, branchPreview } from './sdd/branch.ts'
 import { criteriaIds, taskLines } from './sdd/markdown.ts'
 import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, phaseTouchesMods, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
@@ -2796,10 +2797,10 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
 
 /**
  * El estado de los flujos SDD de `.plans/`. `status` solo lee y sale con 0 aunque el flujo esté
- * bloqueado; `approve` registra la aprobación de un gate y responde el estado nuevo; `phase` lanza la
+ * bloqueado; `approve` registra o recupera la aprobación y sincroniza sus headers; `phase` lanza la
  * fase del flujo en un worker.
  */
-async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
+async function sdd(args: string[], env: Env, cwd: string, deps?: { approve?: ApproveDeps }): Promise<Result> {
   const [sub, ...rest] = args
   if (sub === 'start') return sddStart(rest, env, cwd)
   if (sub === 'branch') return sddBranch(rest, env, cwd)
@@ -2816,9 +2817,14 @@ async function sdd(args: string[], env: Env, cwd: string): Promise<Result> {
     const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { conductor: { type: 'string' } } })
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
     const root = repoRoot(cwd)
-    const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor))
-    const { facts } = readFlow(root, status.id)
-    return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
+    try {
+      const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor), deps?.approve)
+      const { facts } = readFlow(root, status.id)
+      return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
+    } catch (e) {
+      if (e instanceof ApprovalSyncPending) return { code: 3, out: e.result }
+      throw e
+    }
   }
   if (sub === 'verify') return sddVerify(rest, env, cwd)
   throw new SddError('usage', `subcomando desconocido: sdd ${sub ?? ''}`, { next: './bin/sdd-ai sdd start <id> | ./bin/sdd-ai sdd branch <id> [--apply [--current | --prefix <p>] [--refreeze]] | ./bin/sdd-ai sdd status [<id>] | ./bin/sdd-ai sdd approve <id> <gate> | ./bin/sdd-ai sdd phase <id> | ./bin/sdd-ai sdd verify <id> | ./bin/sdd-ai sdd commit <id> --subject <asunto> [--apply --digest <d>]' })
@@ -3130,7 +3136,7 @@ function recoverBeforeVerb(cmd: string | undefined, rest: string[], cwd: string)
  * corre en otro proceso y no cambia la salida, el código ni las decisiones del verbo. init --reuse-config
  * no pide publicación, tampoco después de errores de uso.
  */
-export async function main(argv: string[], env: Env, cwd: string): Promise<Result> {
+export async function main(argv: string[], env: Env, cwd: string, deps?: { approve?: ApproveDeps }): Promise<Result> {
   const [cmd, ...rest] = argv
   const previous = onStatusWritten((dir) => {
     if (reusesConfig(cmd, rest)) return
@@ -3138,7 +3144,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
     if (root !== null) requestPublication(root, `status:${cmd}`, 'cli')
   })
   try {
-    return await verb(cmd, rest, env, cwd)
+    return await verb(cmd, rest, env, cwd, deps)
   } finally {
     onStatusWritten(previous)
     // El supervisor publica por su cuenta; doctor puede correr fuera de un checkout; la copia directa no publica.
@@ -3153,7 +3159,7 @@ export async function main(argv: string[], env: Env, cwd: string): Promise<Resul
   }
 }
 
-async function verb(cmd: string | undefined, rest: string[], env: Env, cwd: string): Promise<Result> {
+async function verb(cmd: string | undefined, rest: string[], env: Env, cwd: string, deps?: { approve?: ApproveDeps }): Promise<Result> {
   try {
     recoverBeforeVerb(cmd, rest, cwd)
     switch (cmd) {
@@ -3165,7 +3171,7 @@ async function verb(cmd: string | undefined, rest: string[], env: Env, cwd: stri
       case 'init': return init(rest, env, cwd)
       case 'prune': return prune(rest, cwd)
       case 'recall': return recallCommand(rest, env, cwd)
-      case 'sdd': return await sdd(rest, env, cwd)
+      case 'sdd': return await sdd(rest, env, cwd, deps)
       case 'doctor': {
         let engine
         try { engine = inspectModEngine(repoRoot(cwd)) } catch (e) {

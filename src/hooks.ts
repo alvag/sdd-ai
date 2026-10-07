@@ -515,7 +515,11 @@ function guardShell(p: Payload): string {
   if (typeof p.agent_id !== 'string' || p.agent_id === '') return ''
   const command = isRecord(p.tool_input) ? p.tool_input.command : undefined
   if (typeof command !== 'string') return ''
-  return shellSegments(command).some(invokesConductorCommand) ? deny('un worker no delega ni toca las corridas del conductor') : ''
+  const denied = shellSegments(command).filter(invokesConductorCommand)
+  if (denied.length === 0) return ''
+  // `sdd approve` nombra además `runner_required`, el mismo código con que la prueba niega a un worker.
+  const approves = denied.some((segment) => /\bsdd\s+approve\b/.test(segment))
+  return deny(`un worker no delega ni toca las corridas del conductor${approves ? ' (runner_required: un subagente no aprueba gates)' : ''}`)
 }
 
 
