@@ -1,10 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolve } from 'node:path'
+import { posix } from 'node:path'
 import { bindingCommand, commitTargets, invokesBinding } from '../src/commands.ts'
 import { shellPipelines } from '../src/shell.ts'
 
-const W = resolve('/w')
+// Estos casos fijan la lectura POSIX previa: plataforma 'linux' y rutas de path.posix, también desde Windows.
+const W = posix.resolve('/w')
+const resolve = posix.resolve
+const targets = (command: string, cwd: string) => commitTargets(command, cwd, 'linux')
 
 test('bindingCommand reconoce las formas del binario solo en el primer tramo', () => {
   const binds: [string, 'status' | 'approve' | 'phase'][] = [
@@ -46,9 +49,9 @@ test('bindingCommand reconoce las formas del binario solo en el primer tramo', (
     'sdd-ai sdd approve f1 spec extra',
   ]
   for (const command of none) assert.equal(bindingCommand(command), undefined, command)
-  assert.equal(invokesBinding('cd x && ./bin/sdd-ai sdd status f1'), true)
-  assert.equal(invokesBinding('false && ./bin/sdd-ai sdd status f1'), true)
-  assert.equal(invokesBinding('echo sdd-ai sdd status f1 && git status'), false)
+  assert.equal(invokesBinding('cd x && ./bin/sdd-ai sdd status f1', 'linux'), true)
+  assert.equal(invokesBinding('false && ./bin/sdd-ai sdd status f1', 'linux'), true)
+  assert.equal(invokesBinding('echo sdd-ai sdd status f1 && git status', 'linux'), false)
 })
 
 test('commitTargets encuentra git commit con -C, -c, asignaciones, subcapas y en cualquier tramo, también tras un & simple', () => {
@@ -62,8 +65,8 @@ test('commitTargets encuentra git commit con -C, -c, asignaciones, subcapas y en
     'git add . & git commit',
     'x | git commit',
   ]
-  for (const command of commands) assert.deepEqual(commitTargets(command, W), [{ dir: W }], command)
-  assert.deepEqual(commitTargets('git -C /r commit && git commit', W), [{ dir: resolve('/r') }, { dir: W }])
+  for (const command of commands) assert.deepEqual(targets(command, W), [{ dir: W }], command)
+  assert.deepEqual(targets('git -C /r commit && git commit', W), [{ dir: resolve('/r') }, { dir: W }])
 })
 
 test('el destino: -C absoluto, cd o pushd previo desconocido, relativo al cwd, no literal desconocido', () => {
@@ -81,13 +84,30 @@ test('el destino: -C absoluto, cd o pushd previo desconocido, relativo al cwd, n
     ['git --git-dir /r/.git commit', { unknown: true }],
     ['git --work-tree=/r commit', { unknown: true }],
   ]
-  for (const [command, target] of cases) assert.deepEqual(commitTargets(command, W), [target], command)
+  for (const [command, target] of cases) assert.deepEqual(targets(command, W), [target], command)
 })
 
 test('no son commits git log --grep commit, echo git commit ni git commit-tree', () => {
   for (const command of ['git log --grep commit', 'echo git commit', 'git commit-tree', 'echo "a; git commit"']) {
-    assert.deepEqual(commitTargets(command, W), [], command)
+    assert.deepEqual(targets(command, W), [], command)
   }
+})
+
+test('fuera de Windows se conserva la lectura POSIX previa en comillas dobles, tramos y movimientos', () => {
+  // Entre comillas dobles la barra escapa cualquier carácter, como antes.
+  assert.deepEqual(targets('git -C "/a\\b" commit', W), [{ dir: resolve('/ab') }])
+  assert.deepEqual(targets("git -C '/a\\b' commit", W), [{ dir: resolve('/a\\b') }])
+  assert.deepEqual(targets('git -C /a\\ b commit', W), [{ dir: resolve('/a b') }])
+  // Solo cd y pushd mueven; las formas de PowerShell no aplican.
+  for (const command of ['Set-Location /r && git commit', 'sl /r && git commit', 'cd.. && git commit', 'D: && git commit']) {
+    assert.deepEqual(targets(command, W), [{ dir: W }], command)
+  }
+  for (const command of ['cd /r && git commit', 'pushd /r && git commit']) assert.deepEqual(targets(command, W), [{ unknown: true }], command)
+  // La barra ante `;` escapa el separador: no hay segundo tramo.
+  assert.deepEqual(targets('echo \\; git commit', W), [])
+  assert.equal(invokesBinding('echo \\; ./bin/sdd-ai sdd status f1', 'linux'), false)
+  // Una ruta con unidad no se lee como absoluta fuera de Windows.
+  assert.deepEqual(targets("git -C 'C:\\a' commit", W), [{ dir: resolve(W, 'C:\\a') }])
 })
 
 test('shellPipelines agrupa los tramos por tubería, también tras un & simple, sin partir una redirección', () => {

@@ -16,8 +16,11 @@ import type { Status } from '../src/types.ts'
 import { checkOutput, payload } from './hook-contract.ts'
 import { makeRepo } from './helpers.ts'
 
-const CLIS = ['claude', 'codex'] as const
-type Cli = typeof CLIS[number]
+import {
+  BIN, CHILD, CIPHER, CLIS, DISPATCH, GUARD_STEPS, SPEC_APPROVED, USER_COMMITS, assertUnconfirmed, bound, boundRepo, canonical,
+  decision, denial, dispatch, dispatchV2, flowRepo, nativeRun, post, reservedRun, sdd, sddRepo, shell, textKey, typeKey, writeFlow,
+  type Cli, type FlowShape, type Out,
+} from './hooks-fixture.ts'
 
 /** Una corrida con dueño `s1` salvo que se diga otro; `session: null` la deja sin dueño. */
 function makeRun(repo: string, id: string, status: Status, o: { session?: string | null; review?: boolean; native?: boolean } = {}): string {
@@ -33,8 +36,6 @@ function makeRun(repo: string, id: string, status: Status, o: { session?: string
 }
 
 const delivered = (dir: string, s: Status) => writeJsonAtomic(join(dir, 'delivered.json'), { round: s.round ?? null, launch: s.launch ?? null })
-
-type Out = Record<string, any>
 
 function fire(cli: Cli, event: 'session-start' | 'stop', repo: string, patch: Record<string, unknown>): Out | '' {
   const out = runHook(JSON.stringify(payload(cli, event, { cwd: repo, ...patch })), cli)
@@ -292,63 +293,6 @@ test('Stop vuelve a recordar si cambian el estado, la ronda o el intento', () =>
     assert.equal(stop(), '')
   }
 })
-
-// Despachos de agentes: las corridas nativas salen de bin/sdd-ai run, como en una sesión real.
-
-const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
-const DISPATCH = { claude: 'pre-tool-use-agent', codex: 'pre-tool-use-spawn-agent-v1' } as const
-const canonical = (file: string) => `Tu encargo está en ${file}. Léelo completo y cúmplelo.`
-
-function sdd(repo: string, cli: Cli, args: string[], session = 's1'): Out {
-  const env: Record<string, string> = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')), SDD_AI_PROJECTION: 'off' }
-  if (cli === 'claude') Object.assign(env, { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: session })
-  else Object.assign(env, { CODEX_THREAD_ID: 't', CODEX_SESSION_ID: session })
-  const r = spawnSync(process.execPath, [BIN, ...args], { cwd: repo, env, encoding: 'utf8' })
-  return JSON.parse(r.stdout) as Out
-}
-
-/** Repo con sdd-ai configurado para una sola familia y sus agentes generados. */
-function sddRepo(cli: Cli): string {
-  const repo = makeRepo()
-  mkdirSync(join(repo, '.sdd-ai'))
-  writeFileSync(join(repo, '.sdd-ai', 'config.yml'), `cross_model:\n  schema_version: 1\n  families: [${cli}]\n  selection: full\n`)
-  sdd(repo, cli, ['agents', 'sync'])
-  return repo
-}
-
-/** Una corrida nativa creada por `run`; devuelve lo que `run` le mostró al conductor. */
-function nativeRun(repo: string, cli: Cli, args: string[] = [], session = 's1'): Out {
-  const prompt = join(mkdtempSync(join(tmpdir(), 'sdd-ai-prompt-')), 'p.md')
-  writeFileSync(prompt, 'Encargo de prueba.\n')
-  const out = sdd(repo, cli, ['run', '--prompt-file', prompt, ...args], session)
-  assert.equal(out.via, 'native', JSON.stringify(out))
-  return out
-}
-
-function dispatch(cli: Cli, repo: string, input: Record<string, unknown>, patch: Record<string, unknown> = {}): Out | '' {
-  const base = payload(cli, DISPATCH[cli], {})
-  const p = { ...base, cwd: repo, session_id: 's1', tool_use_id: 'tu-1', ...patch, tool_input: { ...(base.tool_input as object), ...input } }
-  const out = runHook(JSON.stringify(p), cli)
-  return out === '' ? '' : JSON.parse(out) as Out
-}
-
-const CIPHER = (payload('codex', 'pre-tool-use-spawn-agent-v2', {}).tool_input as Record<string, string>).message
-
-/** Un despacho de `spawn_agent` v2, como lo manda Codex: `collaborationspawn_agent` con el mensaje cifrado. */
-function dispatchV2(repo: string, input: Record<string, unknown> = {}, patch: Record<string, unknown> = {}): Out | '' {
-  const base = payload('codex', 'pre-tool-use-spawn-agent-v2', {})
-  const p = { ...base, cwd: repo, session_id: 's1', tool_use_id: 'tu-1', ...patch, tool_input: { ...(base.tool_input as object), ...input } }
-  const out = runHook(JSON.stringify(p), 'codex')
-  return out === '' ? '' : JSON.parse(out) as Out
-}
-
-const typeKey = (cli: Cli) => (cli === 'claude' ? 'subagent_type' : 'agent_type')
-const textKey = (cli: Cli) => (cli === 'claude' ? 'prompt' : 'message')
-const decision = (out: Out | '') => (out === '' ? '' : out.hookSpecificOutput.permissionDecision)
-const denial = (out: Out | ''): string => {
-  assert.equal(decision(out), 'deny', JSON.stringify(out))
-  return (out as Out).hookSpecificOutput.permissionDecisionReason
-}
 
 test('sin .sdd-ai calla también ante un despacho sdd-ai-*', () => {
   for (const cli of CLIS) {
@@ -617,28 +561,6 @@ test('una reserva sin confirmar se niega y Stop pide preguntar', () => {
   assert.equal(existsSync(join(repo, '.sdd-ai', 'runs', run.id, 'launch.json')), false)
 })
 
-/** Una nativa de `run` con su despacho reservado y sin confirmar, como la deja un lanzamiento que no avisó. */
-function reservedRun(repo: string, cli: Cli, toolUseId: string): Out {
-  const run = nativeRun(repo, cli)
-  assert.equal(reserve(join(repo, '.sdd-ai', 'runs', run.id), toolUseId), true)
-  return run
-}
-
-/** La negación de H-30: nombra la corrida, remite a preguntar y advierte que reintentar puede duplicar el agente. */
-function assertUnconfirmed(out: Out | '', cli: Cli, ids: string[]): string {
-  const reason = denial(out)
-  assert.deepEqual(checkOutput(cli, 'PreToolUse', out), [])
-  for (const id of ids) {
-    assert.ok(reason.includes(id), `no nombra ${id}: ${reason}`)
-    assert.ok(reason.includes(`./bin/sdd-ai cancel ${id}`) && reason.includes(`./bin/sdd-ai run --retry ${id}`), reason)
-  }
-  assert.match(reason, /preguntarle al usuario/)
-  assert.match(reason, /`cancel` solo cambia el registro local/)
-  assert.match(reason, /reintentar puede lanzar otro agente/)
-  assert.doesNotMatch(reason, /no es una nativa sin lanzar ni reservar/)
-  return reason
-}
-
 test('una reserva sin confirmar, sin otra pendiente, se niega nombrándola, remitiendo a preguntar y advirtiendo el riesgo de duplicar', () => {
   for (const cli of CLIS) {
     const repo = sddRepo(cli)
@@ -706,14 +628,6 @@ test('cada salida cumple el esquema de salida de Codex y la forma de Claude', ()
   }
 })
 
-function shell(cli: Cli, repo: string, command: string, patch: Record<string, unknown> = {}): Out | '' {
-  const base = payload(cli, 'pre-tool-use-bash', {})
-  const p = { ...base, cwd: repo, session_id: 's1', ...patch, tool_input: { ...(base.tool_input as object), command } }
-  const out = runHook(JSON.stringify(p), cli)
-  return out === '' ? '' : JSON.parse(out) as Out
-}
-
-const CHILD = { agent_id: 'a1', agent_type: 'general-purpose' }
 const WORKER_COMMANDS = [
   'sdd-ai run --prompt-file encargo.md',
   './bin/sdd-ai wait 20260101-0001-aaaa',
@@ -742,9 +656,13 @@ test('fuera de un hijo no se niega un comando de corridas', () => {
     mkdirSync(join(repo, '.sdd-ai'))
     for (const command of WORKER_COMMANDS) assert.equal(shell(cli, repo, command), '', command)
     assert.equal(shell('claude', repo, WORKER_COMMANDS[0], { agent_type: 'mi-agente' }), '', 'agent_type sin agent_id es la sesión principal')
-    for (const command of ['echo "sdd-ai run"', 'echo "a; sdd-ai run x"', 'echo \\; ./bin/sdd-ai run']) {
+    for (const command of ['echo "sdd-ai run"', 'echo "a; sdd-ai run x"']) {
       assert.equal(shell(cli, repo, command, CHILD), '', command)
     }
+    // En Windows PowerShell ejecutaría el segundo tramo; el negativo POSIX vive en shell-windows.unit.test.ts.
+    const escaped = shell(cli, repo, 'echo \\; ./bin/sdd-ai run', CHILD)
+    if (process.platform === 'win32') assert.match(denial(escaped), /un worker no delega ni toca las corridas del conductor/)
+    else assert.equal(escaped, '')
   }
 })
 
@@ -769,44 +687,7 @@ test('dentro de un hijo se niega sdd approve en sus formas directas y no sdd sta
 
 // La liga con un flujo SDD, SessionStart con los flujos, Stop con el flujo ligado y la guarda del commit.
 
-const SPEC_APPROVED = '2026-09-28T12:00:00-05:00'
-type FlowShape = { handoff?: Record<string, unknown> | null; spec?: boolean; plan?: Record<string, unknown>; tasks?: 'pending' | 'done' }
-
-/** Un flujo completo en `.plans/<id>/`: con la spec aprobada salvo que el handoff diga otra cosa. */
-function writeFlow(repo: string, id: string, o: FlowShape = {}): void {
-  const dir = join(repo, '.plans', id)
-  mkdirSync(dir, { recursive: true })
-  const front = (data: Record<string, unknown>, body: string) =>
-    `---\n${Object.entries(data).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n')}\n---\n\n${body}\n`
-  const handoff = o.handoff === undefined ? { profundidad: 'completa', spec_approved_at: SPEC_APPROVED, branch: 'feature/f' } : o.handoff
-  if (handoff !== null) writeFileSync(join(dir, 'handoff.md'), front(handoff, '# Handoff'))
-  if (o.spec ?? true) writeFileSync(join(dir, 'spec.md'), '# Spec\n\n- **AC-1** — algo.\n')
-  if (o.plan) writeFileSync(join(dir, 'plan.md'), front({ profundidad: 'completa', ...o.plan }, '# Plan'))
-  if (o.tasks) writeFileSync(join(dir, 'tasks.md'), `# Tasks\n\n- [x] **T1 — uno**\n- [${o.tasks === 'done' ? 'x' : ' '}] **T2 — dos**\n`)
-}
-
-function flowRepo(jira?: 'on' | 'off' | 'invalid'): string {
-  const repo = makeRepo()
-  mkdirSync(join(repo, '.sdd-ai'))
-  if (jira) writeFileSync(join(repo, '.sdd-ai', 'config.yml'), `jira_approval:\n  mode: ${jira === 'invalid' ? 'true' : `"${jira}"`}\n`)
-  return repo
-}
-
 const stepOf = (repo: string, id: string) => resolve(readFlow(repo, id).facts).next.step
-
-/** El `PostToolUse` de un `Bash` del conductor que terminó; en Claude, `failed` usa `PostToolUseFailure`. */
-function post(cli: Cli, repo: string, command: string, o: { patch?: Record<string, unknown>; failed?: boolean } = {}): Out | '' {
-  const name = o.failed && cli === 'claude' ? 'post-tool-use-failure-bash' : 'post-tool-use-bash'
-  const base = payload(cli, name, {})
-  const p = { ...base, cwd: repo, session_id: 's1', ...o.patch, tool_input: { ...(base.tool_input as object), command } }
-  const out = runHook(JSON.stringify(p), cli)
-  return out === '' ? '' : JSON.parse(out) as Out
-}
-
-const bound = (repo: string, session = 's1') => {
-  const b = readBinding(repo, session)
-  return b === null || b === 'unreadable' ? b : { id: b.id, step: b.step, gate: b.gate }
-}
 const routeDir = (repo: string) => join(repo, '.sdd-ai', 'hooks', 'route')
 
 /** Corre `fn` con el directorio de la ruta en solo lectura, y lo restaura. */
@@ -1100,35 +981,6 @@ function writeFile(repo: string, id: string, name: string, content: string): voi
   writeFileSync(join(repo, '.plans', id, name), content)
 }
 
-/** Cada paso de AC-5 con un flujo en disco que lo produce, y si el commit pasa. */
-const GUARD_STEPS: Array<[string, FlowShape, boolean]> = [
-  ['depth', { handoff: null }, false],
-  ['specify', { spec: false }, false],
-  ['plan', {}, false],
-  ['tasks', { plan: { status: 'plan-approved' } }, false],
-  ['gate', { handoff: { profundidad: 'completa', spec_approved_at: null } }, false],
-  ['external_gate', { handoff: { profundidad: 'completa', spec_approved_at: SPEC_APPROVED, gate_status: 'awaiting' }, plan: { status: 'implementing' }, tasks: 'pending' }, false],
-  ['implement', { plan: { status: 'implementing' }, tasks: 'pending' }, false],
-  ['verify', { plan: { status: 'implementing' }, tasks: 'done' }, false],
-  ['resolve_blockers', { plan: { status: 'bogus' }, tasks: 'done' }, false],
-  ['review_and_commit', { plan: { status: 'verified' }, tasks: 'done' }, true],
-  ['push', { plan: { status: 'committed' }, tasks: 'done' }, true],
-  ['open_pr', { plan: { status: 'pushed' }, tasks: 'done' }, true],
-  ['archive', { plan: { status: 'pr-open' }, tasks: 'done' }, true],
-]
-
-/** Un repo con remoto, el flujo f1 en ese paso y la sesión s1 ligada a él; el remoto conserva `push` y `open_pr` como pasos de cierre. */
-function boundRepo(cli: Cli, shape: FlowShape = { plan: { status: 'implementing' }, tasks: 'pending' }, jira?: 'on' | 'off' | 'invalid'): string {
-  const repo = flowRepo(jira)
-  execFileSync('git', ['remote', 'add', 'origin', 'https://example.test/repo.git'], { cwd: repo })
-  writeFlow(repo, 'f1', shape)
-  post(cli, repo, './bin/sdd-ai sdd status f1')
-  assert.notEqual(bound(repo), null, 'quedó ligada')
-  return repo
-}
-
-const USER_COMMITS = /el commit lo hace el usuario/
-
 test('un hook crea .sdd-ai/.gitignore si falta y no toca uno existente; si no puede crearlo, SessionStart, Stop y PostToolUse no escriben ni dicen nada, y las guardas siguen negando', () => {
   for (const cli of CLIS) {
     const fresh = flowRepo()
@@ -1236,7 +1088,7 @@ test('un commit a otro repositorio, también anidado, pasa', () => {
     const nested = join(repo, 'sub', 'anidado')
     mkdirSync(nested, { recursive: true })
     spawnSync('git', ['init', '-q'], { cwd: nested })
-    for (const command of [`git -C ${other} commit -m x`, 'git -C sub/anidado commit -m x', `cd /tmp && git -C ${nested} commit -m x`]) {
+    for (const command of [`git -C '${other}' commit -m x`, 'git -C sub/anidado commit -m x', `cd /tmp && git -C '${nested}' commit -m x`]) {
       assert.equal(shell(cli, repo, command), '', command)
     }
     assert.equal(denial(shell(cli, repo, 'git -C sub commit -m x')).includes('flujo f1'), true, 'sub no es otro repositorio')
@@ -1263,7 +1115,7 @@ test('una cadena que liga y commitea se niega en cualquier sesión', () => {
       if (session === 's1') post(cli, repo, './bin/sdd-ai sdd status f1')
       const out = shell(cli, repo, './bin/sdd-ai sdd status f1 && git commit -m x', { session_id: session })
       assert.match(denial(out), /por separado/, session)
-      assert.equal(shell(cli, repo, `./bin/sdd-ai sdd status f1; git -C ${other} commit -m x`, { session_id: session }), '', `${session}: a otro repositorio`)
+      assert.equal(shell(cli, repo, `./bin/sdd-ai sdd status f1; git -C '${other}' commit -m x`, { session_id: session }), '', `${session}: a otro repositorio`)
     }
   }
 })
@@ -1338,7 +1190,7 @@ test('sin liga y con jira on se niega el commit a este repositorio o de destino 
       assert.ok(reason.includes('con jira_approval en on todo cambio del proyecto va por un flujo SDD'), reason)
       assert.match(reason, USER_COMMITS, command)
     }
-    assert.equal(shell(cli, repo, `git -C ${makeRepo()} commit -m x`), '')
+    assert.equal(shell(cli, repo, `git -C '${makeRepo()}' commit -m x`), '')
     assert.equal(shell(cli, repo, 'git status'), '')
     assert.equal(shell(cli, flowRepo('off'), 'git commit -m x'), '')
   }
