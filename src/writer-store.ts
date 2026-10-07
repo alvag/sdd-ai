@@ -484,6 +484,7 @@ export type LaunchFrom = { run: string } | { takeover: { ref: string; digest: st
  * se admite con el contrato anterior y no sirve de padre.
  */
 export interface PhaseControl {
+  findings?: boolean
   flow: string; pending: string[]; inputs: Record<string, string>; handoff_header: string
   kind?: 'implement' | 'continuation' | 'block' | 'fix'
   chain?: string
