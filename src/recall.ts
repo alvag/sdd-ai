@@ -270,9 +270,10 @@ function frontmatterValue(raw: string): string {
 
 /**
  * Los metadatos de un nodo del vault. Se leen línea por línea, como los lee knowledge-vault, y no como YAML: kv
- * escribe títulos y resúmenes con «: » sin comillas, que un parser de YAML rechaza.
+ * escribe títulos y resúmenes con «: » sin comillas, que un parser de YAML rechaza. Las pruebas de
+ * `test/recall-vault-node.unit.test.ts` fijan esa forma con nodos sintéticos.
  */
-function nodeMetadata(text: string): { state: string | null; date: string | null; summary: string | null } {
+export function nodeMetadata(text: string): { state: string | null; date: string | null; summary: string | null } {
   const lines = text.replace(/^\uFEFF/, '').split('\n').map((line) => line.replace(/\r$/, ''))
   const data = new Map<string, string>()
   if (lines[0] === '---') {
