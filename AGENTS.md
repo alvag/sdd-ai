@@ -10,6 +10,13 @@ fuentes:
   flujo terminado: spec, plan, tasks, handoff, hallazgos y mediciones. Los flujos SDD están en
   `sdd/`: cada uno tiene un nodo `<flujo>.md` con su resumen, y sus documentos están en `<flujo>/`.
   El vault no tiene un verbo de búsqueda: se busca con `grep` o `rg` sobre la carpeta del proyecto.
+
+  El frontmatter de los nodos no es YAML válido: knowledge-vault escribe sin comillas títulos y resúmenes
+  que llevan «: », y un parser de YAML los rechaza. sdd-ai los lee línea por línea con el parser portado
+  de knowledge-vault, `nodeMetadata` en `src/recall.ts`. Un lector nuevo del vault usa ese parser y no
+  `yaml`. Sus fixtures tienen la forma de los nodos reales, con datos sintéticos, como los de
+  `test/recall-vault-node.unit.test.ts`. Si knowledge-vault debería emitir YAML válido se decide en su
+  repositorio, no en este.
 - **Engram** guarda la memoria de las sesiones (decisiones, descubrimientos, errores y preferencias)
   en el proyecto `sdd-ai`. Con `mem_search` se busca un tema y con `mem_context` se recupera lo
   reciente.
