@@ -106,7 +106,7 @@ const PLAN_CONTRACT: PlanContract = {
 }
 const TASKS_CONTRACT: TasksContract = {
   phase: 'tasks', assumptions: [], blocking_questions: [], missing_context: [],
-  tasks: [{ id: 'T1', title: 'exportar', covers: ['AC-1', 'AC-2'], pattern: 'como a.ts', test: 'node --test', files: ['src/a.ts'], steps: ['hacerlo'] }],
+  tasks: [{ id: 'T1', title: 'exportar', actor: 'writer', covers: ['AC-1', 'AC-2'], pattern: 'como a.ts', test: 'node --test', files: ['src/a.ts'], steps: ['hacerlo'] }],
 }
 
 function launchFor(repo: string, step: 'specify' | 'plan' | 'tasks', o: { request?: string; context?: string } = {}): FrozenLaunch {
@@ -157,6 +157,19 @@ test('la publicación de una fase escribe el artefacto desde los campos y el flu
   const tasksDir = flowAt(tasks, 'tasks')
   assert.equal(causeOf(publishPhase(tasks, launchFor(tasks, 'tasks'), TASKS_CONTRACT)), 'published')
   assert.equal(readFileSync(join(tasksDir, 'tasks.md'), 'utf8'), renderTasks(TASKS_CONTRACT))
+
+  // Una corrida documental anterior conserva su artefacto sin actor; la publicación no migra sus bytes.
+  const legacyRepo = makeRepo()
+  commit(legacyRepo)
+  execFileSync('git', ['checkout', '-q', '-b', 'feature/f'], { cwd: legacyRepo })
+  const legacyDir = flowAt(legacyRepo, 'tasks')
+  const legacyLaunch = launchFor(legacyRepo, 'tasks')
+  delete legacyLaunch.task_actors
+  const legacyContract: TasksContract = { ...TASKS_CONTRACT, tasks: TASKS_CONTRACT.tasks.map(({ actor: _actor, ...task }) => task) }
+  assert.equal(causeOf(publishPhase(legacyRepo, legacyLaunch, legacyContract)), 'published')
+  const legacyText = readFileSync(join(legacyDir, 'tasks.md'), 'utf8')
+  assert.equal(legacyText, renderTasks(legacyContract))
+  assert.doesNotMatch(legacyText, /actor:/)
 })
 
 test('la publicación de una fase no pisa ni sigue enlaces, y no escribe si algo cambió desde el lanzamiento', () => {

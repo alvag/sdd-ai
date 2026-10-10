@@ -12,6 +12,7 @@ import { renderArtifactPrompt, renderArtifactRoundPrompt } from '../src/review/a
 
 test('los generadores de encargos prohíben Claude directo e indirecto', () => {
   const original = 'material inmutable\n'
+  const tasks = `- [ ] **T1 — Material de prueba**\n  - ${original.trim()}\n`
   assert.equal(withWorkerPolicy(withWorkerPolicy(original)), withWorkerPolicy(original))
   const candidate: Candidate = { base_sha: 'b'.repeat(40), head_sha: null, hash: `sha256:${'a'.repeat(64)}`,
     files: [{ path: 'spec.md', status: 'A', mode: '100644', sha256: 'c', binary: false, lines: 1, visible: [[1, 1]] }],
@@ -27,7 +28,7 @@ test('los generadores de encargos prohíben Claude directo e indirecto', () => {
   assert.ok('prompt' in fix)
   const prompts = [
     writerPrompt(original), writerPrompt(withWorkerPolicy(original)),
-    ...(['specify', 'plan', 'tasks', 'implement'] as const).map((step) => renderPhasePrompt(step, { id: 'f', depth: 'normal', step, pending: ['T1'] }, { request: original, spec: original, plan: original, tasks: original })),
+    ...(['specify', 'plan', 'tasks', 'implement'] as const).map((step) => renderPhasePrompt(step, { id: 'f', depth: 'normal', step, pending: ['T1'] }, { request: original, spec: original, plan: original, tasks })),
     renderContinuationPrompt('f', ['T1']), renderResumePrompt('f', 'r', 'implement', ['T1']), renderResumePrompt('f', 'r', 'fix', ['V1']),
     ...('prompt' in fix ? [fix.prompt] : []),
     renderReviewPrompt(candidate, new Map()),

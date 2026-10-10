@@ -4,7 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { countTasks, criteriaIds, readHeader, section, taskLines } from '../src/sdd/markdown.ts'
+import { countTasks, criteriaIds, readHeader, section, taskLines, projectTaskBlocks } from '../src/sdd/markdown.ts'
 import { renderVerification } from '../src/sdd/verification-contract.ts'
 import {
   type FlowData, type FrozenInputs, PHASE_INPUTS, PLAN_TITLES, type PhaseStep, SPEC_TITLES, STATUS_TITLES, admitFix, admitImplement, admitPlan, admitSpecify,
@@ -14,7 +14,7 @@ import {
 const STEPS: PhaseStep[] = ['specify', 'plan', 'tasks', 'implement']
 const INPUTS: FrozenInputs = {
   request: 'Quiero exportar a CSV.\n', spec: '# Spec\n\n## Criterios de aceptación\n\n- **AC-1:** exporta. (pedido)\n',
-  plan: '---\nid: f\n---\n\n# Plan\n', tasks: '# Tasks\n\n- [ ] **T1 — exportar**  · cubre: AC-1\n',
+  plan: '---\nid: f\n---\n\n# Plan\n', tasks: '# Tasks\n\n- [ ] **T1 — exportar**  · cubre: AC-1\n\n- [ ] **T2 — observar**  · actor: user  · cubre: AC-1\n\n- [ ] **T3 — encabezado**  · cubre: AC-1\n',
 }
 const flow = (step: PhaseStep, id = 'flujo-a'): FlowData => ({ id, depth: 'completa', step, ...(step === 'implement' ? { pending: ['T1', 'T3'] } : {}) })
 
@@ -23,8 +23,11 @@ test('el prompt de cada fase nombra sus insumos y fija sus fuentes', () => {
   for (const step of STEPS) {
     const prompt = renderPhasePrompt(step, flow(step), INPUTS)
     for (const input of PHASE_INPUTS[step]) {
-      assert.ok(prompt.includes(`<<<INSUMO ${input}\n${INPUTS[input] ?? ''}\nINSUMO ${input}>>>`), `${step}: falta el insumo ${input}`)
+      const expected: string = step === 'implement' && input === 'tasks' ? projectTaskBlocks(INPUTS.tasks!, flow('implement').pending!) : INPUTS[input] ?? ''
+      assert.ok(prompt.includes(`<<<INSUMO ${input}\n${expected}\nINSUMO ${input}>>>`), `${step}: falta el insumo ${input}`)
     }
+    // El encargo de implement no lleva la task de user, aunque esté abierta en tasks.md.
+    if (step === 'implement') assert.equal(prompt.includes('T2 — observar'), false)
     for (const input of (['request', 'spec', 'plan', 'tasks'] as const).filter((i) => !PHASE_INPUTS[step].includes(i))) {
       assert.equal(prompt.includes(`INSUMO ${input}`), false, `${step}: sobra el insumo ${input}`)
       assert.equal(prompt.includes((INPUTS[input] ?? '').trim()), false, `${step}: sobra el texto de ${input}`)
@@ -175,7 +178,7 @@ test('la admisión de plan arma el header de sdd-flow y la verificación', () =>
   assert.deepEqual(planHeaderFrom('f', null, 'feature/f', 'abc', now), { missing: ['change_type', 'profundidad', 'risk'] })
 })
 
-const TASK = { id: 'T1', title: 'Exportar a CSV', covers: ['AC-1'], pattern: 'como `src/import.ts:12`', test: '`node --test test/export.test.ts`', files: ['src/export.ts'], steps: ['escribir la prueba', 'implementar'] }
+const TASK = { id: 'T1', title: 'Exportar a CSV', actor: 'writer', covers: ['AC-1'], pattern: 'como `src/import.ts:12`', test: '`node --test test/export.test.ts`', files: ['src/export.ts'], steps: ['escribir la prueba', 'implementar'] }
 const TASKS_C = {
   phase: 'tasks', assumptions: [], blocking_questions: [], missing_context: [],
   tasks: [TASK, { ...TASK, id: 'T2', title: 'Encabezado', covers: ['AC-1', 'AC-2'] }],
@@ -208,10 +211,10 @@ test('la admisión de tasks rechaza con causa y arma exactamente las tasks del c
   if (a.kind !== 'admitted') return
   const doc = renderTasks(a.review)
   assert.deepEqual(taskLines(doc).map((l) => l.task), [
-    { done: false, id: 'T1', title: 'Exportar a CSV', covers: ['AC-1'] },
-    { done: false, id: 'T2', title: 'Encabezado', covers: ['AC-1', 'AC-2'] },
+    { done: false, id: 'T1', title: 'Exportar a CSV', actor: 'writer', covers: ['AC-1'] },
+    { done: false, id: 'T2', title: 'Encabezado', actor: 'writer', covers: ['AC-1', 'AC-2'] },
   ])
-  assert.ok(doc.includes('- [ ] **T1 — Exportar a CSV**  · cubre: AC-1\n'))
+  assert.ok(doc.includes('- [ ] **T1 — Exportar a CSV**  · actor: writer  · cubre: AC-1\n'))
   assert.match(doc, /\n {2}- \*\*Patrón:\*\* como `src\/import\.ts:12`/)
   assert.match(doc, /\n {2}- \*\*Prueba:\*\* `node --test test\/export\.test\.ts`/)
   assert.match(doc, /\n {4}1\. escribir la prueba\n {4}2\. implementar/)
@@ -219,7 +222,19 @@ test('la admisión de tasks rechaza con causa y arma exactamente las tasks del c
   const nested = admitTasks(json(withTask({ steps: ['- [ ] x\n- [ ] y'] })), CRITERIA)
   assert.equal(nested.kind, 'admitted')
   if (nested.kind === 'admitted') assert.equal(countTasks(renderTasks(nested.review)).total, 2)
-  assert.match(errorOf(admitTasks(json(withTask({ steps: ['antes\n```\nsin cerrar'] })), CRITERIA)), /tasks:.*T1:AC-1 T2:AC-1,AC-2/)
+  assert.match(errorOf(admitTasks(json(withTask({ steps: ['antes\n```\nsin cerrar'] })), CRITERIA)), /tasks:.*T1:AC-1:writer T2:AC-1,AC-2:writer/)
+})
+
+test('un contrato de tasks heredado conserva la representación sin actor al seleccionar su versión', () => {
+  const legacy = { ...TASKS_C, tasks: TASKS_C.tasks.map(({ actor: _actor, ...task }) => task) }
+  assert.equal(admitTasks(json(legacy), CRITERIA).kind, 'inadmissible')
+  const accepted = admitTasks(json(legacy), CRITERIA, { taskActors: false })
+  assert.equal(accepted.kind, 'admitted')
+  if (accepted.kind !== 'admitted') return
+  const text = renderTasks(accepted.review)
+  assert.doesNotMatch(text, /actor:/)
+  assert.deepEqual(taskLines(text).map((l) => l.task?.id), ['T1', 'T2'])
+  assert.ok(taskLines(text).every((l) => l.task && !('actor' in l.task)))
 })
 
 const IMPL = {

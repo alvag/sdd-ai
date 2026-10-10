@@ -46,6 +46,8 @@ ${CODE_CLAIMS}`,
 - Cobertura bidireccional AC↔task: sin huérfanos en ningún sentido.
 - Autosuficiencia: cada task tiene sus rutas, sus entradas y sus decisiones.
 - Atomicidad: ninguna task mezcla cambios separables con finalizaciones distintas.
+- Responsabilidad única: cada task declara writer, conductor o user; revisa las capacidades y autoridad de todos sus pasos, no solo el enum. Claude y capacidades reservadas son del conductor; observaciones personales y decisiones humanas, del user.
+- Secuencia final: ninguna task contiene sdd verify final, acreditaciones de sus filas ni aprobación de gates. Todas pueden terminar antes de verify; las observaciones previas del user no sustituyen la prueba humana posterior.
 - Orden ejecutable: los productos van antes que sus consumidores.
 - Interfaces Produce/Consume: los nombres y las firmas coinciden.
 - Evidencia: cada task referencia una verificación capaz de probar su resultado.

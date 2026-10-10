@@ -7,7 +7,7 @@ import { SddError } from '../types.ts'
 import { isFlowId } from './id.ts'
 import {
   type HeaderResult, type SectionState, combinedFingerprint, countTasks, planFingerprint, readHeader, section, singleFingerprint, specFingerprint,
-  tasksFingerprint,
+  tasksFingerprint, readTaskResponsibilities,
 } from './markdown.ts'
 import { type Approval, type ApprovalLog, type Depth, type FileState, type FlowFacts, GATES, type GateId, type Next, type Reason, isDepth, resolve } from './status.ts'
 import { verifyFacts } from './verify-state.ts'
@@ -211,11 +211,13 @@ export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode
   const handoffHeader = handoff === null ? null : readHeader(handoff)
   let planSections: FlowFacts['planSections'] = null
   let tasksSection: FlowFacts['tasksSection'] = null
+  let taskResponsibilitiesSection: FlowFacts['taskResponsibilitiesSection'] = null
   if (planText !== null) {
     const body = planHeader?.ok ? planHeader.body : planText
     const tasksText = section(body, 'Tasks')
     planSections = { spec: sectionState(section(body, 'Spec')), tasks: sectionState(tasksText) }
     tasksSection = tasksText === null ? null : countTasks(tasksText)
+    taskResponsibilitiesSection = tasksText === null ? null : readTaskResponsibilities(tasksText)
   }
 
   const fingerprints: Partial<Record<GateId, string>> = {}
@@ -239,6 +241,8 @@ export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode
       planSections,
       tasksFile: tasks === null ? null : countTasks(tasks),
       tasksSection,
+      taskResponsibilitiesSection,
+      taskResponsibilitiesFile: tasks === null ? null : readTaskResponsibilities(tasks),
       fingerprints,
       log: toLog(approvals),
       paths,

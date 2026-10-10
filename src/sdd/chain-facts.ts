@@ -52,7 +52,7 @@ export function runFacts(root: string, run: string): RunFacts | null {
       harvest: {
         finished: h.state === 'done', endMark: h.endMark, inputsStable: h.phase_inputs !== 'changed',
         integrity: h.flagged.length === 0 && h.runAltered.length === 0 && !h.headMoved,
-        delta: h.delta ?? h.files.map((f) => f.path), files: h.files.length, completed: completedOf(h, c),
+        delta: h.delta_unmeasured ? null : h.delta ?? h.files.map((f) => f.path), files: h.files.length, completed: completedOf(h, c),
       },
     } : {}),
   }
@@ -131,10 +131,17 @@ export function chainView(root: string, id: string, read: FlowRead): ChainView {
   const depth = header?.profundidad
   const planFingerprint = isDepth(depth) ? read.facts.fingerprints[PLAN_GATE[depth]] : undefined
   const tasksFile = join(flowDir(root, id), 'tasks.md')
-  const open = existsSync(tasksFile) ? taskLines(readFileSync(tasksFile, 'utf8')).filter((l) => !l.done && l.task).map((l) => l.task!.id) : []
+  // Las abiertas salen de la misma lectura que las responsabilidades, del artefacto de la profundidad vigente; sin ella
+  // (un flujo sin tasks legibles), de tasks.md como antes.
+  const responsibilities = depth === 'corta' ? read.facts.taskResponsibilitiesSection : read.facts.taskResponsibilitiesFile
+  const open = responsibilities ? responsibilities.pendingAssignments.map((t) => t.id)
+    : existsSync(tasksFile) ? taskLines(readFileSync(tasksFile, 'utf8')).filter((l) => !l.done && l.task).map((l) => l.task!.id) : []
   const input: ChainInput = {
     imp, runs, receipt: receipt && ref ? receiptFacts(root, id, receipt, ref, planFingerprint, imp, record.verify?.attestations ?? []) : null,
     approvals: read.facts.log.state === 'ok' ? read.facts.log.approvals : [], open,
+    ...(responsibilities ? { writerPending: responsibilities.writerPending,
+      externalPending: responsibilities.pendingAssignments.filter((t) => t.actor === 'conductor' || t.actor === 'user'),
+      inlinePending: responsibilities.inlinePending, actorErrors: responsibilities.actorErrors } : {}),
     failed: new Set([
       ...imp.events.filter((e) => e.kind === 'launch_failed' && e.run).map((e) => e.run!),
       // Una corrida que el supervisor no llegó a lanzar tampoco es un eslabón: no tiene sesión que reanudar.

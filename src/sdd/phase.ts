@@ -1,10 +1,10 @@
 import { type FindingReport, type FindingRejection, type FindingsChannel, findingsInstructions } from '../findings.ts'
-import { parse } from 'yaml'
+import { parse, parseDocument, isMap as isYamlMap, isSeq, isScalar } from 'yaml'
 import { WORKER_POLICY } from '../worker-policy.ts'
 import { type Admission, Rejection, admitWith, extractObjects } from '../review/admit.ts'
 import { ARTIFACT_MANDATES } from '../review/artifact-prompt.ts'
 import { WRITER_END_MARK, hasEndMark } from '../writer.ts'
-import { countTasks, criteriaIds, proseProblems, taskLines } from './markdown.ts'
+import { TASK_ACTORS, type TaskActor, countTasks, criteriaIds, proseProblems, taskLines, projectTaskBlocks } from './markdown.ts'
 import { type VerificationContract, admitVerification, renderVerification, roundTrips } from './verification-contract.ts'
 
 // Las fases SDD que corre un worker hijo: el prompt que escribe el binario, la admisión del contrato
@@ -26,7 +26,7 @@ export interface PlanContract extends FindingsChannel {
 }
 export interface TasksContract extends FindingsChannel {
   phase: 'tasks'; assumptions: string[]; blocking_questions: string[]; missing_context: string[]
-  tasks: { id: string; title: string; covers: string[]; pattern: string; test: string; files: string[]; steps: string[] }[]
+  tasks: { id: string; title: string; actor?: TaskActor; covers: string[]; pattern: string; test: string; files: string[]; steps: string[] }[]
 }
 /** Si la task quedó hecha entera o sin terminar, según el writer. La prosa del reporte no cuenta. */
 export type Completion = 'done' | 'pending'
@@ -82,7 +82,7 @@ Responde con un único objeto JSON con la clave \`"phase": "${step}"\` y exactam
 const TASK_OF: Record<PhaseStep, (f: FlowData) => string> = {
   specify: (f) => `Escribe la spec del flujo ${f.id}: el QUÉ y el por qué del INSUMO request, con criterios de aceptación verificables y sin detalles de implementación. Lee el código que haga falta para separar lo que se sabe de lo que supones.`,
   plan: (f) => `Escribe el plan técnico del flujo ${f.id}: el CÓMO que cumple la spec del INSUMO spec. El enfoque es la solución más simple que cumple sus criterios; lo que vaya por encima se nombra en decisiones y trade-offs.`,
-  tasks: (f) => `Descompón en tasks el plan del flujo ${f.id} (INSUMOS spec y plan): tareas atómicas, ordenadas y autosuficientes, que alguien sin esta conversación pueda ejecutar.`,
+  tasks: (f) => `Descompón en tasks el plan del flujo ${f.id} (INSUMOS spec y plan): tareas atómicas, ordenadas y autosuficientes, cada una de un solo actor. Los productos preceden a sus consumidores. Asigna cambios delegables al writer, comprobaciones con Claude y capacidades reservadas al conductor, y observaciones personales o decisiones humanas al user. Todas las tasks deben poder completarse antes de la verificación final. Excluye como tasks sdd verify final, la acreditación de sus filas y la aprobación de gates; conserva esas obligaciones en su momento vigente. Una observación previa de user no sustituye la prueba humana posterior.`,
   implement: (f) => `Implementa las tasks pendientes del flujo ${f.id} en esta corrida: ${(f.pending ?? []).join(', ')}. Sigue el plan y las tasks de los INSUMOS. Una task que no termines va con \`completion: pending\`; no marques las tasks, eso lo hace el conductor.`,
 }
 
@@ -131,7 +131,7 @@ const SCHEMA: Record<PhaseStep, string> = {
   "assumptions": ["<supuesto>"],
   "blocking_questions": ["<pregunta para el usuario>"],
   "missing_context": ["<lo que falta>"],
-  "tasks": [{ "id": "T<n>", "title": "<acción concreta>", "covers": ["AC-<n>"], "pattern": "<el patrón del repositorio que sigue, con ruta:línea>", "test": "<la prueba que la discrimina y el comando acotado>", "files": ["<ruta>"], "steps": ["<paso>"] }]
+  "tasks": [{ "id": "T<n>", "title": "<acción concreta>", "actor": "writer" | "conductor" | "user", "covers": ["AC-<n>"], "pattern": "<el patrón del repositorio que sigue, con ruta:línea>", "test": "<la prueba que la discrimina y el comando acotado>", "files": ["<ruta>"], "steps": ["<paso>"] }]
 }
 - Hay al menos una task; sus ids son \`T<n>\` y no se repiten. Cada task cubre al menos un criterio de la spec, y cada criterio de la spec lo cubre al menos una task.
 - \`pattern\`, \`test\`, \`files\` y \`steps\` no pueden ir vacíos. Un paso no lleva checkboxes.`,
@@ -144,7 +144,7 @@ const SCHEMA: Record<PhaseStep, string> = {
 - Una entrada por cada task pendiente de esta corrida, y solo esas.
 - \`completion\` es \`done\` si la task quedó hecha entera y \`pending\` si no la terminaste. Es lo único que cuenta: una task pending no pasa a hecha porque la prosa o \`STATUS: done\` digan otra cosa.
 - \`check\` nombra la fila de \`## Verification\` que demuestra la task (por ejemplo \`V3\`), o dice por qué ninguna la cubre. Esa fila la corre \`sdd verify\`, no tú.
-- \`missing_context\` es obligatorio aunque vaya vacío; vacío significa "ninguno".`,
+- \`missing_context\` es obligatorio aunque vaya vacío; vacío significa "ninguno". Los faltantes destinados al conductor se comunican sin declarar completitud ni autorizar acciones reservadas.`,
 }
 
 const IMPLEMENT_OUTPUT = `## Formato del reporte
@@ -174,7 +174,8 @@ export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: Froze
     `Eres el worker de la fase ${step} de un flujo SDD en profundidad ${flow.depth}. ${TASK_OF[step](flow)}`,
     SOURCES,
     '## Insumos',
-    ...PHASE_INPUTS[step].map((name) => block(`INSUMO ${name}`, inputs[name] ?? '')),
+    ...PHASE_INPUTS[step].map((name) => block(`INSUMO ${name}`, step === 'implement' && name === 'tasks'
+      ? projectTaskBlocks(inputs.tasks ?? '', flow.pending ?? []) : inputs[name] ?? '')),
   ]
   if (engineContext !== undefined) parts.push(engineContext)
   if (inputs.context !== undefined) {
@@ -425,7 +426,7 @@ function taskIds(items: unknown[], field: string): string[] {
   })
 }
 
-function checkTasks(raw: Record<string, unknown>, criteria: readonly string[]): Admission<TasksContract> {
+function checkTasks(raw: Record<string, unknown>, criteria: readonly string[], taskActors: boolean): Admission<TasksContract> {
   const c = contract(raw, 'tasks', ['phase', ...LIST_KEYS, 'tasks'])
   if (!Array.isArray(c.tasks) || c.tasks.length === 0) throw new Rejection('tasks tiene que traer al menos una task')
   const list = c.tasks
@@ -433,13 +434,16 @@ function checkTasks(raw: Record<string, unknown>, criteria: readonly string[]): 
   const tasks = list.map((t, i) => {
     const where = `tasks[${i}]`
     if (!isMap(t)) throw new Rejection(`${where} tiene que ser un objeto`)
-    keysOf(t, ['id', 'title', 'covers', 'pattern', 'test', 'files', 'steps'], where)
+    keysOf(t, ['id', 'title', 'covers', 'pattern', 'test', 'files', 'steps', ...(taskActors ? ['actor'] : [])], where)
+    if (taskActors && (typeof t.actor !== 'string' || !(TASK_ACTORS as readonly string[]).includes(t.actor))) {
+      throw new Rejection(`${where} (${ids[i]}).actor tiene que ser writer, conductor o user`)
+    }
     const title = text(t.title, `${where}.title`)
     if (title.includes('\n')) throw new Rejection(`${where}.title tiene que ir en una sola línea`)
     const covers = texts(t.covers, `${where}.covers`, { min: 1 })
     for (const ac of covers) if (!criteria.includes(ac)) throw new Rejection(`${where}.covers cita ${ac}, que no es un criterio de la spec`)
     return {
-      id: ids[i], title: title.trim(), covers, pattern: text(t.pattern, `${where}.pattern`), test: text(t.test, `${where}.test`),
+      id: ids[i], title: title.trim(), covers, ...(taskActors ? { actor: t.actor as TaskActor } : {}), pattern: text(t.pattern, `${where}.pattern`), test: text(t.test, `${where}.test`),
       files: texts(t.files, `${where}.files`, { min: 1 }), steps: texts(t.steps, `${where}.steps`, { min: 1 }),
     }
   })
@@ -457,8 +461,27 @@ function checkTasks(raw: Record<string, unknown>, criteria: readonly string[]): 
 }
 
 /** El contrato de `tasks`: cada task con patrón y prueba, y la cobertura cerrada contra los criterios de la spec. */
-export function admitTasks(text: string, criteria: readonly string[]): Admission<TasksContract> {
-  return admitWith(text, (raw) => checkTasks(raw, criteria), 'phase')
+export function admitTasks(text: string, criteria: readonly string[], o: { taskActors?: boolean } = {}): Admission<TasksContract> {
+  const taskActors = o.taskActors !== false
+  return admitWith(text, (raw) => {
+    if (taskActors) {
+      for (const object of extractObjects(text, 'phase')) {
+        const doc = parseDocument(text.slice(object.start, object.end + 1), { uniqueKeys: false })
+        if (!isYamlMap(doc.contents)) continue
+        // JSON.parse se queda con el último `tasks`: se revisan todos los contenedores repetidos, no solo el primero.
+        for (const container of doc.contents.items) {
+          if (!isScalar(container.key) || container.key.value !== 'tasks' || !isSeq(container.value)) continue
+          for (const task of container.value.items) {
+            if (!isYamlMap(task)) continue
+            if (task.items.filter((pair) => isScalar(pair.key) && pair.key.value === 'actor').length > 1) {
+              throw new Rejection(`actor repetido en la task ${String(task.get('id') ?? 'sin id')}`)
+            }
+          }
+        }
+      }
+    }
+    return checkTasks(raw, criteria, taskActors)
+  }, 'phase')
 }
 
 /** Un campo de la task: sus líneas siguientes quedan sangradas bajo el campo. */
@@ -471,7 +494,7 @@ const code = (path: string) => (path.includes('`') ? path : `\`${path}\``)
  */
 export function renderTasks(c: TasksContract): string {
   const blocks = c.tasks.map((t) => [
-    `- [ ] **${t.id} — ${t.title}**  · cubre: ${t.covers.join(', ')}`,
+    `- [ ] **${t.id} — ${t.title}**${t.actor === undefined ? '' : `  · actor: ${t.actor}`}  · cubre: ${t.covers.join(', ')}`,
     field('Patrón', t.pattern),
     field('Prueba', t.test),
     field('Archivos', t.files.map((f) => code(f.trim())).join('; ')),
@@ -480,8 +503,8 @@ export function renderTasks(c: TasksContract): string {
   ].join('\n'))
   const doc = `# Tasks\n\n${blocks.join('\n\n')}\n`
   const read = taskLines(doc)
-  const expected = c.tasks.map((t) => `${t.id}:${t.covers.join(',')}`).join(' ')
-  const got = read.map((l) => (l.task ? `${l.task.id}:${l.task.covers.join(',')}` : '?')).join(' ')
+  const expected = c.tasks.map((t) => `${t.id}:${t.covers.join(',')}:${t.actor ?? ''}`).join(' ')
+  const got = read.map((l) => (l.task ? `${l.task.id}:${l.task.covers.join(',')}:${l.task.actor ?? ''}` : '?')).join(' ')
   if (got !== expected || countTasks(doc).total !== c.tasks.length) {
     throw new Error(`el documento armado deja leer ${got || 'ninguna task'} en vez de ${expected}`)
   }

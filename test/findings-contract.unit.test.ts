@@ -79,7 +79,7 @@ test('un findings mal formado no vuelve inadmisible el contrato y llega aparte c
 
 test('los prompts de fase y corrección piden findings y conservan el contrato al reanudar', () => {
   for (const step of ['specify', 'plan', 'tasks', 'implement'] as const) {
-    const prompt = renderPhasePrompt(step, { id: 'f', depth: 'normal', step, pending: ['T1'] }, { request: 'x', spec: 'x', plan: 'x', tasks: 'x' })
+    const prompt = renderPhasePrompt(step, { id: 'f', depth: 'normal', step, pending: ['T1'] }, { request: 'x', spec: 'x', plan: 'x', tasks: renderTasks(TASKS) })
     assert.ok(prompt.includes('"findings": []'))
     assert.ok(prompt.includes(FINDING_REPORT_SCHEMA))
     assert.ok(prompt.includes('también con preguntas bloqueantes o contexto faltante'))

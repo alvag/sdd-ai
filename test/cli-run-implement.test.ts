@@ -126,7 +126,6 @@ test('sdd phase en implement lanza un writer con las tasks congeladas y la cosec
 
   const failures: Array<[string, object, RegExp]> = [
     ['contrato no admitido', { actions: [{ write: 'n.txt', content: 'x\n' }], report: 'Hice el cambio.\nSTATUS: done\n' }, /contrato/],
-    ['contexto faltante', { actions: [{ write: 'n.txt', content: 'x\n' }], report: implementReport({ missing_context: ['el esquema'] }) }, /el esquema/],
     ['tasks cambiadas', { actions: [{ write: 'n.txt', content: 'x\n' }, { append: '.plans/f/tasks.md', content: '- [ ] **T4 — otra**  · cubre: AC-1\n' }], report: implementReport() }, /insumos/],
   ]
   for (const [name, script, cause] of failures) {
@@ -138,6 +137,28 @@ test('sdd phase en implement lanza un writer con las tasks congeladas y la cosec
     assert.ok(h.out.failed.some((f: string) => cause.test(f)), `${name}: ${JSON.stringify(h.out.failed)}`)
     assert.doesNotMatch(h.out.next, /review start/, name)
   }
+
+  // Un faltante de implement queda visible para el conductor sin hacer fallar la cosecha: el contrato se admite, la
+  // completitud la dicen las tasks y la orientación sigue la cadena, sin copiar el texto del writer.
+  const context = writerSetup({ script: { actions: [{ write: 'n.txt', content: 'x\n' }], report: implementReport({ missing_context: ['el esquema'] }) } })
+  implementFlow(context.repo)
+  const c = cli(context, ['wait', cli(context, ['sdd', 'phase', 'f']).out.id, '--max', '30'])
+  assert.equal(c.code, 0, JSON.stringify(c.out))
+  assert.equal(c.out.failed, undefined, JSON.stringify(c.out.failed))
+  assert.deepEqual([c.out.contract.admitted, c.out.contract.missing_context, c.out.missing_context], [true, ['el esquema'], ['el esquema']])
+  assert.deepEqual([c.out.covered, c.out.left], [['T2', 'T3'], []])
+  assert.match(c.out.next, /sdd verify f/)
+  assert.match(c.out.next, /revisa missing_context/)
+  assert.equal(c.out.next.includes('el esquema'), false)
+  assert.doesNotMatch(c.out.next, /review start/)
+  // Con una task sin terminar, el faltante tampoco la completa: queda pendiente y la cosecha es parcial por eso.
+  const partial = writerSetup({ script: { actions: [{ write: 'n.txt', content: 'x\n' }], report: implementReport({ missing_context: ['el esquema'],
+    tasks: [{ id: 'T2', completion: 'done', change_kind: 'behavior_change', changed: 'exporta', deviation: null, check: 'V1' },
+      { id: 'T3', completion: 'pending', change_kind: 'refactor', changed: 'sin terminar', deviation: null, check: 'V1' }] }) } })
+  implementFlow(partial.repo)
+  const p = cli(partial, ['wait', cli(partial, ['sdd', 'phase', 'f']).out.id, '--max', '30'])
+  assert.deepEqual([p.out.contract.admitted, p.out.missing_context, p.out.covered, p.out.left], [true, ['el esquema'], ['T2'], ['T3']])
+  assert.deepEqual(p.out.failed, ['cosecha parcial: quedan T3'])
 
   // Un writer de fase que no dejó ningún cambio no acredita nada: la cadena sigue con las mismas tasks.
   const empty = writerSetup({ script: { report: implementReport() } })

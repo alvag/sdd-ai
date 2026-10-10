@@ -3,6 +3,7 @@ import { SddError } from '../types.ts'
 import { WORKER_POLICY } from '../worker-policy.ts'
 import { WRITER_END_MARK } from '../writer.ts'
 import { implementReportFormat } from './phase.ts'
+import type { TaskActorError, TaskAssignment } from './markdown.ts'
 import type { Chain, ChainClass, ChainEntry, ChainTerminal, Classification, ImplementRecord, RunEntry, RunKind } from './phase-state.ts'
 import type { VerificationRow } from './verification-contract.ts'
 import type { RowResult, VerifyReceipt } from './verify-receipt.ts'
@@ -248,7 +249,7 @@ export interface RunFacts {
     /** Sin rutas sensibles señaladas, sin corrida alterada y sin HEAD movido. */
     integrity: boolean
     /** Las rutas que cambió frente a su padre; en una reanudación, frente al padre de la corrida original. */
-    delta: string[]
+    delta: string[] | null
     /** Cuántos archivos trae el candidato acumulado contra la base. */
     files: number
     /** El contrato admitido: las tasks que declaró `done` (implement) o que respondió (fix). `null` si no se admitió. */
@@ -269,6 +270,11 @@ export interface ReceiptFacts {
 }
 
 export interface ChainInput {
+  /** Las responsabilidades del artefacto de tasks vigente. Sin ellas (un llamador anterior), rige `open`. */
+  writerPending?: string[]
+  externalPending?: TaskAssignment[]
+  inlinePending?: string[]
+  actorErrors?: TaskActorError[]
   imp: ImplementRecord
   runs: ReadonlyMap<string, RunFacts>
   receipt: ReceiptFacts | null
@@ -281,13 +287,14 @@ export interface ChainInput {
 
 /** Qué propone la cadena a continuación. */
 export type ChainNext =
+  | { kind: 'actors_pending'; assignments: TaskAssignment[]; covered: string[] }
   | { kind: 'start' }
   | { kind: 'wait'; run: string }
   | { kind: 'orphan'; run: string }
   | { kind: 'resume'; run: string }
   | { kind: 'continue'; left: string[] }
   | { kind: 'blocks_or_takeover'; left: string[]; why: string }
-  | { kind: 'mark_and_verify' }
+  | { kind: 'mark_and_verify'; unmarked: string[] }
   | { kind: 'verify' }
   | { kind: 'classify'; receipt: string }
   | { kind: 'fix'; receipt: string; rows: string[] }
@@ -297,6 +304,8 @@ export type ChainNext =
   | { kind: 'attest'; rows: string[] }
   | { kind: 'review' }
   | { kind: 'conductor'; why: string }
+  /** Trabajo que el conductor coordina antes de verificar: no es una toma ni propone `verify`. */
+  | { kind: 'coordinate'; why: string }
   | { kind: 'takeover'; why: string }
 
 export interface ChainState {
@@ -305,6 +314,8 @@ export interface ChainState {
   last: ChainEntry | null
   /** Las tasks congeladas de la cadena, las acreditadas y las que siguen. */
   scope: string[]; covered: string[]; left: string[]
+  /** Las acreditadas que siguen abiertas en tasks.md: las únicas que el conductor todavía tiene que marcar. */
+  unmarked: string[]
   fixes: number
   terminal: ChainTerminal | null
   /** Un terminal que el estado ya implica y que todavía no se escribió. */
@@ -325,12 +336,13 @@ export function lastLink(chain: Chain, failed: ReadonlySet<string>): ChainEntry 
 }
 
 /**
- * Las tasks que una corrida acredita: las que declaró `done`, solo si terminó con su marca final y cambió
- * algo frente a su padre. Una corrida cortada no acredita nada: lo que declaró lo dice su reanudación.
+ * Las tasks que una corrida acredita: las que declaró `done`, solo si terminó con su marca final, cambió
+ * algo medido frente a su padre, dejó un candidato no vacío y su cosecha es íntegra con insumos estables.
+ * Una corrida cortada no acredita nada: lo que declaró lo dice su reanudación.
  */
 function credited(f: RunFacts | undefined): string[] {
   const h = f?.harvest
-  if (!h || !h.finished || !h.endMark || h.completed === null || f?.kind === 'fix' || h.delta.length === 0 || !h.inputsStable) return []
+  if (!h || !h.finished || !h.endMark || h.completed === null || f?.kind === 'fix' || !h.delta?.length || h.files === 0 || !h.inputsStable || !h.integrity) return []
   return h.completed
 }
 
@@ -352,31 +364,54 @@ export function chainState(input: ChainInput): ChainState {
   const chain = imp.chains.at(-1) ?? null
   const base = { chain, counts, epoch, derived: null as ChainTerminal | null }
   const at = new Date(0).toISOString()
+  // Lo que el writer no puede tomar: actores inválidos, pendientes fuera de la gramática y, sin trabajo del writer,
+  // las tasks de conductor y user. Va después de las guardas de actividad e integridad de cada camino. Una task del
+  // writer ya acreditada y sin marcar no es trabajo del writer: solo falta marcarla.
+  const coordination = (covered: string[]): ChainNext | null => {
+    const writerLeft = input.writerPending?.filter((t) => !covered.includes(t))
+    if (input.actorErrors?.length) {
+      return { kind: 'coordinate', why: `hay tasks con actor inválido: ${input.actorErrors.map((e) => `línea ${e.line} (${e.id ?? 'sin id'}): ${e.detail}`).join('; ')}` }
+    }
+    if (input.inlinePending?.length) return { kind: 'coordinate', why: `hay pendientes que requieren atención inline: ${input.inlinePending.join('; ')}` }
+    if (input.externalPending?.length && writerLeft?.length === 0) {
+      return { kind: 'actors_pending', assignments: input.externalPending, covered: covered.filter((t) => input.open.includes(t)) }
+    }
+    return null
+  }
+  // Sin eslabones vivos solo queda lanzar el inicial o, si no hay trabajo del writer, coordinar las tasks de conductor y
+  // user. Los actores inválidos y las pendientes inline los diagnostica el propio lanzamiento inicial (`start`).
+  const startOrCoordinate = (covered: string[]): ChainNext =>
+    (input.actorErrors?.length || input.inlinePending?.length ? null : coordination(covered)) ?? { kind: 'start' }
   if (chain === null) {
-    return { ...base, last: null, scope: [], covered: [], left: [], fixes: 0, terminal: null, next: { kind: 'start' } }
+    return { ...base, last: null, scope: [], covered: [], left: [], unmarked: [], fixes: 0, terminal: null, next: startOrCoordinate([]) }
   }
   const last = lastLink(chain, failed)
   const runEntries = chain.entries.filter(isRun).filter((e) => !failed.has(e.run))
   const scope = runEntries[0]?.pending ?? []
   const covered = [...new Set(runEntries.flatMap((e) => credited(runs.get(e.run))))].filter((t) => scope.includes(t))
   const left = scope.filter((t) => !covered.includes(t))
+  const unmarked = covered.filter((t) => input.open.includes(t))
+  // `left` es todo el alcance sin acreditar; `candidates`, lo que de eso sigue siendo del writer en el artefacto
+  // vigente. `continue` y `blocks_or_takeover` llevan `candidates`.
+  const candidates = input.writerPending === undefined ? left : left.filter((t) => input.writerPending!.includes(t))
   const fixes = runEntries.filter((e) => e.kind === 'fix').length
-  const done = { ...base, last, scope, covered, left, fixes, terminal: chain.terminal }
+  const done = { ...base, last, scope, covered, left, unmarked, fixes, terminal: chain.terminal }
   const derive = (code: ChainTerminal['code'], detail: string): ChainTerminal => ({ code, at, detail })
 
   // Una cadena cerrada: la toma o un terminal. Después, solo el conductor, o una cadena nueva con una aprobación posterior.
   // Con el tope de fallos alcanzado, solo reaprobar el plan (que abre otra época) deja abrir otra cadena.
   const closed = chain.terminal ?? (last && !isRun(last) ? derive('takeover', 'la cadena la tomó el conductor') : null)
   if (closed !== null) {
-    const reopen = input.open.length > 0 && !capped && approvedAfter(approvals, closed.at === at ? (last?.at ?? at) : closed.at)
+    const reopen = (input.writerPending ?? input.open).length > 0 && !capped && approvedAfter(approvals, closed.at === at ? (last?.at ?? at) : closed.at)
       && !(closed.code === 'legacy' && (last === null || isRun(last)))
     if (reopen) return { ...done, derived: chain.terminal ? null : closed, next: { kind: 'start' } }
     const next: ChainNext = capped && !(receipt?.current && receipt.green)
       ? { kind: 'conductor', why: 'tres fallos de la misma fila en esta época del plan: vuelve al plan o a la spec' }
-      : afterClose(closed, receipt, last, input.open, imp)
+      : coordination(covered) ?? afterClose(closed, receipt, last, input.open, imp)
     return { ...done, derived: chain.terminal ? null : closed, next }
   }
-  if (last === null) return { ...done, next: { kind: 'start' } }
+  // Sin eslabones vivos se relanza el inicial, salvo que no quede trabajo del writer: misma salida que sin cadena.
+  if (last === null) return { ...done, next: startOrCoordinate(covered) }
   const facts = isRun(last) ? runs.get(last.run) : undefined
   const h = facts?.harvest
   if (isRun(last) && !facts) return { ...done, next: { kind: 'orphan', run: last.run } }
@@ -392,15 +427,29 @@ export function chainState(input: ChainInput): ChainState {
   }
   const lastRun = last as RunEntry
   if (h && h.completed === null) return { ...done, next: { kind: 'takeover', why: 'el contrato del writer no se admitió: su cosecha no es padre de otra corrida' } }
-  if (lastRun.kind !== 'fix' && left.length > 0) {
+  // Un candidato acumulado vacío (una corrección que deshizo todo) no se verifica ni es padre de otra corrección. Va
+  // antes de la coordinación y del marcado; una continuación con tasks del writer sigue disponible, como antes.
+  const continuing = lastRun.kind !== 'fix' && candidates.length > 0
+  if (h && h.files === 0 && !continuing) return { ...done, next: { kind: 'takeover', why: 'el candidato acumulado quedó vacío: no hay cambio que verificar' } }
+  const remaining = coordination(covered)
+  if (remaining) return { ...done, next: remaining }
+  if (continuing) {
     const progress = credited(facts).some((t) => !runEntries.slice(0, -1).flatMap((e) => credited(runs.get(e.run))).includes(t))
     const first = runEntries.length === 1
     if (lastRun.kind === 'block' && !progress) return { ...done, derived: derive('no_progress', 'un bloque no completó ninguna task nueva'), next: { kind: 'takeover', why: 'un bloque no completó ninguna task nueva' } }
-    if (!first && !progress) return { ...done, next: { kind: 'blocks_or_takeover', left, why: 'la continuación no completó ninguna task nueva' } }
-    return { ...done, next: { kind: 'continue', left } }
+    if (!first && !progress) return { ...done, next: { kind: 'blocks_or_takeover', left: candidates, why: 'la continuación no completó ninguna task nueva' } }
+    return { ...done, next: { kind: 'continue', left: candidates } }
   }
-  // Un candidato acumulado vacío (una corrección que deshizo todo) no se verifica ni es padre de otra corrección.
-  if (h && h.files === 0) return { ...done, next: { kind: 'takeover', why: 'el candidato acumulado quedó vacío: no hay cambio que verificar' } }
+  // Las tasks del writer fuera del alcance congelado van antes que las externas, para que la salida no las oculte.
+  const outside = input.writerPending?.filter((t) => !scope.includes(t)) ?? []
+  if (outside.length > 0) {
+    const external = input.externalPending?.length ? `; quedan además ${input.externalPending.map((t) => `${t.id} (${t.actor})`).join(', ')}` : ''
+    return { ...done, next: { kind: 'coordinate', why: `hay tasks del writer fuera del alcance congelado (${outside.join(', ')}): coordina su ejecución sin ampliar esta cadena${external}` } }
+  }
+  if (input.externalPending?.length) return { ...done, next: { kind: 'actors_pending', assignments: input.externalPending, covered: unmarked } }
+  // Las tasks que el writer acreditó y siguen abiertas en tasks.md: primero se marcan, después se verifica. Solo con
+  // las responsabilidades del artefacto: un llamador anterior conserva su orientación.
+  if (input.writerPending !== undefined && unmarked.length > 0) return { ...done, next: { kind: 'mark_and_verify', unmarked } }
   const next = onCandidate(receipt, imp, lastRun.kind === 'fix', fixes)
   // Una corrección que no cambió nada deja el mismo candidato: el recibo sigue vigente y la cadena vuelve a él.
   if (next.kind === 'takeover' && next.why.startsWith(FIX_CAP)) return { ...done, derived: derive('fix_cap', 'dos correcciones sin llegar al verde'), next }
@@ -457,9 +506,22 @@ export const classesPath = (id: string, receipt: string) => `.plans/${id}/classe
 /** Cómo sigue a mano el conductor cuando la cadena del writer no lanza nada más. */
 export const takeoverHint = (id: string) => `sigue a mano y declara la toma antes de verificar: ./bin/sdd-ai sdd verify ${id} --takeover`
 
+/** La indicación de marcar en tasks.md lo que acreditó el writer: la cadena no marca tasks. */
+export const markHint = (covered: readonly string[]) => `marca en tasks.md las tasks acreditadas (${covered.join(', ') || 'ninguna'})`
+
+/**
+ * Si la cosecha antepone `markHint`: no cuando la orientación ya pide marcar ni cuando queda una corrida del writer por
+ * esperar, reanudar o cerrar.
+ */
+export function harvestNeedsMarkHint(next: ChainNext): boolean {
+  const own = ['actors_pending', 'mark_and_verify', 'wait', 'resume', 'orphan'] satisfies ChainNext['kind'][]
+  return !(own as readonly string[]).includes(next.kind)
+}
+
 /** Qué hacer, en palabras, según el estado de la cadena. */
 export function orientation(id: string, next: ChainNext): string {
   switch (next.kind) {
+    case 'actors_pending': return `coordina las tasks pendientes: ${next.assignments.map((t) => `${t.id} — ${t.title} (${t.actor})`).join('; ')}. Cada responsable ejecuta su acción y el conductor marca la task después; todavía no corresponde verify final${next.covered.length > 0 ? `; ${markHint(next.covered)}` : ''}`
     case 'verify': return `corre ./bin/sdd-ai sdd verify ${id}`
     case 'classify': return `clasifica las filas rojas del recibo ${next.receipt} en ${classesPath(id, next.receipt)} y corre ./bin/sdd-ai sdd phase ${id} --classes ${classesPath(id, next.receipt)}`
     case 'fix': return `lanza el fix: ./bin/sdd-ai sdd phase ${id}`
@@ -476,8 +538,9 @@ export function orientation(id: string, next: ChainNext): string {
     case 'wait': return `./bin/sdd-ai wait ${next.run}`
     case 'orphan': return `la corrida ${next.run} quedó registrada sin control: ciérrala con ./bin/sdd-ai cancel ${next.run}`
     case 'start': return `./bin/sdd-ai sdd phase ${id}`
-    case 'mark_and_verify': return `marca las tasks y corre ./bin/sdd-ai sdd verify ${id}`
+    case 'mark_and_verify': return `${markHint(next.unmarked)} y corre ./bin/sdd-ai sdd verify ${id}`
     case 'takeover':
     case 'conductor': return `${next.why}; ${takeoverHint(id)}`
+    case 'coordinate': return `${next.why}; resuélvelo antes de verificar y vuelve a consultar ./bin/sdd-ai sdd status ${id}`
   }
 }
