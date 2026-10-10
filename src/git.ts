@@ -3,11 +3,12 @@ import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpath
 import { tmpdir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 import { SddError } from './types.ts'
+import { memoGitQuery, withoutGitQueryMemo } from './git-memo.ts'
 
 /** Raíz del árbol de trabajo actual; en un worktree, la de ese worktree. */
 export function repoRoot(cwd: string): string {
   try {
-    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+    return memoGitQuery('repoRoot', cwd, () => execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim())
   } catch (e) {
     throw new SddError('not_a_repo', `${cwd} no está dentro de un repositorio Git`, {
       detail: (e as { stderr?: string }).stderr?.trim(),
@@ -35,7 +36,7 @@ export function withGitMemo<T>(fn: () => T): T {
   const outer = memo
   memo ??= new Map()
   try {
-    return fn()
+    return withoutGitQueryMemo(fn, 'legacy')
   } finally {
     memo = outer
   }
@@ -152,10 +153,10 @@ export function switchBranch(root: string, name: string): void {
 
 /** El directorio de Git del checkout y el común, con rutas reales: en un worktree son distintos. */
 export function gitDirs(root: string): { gitDir: string; commonDir: string } {
-  return remembered(`dirs:${root}`, () => {
+  return remembered(`dirs:${root}`, () => memoGitQuery('gitDirs', root, () => {
     const [gitDir, commonDir] = git(root, ['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir']).trim().split('\n')
     return { gitDir: realpathSync(gitDir), commonDir: realpathSync(commonDir) }
-  })
+  }))
 }
 
 /**
@@ -264,9 +265,9 @@ export function removeIndex(indexFile: string): void {
 
 /** El directorio de objetos del repositorio y los alternativos que declara. */
 function objectDirs(gitDir: string, commonDir?: string): string[] {
-  const objects = commonDir ? join(commonDir, 'objects') : execFileSync('git', ['--git-dir', gitDir, 'rev-parse', '--path-format=absolute', '--git-path', 'objects'], {
+  const objects = commonDir ? join(commonDir, 'objects') : memoGitQuery('objects', gitDir, () => execFileSync('git', ['--git-dir', gitDir, 'rev-parse', '--path-format=absolute', '--git-path', 'objects'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-  }).trim()
+  }).trim())
   let alternates: string[] = []
   try {
     alternates = readFileSync(join(objects, 'info', 'alternates'), 'utf8').split('\n').map((l) => l.trim())

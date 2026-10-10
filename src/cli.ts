@@ -1,4 +1,5 @@
 import { type FindingsChannel, findingsInstructions } from './findings.ts'
+import { withGitQueryScope, withoutGitQueryMemo } from './git-memo.ts'
 import { type SpawnOptions, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -1676,6 +1677,7 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
   const dir = runDir(root, id)
   const until = Date.now() + max * 1000
   for (;;) {
+    const observed = withGitQueryScope('iteration', (): Result | undefined => {
     let s = readStatus(dir)
     if (TERMINAL.has(s.state)) return report(root, id, dir, s, env)
     const supervisorPid = s.supervisor_pid ?? readSupervisorPid(dir)
@@ -1694,6 +1696,8 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
       if (req?.kind === 'review') Object.assign(out, { risk: riskView(req), round: s.round ?? 1, ...roundShape(dir, s, s.round ?? 1) })
       return { code: 3, out: { ...out, next: `./bin/sdd-ai wait ${id}` } }
     }
+    })
+    if (observed !== undefined) return observed
     await sleep(250)
   }
 }
@@ -2010,6 +2014,7 @@ async function waitWriter(root: string, id: string, max: number, env: Env): Prom
   const store = controlStore(root, readControl(root, id))
   const until = Date.now() + max * 1000
   for (;;) {
+    const observed = await withGitQueryScope('iteration', async (): Promise<Result | undefined> => {
     const h = readHarvest(root, id)
     if (h) {
       // Una caída entre publicar el registro y liberar deja la reserva tomada: la libera quien lo lee. Si no
@@ -2029,6 +2034,8 @@ async function waitWriter(root: string, id: string, max: number, env: Env): Prom
       return late ? writerReport(root, id, late, env) : recoverWriter(root, id, env)
     }
     if (Date.now() >= until) return { code: 3, out: { id, state: s.state, next: `./bin/sdd-ai wait ${id}` } }
+    })
+    if (observed !== undefined) return observed
     await sleep(250)
   }
 }
@@ -3173,8 +3180,11 @@ export async function main(argv: string[], env: Env, cwd: string, deps?: { appro
     if (root !== null) requestPublication(root, `status:${cmd}`, 'cli')
   })
   try {
-    return await verb(cmd, rest, env, cwd, deps)
+    return await (cmd === '__supervise'
+      ? withoutGitQueryMemo(() => verb(cmd, rest, env, cwd, deps))
+      : withGitQueryScope('call', () => verb(cmd, rest, env, cwd, deps)))
   } finally {
+    withoutGitQueryMemo(() => {
     onStatusWritten(previous)
     // El supervisor publica por su cuenta; doctor puede correr fuera de un checkout; la copia directa no publica.
     if (!reusesConfig(cmd, rest) && cmd !== '__supervise' && cmd !== '__publish' && cmd !== 'doctor') {
@@ -3185,6 +3195,7 @@ export async function main(argv: string[], env: Env, cwd: string, deps?: { appro
         // Fuera de un repositorio no hay proyección.
       }
     }
+    })
   }
 }
 

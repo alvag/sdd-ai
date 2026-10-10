@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { withGitQueryScope } from './git-memo.ts'
 import { createHash, randomBytes } from 'node:crypto'
 import {
   closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync,
@@ -279,10 +280,14 @@ export function releaseReservation(handle: ReservationHandle): ReleaseResult {
   try {
     const until = Date.now() + RELEASE_WAIT_MS
     for (;;) {
-      if (!pathPresent(handle.path)) return { state: 'absent' }
-      if (publishLock(mutex, owner)) { acquired = true; break }
-      if (abandonedRelease(mutex)) return retained('release_abandoned', `mutex abandonado o ilegible: ${mutex}`)
-      if (Date.now() >= until) return retained('release_busy', `otro liberador sigue teniendo ${mutex}`)
+      const observed = withGitQueryScope('iteration', (): ReleaseResult | 'acquired' | undefined => {
+        if (!pathPresent(handle.path)) return { state: 'absent' }
+        if (publishLock(mutex, owner)) { acquired = true; return 'acquired' }
+        if (abandonedRelease(mutex)) return retained('release_abandoned', `mutex abandonado o ilegible: ${mutex}`)
+        if (Date.now() >= until) return retained('release_busy', `otro liberador sigue teniendo ${mutex}`)
+      })
+      if (observed === 'acquired') break
+      if (observed !== undefined) return observed
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RELEASE_RETRY_MS)
     }
     // La relectura y el unlink están bajo el mismo mutex: dos liberadores no pueden borrar una
@@ -1151,23 +1156,27 @@ export async function freezeHarvest(root: string, id: string, outcome: Outcome, 
   const release = () => releaseAndReport(controlReservation(control))
   const until = Date.now() + CLAIM_WAIT_MS
   for (;;) {
-    if (existsSync(harvestFile(dir))) {
-      release()
-      return readJson<HarvestRecord>(harvestFile(dir))
-    }
-    const claims = readdirSync(dir).map((f) => CLAIM.exec(f)?.[1]).filter((n) => n !== undefined).map(Number)
-    const top = Math.max(0, ...claims)
-    let mine = false
-    if (top === 0) {
-      mine = claim(dir, 1)
-    } else if (!ownerAlive(readJson<{ pid: number; lstart: string | null }>(join(dir, `harvest.claim.${top}`)))) {
-      await hooks.beforeRescue?.()
-      mine = claim(dir, top + 1)
-    }
-    if (mine) break
-    if (Date.now() > until) {
-      throw new SddError('harvest_busy', `otro proceso está congelando la cosecha de ${id} y no terminó`, { next: `./bin/sdd-ai wait ${id}` })
-    }
+    const observed = await withGitQueryScope('iteration', async (): Promise<HarvestRecord | 'claimed' | undefined> => {
+      if (existsSync(harvestFile(dir))) {
+        release()
+        return readJson<HarvestRecord>(harvestFile(dir))
+      }
+      const claims = readdirSync(dir).map((f) => CLAIM.exec(f)?.[1]).filter((n) => n !== undefined).map(Number)
+      const top = Math.max(0, ...claims)
+      let mine = false
+      if (top === 0) {
+        mine = claim(dir, 1)
+      } else if (!ownerAlive(readJson<{ pid: number; lstart: string | null }>(join(dir, `harvest.claim.${top}`)))) {
+        await hooks.beforeRescue?.()
+        mine = claim(dir, top + 1)
+      }
+      if (mine) return 'claimed'
+      if (Date.now() > until) {
+        throw new SddError('harvest_busy', `otro proceso está congelando la cosecha de ${id} y no terminó`, { next: `./bin/sdd-ai wait ${id}` })
+      }
+    })
+    if (observed === 'claimed') break
+    if (observed !== undefined) return observed
     await sleep(100)
   }
 
