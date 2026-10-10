@@ -18,7 +18,7 @@ export const PLAN: PlanContract = {
 }
 export const TASKS: TasksContract = {
   phase: 'tasks', assumptions: [], blocking_questions: [], missing_context: [],
-  tasks: [{ id: 'T1', title: 'Exportar', covers: ['AC-1'], pattern: 'src/a.ts', test: 'V1', files: ['src/a.ts'], steps: ['Exportar'] }],
+  tasks: [{ id: 'T1', title: 'Exportar', actor: 'writer', covers: ['AC-1'], pattern: 'src/a.ts', test: 'V1', files: ['src/a.ts'], steps: ['Exportar'] }],
 }
 export const IMPLEMENT = { phase: 'implement', missing_context: [], tasks: [{ id: 'T1', completion: 'pending', change_kind: 'behavior_change', changed: 'Sin terminar', deviation: null, check: 'V1' }] }
 export const FIX = { phase: 'fix', missing_context: [], rows: [{ id: 'V1', changed: 'Corregido', deviation: null }] }

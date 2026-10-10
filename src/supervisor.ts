@@ -1027,7 +1027,7 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
   const admitFn = (text: string): Admission<DocumentContract> => {
     if (phase.step === 'specify') return admitSpecify(text)
     if (phase.step === 'plan') return admitPlan(text, phase.criteria ?? [])
-    return admitTasks(text, phase.criteria ?? [])
+    return admitTasks(text, phase.criteria ?? [], { taskActors: phase.task_actors === true })
   }
   const admitted = await admitPhase(ctx, r.current, r.last, resumeSec, admitFn, { name: '-fix', suffix: '-fix', kind: 'correction' })
   const empty = { assumptions: [], blocking_questions: [], missing_context: [] }

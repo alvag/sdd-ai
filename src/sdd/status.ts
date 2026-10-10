@@ -1,6 +1,6 @@
 import type { Proof } from '../approval/proof.ts'
 import type { JiraMode } from '../config.ts'
-import type { HeaderResult, SectionState, TaskCount } from './markdown.ts'
+import type { HeaderResult, SectionState, TaskCount, TaskResponsibilities, TaskAssignment } from './markdown.ts'
 
 // El estado de un flujo SDD como función pura de sus hechos: no lee el disco, no mira el reloj y no
 // escribe. Por eso este módulo solo importa tipos.
@@ -37,6 +37,8 @@ export interface FlowFacts {
   tasksFile: TaskCount | null
   /** Las tasks de la sección `## Tasks` de `plan.md`. */
   tasksSection: TaskCount | null
+  taskResponsibilitiesFile?: TaskResponsibilities | null
+  taskResponsibilitiesSection?: TaskResponsibilities | null
   /** Las huellas que se pueden calcular con lo que está presente. */
   fingerprints: Partial<Record<GateId, string>>
   log: ApprovalLog
@@ -65,7 +67,7 @@ export interface FlowStatus {
   id: string
   depth: Depth | null
   gates: GateView[]
-  tasks: { total: number; done: number; pending: number; first_pending: string | null }
+  tasks: { total: number; done: number; pending: number; first_pending: string | null; pending_assignments?: TaskAssignment[]; inline_pending?: string[] }
   next: Next
   blocked_reasons: Reason[]
   notes: Reason[]
@@ -229,6 +231,11 @@ export function resolve(facts: FlowFacts): FlowStatus {
 
   const count = (depth === 'corta' ? facts.tasksSection : facts.tasksFile) ?? { total: 0, done: 0, firstPending: null, firstPendingId: null }
   const pending = count.total - count.done
+  const responsibilities = depth === 'corta' ? facts.taskResponsibilitiesSection : facts.taskResponsibilitiesFile
+  for (const error of responsibilities?.actorErrors ?? []) {
+    const where = depth === 'corta' ? 'de la sección Tasks de plan.md' : 'de tasks.md'
+    blocked.push({ code: 'task_actor_invalid', detail: `línea ${error.line} ${where}${error.id ? ` (${error.id})` : ''}: ${error.detail}` })
+  }
   if (status !== null && AFTER_IMPLEMENTING.includes(status) && pending > 0) {
     blocked.push({ code: 'status_ahead', detail: `plan.md dice ${status} y quedan ${pending} tasks pendientes` })
   }
@@ -284,7 +291,8 @@ export function resolve(facts: FlowFacts): FlowStatus {
     id: facts.id,
     depth,
     gates,
-    tasks: { total: count.total, done: count.done, pending, first_pending: count.firstPending },
+    tasks: { total: count.total, done: count.done, pending, first_pending: count.firstPending,
+      ...(responsibilities?.hasExplicitActors ? { pending_assignments: responsibilities.pendingAssignments, inline_pending: responsibilities.inlinePending } : {}) },
     next,
     blocked_reasons: blocked,
     notes,

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { SddError } from '../src/types.ts'
 import {
   type ChainInput, FIX_PROMPT_BUDGET, type ReceiptFacts, type RunFacts, chainState, checkClassification, derive, failureCounts, planEpoch, proposeClass, redRows, renderContinuationPrompt, renderFixPrompt,
-  renderResumePrompt, unattestedRows,
+  orientation, renderResumePrompt, unattestedRows,
 } from '../src/sdd/chain.ts'
 import { writerEnvelopeBytes } from '../src/writer.ts'
 import type { ChainClass, ChainEntry, ChainTerminal, Classification, RunEntry } from '../src/sdd/phase-state.ts'
@@ -268,4 +268,87 @@ test('estado de cadena: la toma cierra la cadena, y solo una aprobación posteri
   const legacy = chainState(input([runEntry('R1', 'implement', null, { pending: ['T1', 'T2'] })], [R1],
     { terminal: { code: 'legacy', at: '2026-09-29T21:00:00.000Z', detail: 'x' }, approvals: [{ gate: 'tasks', at: '2026-09-29T22:00:00.000Z' }], open: ['T2'] }))
   assert.equal(legacy.next.kind, 'conductor')
+})
+
+test('la cadena no orienta a verify ni continúa con una task de actor inválido', () => {
+  const view = chainState({ imp: { schema: 1, chains: [], classifications: [], events: [] }, runs: new Map(), receipt: null, approvals: [], open: ['T1'],
+    failed: new Set(), writerPending: [], externalPending: [], inlinePending: [], actorErrors: [{ line: 3, id: 'T1', detail: 'actor vacío o desconocido' }] })
+  // Sin cadena, la orientación es lanzar: el lanzamiento inicial diagnostica el actor inválido con task_actor_invalid.
+  assert.equal(view.next.kind, 'start')
+  assert.doesNotMatch(orientation('f', view.next), /sdd verify|--takeover/)
+  const chained = chainState({ imp: { schema: 1, chains: [{ id: 'c1', entries: [], terminal: { code: 'takeover', at: '2026-01-01T00:00:00.000Z', detail: 'toma' } }], classifications: [], events: [] },
+    runs: new Map(), receipt: null, approvals: [], open: ['T1'], failed: new Set(), writerPending: [], externalPending: [], inlinePending: [],
+    actorErrors: [{ line: 3, id: 'T1', detail: 'actor vacío o desconocido' }] })
+  assert.equal(chained.next.kind, 'coordinate')
+  assert.match((chained.next as { why: string }).why, /actor inválido.*T1/)
+  assert.doesNotMatch(orientation('f', chained.next), /sdd verify/)
+})
+
+test('las tasks fuera del alcance y las pendientes inline se coordinan sin proponer verify ni la toma', () => {
+  const R1 = { run: 'R1', kind: 'implement' as const, pending: ['T1'], harvest: harvest({ completed: ['T1'] }) }
+  const e1 = [runEntry('R1', 'implement', null, { pending: ['T1'] })]
+  const base = { ...input(e1, [R1], { open: ['T99'] }), writerPending: ['T99'], externalPending: [], inlinePending: [], actorErrors: [] }
+  const outside = chainState(base).next
+  assert.deepEqual([outside.kind, /T99/.test((outside as { why: string }).why)], ['coordinate', true])
+  const inline = chainState({ ...base, open: [], writerPending: [], inlinePending: ['- [ ] tarea inline'] }).next
+  assert.equal(inline.kind, 'coordinate')
+  for (const next of [outside, inline]) assert.doesNotMatch(orientation('f', next), /sdd verify|--takeover/)
+})
+
+test('con tasks acreditadas sin marcar la cadena pide marcarlas antes de verificar', () => {
+  const R1 = { run: 'R1', kind: 'implement' as const, pending: ['T1'], harvest: harvest({ completed: ['T1'] }) }
+  const e1 = [runEntry('R1', 'implement', null, { pending: ['T1'] })]
+  const responsibilities = { writerPending: ['T1'], externalPending: [], inlinePending: [], actorErrors: [] }
+  // `input` no copia las responsabilidades: se suman al resultado.
+  assert.equal(chainState({ ...input(e1, [R1], { open: ['T1'] }), ...responsibilities }).next.kind, 'mark_and_verify')
+  assert.equal(chainState({ ...input(e1, [R1], { open: [] }), ...responsibilities, writerPending: [] }).next.kind, 'verify')
+})
+
+test('un fix que vacía el candidato gana al marcado de una task acreditada antes y reabierta', () => {
+  const R1 = { run: 'R1', kind: 'implement' as const, pending: ['T1'], harvest: harvest({ completed: ['T1'] }) }
+  const R2 = { run: 'R2', kind: 'fix' as const, pending: [], harvest: harvest({ files: 0, delta: [], completed: [] }) }
+  const entries = [runEntry('R1', 'implement', null, { pending: ['T1'] }), runEntry('R2', 'fix', 'R1', { pending: [] })]
+  const responsibilities = { writerPending: ['T1'], externalPending: [], inlinePending: [], actorErrors: [] }
+  const s = chainState({ ...input(entries, [R1, R2], { open: ['T1'] }), ...responsibilities })
+  assert.deepEqual(s.covered, ['T1'])
+  assert.deepEqual(s.next, { kind: 'takeover', why: 'el candidato acumulado quedó vacío: no hay cambio que verificar' })
+  // La primera corrida sin cambios sigue con su continuación: la guarda no la adelanta.
+  const first = { run: 'R1', kind: 'implement' as const, pending: ['T1'], harvest: harvest({ files: 0, delta: [], completed: [] }) }
+  assert.deepEqual(chainState({ ...input([entries[0]], [first], { open: ['T1'] }), ...responsibilities }).next, { kind: 'continue', left: ['T1'] })
+  // Con el candidato vacío, la guarda también gana a la coordinación de conductor y user.
+  const external = { writerPending: [], externalPending: [{ id: 'T2', title: 'Observar', actor: 'user' as const }], inlinePending: [], actorErrors: [] }
+  assert.equal(chainState({ ...input(entries, [R1, R2], { open: ['T2'] }), ...external }).next.kind, 'takeover')
+})
+
+test('una cadena sin eslabones vivos coordina las pendientes externas igual que sin cadena', () => {
+  const entries = [runEntry('R1', 'implement', null, { pending: ['T1'] })]
+  const external = { writerPending: [], externalPending: [{ id: 'T2', title: 'Observar', actor: 'user' as const }], inlinePending: [], actorErrors: [] }
+  const s = chainState({ ...input(entries, [], { open: ['T2'], failed: new Set(['R1']) }), ...external })
+  assert.deepEqual(s.next, { kind: 'actors_pending', assignments: external.externalPending, covered: [] })
+})
+
+test('la indicación de marcar solo nombra las acreditadas que siguen abiertas', () => {
+  const R1 = { run: 'R1', kind: 'implement' as const, pending: ['T1'], harvest: harvest({ completed: ['T1'] }) }
+  const entries = [runEntry('R1', 'implement', null, { pending: ['T1'] })]
+  const external = { writerPending: [], externalPending: [{ id: 'T3', title: 'Observar', actor: 'user' as const }], inlinePending: [], actorErrors: [] }
+  // T1 ya marcada: actors_pending sin pedir que se marque otra vez.
+  const marked = chainState({ ...input(entries, [R1], { open: ['T3'] }), ...external })
+  assert.deepEqual([marked.unmarked, marked.next], [[], { kind: 'actors_pending', assignments: external.externalPending, covered: [] }])
+  assert.doesNotMatch(orientation('f', marked.next), /tasks acreditadas/)
+  // T1 todavía abierta: se pide marcarla.
+  const open = chainState({ ...input(entries, [R1], { open: ['T1', 'T3'] }), ...external, writerPending: ['T1'] })
+  assert.deepEqual([open.unmarked, open.next], [['T1'], { kind: 'actors_pending', assignments: external.externalPending, covered: ['T1'] }])
+  assert.match(orientation('f', open.next), /marca en tasks.md las tasks acreditadas \(T1\)/)
+})
+
+test('una cadena cerrada con una acreditada sin marcar y pendientes externas orienta a coordinarlas', () => {
+  const R1 = { run: 'R1', kind: 'implement' as const, pending: ['T1'], harvest: harvest({ completed: ['T1'] }) }
+  const entries = [runEntry('R1', 'implement', null, { pending: ['T1'] })]
+  const terminal = { code: 'takeover' as const, at: '2026-09-29T21:00:00.000Z', detail: 'toma' }
+  const external = { writerPending: ['T1'], externalPending: [{ id: 'T3', title: 'Confirmar', actor: 'conductor' as const }], inlinePending: [], actorErrors: [] }
+  const s = chainState({ ...input(entries, [R1], { terminal, open: ['T1', 'T3'] }), ...external })
+  assert.deepEqual(s.next, { kind: 'actors_pending', assignments: external.externalPending, covered: ['T1'] })
+  // Con una task del writer sin acreditar, la cadena cerrada sigue su camino anterior.
+  const pending = chainState({ ...input(entries, [R1], { terminal, open: ['T1', 'T2', 'T3'] }), ...external, writerPending: ['T1', 'T2'] })
+  assert.notEqual(pending.next.kind, 'actors_pending')
 })

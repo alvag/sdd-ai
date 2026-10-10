@@ -521,7 +521,10 @@ function chainNext(root: string, id: string, status: Pick<FlowStatus, 'depth' | 
     return { step: status.next.step, detail: `no se pudo leer la cadena del writer: ${(e as Error).message}` }
   }
   const s = view.state
-  if (s.chain === null) return null
+  if (s.chain === null && s.next.kind !== 'actors_pending') {
+    if (view.input.inlinePending?.length) return { ...status.next, detail: `sigue implement inline: ${view.input.inlinePending.join('; ')}` }
+    return null
+  }
   const n = s.next
   const phase = `./bin/sdd-ai sdd phase ${id}`
   const detail = orientation(id, n)
@@ -532,7 +535,7 @@ function chainNext(root: string, id: string, status: Pick<FlowStatus, 'depth' | 
     let base: string | null
     let family: string | undefined
     try {
-      base = chainBaseOf(root, view.input.imp, s.chain)
+      base = s.chain ? chainBaseOf(root, view.input.imp, s.chain) : null
       family = link.kind === 'takeover' ? undefined : readControl(root, link.run).family
     } catch (e) {
       return { step: status.next.step, detail: `no se pudo leer el control de la cadena para armar la revisión: ${(e as Error).message}` }
@@ -543,10 +546,11 @@ function chainNext(root: string, id: string, status: Pick<FlowStatus, 'depth' | 
     return { ...status.next, command: reviewStartCommand(id, base, { run: link.run, author: family }) }
   }
   switch (n.kind) {
+    case 'mark_and_verify': return { ...status.next, detail: `el último eslabón está completo: ${detail}` }
     case 'verify':
     case 'repeat_verify':
       return step === 'verify' ? { ...status.next, command: `./bin/sdd-ai sdd verify ${id}`, ...(n.kind === 'repeat_verify' ? { detail } : {}) }
-        : { ...status.next, detail: `el último eslabón está completo: marca en tasks.md las tasks acreditadas (${s.covered.join(', ') || 'ninguna'}) y corre ./bin/sdd-ai sdd verify ${id}` }
+        : { ...status.next, detail: `el último eslabón está completo: ${orientation(id, { kind: 'mark_and_verify', unmarked: s.unmarked })}` }
     case 'wait': return { ...status.next, command: `./bin/sdd-ai wait ${n.run}` }
     case 'orphan': return { ...status.next, command: `./bin/sdd-ai cancel ${n.run}`, detail }
     case 'classify': {
@@ -563,6 +567,7 @@ function chainNext(root: string, id: string, status: Pick<FlowStatus, 'depth' | 
     case 'attest': return { ...status.next, command: `./bin/sdd-ai sdd verify ${id} --attest ${n.rows[0]}`, detail }
     case 'takeover':
     case 'conductor': return { ...status.next, command: `./bin/sdd-ai sdd verify ${id} --takeover`, detail }
+    // `actors_pending` y `coordinate` caen aquí: sin comando, porque ni lanzar el writer ni verificar corresponden todavía.
     default: return { ...status.next, detail }
   }
 }

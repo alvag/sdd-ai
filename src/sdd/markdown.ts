@@ -1,5 +1,6 @@
 import { parse } from 'yaml'
 import { sha256 } from '../review/candidate.ts'
+import { SddError } from '../types.ts'
 
 /** `firstPending` es el texto de la primera task pendiente tras su checkbox; `firstPendingId`, su `T<n>`, o `null` si no cumple la gramática. */
 export interface TaskCount { total: number; done: number; firstPending: string | null; firstPendingId: string | null }
@@ -127,8 +128,17 @@ export function countTasks(text: string): TaskCount {
   return { total, done, firstPending, firstPendingId: firstPending === null ? null : (TASK_BODY.exec(firstPending)?.[2] ?? null) }
 }
 
+/** Los actores de una task: la única lista, de la que salen el tipo, el lector y la admisión del contrato. */
+export const TASK_ACTORS = ['writer', 'conductor', 'user'] as const
+export type TaskActor = typeof TASK_ACTORS[number]
 /** Lo que se lee de la línea de una task con la gramática de la plantilla de `sdd-flow`. */
-export interface TaskLine { done: boolean; id: string; title: string; covers: string[] }
+export interface TaskLine { done: boolean; id: string; title: string; covers: string[]; actor?: TaskActor }
+export interface TaskAssignment { id: string; title: string; actor: TaskActor | null }
+export interface TaskActorError { line: number; id: string | null; detail: string }
+export interface TaskResponsibilities {
+  hasExplicitActors: boolean; pendingAssignments: TaskAssignment[]; writerPending: string[]
+  inlinePending: string[]; actorErrors: TaskActorError[]
+}
 
 const TASK_BODY = /^(\*\*)?(T\d+) — (.+?)\1(?:[ \t]+·[ \t]+cubre:[ \t]*(.*))?$/
 const CRITERION = /^[-*+][ \t]+\*\*(AC-\d+):\*\*/
@@ -138,19 +148,102 @@ const CRITERION = /^[-*+][ \t]+\*\*(AC-\d+):\*\*/
  * si la línea no es un checkbox de primer nivel o si lo es y no cumple la gramática.
  */
 export function parseTaskLine(line: string): TaskLine | null {
+  return readTaskLine(line).task
+}
+
+/** La línea en negrita con metadatos después del cierre: el título llega hasta el último `**`, como en `TASK_BODY`. */
+const BOLD_TASK = /^\*\*(T\d+) — (.+)\*\*(.*)$/
+/** Lo que sigue al primer cierre de la negrita: si ahí hay un `· actor:`, la línea declara actor aunque no se lea. */
+const AFTER_FIRST_BOLD = /^\*\*(T\d+) — .+?\*\*(.*)$/
+const DECLARES_ACTOR = /[ \t]·[ \t]+actor:/
+/** El valor de un metadato `<clave>: <valor>`. */
+const metaValue = (part: string, key: 'actor' | 'cubre') => part.slice(key.length + 1).trim()
+
+/**
+ * Lee una línea de task. El actor solo se declara como metadato de la gramática en negrita, después del cierre del
+ * título; sin esa declaración la línea se lee con la gramática anterior, así que una task heredada conserva su lectura.
+ * Una declaración repetida, vacía o desconocida no es una task: se diagnostica con su id.
+ */
+function readTaskLine(line: string): { task: TaskLine | null; explicit: boolean; error?: string; id?: string } {
   const m = TASK.exec(line)
-  const b = m ? TASK_BODY.exec(m[2].trim()) : null
-  if (!m || !b) return null
+  if (!m) return { task: null, explicit: false }
+  const bold = BOLD_TASK.exec(m[2].trim())
+  const metadata = bold ? bold[3].split(/[ \t]+·[ \t]+/) : []
+  const actors = metadata.slice(1).filter((part) => part.startsWith('actor:'))
+  if (bold && actors.length > 0) {
+    if (actors.length > 1) return { task: null, explicit: true, id: bold[1], error: 'actor repetido' }
+    const actor = metaValue(actors[0], 'actor')
+    if (!(TASK_ACTORS as readonly string[]).includes(actor)) return { task: null, explicit: true, id: bold[1], error: 'actor vacío o desconocido' }
+    if (metadata[0].trim() !== '' || metadata.slice(1).some((part) => !/^(actor|cubre):/.test(part))) {
+      return { task: null, explicit: true, id: bold[1], error: 'metadato fuera de la gramática junto a la declaración de actor' }
+    }
+    const covers = metadata.slice(1).find((part) => part.startsWith('cubre:'))
+    return { explicit: true, task: { done: m[1] !== ' ', id: bold[1], title: bold[2], actor: actor as TaskActor,
+      covers: covers === undefined ? [] : metaValue(covers, 'cubre').split(',').map((c) => c.trim()).filter((c) => c !== '') } }
+  }
+  // Un `**` después de los metadatos hace que el título codicioso se trague la declaración: no se lee como heredada.
+  const first = AFTER_FIRST_BOLD.exec(m[2].trim())
+  if (first && DECLARES_ACTOR.test(first[2])) return { task: null, explicit: true, id: first[1], error: 'actor fuera de los metadatos de la línea' }
+  const b = TASK_BODY.exec(m[2].trim())
+  if (!b) return { task: null, explicit: false }
   const covers = b[4] === undefined ? [] : b[4].split(',').map((c) => c.trim()).filter((c) => c !== '')
-  return { done: m[1] !== ' ', id: b[2], title: b[3], covers }
+  return { explicit: false, task: { done: m[1] !== ' ', id: b[2], title: b[3], covers } }
+}
+
+/** Las líneas de `taskLines`, con su número (desde 1) y la lectura del actor. */
+function taskEntries(text: string): { text: string; done: boolean; task: TaskLine | null; line: number; explicit: boolean; actorError?: TaskActorError }[] {
+  return scan(splitLines(text)).flatMap((l, i) => {
+    const m = l.fenced ? null : TASK.exec(l.text)
+    if (!m) return []
+    const read = readTaskLine(l.text)
+    return [{ text: l.text, done: m[1] !== ' ', task: read.task, line: i + 1, explicit: read.explicit,
+      ...(read.error ? { actorError: { line: i + 1, id: read.id ?? null, detail: read.error } } : {}) }]
+  })
 }
 
 /** Las líneas que `countTasks` cuenta, en orden, con su marca y lo que la gramática de task lee de cada una. */
 export function taskLines(text: string): { text: string; done: boolean; task: TaskLine | null }[] {
-  return scan(splitLines(text)).flatMap((l) => {
-    const m = l.fenced ? null : TASK.exec(l.text)
-    return m ? [{ text: l.text, done: m[1] !== ' ', task: parseTaskLine(l.text) }] : []
-  })
+  return taskEntries(text).map(({ text, done, task }) => ({ text, done, task }))
+}
+
+/**
+ * Quién hace cada task pendiente. Una task sin actor declarado lleva `actor: null` y se trata como del writer para
+ * seleccionar ejecución; las líneas que no cumplen la gramática quedan para atención inline, y las de actor inválido,
+ * como errores con su línea dentro de `text`.
+ */
+export function readTaskResponsibilities(text: string): TaskResponsibilities {
+  const lines = taskEntries(text)
+  // Un id repetido no se puede proyectar al encargo del writer: sus pendientes quedan para atención inline.
+  const ids = lines.flatMap((l) => (l.task ? [l.task.id] : []))
+  const repeated = new Set(ids.filter((id, i) => ids.indexOf(id) !== i))
+  const delegable = (l: (typeof lines)[number]) => l.task !== null && !repeated.has(l.task.id)
+  const pendingAssignments = lines.flatMap((l) => !l.done && l.task && delegable(l) ? [{ id: l.task.id, title: l.task.title, actor: l.task.actor ?? null }] : [])
+  return { hasExplicitActors: lines.some((l) => l.explicit), pendingAssignments,
+    writerPending: pendingAssignments.filter((t) => t.actor === null || t.actor === 'writer').map((t) => t.id),
+    inlinePending: lines.filter((l) => !l.done && !delegable(l) && !l.actorError).map((l) => l.text),
+    actorErrors: lines.flatMap((l) => l.actorError ? [l.actorError] : []) }
+}
+
+/** Proyecta bloques completos sin cambiar el artefacto que se usa para las huellas. */
+export function projectTaskBlocks(text: string, ids: readonly string[]): string {
+  const lines = scan(splitLines(text))
+  const blocks = new Map<string, string[]>()
+  for (let start = 0; start < lines.length; start++) {
+    const l = lines[start]
+    const task = l.fenced ? null : parseTaskLine(l.text)
+    if (!task) continue
+    let end = start + 1
+    while (end < lines.length && (lines[end].fenced || (!TASK.test(lines[end].text) && lines[end].level === 0))) end++
+    const block = lines.slice(start, end).map((line) => line.text).join('\n').trimEnd()
+    blocks.set(task.id, [...(blocks.get(task.id) ?? []), block])
+  }
+  for (const id of ids) {
+    if (blocks.get(id)?.length !== 1) {
+      throw new SddError('task_projection_invalid', `la task ${id} está ausente o repetida en tasks.md: no se puede armar el encargo del writer`,
+        { next: 'corrige tasks.md, vuelve a aprobar el gate de las tasks y consulta ./bin/sdd-ai sdd status' })
+    }
+  }
+  return `# Tasks\n\n${[...blocks].filter(([id]) => ids.includes(id)).map(([, found]) => found[0]).join('\n\n')}\n`
 }
 
 /** Los `AC-<n>` de los ítems `- **AC-<n>:**` de primer nivel dentro de `## Criterios de aceptación`, en orden. */

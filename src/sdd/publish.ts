@@ -16,6 +16,7 @@ import { type Step, resolve } from './status.ts'
  * de `plan.md`. `created_at` se fija al escribir.
  */
 export interface FrozenLaunch {
+  task_actors?: true
   flow: string; step: DocumentStep; depth: 'normal' | 'completa'
   /** `sha256:` de los bytes de cada insumo congelado: el pedido, la spec, el plan y el contexto. */
   inputs: Record<string, string>
@@ -59,6 +60,7 @@ export function freezeLaunch(read: FlowRead, o: {
   if (o.request) inputs.request = bytesHash(o.request.bytes)
   if (o.context) inputs.context = bytesHash(o.context.bytes)
   return {
+    ...(o.step === 'tasks' ? { task_actors: true as const } : {}),
     flow: read.facts.id, step: o.step, depth: o.depth, inputs, handoff_header: headerHash(read.facts.handoffHeader),
     ...(o.plan_header ? { plan_header: o.plan_header } : {}), ...(o.criteria ? { criteria: o.criteria } : {}),
     ...(o.request ? { request_path: o.request.path } : {}), ...(o.context ? { context_path: o.context.path } : {}), amended: o.amended,
