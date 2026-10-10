@@ -1,4 +1,5 @@
 import { type FindingsChannel } from './findings.ts'
+import { withGitQueryScope } from './git-memo.ts'
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
@@ -307,13 +308,13 @@ async function attempt(ctx: RunContext, launch: LaunchSpec, suffix: string, unti
       graceTimer = setTimeout(() => kill('SIGKILL'), grace)
     }, Math.max(0, until - Date.now()))
     // `cancel` puede llegar antes de que exista el PID; el pedido en disco es la señal.
-    cancelWatch = setInterval(() => {
+    cancelWatch = setInterval(() => withGitQueryScope('iteration', () => {
       if (existsSync(cancelFile)) {
         clearInterval(cancelWatch)
         kill('SIGTERM')
         graceTimer = setTimeout(() => kill('SIGKILL'), grace)
       }
-    }, 250)
+    }), 250)
   }
 
   const { code, spawnError } = await ended
@@ -1084,11 +1085,15 @@ export async function settleGroup(g: GroupIdentity, graceMs: number, state: (g: 
   Promise<'gone' | 'alive' | 'unknown'> {
   const until = Date.now() + graceMs
   for (;;) {
-    const s = state(g)
-    if (s === 'gone') return s
-    // `alive` en false: en Windows el líder pudo salir y su PID estar reusado; fuera de Windows se ignora.
-    if (s === 'alive') killGroup(g.pgid, 'SIGKILL', false)
-    if (Date.now() >= until) return s
+    const observed = withGitQueryScope('iteration', () => {
+      const s = state(g)
+      if (s === 'gone') return s
+      // `alive` en false: en Windows el líder pudo salir y su PID estar reusado; fuera de Windows se ignora.
+      if (s === 'alive') killGroup(g.pgid, 'SIGKILL', false)
+      if (Date.now() >= until) return s
+      return undefined
+    })
+    if (observed !== undefined) return observed
     await sleep(100)
   }
 }
