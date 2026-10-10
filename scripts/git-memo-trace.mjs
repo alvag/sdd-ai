@@ -59,7 +59,9 @@ for (const api of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'exec', 'ex
     const fork = api === 'fork'
     const file = shell ? '<shell>' : fork ? process.execPath : args[0]
     const functional = shell ? [String(args[0])] : fork ? [String(args[0]), ...(Array.isArray(args[1]) ? args[1] : [])] : Array.isArray(args[1]) ? [...args[1]] : []
-    const options = args[Array.isArray(args[1]) ? 2 : 1]
+    // Las opciones van después de los argumentos, también cuando estos vienen indefinidos: fork(m, undefined, opts).
+    const optionsIndex = Array.isArray(args[1]) || (args[1] == null && args.length > 2) ? 2 : 1
+    const options = args[optionsIndex]
     const cwd = options && typeof options === 'object' && options.cwd !== undefined ? String(options.cwd) : process.cwd()
     const query = classify(file, functional)
     const synchronous = api.endsWith('Sync')
@@ -78,8 +80,7 @@ for (const api of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'exec', 'ex
     const finish = (row) => write({ kind: 'process', stage: 'completion', id, duration_ms: performance.now() - started, ...row })
     const launched = [...args]
     if (fork) {
-      const index = Array.isArray(args[1]) ? 2 : 1
-      launched[index] = { ...(options ?? {}), execArgv: inject(options?.execArgv ?? inherited(process.execArgv)) }
+      launched[optionsIndex] = { ...(options ?? {}), execArgv: inject(options?.execArgv ?? inherited(process.execArgv)) }
     } else if (!shell && String(file) === process.execPath) {
       if (Array.isArray(args[1])) launched[1] = inject(args[1])
       else launched.splice(1, 0, inject([]))

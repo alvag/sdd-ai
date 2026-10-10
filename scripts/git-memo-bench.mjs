@@ -1,10 +1,10 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { loadavg, release, tmpdir } from 'node:os'
-import { cleanGitEnv, createFixture, captureState, withGitEnv } from '../test/git-memo-fixture.ts'
-import { aggregate, compare } from './git-memo-report.mjs'
+import { cleanGitEnv, createFixture, captureState, FIXTURE_GIT_ENV, withGitEnv } from '../test/git-memo-fixture.ts'
+import { aggregate, compare, operationReached } from './git-memo-report.mjs'
 import { createHash } from 'node:crypto'
 
 const sourceRoot = resolve(import.meta.dirname, '..')
@@ -64,12 +64,26 @@ export async function snapshotCandidate(root, baseCommit, destination) {
   // Sin detección de renombres: un renombre lista el origen (que se borra del snapshot) y el destino.
   const changed = new Set([...git(root, ['diff', '--name-only', '--no-renames', '-z', baseCommit]).toString().split('\0'),
     ...git(root, ['ls-files', '--others', '--exclude-standard', '-z']).toString().split('\0')].filter(Boolean))
-  for (const name of changed) {
+  // Las rutas más profundas primero: si el candidato reemplaza un directorio `d` por un enlace, `d/file` se procesa
+  // mientras `d` sigue siendo el directorio del snapshot, y no a través del enlace ya copiado.
+  const inside = realpathSync(destination)
+  for (const name of [...changed].sort((a, b) => b.split('/').length - a.split('/').length || a.localeCompare(b))) {
     if (name === '.plans/git-memo-228' || name.startsWith('.plans/git-memo-228/')) continue
     const from = join(root, name); const to = join(destination, name)
+    // Nunca se borra ni se escribe fuera del snapshot.
+    // Se mira el ancestro más cercano que existe: un directorio que todavía no existe se crea debajo de él.
+    let ancestor = dirname(to)
+    while (!existsSync(ancestor) && dirname(ancestor) !== ancestor) ancestor = dirname(ancestor)
+    const parent = realpathSync(ancestor)
+    if (parent !== inside && !parent.startsWith(inside + sep)) throw new Error(`ruta candidata fuera del snapshot: ${name}`)
     rmSync(to, { recursive: true, force: true })
-    if (!existsSync(from)) continue
-    const stat = lstatSync(from)
+    // lstat y no existsSync: existsSync sigue el enlace y daría por ausente un symlink colgante, que Git versiona.
+    let stat
+    try { stat = lstatSync(from) } catch (error) {
+      // Solo una ruta ausente (borrada en el candidato) se omite; otro error deja la causa y la ruta a la vista.
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') continue
+      throw error
+    }
     mkdirSync(dirname(to), { recursive: true })
     if (stat.isSymbolicLink()) symlinkSync(readlinkSync(from), to)
     else if (stat.isFile()) { writeFileSync(to, readFileSync(from)); chmodSync(to, stat.mode & 0o777) }
@@ -80,6 +94,11 @@ export async function snapshotCandidate(root, baseCommit, destination) {
   // atrapa directorios, así que sin esta exclusión el enlace entraría en el árbol del snapshot.
   writeFileSync(join(destination, '.git', 'info', 'exclude'), 'node_modules\n')
   git(destination, ['add', '-A'])
+  // El índice nuevo no conoce los archivos versionados que coinciden con .gitignore, y `add -A` los omite: se agregan
+  // forzados los que están en el árbol del candidato.
+  const tracked = execFileSync('git', ['ls-tree', '-r', '-z', '--name-only', fingerprint.tree], { cwd: root, env: cleanGitEnv(), maxBuffer: 256 * 1024 * 1024 })
+  // Con --literal-pathspecs: un nombre versionado como `:asset` o `:(literal)foo` es una ruta, no sintaxis de pathspec.
+  execFileSync('git', ['--literal-pathspecs', 'add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { cwd: destination, env: cleanGitEnv(), input: tracked })
   git(destination, ['commit', '-qm', 'candidate snapshot'])
   const tree = git(destination, ['rev-parse', 'HEAD^{tree}']).toString().trim()
   if (tree !== fingerprint.tree) throw new Error('el snapshot no representa el mismo candidato')
@@ -92,17 +111,9 @@ const BENCH_FILE = /^(?:manifest\.json|baseline\.json|report\.json|.+\.(?:initia
 const putJson = (file, value) => writeFileSync(file, JSON.stringify(value, null, 2) + '\n')
 const fileDigest = (file) => `sha256:${createHash('sha256').update(readFileSync(file)).digest('hex')}`
 
-export function validateOperation(scenario, operations, beforeHead, afterHead, receipt) {
-  // Un timeout o un fallo de lanzamiento ya se rechazó en timedOperation: aquí solo queda el código de salida.
-  if (operations.some((op) => op.exit_code !== 0)) throw new Error('operación fallida')
-  if (scenario === 'verify') {
-    const executed = receipt?.rows?.filter((row) => row.execution && row.execution.exit_code === 0).length ?? 0
-    if (!receipt?.green || receipt.mode !== 'final' || !operations[0].json?.digest || executed === 0 || executed !== receipt.rows.length) throw new Error('verify no ejecutó todas las filas ni produjo recibo verde')
-    return { executed_rows: executed, commit_created: false }
-  }
-  if (operations.length !== 2 || operations[0].json?.state !== 'dry_run' || !operations[0].json?.digest || beforeHead === afterHead || operations[1].json?.sha !== afterHead) throw new Error('commit no llegó al ensayo y aplicación efectivos')
-  return { executed_rows: 0, commit_created: true }
-}
+// Un timeout o un fallo de lanzamiento ya se rechazó en timedOperation. El criterio de camino lo comparten el bench y la
+// validación del informe (operationReached), para que el informe no acepte una operación que el bench rechazaría.
+export const validateOperation = operationReached
 
 /** El entorno de cada operación medida: Git sin variables heredadas, telemetría y publicación apagadas. */
 export function operationEnv() {
@@ -111,13 +122,15 @@ export function operationEnv() {
 
 /**
  * El entorno que registra el manifiesto, derivado del que reciben las operaciones: los interruptores, las variables
- * GIT_* que fija el fixture y las que tienen el mismo valor que en el host (heredadas).
+ * GIT_* que fija el fixture y las que no fija (heredadas, que tienen que ser ninguna).
  */
 function measuredEnv() {
   const env = operationEnv()
   const git = Object.keys(env).filter((name) => name.startsWith('GIT_')).sort()
+  // Heredada es la que el fixture no fija, no la que coincide con el host: el fixture puede fijar a propósito el mismo
+  // valor que tiene el host (por ejemplo, GIT_CONFIG_NOSYSTEM=1).
   return { SDD_AI_TELEMETRY: env.SDD_AI_TELEMETRY, SDD_AI_PROJECTION: env.SDD_AI_PROJECTION, git_variables: git,
-    inherited_git_variables: git.filter((name) => process.env[name] === env[name]) }
+    inherited_git_variables: git.filter((name) => !Object.hasOwn(FIXTURE_GIT_ENV, name) || FIXTURE_GIT_ENV[name] !== env[name]) }
 }
 
 const OPERATION_TIMEOUT_MS = 240000
@@ -143,7 +156,8 @@ function runGroup(command, options) {
     const timer = setTimeout(() => { timedOut = true; killGroup(child.pid) }, OPERATION_TIMEOUT_MS)
     const finish = (status, signal) => {
       if (settled) return
-      settled = true; clearTimeout(timer); activeGroups.delete(child.pid)
+      // Un hijo que quedó en el grupo después de que time salió no puede seguir cargando las muestras siguientes.
+      settled = true; clearTimeout(timer); killGroup(child.pid); activeGroups.delete(child.pid)
       child.stdout.destroy(); child.stderr.destroy()
       done({ stdout, stderr, status, signal, timedOut })
     }
@@ -166,9 +180,12 @@ async function timedOperation(binRoot, root, argv, trace, operation) {
   const result = await runGroup(command, { cwd: root, env: operationEnv() })
   const loadAfter = loadavg()
   if (interrupted) throw interrupted
-  if (result.timedOut) throw new Error(`timeout: la operación superó ${OPERATION_TIMEOUT_MS / 1000} s y se mató su grupo de procesos`)
+  // Un intento rechazado lleva lo que la operación alcanzó a producir, para guardarlo como evidencia de la exclusión.
+  const rejected = (message) => Object.assign(new Error(message), { operation: { command, cwd: root, stdout: result.stdout, stderr: result.stderr,
+    exit_code: result.status, signal: result.signal, timed_out: result.timedOut, load_before: loadBefore, load_after: loadAfter } })
+  if (result.timedOut) throw rejected(`timeout: la operación superó ${OPERATION_TIMEOUT_MS / 1000} s y se mató su grupo de procesos`)
   const timing = /(?:^|\n)real\s+([\d.]+)\s*\nuser\s+([\d.]+)\s*\nsys\s+([\d.]+)\s*$/.exec(result.stderr ?? '')
-  if (!timing) throw new Error(`time no produjo CPU y pared con unidades conocidas (código ${result.status}, señal ${result.signal})`)
+  if (!timing) throw rejected(`time no produjo CPU y pared con unidades conocidas (código ${result.status}, señal ${result.signal})`)
   const stderr = result.stderr.slice(0, timing.index)
   let json = null
   try { json = JSON.parse(result.stdout) } catch { /* La muestra se rechaza por no alcanzar el camino. */ }
@@ -189,12 +206,24 @@ async function measureSample({ binRoot, scenario, instrumented, directory, repor
     // La precarga agrega líneas: la traza empieza vacía aunque el archivo exista.
     if (trace) writeFileSync(trace, '')
     const operations = []
-    if (scenario === 'verify') operations.push(await timedOperation(binRoot, fixture.root, ['sdd', 'verify', fixture.flow], trace, `${id}:verify`))
+    const evidenceFile = join(directory, `${id}.evidence.json`)
+    const evidencePath = relative(reportDir, evidenceFile).split(sep).join('/')
+    const operate = async (argv, operation) => {
+      try { return await timedOperation(binRoot, fixture.root, argv, trace, operation) } catch (error) {
+        // Un timeout o una salida sin time: se guarda lo que la operación produjo antes de excluir la muestra.
+        if (error.operation) {
+          putJson(evidenceFile, { flow: fixture.flow, operations: [...operations, error.operation], failure: error.message })
+          error.evidence = evidencePath
+        }
+        throw error
+      }
+    }
+    if (scenario === 'verify') operations.push(await operate(['sdd', 'verify', fixture.flow], `${id}:verify`))
     else {
-      const draft = await timedOperation(binRoot, fixture.root, ['sdd', 'commit', fixture.flow, '--subject', 'fixture candidate'], trace, `${id}:commit-draft`)
+      const draft = await operate(['sdd', 'commit', fixture.flow, '--subject', 'fixture candidate'], `${id}:commit-draft`)
       operations.push(draft)
-      if (draft.exit_code === 0 && draft.json?.digest) operations.push(await timedOperation(binRoot, fixture.root,
-        ['sdd', 'commit', fixture.flow, '--subject', 'fixture candidate', '--apply', '--digest', draft.json.digest], trace, `${id}:commit-apply`))
+      if (draft.exit_code === 0 && draft.json?.digest) operations.push(await operate(
+        ['sdd', 'commit', fixture.flow, '--subject', 'fixture candidate', '--apply', '--digest', draft.json.digest], `${id}:commit-apply`))
     }
     const afterHead = git(fixture.root, ['rev-parse', 'HEAD']).toString().trim()
     let receipt = null
@@ -202,7 +231,13 @@ async function measureSample({ binRoot, scenario, instrumented, directory, repor
       const gitDir = git(fixture.root, ['rev-parse', '--absolute-git-dir']).toString().trim()
       receipt = JSON.parse(readFileSync(join(gitDir, 'sdd-ai', 'verify', operations[0].json.receipt, 'receipt.json'), 'utf8'))
     }
-    const reached = validateOperation(scenario, operations, beforeHead, afterHead, receipt)
+    // La evidencia de las operaciones se guarda antes de validarlas: un intento rechazado conserva su salida y su código.
+    putJson(evidenceFile, { flow: fixture.flow, operations, receipt, before_head: beforeHead, after_head: afterHead })
+    let reached
+    try { reached = validateOperation(scenario, operations, beforeHead, afterHead, receipt) } catch (error) {
+      error.evidence = evidencePath
+      throw error
+    }
     const afterParent = reached.commit_created ? git(fixture.root, ['rev-parse', 'HEAD^']).toString().trim() : null
     if (reached.commit_created && afterParent !== beforeHead) throw new Error('el commit no tiene el padre esperado')
     const final = captureState(fixture.root)
@@ -210,7 +245,6 @@ async function measureSample({ binRoot, scenario, instrumented, directory, repor
       const registry = JSON.parse(readFileSync(join(fixture.root, '.plans', fixture.flow, 'sdd-ai-phases.json'), 'utf8'))
       if (registry.commit?.state !== 'done' || registry.commit.sha !== afterHead || registry.commit.tree !== final.tree) throw new Error('registro de commit ausente o incoherente')
     }
-    const evidenceFile = join(directory, `${id}.evidence.json`)
     putJson(evidenceFile, { flow: fixture.flow, operations, receipt, before_head: beforeHead, after_head: afterHead, after_parent: afterParent, final })
     const traced = trace ? aggregate(readFileSync(trace, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))) : null
     if (traced) putJson(join(directory, `${id}.aggregate.json`), traced)
@@ -282,7 +316,7 @@ export async function runBenchmark({ base, candidateRoot, pairs = 3, output, rep
           validRounds++
         } catch (error) {
           if (interrupted) throw interrupted
-          manifest.exclusions.push({ scenario, attempt, round, reason: error.message, samples: staged })
+          manifest.exclusions.push({ scenario, attempt, round, reason: error.message, evidence: error.evidence ?? null, samples: staged })
         }
         putJson(join(output, 'manifest.json'), manifest)
       }

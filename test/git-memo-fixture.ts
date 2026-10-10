@@ -115,7 +115,16 @@ export function captureState(root: string, output: CliCapture | null = null) {
     // El índice se compara por su contenido lógico (modo, sha, etapa y ruta). Sus bytes crudos guardan datos de stat
     // (inodo, ctime, mtime) que difieren entre dos fixtures en cuanto una operación lo reescribe.
     refs: gitIn(root, 'show-ref'), index: gitIn(root, 'ls-files', '--stage', '-z'),
-    diff: gitIn(root, 'diff-files', '--binary', '-p') }
+    diff: gitIn(root, 'diff-files', '--binary', '-p'), objects: objectConnectivity(root) }
+}
+
+/**
+ * Si los objetos alcanzables están completos. La captura no compara los bytes de `objects` (dependen de la
+ * compresión y del empaquetado), pero un blob o un árbol faltante tiene que verse: el resultado es `ok` o el error.
+ */
+function objectConnectivity(root: string): string {
+  const result = spawnSync('git', ['fsck', '--connectivity-only', '--no-dangling', '--no-progress'], { cwd: root, env: cleanGitEnv(), encoding: 'utf8' })
+  return result.status === 0 ? 'ok' : `error ${result.status}: ${(result.stderr || result.stdout || String(result.error)).trim()}`
 }
 
 export interface EquivalenceScenario {
@@ -130,7 +139,8 @@ export function keyScenarios(): EquivalenceScenario[] {
     prepare() {},
     async run(binRoot, root, env) {
       const api = await import(pathToFileURL(join(binRoot, 'src', 'git.ts')).href)
-      const json = withGitEnv(env, () => {
+      // En un ámbito del memo, como los demás escenarios: sin él, el candidato no reutilizaría (bypass no_scope).
+      const json = await observeVersion(binRoot, env, () => {
         const dirs = api.gitDirs(root)
         return {
           root: api.repoRoot(root), root_again: api.repoRoot(root),
@@ -146,7 +156,8 @@ export function keyScenarios(): EquivalenceScenario[] {
     prepare(root) { symlinkSync(root, join(root, 'key-alias'), process.platform === 'win32' ? 'junction' : 'dir') },
     async run(binRoot, root, env) {
       const api = await import(pathToFileURL(join(binRoot, 'src', 'git.ts')).href)
-      const json = withGitEnv(env, () => {
+      // En un ámbito del memo, como los demás escenarios: sin él, el candidato no reutilizaría (bypass no_scope).
+      const json = await observeVersion(binRoot, env, () => {
         const original = statSync(root, { bigint: true })
         const variant = root.toUpperCase()
         const sameIdentity = existsSync(variant) && statSync(variant, { bigint: true }).dev === original.dev && statSync(variant, { bigint: true }).ino === original.ino
@@ -212,6 +223,13 @@ export function consumerScenarios(): EquivalenceScenario[] {
       const observations = existsSync(live) ? readdirSync(live).filter((name) => name.endsWith('.json')).sort().map((name) => {
         const o = JSON.parse(readFileSync(join(live, name), 'utf8'))
         if (!/^[0-9a-f]{64}$/.test(o.checkout?.id ?? '') || typeof o.observation?.publisher?.pid !== 'number') throw new Error('observación con forma inesperada')
+        // Los campos que se reemplazan tienen que estar, con un valor: una observación incompleta no se iguala a una completa.
+        // Cada uno con el tipo de ProjectionObservation (src/projection-types.ts).
+        const fields = { id: 'string', m0: 'string', boot: 'string', observed_at: 'number', read_finished_at: 'number' } as const
+        for (const [field, type] of Object.entries(fields)) {
+          const value = o.observation[field]
+          if (typeof value !== type || value === '' || (type === 'number' && !Number.isFinite(value))) throw new Error(`observación sin ${field} de tipo ${type}`)
+        }
         return { ...o, checkout: { ...o.checkout, id: '<checkout-id>' },
           observation: { ...o.observation, id: '<observation>', m0: '<m0>', boot: '<boot>', observed_at: '<epoch>', read_finished_at: '<epoch>',
             publisher: { ...o.observation.publisher, pid: '<pid>' } } }
@@ -425,9 +443,14 @@ function prepareScenarioFlow(root: string) {
   withGitEnv({}, () => approveAll(root))
 }
 
+/**
+ * Las operaciones de un escenario en una sola captura. Un error de lanzamiento o un timeout de cualquiera de ellas
+ * queda en el `error` de la captura combinada, que es el campo que comprueba la matriz.
+ */
 function combinedCapture(operations: unknown[], exitCode: number): CliCapture {
   const json = { operations }
-  return { stdout: JSON.stringify(json) + '\n', stderr: '', exit_code: exitCode, error: null, json }
+  const errors = operations.map((op) => (op && typeof op === 'object' ? (op as { error?: unknown }).error : null)).filter((error) => error !== null && error !== undefined)
+  return { stdout: JSON.stringify(json) + '\n', stderr: '', exit_code: exitCode, error: errors.length ? errors.map(String).join('; ') : null, json }
 }
 
 export function changeScenarios(): EquivalenceScenario[] {
@@ -612,7 +635,7 @@ for (const launch of launches) {
   if (launch.api === 'execSync') cp.execSync(launch.file, opts);
   else if (launch.api === 'exec') await new Promise((resolve, reject) => cp.exec(launch.file, opts, (e) => e ? reject(e) : resolve()));
   else if (sync) cp[launch.api](launch.file, args, opts);
-  else await new Promise((resolve, reject) => { const child = cp[launch.api](launch.file, args, opts); child.on('error', reject); child.on('close', resolve); });
+  else await new Promise((resolve, reject) => { const child = cp[launch.api](launch.file, args, opts); child.on('error', reject); child.on('close', (code, signal) => code === 0 ? resolve() : reject(new Error('lanzamiento terminado con código ' + code + ' y señal ' + signal))); });
  } catch (error) { if (!${JSON.stringify(options.tolerateFailures ?? false)}) throw error; }
 }`
   // El programa va a un archivo y no a `-e`: con `-e`, un fork del proceso heredaría el programa en su execArgv
@@ -636,7 +659,7 @@ for (const launch of launches) {
 
 export function spawnControlledWriter(options: { root: string; onSignal: 'exit' | 'ignore'; steps: Array<{ path: string; content?: string; remove?: boolean; move_to?: string; copy_from?: string; delay_ms?: number }> }) {
   const state = join(options.root, 'controlled-writer.json')
-  const program = `import { cpSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'; import { dirname, resolve } from 'node:path';
+  const program = `import { closeSync, cpSync, ftruncateSync, lstatSync, mkdirSync, openSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs'; import { dirname, resolve } from 'node:path';
 const root = ${JSON.stringify(options.root)}; const state = ${JSON.stringify(state)};
 process.on('SIGTERM', () => { if (${JSON.stringify(options.onSignal)} === 'exit') process.exit(0); });
 writeFileSync(state, JSON.stringify({pid:process.pid,step:0}));
@@ -645,7 +668,11 @@ for (const [index, step] of steps.entries()) { await new Promise(r => setTimeout
  if (step.remove) rmSync(path,{recursive:true,force:true});
  else if (step.move_to) { const target = resolve(root,step.move_to); mkdirSync(dirname(target),{recursive:true}); renameSync(path,target); }
  else if (step.copy_from) { mkdirSync(dirname(path),{recursive:true}); cpSync(resolve(root,step.copy_from),path,{recursive:true}); }
- else { mkdirSync(dirname(path),{recursive:true}); writeFileSync(path,step.content ?? ''); }
+ else { mkdirSync(dirname(path),{recursive:true}); const bytes = Buffer.from(step.content ?? '');
+  // Un archivo existente se reescribe con 'r+', como writeGitFile: Git for Windows marca oculto el gitfile y 'w' falla con EPERM.
+  let existing = false; try { existing = lstatSync(path).isFile() } catch {}
+  if (existing) { const fd = openSync(path,'r+'); try { ftruncateSync(fd,0); writeSync(fd,bytes,0,bytes.length,0) } finally { closeSync(fd) } }
+  else writeFileSync(path,bytes); }
  writeFileSync(state, JSON.stringify({pid:process.pid,step:index+1})); }
 // Sigue vivo mientras viva el proceso del test: si este muere sin limpiar, el writer desligado no queda huérfano.
 setInterval(() => { try { process.kill(${process.pid}, 0) } catch { process.exit(0) } }, 500);`
@@ -666,17 +693,28 @@ export function writeLegacyControl(root: string, id: string, control: Record<str
   return dir
 }
 
+/**
+ * La configuración de Git del host no entra en los tests: sin la de sistema y con un global que no existe. Un
+ * `commit.gpgsign` impediría crear commits, y un include global haría que las consultas no se memoricen
+ * (`config_include`). Un test que necesita otra configuración la trae en su `extra`.
+ */
+export const ISOLATED_GIT_CONFIG = { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(tmpdir(), 'sdd-ai-git-memo-no-config', 'gitconfig') }
+
+/** Las variables Git que fija el fixture: cualquier otra GIT_* en un entorno de operación vendría del host. */
+export const FIXTURE_GIT_ENV: Readonly<Record<string, string>> = { ...ISOLATED_GIT_CONFIG, GIT_AUTHOR_NAME: 'Fixture',
+  GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
+  GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z' }
+
 export function cleanGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return { ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_') && name !== 'NODE_TEST_CONTEXT')),
-    GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture',
-    GIT_COMMITTER_EMAIL: 'fixture@example.invalid', GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
-    SDD_AI_TELEMETRY: 'off', SDD_AI_PROJECTION: 'off', ...extra }
+    ...FIXTURE_GIT_ENV, SDD_AI_TELEMETRY: 'off', SDD_AI_PROJECTION: 'off', ...extra }
 }
 
 /** Las modificaciones globales del entorno son síncronas y se restauran aun con excepción. */
 export function withGitEnv<T>(extra: NodeJS.ProcessEnv, fn: () => T): T {
   const saved = Object.fromEntries(Object.entries(process.env).filter(([name]) => name.startsWith('GIT_')))
   for (const name of Object.keys(process.env)) if (name.startsWith('GIT_')) delete process.env[name]
+  Object.assign(process.env, ISOLATED_GIT_CONFIG)
   for (const [name, value] of Object.entries(extra)) if (name.startsWith('GIT_') && value !== undefined) process.env[name] = value
   try { return fn() } finally {
     for (const name of Object.keys(process.env)) if (name.startsWith('GIT_')) delete process.env[name]
@@ -694,6 +732,7 @@ export async function withGitAndSwitchesEnvAsync<T>(extra: NodeJS.ProcessEnv, fn
   const switches = ['SDD_AI_TELEMETRY', 'SDD_AI_PROJECTION'] as const
   const savedSwitches = Object.fromEntries(switches.map((name) => [name, process.env[name]]))
   for (const name of Object.keys(process.env)) if (name.startsWith('GIT_')) delete process.env[name]
+  Object.assign(process.env, ISOLATED_GIT_CONFIG)
   for (const [name, value] of Object.entries(extra)) if (name.startsWith('GIT_') && value !== undefined) process.env[name] = value
   for (const name of switches) process.env[name] = extra[name] ?? 'off'
   try { return await fn() } finally {

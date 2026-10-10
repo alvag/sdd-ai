@@ -4,7 +4,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync,
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { gitDirs, indexEnv, repoRoot } from '../src/git.ts'
-import { withGitQueryScope } from '../src/git-memo.ts'
+import { withGitQueryScope, withoutGitQueryMemo } from '../src/git-memo.ts'
 import { countGitQueries, gitIn, listenGitMemo, makeGitMemoRepo, withGitEnv, writeGitFile, assertSamePath } from './git-memo-fixture.ts'
 
 test('las estampas reutilizan el estado estable y detectan cada cambio de disposición sin subprocesos', () => {
@@ -34,8 +34,9 @@ test('las estampas reutilizan el estado estable y detectan cada cambio de dispos
       assertSamePath(first.dirs.commonDir, commonDir)
       assertSamePath(first.objects!, join(commonDir, 'objects'))
     }
-    // `config` y `config.worktree` pueden cambiar la raíz y los directorios que informa Git, no la ruta de objetos.
-    const CONFIG = ['repoRoot', 'gitDirs']
+    // La configuración se estampa en las tres consultas (AC-17): un cambio de `config` o `config.worktree` puede cambiar
+    // la raíz y los directorios que informa Git, y una configuración mal formada hace fallar también la de objetos.
+    const CONFIG = ALL
     repeat(join(root, '.git'))
     assert.equal(observed.events.filter((e) => e.kind === 'hit').length, 3)
     // Se conserva el directorio anterior hasta terminar: el SO no puede reciclar su inodo aquí.
@@ -106,7 +107,31 @@ test('las estampas reutilizan el estado estable y detectan cada cambio de dispos
   })) } finally { counter.restore(); observed.stop(); fixture.cleanup() }
   // Un repositorio movido dentro del ámbito: va en el test que nombra V4, para que el recibo lo acredite.
   movedRepository()
+  brokenRecognition()
 })
+
+/**
+ * Lo que Git exige para reconocer un directorio Git (HEAD, refs y objects) está en la estampa: si falta, la consulta
+ * con memo da lo mismo que sin memo, también el error.
+ */
+function brokenRecognition() {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-git-memo-head-')))
+  const repo = join(base, 'repo'); const nested = join(repo, 'nested')
+  mkdirSync(nested, { recursive: true })
+  gitIn(repo, 'init', '-q')
+  const outcome = (read: () => unknown) => { try { return { ok: true, value: read() } } catch { return { ok: false } } }
+  try { withGitEnv({}, () => withGitQueryScope('call', () => {
+    assertSamePath(repoRoot(nested), repo)
+    for (const name of ['HEAD', 'refs', 'objects']) {
+      const path = join(repo, '.git', name); const aside = `${path}.aside`
+      renameSync(path, aside)
+      try {
+        assert.deepEqual(outcome(() => repoRoot(nested)), outcome(() => withoutGitQueryMemo(() => repoRoot(nested))), `repoRoot sin ${name}`)
+      } finally { renameSync(aside, path) }
+      assertSamePath(repoRoot(nested), repo)
+    }
+  })) } finally { rmSync(base, { recursive: true, force: true }) }
+}
 
 /** Un repositorio movido dentro del ámbito no devuelve sus rutas anteriores. */
 function movedRepository() {

@@ -16,7 +16,8 @@ node scripts/git-memo-report.mjs validate --input /ruta/a/aggregate.json
 ```
 
 La precarga intercepta spawn, spawnSync, execFile, execFileSync, exec, execSync y fork. Propaga su URL
-a hijos lanzados con process.execPath y a fork. Cada lanzamiento tiene un attempt y una completion
+a hijos lanzados con process.execPath y a fork, con las opciones en su lugar también cuando los
+argumentos vienen indefinidos (`fork(m, undefined, opts)`). Cada lanzamiento tiene un attempt y una completion
 con el mismo id. Los intentos fallidos permanecen en la traza; `observed_processes` cuenta solo los
 procesos observados. Las llamadas internas de una API no se cuentan dos veces.
 La duración acumulada suma solo procesos observados. Los grupos conservan por separado
@@ -29,7 +30,7 @@ El baseline conserva scope/call desconocidos: no se infieren ámbitos desde argv
 
 La traza distingue operación, clase de consulta, entrada/cwd y, cuando existe, clave y ámbito.
 Las clases objetivo son repoRoot, gitDirs y objects; las otras consultas Git figuran como other.
-La lista de bypass admite no_scope, legacy, redirect_env y stamp_unreadable. Los descartes admiten
+La lista de bypass admite no_scope, legacy, redirect_env, stamp_unreadable y config_include. Los descartes admiten
 stale_stamp, stamp_unreadable, unstable e incoherent, con referencia al miss o store correspondiente.
 
 ## Bench macOS
@@ -51,13 +52,23 @@ artefactos se registran con rutas relativas al informe, así que validate los re
 directorio (o desde `--artifacts-root`) en cualquier clon.
 
 Cada operación corre en su propio grupo de procesos. Al vencer el timeout de 240 s se mata el grupo
-completo y la exclusión dice `timeout`. La espera termina cuando sale `time`, aunque un descendiente
-desligado retenga los pipes. Un SIGINT o SIGTERM al bench mata los grupos en curso, limpia los
+completo y la exclusión dice `timeout`; la salida, el código y la señal que alcanzó a producir quedan en
+la evidencia que cita la exclusión, igual que si falta el bloque de `time`. La espera termina cuando sale `time`, aunque un descendiente
+desligado retenga los pipes. Al terminar la operación se mata lo que quedó en su grupo, para que no
+cargue las muestras siguientes. Un SIGINT o SIGTERM al bench mata los grupos en curso, limpia los
 fixtures y termina con error.
+
+El snapshot del candidato copia cada archivo cambiado con `lstat` (un symlink colgante también se
+versiona) y omite solo las rutas borradas. Después de `git add -A` agrega forzados, con
+`--literal-pathspecs`, los archivos del árbol del candidato que coinciden con `.gitignore`, que un índice
+nuevo no conoce.
 
 El entorno del manifiesto se deriva del que reciben las operaciones: los interruptores, las variables
 GIT_* que fija el fixture y las heredadas del host, que tienen que ser ninguna. validate con
-`--require-measurement` exige muestras y recalcula el overhead, las diferencias y sus estadísticas. Un
+`--require-measurement` exige muestras y recalcula el overhead, las diferencias y sus estadísticas; en
+cada muestra con traza, también los procesos, las consultas, la duración y los grupos por consulta,
+clave y ámbito. Heredada es una variable `GIT_*` que el fixture no fija (`FIXTURE_GIT_ENV`), no una que
+coincide con el host. Un
 informe trae una traza o muestras, no las dos.
 
 El comando crea fixtures nuevos para verify final y commit en ensayo/aplicación. Registra filas
@@ -65,7 +76,10 @@ ejecutadas y commit creado; rechaza salidas fallidas, timeout, recibo ausente, f
 aplicación sin commit, padre inesperado o registro incoherente. Cada ronda válida contiene las dos
 versiones y las condiciones con/sin traza. El orden de ambas dimensiones alterna por ronda. El límite
 es 2N intentos por escenario para conseguir N rondas válidas; no alcanzarlo hace fallar el bench.
-Las exclusiones se guardan en manifest.json, sin convertirlas en muestras válidas.
+Las exclusiones se guardan en manifest.json, sin convertirlas en muestras válidas. La evidencia de las
+operaciones se escribe antes de validarlas, y la exclusión la cita en `evidence`: un intento rechazado
+conserva su salida, su error y su código. El bench y validate aplican el mismo criterio de camino
+(`operationReached` en `scripts/git-memo-report.mjs`).
 
 El manifiesto schema=1 conserva base_commit, candidate.fingerprint, candidate.snapshot_sha,
 candidate.source_sha, fixture_sha, runtime, env, samples y exclusions. Cada muestra declara version,
@@ -141,7 +155,15 @@ caer en segundos contiguos del otro lado); si no, la clase no se normaliza. Dos 
 distintos que caen en el mismo segundo son eventos distintos y no cuentan como copia. Las duraciones y `lstart` miden al host y se
 normalizan sin relaciones. Es un desvío del plan, que pedía correspondencias biyectivas para todo dato
 variable: Max lo aceptó de forma explícita el 2026-10-09 (F-10), y queda declarado en el informe de
-medición. Una regla `time` solo normaliza un valor con la forma de su clase.
+medición. Una regla `time` solo normaliza un valor con la forma de su clase (un instante, además, tiene
+que existir: `2026-99-99T99:99:99Z` no se normaliza), y una correspondencia, un
+valor con la forma de su kind (un `run_id` no puede emparejar dos mensajes cualesquiera).
+
+En el JSON estructurado, un número se normaliza solo en su campo: un PID o un inodo con la regla que se
+derivó de su texto (con cualquier espacio después de los dos puntos, y también si el campo guarda el
+número como cadena), y una duración por su clase. El
+marcador de un número no es una cadena ni un objeto posible (las claves que empiezan con `<` se escapan),
+así que un campo que cambia de tipo sigue siendo una diferencia.
 
 **Integridad** (`integrity`): cada referencia contiene left/right con path y digest, con el prefijo
 `sha256:` o como hex solo. Primero comprueba el SHA-256 de los bytes originales. Después compara el
@@ -153,7 +175,8 @@ lado y los ordena por dependencia.
 **Qué captura cada estado** (`captureState`): la salida, los archivos del árbol, el gitfile de un
 worktree enlazado, los almacenes `sdd-ai/` del directorio Git y del común, los metadatos de Git que los
 registros citan (HEAD, config, commondir, refs, info y worktrees, sin index, objects, logs ni hooks),
-HEAD, el árbol, las refs, el índice lógico (`ls-files --stage`) y `diff-files`. Los bytes crudos del
+HEAD, el árbol, las refs, el índice lógico (`ls-files --stage`), `diff-files` y la conectividad de los
+objetos alcanzables (`fsck --connectivity-only`: `ok` o el error). Los bytes crudos del
 índice no se comparan: guardan datos de stat que difieren entre fixtures en cuanto una operación lo
 reescribe.
 
@@ -178,12 +201,43 @@ rechazo. Las iteraciones no heredan entradas. finally y la proyección legacy co
 memo nuevo; el legacy mantiene sus claves y comportamiento. __supervise no abre un ámbito de verbo.
 Las esperas de groupGone no consultan las tres funciones objetivo y permanecen intactas.
 
-Las estampas usan dev/ino enteros, tipo y el contenido del gitfile, de `commondir` y de las
-configuraciones; no guardan rutas, así que dos grafías de la misma raíz (que comparten clave en
-gitDirs) dan la misma estampa. No usan fechas de directorios, que cambian al escribir HEAD, índices o
-locks. Discovery vigila las identificaciones intermedias; objects vigila el directorio Git explícito,
-`commondir`, el común y el de objetos (no `config` ni `config.worktree`, que no cambian esa ruta), y
-vuelve a leer alternates en cada llamada.
+Las estampas usan dev/ino enteros, tipo y el contenido del gitfile, de `commondir` y de `HEAD`, más la
+identidad de `refs` y `objects` del común: lo que Git exige para reconocer un directorio Git. No guardan rutas,
+así que dos grafías de la misma raíz (que comparten clave en gitDirs) dan la misma estampa. No usan
+fechas de directorios, que cambian al escribir HEAD, índices o locks. Discovery vigila las
+identificaciones intermedias; objects vigila el directorio Git explícito, `commondir`, el común y el de
+objetos, y vuelve a leer alternates en cada llamada.
+
+**Configuración de Git** (corrección por la revisión de Hermes del PR #63, AC-17). Las tres consultas
+estampan además la configuración que Git lee:
+
+- **Orígenes:** los archivos los informa Git con
+  `git --git-dir <gitDir> config --list --show-origin --show-scope -z --no-includes`: sistema, global,
+  el `gitconfig` de la instalación (en el Git de Apple, el de Xcode), `config` y `config.worktree`.
+  Esa consulta se reutiliza en el ámbito, una vez por directorio Git y entorno, mientras su evidencia no
+  cambie. Es la única consulta fuera de las tres, y existe solo como parte de la estampa. Corre desde el
+  mismo directorio que la consulta (la entrada en `repoRoot` y `gitDirs`, el del proceso en `objects`), así
+  que un `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `HOME` o `XDG_CONFIG_HOME` relativo se resuelve igual que
+  en Git; con alguno relativo, se reutiliza además por directorio. Corre sin `GIT_CONFIG`, que solo lee
+  `git config` (como `--file`) y no `rev-parse`. Se lista dos veces, antes y después de estampar: si la
+  configuración cambió en el medio (por ejemplo, apareció un include), la estampa no se puede leer y la
+  consulta va a Git sin memo.
+- **Evidencia:** el contenido (o la ausencia) de cada origen, de `config` y `config.worktree` del
+  repositorio, de los globales conocidos (`$GIT_CONFIG_GLOBAL`, o `$XDG_CONFIG_HOME/git/config` o
+  `~/.config/git/config`, y `~/.gitconfig`) y de `$GIT_CONFIG_SYSTEM` si está definida, sin rutas y
+  ordenada.
+- **`config_include`:** si alguna configuración trae una clave `include.*` o `includeif.*`, de cualquier
+  alcance (también de `GIT_CONFIG_*`), las tres consultas emiten `bypass` con ese motivo y van a Git sin
+  memo.
+- **Configuración ilegible:** si Git falla al listar la configuración (por ejemplo, mal formada), la
+  estampa no se puede leer (`stamp_unreadable`) y la consulta devuelve el error de Git.
+- **Clave:** suma `HOME`, `XDG_CONFIG_HOME` y todas las `GIT_CONFIG_*` presentes, por el sha256 de su
+  valor y no en claro: la clave viaja en la traza, y `GIT_CONFIG_VALUE_<n>` puede llevar una credencial.
+- **Tests:** las fixtures aíslan la configuración del host (`GIT_CONFIG_NOSYSTEM=1` y un
+  `GIT_CONFIG_GLOBAL` que no existe), salvo que el test traiga la suya.
+- **Límite residual:** sin `GIT_CONFIG_SYSTEM`, un archivo de configuración de sistema que no existía y
+  se crea durante un mismo ámbito no se detecta, porque Git no informa la ruta de un archivo de sistema
+  ausente.
 
 Cada entrada guarda además el ancla de su valor: la ruta real y la identidad de cada ruta que devuelve.
 Antes de reutilizarla se recalcula. Un repositorio renombrado (la ruta guardada ya no existe) o un padre

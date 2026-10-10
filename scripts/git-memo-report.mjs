@@ -8,6 +8,22 @@ import { cleanGitEnv, withGitEnv } from '../test/git-memo-fixture.ts'
 const fail = (message) => { throw new Error(message) }
 const sha256 = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`
 
+/**
+ * Si las operaciones medidas llegaron al camino del escenario: verify, con recibo final verde y todas sus filas
+ * ejecutadas; commit, con ensayo, digest y aplicación que mueve HEAD al commit informado. Lo usan el bench, antes de
+ * aceptar una muestra, y la validación del informe, sobre la evidencia guardada: los dos aplican el mismo contrato.
+ */
+export function operationReached(scenario, operations, beforeHead, afterHead, receipt) {
+  if (operations.some((op) => op.exit_code !== 0)) throw new Error('operación fallida')
+  if (scenario === 'verify') {
+    const executed = receipt?.rows?.filter((row) => row.execution && row.execution.exit_code === 0).length ?? 0
+    if (!receipt?.green || receipt.mode !== 'final' || !operations[0]?.json?.digest || executed === 0 || executed !== receipt.rows.length) throw new Error('verify no ejecutó todas las filas ni produjo recibo verde')
+    return { executed_rows: executed, commit_created: false }
+  }
+  if (operations.length !== 2 || operations[0].json?.state !== 'dry_run' || !operations[0].json?.digest || beforeHead === afterHead || operations[1].json?.sha !== afterHead) throw new Error('commit no llegó al ensayo y aplicación efectivos')
+  return { executed_rows: 0, commit_created: true }
+}
+
 /** Comprueba los cuerpos y las salidas originales antes de normalizar referencias. */
 export function validateReceiptIntegrity(state) {
   const receipts = new Map()
@@ -104,7 +120,17 @@ export const TIME_CLASSES = {
   // La hora de arranque de un proceso en el formato de `ps -o lstart`.
   l: /\b[A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4}\b/g,
 }
-const timeShape = (symbol, value) => TIME_CLASSES[symbol] !== undefined && new RegExp(`^(?:${TIME_CLASSES[symbol].source})$`).test(value)
+/** Un instante que existe: la forma ISO no basta, `2026-99-99T99:99:99Z` también la tiene. */
+function validInstant(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(value)
+  if (!m) return false
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number)
+  const offset = m[7] === undefined || (Number(m[7]) < 24 && Number(m[8]) < 60)
+  return month >= 1 && month <= 12 && day >= 1 && day <= new Date(Date.UTC(year, month, 0)).getUTCDate() &&
+    hour < 24 && minute < 60 && second < 60 && offset && !Number.isNaN(Date.parse(value))
+}
+const timeShape = (symbol, value) => TIME_CLASSES[symbol] !== undefined && new RegExp(`^(?:${TIME_CLASSES[symbol].source})$`).test(value) &&
+  (symbol !== 't' || validInstant(value))
 
 /**
  * Las reglas de normalización de los datos que varían entre corridas independientes. Cada regla reemplaza una
@@ -182,8 +208,9 @@ export function deriveVariableRules(left, right) {
     if (kind === 'time') {
       const x = a.map((o) => o.text); const y = b.map((o) => o.text)
       if (ordered && x.some((_, i) => x.some((__, j) => j > i && broken(x, y, i, j)))) continue
-      for (const value of new Set(x)) rules.push({ kind, side: 'left', value, symbol })
-      for (const value of new Set(y)) rules.push({ kind, side: 'right', value, symbol })
+      // Un instante imposible no se normaliza: la diferencia queda a la vista.
+      for (const value of new Set(x)) if (timeShape(symbol, value)) rules.push({ kind, side: 'left', value, symbol })
+      for (const value of new Set(y)) if (timeShape(symbol, value)) rules.push({ kind, side: 'right', value, symbol })
       continue
     }
     // Se empareja por ocurrencia, en el mismo orden de recorrido. Un valor que se emparejaría con dos distintos, o una
@@ -277,10 +304,29 @@ function firstDifference(a, b, path = '') {
   return { path, left: show(a), right: show(b) }
 }
 
+/**
+ * La forma que exige cada clase de correspondencia: una regla no puede borrar la diferencia entre dos mensajes
+ * cualesquiera usando una clase reservada para identificadores. Las raíces se emparejan también por su nombre (sin
+ * barras), así que solo se exige un texto de una línea.
+ */
+const RULE_SHAPES = {
+  root: /^[^\n]+$/,
+  run_id: /^\d{8}-\d{4}-[0-9a-f]{4}$/,
+  // PID e inodos se derivan con su campo (`"pid": 7`, `"ino": "12"`).
+  pid: /^(?:"(?:supervisor_pid|pid|child_pid)":\s*)?\d+$/,
+  inode: /^(?:"ino":\s*)?"?\d+"?$/,
+  derived_digest: /^(?:sha256:)?[0-9a-f]{64}$/,
+}
+/**
+ * Los campos numéricos del JSON estructurado que citan un PID o un inodo. Se buscan con el mismo campo con que se
+ * derivó la regla de su texto, y si no, por el número solo (una regla escrita a mano).
+ */
+const NUMERIC_IDS = { supervisor_pid: 'pid', pid: 'pid', child_pid: 'pid', ino: 'inode' }
+
 export function compareStates(left, right, rules = [], integrity = []) {
   validateRecordedIntegrity(left); validateRecordedIntegrity(right)
   // Un símbolo es de una clase de tiempo (muchos valores por lado) o de una sola correspondencia, nunca de las dos.
-  const leftMap = new Map(); const rightMap = new Map(); const classes = new Set(); const pairs = new Set()
+  const leftMap = new Map(); const rightMap = new Map(); const classes = new Set(); const pairs = new Set(); const kinds = new Map()
   for (const rule of rules) {
     if (!['root', 'time', 'run_id', 'derived_digest', 'pid', 'inode'].includes(rule.kind) || typeof rule.symbol !== 'string' || !rule.symbol) fail('regla de normalización inválida')
     if (rule.kind === 'time') {
@@ -290,7 +336,8 @@ export function compareStates(left, right, rules = [], integrity = []) {
       map.set(rule.value, rule.symbol); classes.add(rule.symbol)
       continue
     }
-    if (rule.side !== undefined || typeof rule.left !== 'string' || typeof rule.right !== 'string' || !rule.left || !rule.right) fail('regla de normalización inválida')
+    if (rule.side !== undefined || typeof rule.left !== 'string' || typeof rule.right !== 'string' || !RULE_SHAPES[rule.kind].test(rule.left) || !RULE_SHAPES[rule.kind].test(rule.right)) fail('regla de normalización inválida')
+    kinds.set(rule.symbol, rule.kind)
     if (leftMap.has(rule.left) || rightMap.has(rule.right) || pairs.has(rule.symbol) || classes.has(rule.symbol)) fail('normalización no biyectiva')
     leftMap.set(rule.left, rule.symbol); rightMap.set(rule.right, rule.symbol); pairs.add(rule.symbol)
   }
@@ -333,16 +380,43 @@ export function compareStates(left, right, rules = [], integrity = []) {
       fail(`contenidos íntegros distintos en ${reference.left.path} (línea ${at + 1}): ${JSON.stringify(la[at]).slice(0, 300)} ≠ ${JSON.stringify(lb[at]).slice(0, 300)}`)
     }
   }
+  // La regla de un número se busca por el texto con que se derivó, con cualquier espacio después de los dos puntos
+  // (`"pid":\t7`), o por el número solo (una regla escrita a mano), y solo en su campo y con su clase.
+  const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const numericSymbol = (map, key, value) => {
+    const number = escape(String(value))
+    const kind = NUMERIC_IDS[key]
+    const text = kind ? new RegExp(`^(?:"${escape(key)}":\\s*"?${number}"?|${number})$`) : key === 'duration_ms' ? new RegExp(`^duration_ms"?:?\\s*${number}$`) : null
+    if (!text) return undefined
+    for (const [from, symbol] of map) if (text.test(from) && (kind ? kinds.get(symbol) === kind : classes.has(symbol))) return symbol
+    return undefined
+  }
   const canonicalize = (value, map, key = '') => {
     if (typeof value === 'string') {
       if (key === 'bytes') {
         const bytes = Buffer.from(value, 'base64'); const utf8 = bytes.toString('utf8')
         return Buffer.from(utf8, 'utf8').equals(bytes) ? Buffer.from(replace(utf8, map)).toString('base64') : value
       }
+      // Un PID o un inodo guardado como cadena en su campo (`"ino": "123"`) toma la regla derivada con su campo.
+      if (NUMERIC_IDS[key] && /^\d+$/.test(value)) {
+        const symbol = numericSymbol(map, key, value)
+        if (symbol !== undefined) return `<${symbol}>`
+      }
       return replace(value, map)
     }
+    // Un número del JSON estructurado se normaliza solo en su contexto: un PID o un inodo en su campo, con la misma
+    // correspondencia que su texto, y una duración por su clase. Otro número igual en otro campo se compara tal cual.
+    // El marcador de un número no es una cadena: un campo que pasó de número a texto sigue siendo una diferencia.
+    if (typeof value === 'number') {
+      const symbol = numericSymbol(map, key, value)
+      return symbol === undefined ? value : { '<number>': symbol }
+    }
     if (Array.isArray(value)) return value.map((item) => canonicalize(item, map))
-    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([name, item]) => [replace(name, map), canonicalize(item, map, name)]))
+    // Una clave que empieza con `<` se escapa con otro `<`: así ningún objeto real se confunde con el marcador de un número.
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([name, item]) => {
+      const canonicalName = replace(name, map)
+      return [canonicalName.startsWith('<') ? `<${canonicalName}` : canonicalName, canonicalize(item, map, name)]
+    }))
     return value
   }
   const a = canonicalize(left, leftMap); const b = canonicalize(right, rightMap)
@@ -405,7 +479,7 @@ export function aggregate(rows) {
       if (e.seq <= (lastSequence.get(source) ?? 0)) fail('secuencia de memo fuera de orden')
       lastSequence.set(source, e.seq)
       memo.set(id, { ...e, operation: row.operation })
-      if (e.kind === 'bypass' && !['no_scope', 'legacy', 'redirect_env', 'stamp_unreadable'].includes(e.reason)) fail(`bypass desconocido: ${e.reason}`)
+      if (e.kind === 'bypass' && !['no_scope', 'legacy', 'redirect_env', 'stamp_unreadable', 'config_include'].includes(e.reason)) fail(`bypass desconocido: ${e.reason}`)
       if (e.kind === 'discard' && !['stale_stamp', 'stamp_unreadable', 'unstable', 'incoherent'].includes(e.reason)) fail(`discard desconocido: ${e.reason}`)
     } else if (row.kind === 'process') {
       const target = row.stage === 'attempt' ? attempts : row.stage === 'completion' ? completions : fail('fase de proceso desconocida')
@@ -557,22 +631,27 @@ export function validateManifest(manifest, requireArtifacts = false, artifactsRo
         if (!trace) fail('traza ausente')
         const result = aggregate(readFileSync(artifactPath(trace), 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)))
         if (result.observed_processes !== sample.observed_processes || result.git_queries !== sample.git_queries || result.accumulated_duration.value !== duration.value) fail('agregado distinto de la traza original')
-      }
+        // El desglose por consulta, clave y ámbito también sale de la traza, no del informe.
+        if (JSON.stringify(result.groups) !== JSON.stringify(sample.groups)) fail('grupos distintos de la traza original')
+      } else if (sample.groups !== null) fail('una muestra sin traza no puede declarar grupos')
       const evidence = sample.artifacts.find((artifact) => artifact.path.endsWith('.evidence.json'))
       if (!evidence) fail('evidencia de camino ausente')
       const data = JSON.parse(readFileSync(artifactPath(evidence), 'utf8'))
       if (JSON.stringify(data.operations) !== JSON.stringify(sample.operations) || data.before_head !== sample.fixture_sha || data.final?.head !== data.after_head) fail('operaciones o HEAD distintos de la evidencia original')
       validateReceiptIntegrity(data.final)
+      let reached
+      try { reached = operationReached(sample.scenario, data.operations, data.before_head, data.after_head, data.receipt) } catch (error) {
+        fail(`${sample.scenario === 'verify' ? 'recibo o filas no acreditados' : 'commit no acreditado'}: ${error.message}`)
+      }
       if (sample.scenario === 'verify') {
-        const count = data.receipt?.rows?.filter((row) => row.execution?.exit_code === 0).length ?? 0
-        if (!data.receipt?.green || data.receipt.mode !== 'final' || count !== sample.executed_rows || count !== data.receipt.rows.length) fail('recibo o filas no acreditados')
+        if (reached.executed_rows !== sample.executed_rows) fail('recibo o filas no acreditados')
         const operation = data.operations[0]
         const matching = Object.entries(data.final.files ?? {}).filter(([path]) => path.endsWith(`/sdd-ai/verify/${operation.json?.receipt}/receipt.json`))
         if (matching.length !== 1) fail('cuerpo original del recibo medido ausente o ambiguo')
         const bytes = Buffer.from(matching[0][1].bytes, 'base64')
         if (sha256(bytes) !== operation.json.digest || JSON.stringify(JSON.parse(bytes.toString('utf8'))) !== JSON.stringify(data.receipt)) fail('recibo medido distinto de su cuerpo o digest original')
       } else {
-        if (data.operations.length !== 2 || data.operations[0].json?.state !== 'dry_run' || data.before_head === data.after_head || data.operations[1].json?.sha !== data.after_head || data.after_parent !== data.before_head) fail('commit no acreditado')
+        if (!reached.commit_created || data.after_parent !== data.before_head) fail('commit no acreditado')
         // El flujo del fixture lo registra el bench en la evidencia, junto a las operaciones que lo usaron.
         if (typeof data.flow !== 'string' || !data.flow) fail('flujo del fixture ausente en la evidencia')
         const registryFile = data.final.files?.[`.plans/${data.flow}/sdd-ai-phases.json`]

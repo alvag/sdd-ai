@@ -11,19 +11,40 @@ import { changeScenarios, cleanGitEnv, consumerScenarios, exclusionScenarios, gi
 test('baseline y candidato conservan salidas códigos y efectos con normalizaciones verificadas', { timeout: 900000 }, async (t) => {
   const report = await import(pathToFileURL(join(SOURCE_ROOT, 'scripts', 'git-memo-report.mjs')).href)
   const digest = (bytes: string) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`
-  const leftText = '/fixture/a run-a\n'; const rightText = '/fixture/b run-b\n'
+  const leftText = '/fixture/a 20260101-0000-aaaa\n'; const rightText = '/fixture/b 20260101-0000-bbbb\n'
   const leftDigest = digest(leftText); const rightDigest = digest(rightText)
-  const left = { stdout: '/fixture/a run-a', stderr: '', exit_code: 0, unknown: { message: 'conservar' },
-    files: { 'output.log': { bytes: Buffer.from(leftText).toString('base64'), mode: 420 } }, refs: [leftDigest], json: { digest: leftDigest, run: 'run-a' } }
-  const right = { ...left, stdout: '/fixture/b run-b', files: { 'output.log': { bytes: Buffer.from(rightText).toString('base64'), mode: 420 } }, refs: [rightDigest], json: { digest: rightDigest, run: 'run-b' } }
-  const rules = [{ kind: 'root', left: '/fixture/a', right: '/fixture/b', symbol: 'root' }, { kind: 'run_id', left: 'run-a', right: 'run-b', symbol: 'run' }]
+  const left = { stdout: '/fixture/a 20260101-0000-aaaa', stderr: '', exit_code: 0, unknown: { message: 'conservar' },
+    files: { 'output.log': { bytes: Buffer.from(leftText).toString('base64'), mode: 420 } }, refs: [leftDigest], json: { digest: leftDigest, run: '20260101-0000-aaaa' } }
+  const right = { ...left, stdout: '/fixture/b 20260101-0000-bbbb', files: { 'output.log': { bytes: Buffer.from(rightText).toString('base64'), mode: 420 } }, refs: [rightDigest], json: { digest: rightDigest, run: '20260101-0000-bbbb' } }
+  const rules = [{ kind: 'root', left: '/fixture/a', right: '/fixture/b', symbol: 'root' }, { kind: 'run_id', left: '20260101-0000-aaaa', right: '20260101-0000-bbbb', symbol: 'run' }]
   const integrity = [{ left: { path: 'output.log', digest: leftDigest }, right: { path: 'output.log', digest: rightDigest } }]
   assert.equal(report.compareStates(left, right, rules, integrity).equivalent, true)
   assert.throws(() => report.compareStates(left, { ...right, unknown: { message: 'distinto' } }, rules, integrity), /diferencia/)
-  assert.throws(() => report.compareStates(left, { ...right, json: { digest: leftDigest, run: 'run-b' } }, rules, integrity), /diferencia/)
+  assert.throws(() => report.compareStates(left, { ...right, json: { digest: leftDigest, run: '20260101-0000-bbbb' } }, rules, integrity), /diferencia/)
   assert.throws(() => report.compareStates(left, right, [...rules, { ...rules[0], symbol: 'second' }], integrity), /biyectiva/)
   assert.throws(() => report.compareStates(left, right, rules, [{ ...integrity[0], right: { path: 'output.log', digest: leftDigest } }]), /digest inválido/)
   assert.throws(() => report.compareStates(left, { ...right, exit_code: 2 }, rules, integrity), /diferencia/)
+  // Una correspondencia exige la forma de su clase: un id de corrida no puede emparejar dos mensajes cualesquiera.
+  assert.throws(() => report.compareStates({ stdout: 'ERROR', files: {} }, { stdout: 'OK', files: {} }, [{ kind: 'run_id', left: 'ERROR', right: 'OK', symbol: 'r1' }]), /regla de normalización inválida/)
+  // Un PID numérico del JSON estructurado se normaliza con la misma correspondencia que su texto; otro número igual en
+  // otro campo se compara tal cual.
+  const structured = (pid: number, count: number) => ({ stdout: `{"pid":${pid}}`, json: { pid, count }, files: {} })
+  const pidRules = (a: ReturnType<typeof structured>, b: ReturnType<typeof structured>) => report.compareStates(a, b, report.deriveVariableRules(a, b))
+  assert.equal(pidRules(structured(123, 1), structured(456, 1)).equivalent, true)
+  assert.throws(() => pidRules({ ...structured(123, 1), json: { pid: 123, count: 123 } }, { ...structured(456, 1), json: { pid: 456, count: 456 } }), /diferencia/)
+  // Con cualquier espacio después de los dos puntos, y sin perder el tipo: un PID que pasó de número a texto difiere.
+  const spaced = (pid: number) => ({ stdout: `{"pid":\t ${pid}}`, json: { pid }, files: {} })
+  assert.equal(report.compareStates(spaced(123), spaced(456), report.deriveVariableRules(spaced(123), spaced(456))).equivalent, true)
+  const manual = [{ kind: 'pid', left: '123', right: '456', symbol: 'p1' }]
+  assert.throws(() => report.compareStates({ json: { pid: 123 }, files: {} }, { json: { pid: '456' }, files: {} }, manual), /diferencia/)
+  assert.throws(() => report.compareStates({ json: { pid: 123 }, files: {} }, { json: { pid: { '<number>': 'p1' } }, files: {} }, manual), /diferencia/)
+  // Un inodo guardado como cadena en su campo toma la regla derivada de su texto.
+  const inode = (ino: string) => ({ stdout: `{"ino": "${ino}"}`, json: { ino }, files: {} })
+  assert.equal(report.compareStates(inode('11'), inode('22'), report.deriveVariableRules(inode('11'), inode('22'))).equivalent, true)
+  // Un instante imposible no se normaliza: su diferencia queda a la vista.
+  const created = (at: string) => ({ stdout: `{"created_at": "${at}"}`, files: {} })
+  assert.throws(() => report.compareStates(created('2026-10-10T00:00:00Z'), created('2026-99-99T99:99:99Z'),
+    report.deriveVariableRules(created('2026-10-10T00:00:00Z'), created('2026-99-99T99:99:99Z'))), /diferencia/)
   // Las reglas derivadas normalizan el dato en su contexto: un número igual en otro campo sigue comparándose.
   const variable = (stdout: string) => ({ stdout, files: {} })
   const derived = (a: string, b: string) => report.compareStates(variable(a), variable(b), report.deriveVariableRules(variable(a), variable(b)))

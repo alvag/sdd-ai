@@ -52,7 +52,7 @@ test('verify y commit reutilizan cada consulta estable por ámbito y consultan n
     }
     for (const [key, n] of launched) assert.equal(n, 1, `consulta repetida con el repositorio estable: ${key}`)
     const reasons = new Set(observed.events.filter((e) => e.kind === 'bypass').map((e) => e.reason))
-    assert.ok([...reasons].every((reason) => ['no_scope', 'legacy', 'redirect_env', 'stamp_unreadable'].includes(reason)), [...reasons].join(', '))
+    assert.ok([...reasons].every((reason) => ['no_scope', 'legacy', 'redirect_env', 'stamp_unreadable', 'config_include'].includes(reason)), [...reasons].join(', '))
     // Las tres llamadas (verify, ensayo y aplicación) reutilizan al menos una consulta.
     const calls = [...new Set(misses.map((e) => e.call))]
     assert.equal(calls.length, 3)
