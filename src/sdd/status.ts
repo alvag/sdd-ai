@@ -188,8 +188,11 @@ export function resolveGates(facts: FlowFacts): GateResolution {
       }
     } else if (byHeader && barred) {
       state = 'stale'
-      const header = gate === 'spec' && headerData(facts.handoffHeader)?.spec_approved_at != null
-        ? 'handoff.md: spec_approved_at' : 'plan.md: status'
+      const headers: string[] = []
+      const at = headerData(facts.handoffHeader)?.spec_approved_at
+      if (gate === 'spec' && at !== undefined && at !== null) headers.push('handoff.md: spec_approved_at')
+      if (status !== null && STATUSES.indexOf(status) >= STATUSES.indexOf(ACCREDITED_FROM[gate])) headers.push('plan.md: status')
+      const header = headers.join(' y ')
       notes.push({ code: 'header_ahead', detail: `${header} todavía acredita el gate ${gate}, pero ${facts.revisions?.invalid ? 'el registro ilegible de correcciones impide acreditar el header y exige' : 'una corrección publicada exige'} la aprobación humana de las huellas vigentes` })
     } else if (byHeader && (escalatedFrom === null || GATES[escalatedFrom].includes(gate))) {
       // Un gate aprobado cuyo artefacto quedó vacío vence; si lo que falta son las tasks, lo dice tasks_empty.

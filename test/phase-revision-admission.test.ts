@@ -4,6 +4,7 @@ import { dirname } from 'node:path'
 import test from 'node:test'
 import { type Ledger } from '../src/review/ledger.ts'
 import { type ReviewRequest } from '../src/review/standing.ts'
+import { resolve } from '../src/sdd/status.ts'
 import { readFlow } from '../src/sdd/read.ts'
 import { calls, cleanup, cli, entries, flowFile, json, makeFixture, put, record, refreshReview, revise, runFile, saveRecord, settle, snapshotFiles } from './phase-revision-fixture.ts'
 
@@ -15,7 +16,7 @@ test('la devolucion admite las tres fases antes de implement en ambas profundida
       if (artifact === 'spec' && stage !== 'posterior') {
         rmSync(flowFile(s, 'plan.md')); rmSync(flowFile(s, 'tasks.md'))
       } else if (artifact === 'plan' && stage !== 'approved') {
-        rmSync(flowFile(s, 'tasks.md'))
+        if (stage === 'posterior' || depth === 'completa') rmSync(flowFile(s, 'tasks.md'))
         const status = stage === 'posterior' && depth === 'completa' ? 'plan-approved' : 'planned'
         writeFileSync(flowFile(s, 'plan.md'), readFileSync(flowFile(s, 'plan.md'), 'utf8').replace(/status: (planned|tasks-ready)/, `status: ${status}`))
       } else if (artifact === 'tasks' && stage === 'gate' && depth === 'completa') {
@@ -25,6 +26,11 @@ test('la devolucion admite las tres fases antes de implement en ambas profundida
       if (artifact !== 'spec') writeFileSync(flowFile(s, 'handoff.md'), readFileSync(flowFile(s, 'handoff.md'), 'utf8').replace('spec_approved_at: null', 'spec_approved_at: 2026-10-10T00:00:00Z'))
       // Congela la revisión después de elegir la versión documental y sus fuentes.
       refreshReview(s)
+      const next = resolve(readFlow(s.repo, 'f').facts).next
+      const expected = stage === 'approved' ? (artifact === 'spec' ? 'plan' : 'implement')
+        : stage === 'posterior' ? (artifact === 'spec' ? 'implement' : 'tasks') : 'gate'
+      assert.equal(next.step, expected, `${depth}/${artifact}/${stage}: ${JSON.stringify(next)}`)
+      if (stage === 'gate') assert.equal(next.gate, artifact === 'spec' ? 'spec' : depth === 'normal' ? 'plan-tasks' : artifact)
       const before = snapshotFiles(s)
       const ledger = readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8')
       const usages = [

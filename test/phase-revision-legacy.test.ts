@@ -63,6 +63,7 @@ test('la adopcion heredada exige origen verificable y no transforma corridas viv
   } finally { await cleanup(legacy) }
   const live = makeFixture({ approved: false })
   const barrier = join(live.work, 'release')
+  let running: ReturnType<typeof concurrentCli> | undefined
   try {
     for (const name of ['spec.md', 'plan.md', 'tasks.md']) rmSync(flowFile(live, name))
     saveRecord(live, { schema_version: 1, last_run: null, phases: {} })
@@ -83,8 +84,8 @@ test('la adopcion heredada exige origen verificable y no transforma corridas viv
       handoff_header: headerHash(readFlow(live.repo, 'f').facts.handoffHeader),
     } })
     saveRecord(live, { schema_version: 1, last_run: { id: run, step: 'specify' }, phases: {} })
-    const running = concurrentCli(live, ['__supervise', dir, 'argv.json'])
-    await waitFor(`${barrier}.ready`)
+    running = concurrentCli(live, ['__supervise', dir, 'argv.json'])
+    await waitFor(`${barrier}.ready`, 10000, running.diagnostic)
     assert.equal(json<{ phase: { revision?: unknown } }>(join(dir, 'argv.json')).phase.revision, undefined)
     assert.equal(revise(live).out.code, 'phase_running')
     writeFileSync(barrier, '')
@@ -92,7 +93,7 @@ test('la adopcion heredada exige origen verificable y no transforma corridas viv
     await running
     assert.equal(record(live).revisions, undefined)
     assert.equal(record(live).documents!.specify!.run, run)
-  } finally { writeFileSync(barrier, ''); await cleanup(live) }
+  } finally { writeFileSync(barrier, ''); await cleanup(live); await running?.catch(() => {}) }
 })
 
 test('la ampliacion de creacion con context conserva su significado junto a la devolucion', async () => {
@@ -125,4 +126,31 @@ test('la ampliacion de creacion con context conserva su significado junto a la d
       }
     } finally { await cleanup(s) }
   }
+  const coexist = makeFixture({ approved: false })
+  try {
+    const c = corrected('spec'); c.blocking_questions = ['¿Qué resultado corregido?']
+    script(coexist, [{ answer: JSON.stringify(c) }])
+    const revision = revise(coexist); assert.equal(revision.code, 0, JSON.stringify(revision.out))
+    assert.equal((await settle(coexist, revision.out.id)).out.outcome, 'awaiting_context')
+    const revisionState = structuredClone(record(coexist).revisions)
+    const count = calls(coexist).length
+    writeFileSync(`${coexist.repo}/answers.md`, 'Max: ampliación de creación.\n')
+    const refused = cli(coexist, ['sdd', 'phase', 'f', '--context', 'answers.md'])
+    assert.notEqual(refused.code, 0, JSON.stringify(refused.out))
+    assert.equal(calls(coexist).length, count); assert.deepEqual(record(coexist).revisions, revisionState)
+    // Una fase distinta conserva su ampliación original aunque haya una corrección en espera.
+    rmSync(flowFile(coexist, 'plan.md')); rmSync(flowFile(coexist, 'tasks.md'))
+    writeFileSync(flowFile(coexist, 'handoff.md'), readFileSync(flowFile(coexist, 'handoff.md'), 'utf8').replace('spec_approved_at: null', 'spec_approved_at: 2026-10-10T00:00:00Z'))
+    const plan = structuredClone(contracts.plan); plan.blocking_questions = ['¿Qué enfoque?']
+    script(coexist, [{ answer: JSON.stringify(plan) }])
+    const first = cli(coexist, ['sdd', 'phase', 'f']); assert.equal(first.code, 0, JSON.stringify(first.out))
+    assert.equal((await settle(coexist, first.out.id)).out.outcome, 'awaiting_context')
+    script(coexist, [{ answer: JSON.stringify(contracts.plan) }])
+    const second = cli(coexist, ['sdd', 'phase', 'f', '--context', 'answers.md']); assert.equal(second.code, 0, JSON.stringify(second.out))
+    assert.equal((await settle(coexist, second.out.id)).out.outcome, 'published')
+    assert.equal(record(coexist).phases.plan!.amended!.consumed, true)
+    assert.deepEqual(record(coexist).revisions, revisionState)
+    assert.equal(calls(coexist).length, count + 2)
+  } finally { await cleanup(coexist) }
+
 })

@@ -3,14 +3,17 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
+import { bytesHash } from '../src/sdd/read.ts'
 import { calls, cleanup, cli, corrected, directedAnswer, entries, flowFile, interrupted, makeFixture, record, revise, saveRecord, script, settle, snapshotFiles, waitFor } from './phase-revision-fixture.ts'
 
 test('las consultas recuperan procedencia y publicacion sin repetir efectos', async (t) => {
   const s = makeFixture()
+  const barrier = join(s.work, 'first-release')
   try {
-    const barrier = join(s.work, 'first-release')
+    const contribution = 'Max: resultado consultable.\n'
+    writeFileSync(join(s.repo, 'decisions.md'), contribution)
     script(s, [{ barrier, answer: JSON.stringify(corrected('spec')) }])
-    const start = revise(s); assert.equal(start.code, 0, JSON.stringify(start.out)); await waitFor(`${barrier}.ready`)
+    const start = revise(s, ['--decisions', 'decisions.md']); assert.equal(start.code, 0, JSON.stringify(start.out)); await waitFor(`${barrier}.ready`)
     const before = readFileSync(flowFile(s, 'spec.md'), 'utf8')
     for (let n = 0; n < 2; n++) {
       const running = cli(s, ['wait', start.out.id, '--max', '0']).out
@@ -28,6 +31,11 @@ test('las consultas recuperan procedencia y publicacion sin repetir efectos', as
       assert.equal(view.outcome, 'published'); assert.equal(view.revision.origin_run, s.origin)
       assert.equal(view.revision.family, s.family); assert.equal(view.revision.session_mode, 'same')
       assert.deepEqual(view.revision.accepted, ['F-1']); assert.ok(view.revision.materials.length)
+      assert.equal(view.revision.artifact, '.plans/f/spec.md'); assert.equal(view.revision.phase, 'specify')
+      assert.equal(view.revision.review, s.review); assert.equal(view.revision.round, 1)
+      assert.deepEqual(view.revision.decisions, template.decisions)
+      assert.equal(view.revision.decisions[0].decision.action, 'accept')
+      assert.equal(view.revision.conductor.path, 'decisions.md'); assert.equal(view.revision.conductor.digest, bytesHash(contribution))
       assert.equal(cli(s, ['sdd', 'status', 'f']).out.revisions.at(-1).result.state, 'published')
     }
     assert.equal(calls(s).length, count); assert.equal(readFileSync(flowFile(s, 'spec.md'), 'utf8'), bytes)
@@ -96,7 +104,7 @@ test('las consultas recuperan procedencia y publicacion sin repetir efectos', as
     assert.equal(entries(s)[0].result!.state, 'published')
     assert.equal(cli(s, ['cancel', reviewPoint.run]).out.outcome, 'published')
     assert.equal(record(s).revisions!.barriers.length, 1)
-  } finally { await cleanup(s) }
+  } finally { writeFileSync(barrier, ''); await cleanup(s) }
 
   const flag = (file: string, on: boolean) => spawnSync(process.platform === 'darwin' ? 'chflags' : 'chattr',
     [process.platform === 'darwin' ? (on ? 'uchg' : 'nouchg') : (on ? '+i' : '-i'), file], { encoding: 'utf8' })

@@ -43,10 +43,16 @@ test('la ronda conserva el ledger y distingue productor conductor y autoria mezc
       const promptFiles = ['prompt-r2-l1-base-b1.md', 'prompt-r2-l1.md']
       const actual = readdirSync(`${s.repo}/.sdd-ai/runs/${s.review}`).filter((p) => p.startsWith('prompt-r2') && p.endsWith('.md'))
       assert.ok(actual.length > 0 && actual.every((p) => promptFiles.includes(p)), JSON.stringify(actual))
-      const promptFile = actual[0]
-      const prompt = readFileSync(runFile(s, s.review, promptFile), 'utf8')
-      assert.match(prompt, scenario === 'producer' ? /productor.*codex/ : scenario.startsWith('mixed') ? /mezclada/ : /conductor/)
-      assert.match(prompt, /CAMBIOS/)
+      for (const promptFile of actual) {
+        const prompt = readFileSync(runFile(s, s.review, promptFile), 'utf8')
+        if (scenario === 'producer') assert.ok(prompt.includes(`el productor de familia ${s.family} corrigió los hallazgos aceptados del artefacto`))
+        else if (scenario.startsWith('mixed')) assert.ok(prompt.includes('el productor y el conductor corrigieron los hallazgos aceptados del artefacto'))
+        else {
+          assert.ok(prompt.includes('el conductor corrigió los que aceptó; los hallazgos rechazados conservan el motivo del conductor'))
+          assert.ok(!prompt.includes('el productor de familia')); assert.ok(!prompt.includes('el productor y el conductor corrigieron'))
+        }
+        assert.match(prompt, /CAMBIOS/)
+      }
       const ledger = json<Ledger>(runFile(s, s.review, 'ledger.json'))
       assert.equal(ledger.completed, 2); assert.equal(ledger.entries[0].id, 'F-1'); assert.equal(ledger.entries[0].state, 'resuelto')
       assert.deepEqual(ledger.entries[0].decision, JSON.parse(before).entries[0].decision)
@@ -67,7 +73,7 @@ test('devolver al productor no concede rondas extra ni resuelve disputas', async
     assert.equal(readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8'), ledger)
     const count = calls(s).length
     const capped = cli(s, ['review', 'round', s.review])
-    assert.notEqual(capped.code, 0); assert.match(JSON.stringify(capped.out), /tope|rondas|extra/)
+    assert.notEqual(capped.code, 0); assert.equal(capped.out.code, 'round_cap')
     const extra = cli(s, ['review', 'round', s.review, '--extra'])
     assert.equal(extra.out.code, 'approval_missing'); assert.equal(calls(s).length, count)
     assert.equal(readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8'), ledger)

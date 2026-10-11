@@ -32,7 +32,8 @@ async function documentScript(): Promise<void> {
     answer?: string; session?: string; reject_resume?: boolean; startup_failure?: boolean; execution_failure?: boolean
     barrier?: string; hang?: boolean
   }>
-  const entry = entries[callCount() - 1] ?? entries.at(-1) ?? {}
+  const entry = entries[callCount() - 1]
+  if (!entry) throw new Error(`fake-cli: invocación documental no prevista ${callCount()}`)
   const prompt = readFileSync(0, 'utf8')
   if (process.env.FAKE_CALLS_FILE) appendFileSync(`${process.env.FAKE_CALLS_FILE}.prompts`, `${JSON.stringify(prompt)}\n`)
   const codex = args[0] === 'exec'
@@ -40,7 +41,7 @@ async function documentScript(): Promise<void> {
   // codexResume termina con <thread> -; Claude nombra la sesión con un flag.
   const resume = codex ? (args[1] === 'resume' && args.at(-1) === '-' ? args.at(-2) : undefined) : sessionOption('--resume')
   if (entry.startup_failure || (entry.reject_resume && resume !== undefined)) {
-    process.stderr.write(entry.reject_resume && resume !== undefined ? 'session not found: resume rejected\n' : 'fake-cli: startup failed\n')
+    process.stderr.write(entry.reject_resume && resume !== undefined ? `No conversation found with session ID: ${resume}\n` : 'fake-cli: startup failed\n')
     process.exitCode = 1
     return
   }
@@ -107,9 +108,7 @@ async function telemetryScript(): Promise<void> {
   const entry = script[callCount() - 1] ?? {}
   if (entry.barrier) {
     writeFileSync(`${entry.barrier}.ready`, '')
-    const until = Date.now() + 60000
-    while (!existsSync(entry.barrier) && Date.now() < until) await sleep(10)
-    if (!existsSync(entry.barrier)) throw new Error(`fake-cli: barrera sin liberar ${entry.barrier}`)
+    while (!existsSync(entry.barrier)) await sleep(10)
   }
   if (entry.reject) {
     fail(entry.reject === 'model' ? 'codex-modelo-rechazado.jsonl' : 'codex-esfuerzo-rechazado.jsonl')

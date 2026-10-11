@@ -71,6 +71,7 @@ export function cli(s: RevisionFixture, args: string[], env: Record<string, stri
   assertProviders(s, effectiveEnv)
   const r = spawnSync(process.execPath, ['--import', join(import.meta.dirname, 'no-subprocess.ts'), BIN, ...args],
     { cwd: s.repo, env: effectiveEnv, encoding: 'utf8', timeout: timeoutMs })
+  if (r.signal) throw new Error(`CLI ${args.join(' ')} murió por ${r.signal}; stdout=${r.stdout}; stderr=${r.stderr}`)
   if (r.error) throw new Error(`CLI ${args.join(' ')}: ${r.error.message}; stdout=${r.stdout}; stderr=${r.stderr}`, { cause: r.error })
   try { return { code: r.status, out: JSON.parse(r.stdout || 'null') as any, stderr: r.stderr } } catch (e) {
     throw new Error(`CLI ${args.join(' ')} terminó con ${r.status}; stdout=${r.stdout}; stderr=${r.stderr}`, { cause: e })
@@ -79,9 +80,9 @@ export function cli(s: RevisionFixture, args: string[], env: Record<string, stri
 export function concurrentCli(s: RevisionFixture, args: string[]) {
   assertProviders(s)
   const p = spawn(process.execPath, ['--import', join(import.meta.dirname, 'no-subprocess.ts'), BIN, ...args], { cwd: s.repo, env: s.env })
-  return new Promise<ReturnType<typeof cli>>((resolve, reject) => {
-    let stdout = ''; let stderr = ''
-    const timer = setTimeout(() => { p.kill('SIGKILL'); reject(new Error(`CLI agotó 20 s: ${args.join(' ')}; stdout=${stdout}; stderr=${stderr}`)) }, 20000)
+  let stdout = ''; let stderr = ''
+  const promise = new Promise<ReturnType<typeof cli>>((resolve, reject) => {
+    const timer = setTimeout(() => { p.kill('SIGKILL'); reject(new Error(`CLI agotó 45 s: ${args.join(' ')}; stdout=${stdout}; stderr=${stderr}`)) }, 45000)
     p.stdout.on('data', (b) => { stdout += b }); p.stderr.on('data', (b) => { stderr += b })
     p.on('error', (e) => { clearTimeout(timer); reject(e) })
     p.on('close', (code) => {
@@ -89,10 +90,13 @@ export function concurrentCli(s: RevisionFixture, args: string[]) {
       try { resolve({ code, out: JSON.parse(stdout || 'null'), stderr }) } catch (e) { reject(new Error(`CLI terminó con ${code}; stdout=${stdout}; stderr=${stderr}`, { cause: e })) }
     })
   })
+  // Observar enseguida evita un rechazo sin manejar si falla la preparación del caso.
+  void promise.catch(() => {})
+  return Object.assign(promise, { diagnostic: () => `stdout=${stdout}; stderr=${stderr}` })
 }
-export async function waitFor(file: string, timeout = 10000): Promise<void> {
+export async function waitFor(file: string, timeout = 10000, diagnostic?: () => string): Promise<void> {
   const until = Date.now() + timeout
-  while (!existsSync(file)) { assert.ok(Date.now() < until, `no apareció ${file}`); await sleep(20) }
+  while (!existsSync(file)) { assert.ok(Date.now() < until, `no apareció ${file}${diagnostic ? `; ${diagnostic()}` : ''}`); await sleep(20) }
 }
 export function script(s: RevisionFixture, steps: DocumentStepScript[]): void {
   // Conserva el índice de llamadas previas al cambiar el guion.

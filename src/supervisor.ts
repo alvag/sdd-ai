@@ -35,7 +35,7 @@ import { type DocumentContract, admitPlan, admitSpecify, admitTasks } from './sd
 import { readPhaseRecord, withFlowLock, writePhaseRecord } from './sdd/phase-state.ts'
 import { admitDocumentContract, documentArtifactPath, documentOpeningLaunch, relativePath, revisionRunState, runRevisionAttempts, type RevisionAttemptResult } from './phase-session.ts'
 import { type CorrectionProvenance, finishRevision } from './sdd/revision.ts'
-import type { RevisionResult } from './sdd/revision-record.ts'
+import { type RevisionResult, type EffectiveLaunch, revisionPublicationFacts } from './sdd/revision-record.ts'
 import { type FrozenLaunch, type PublishOutcome, publishPhase } from './sdd/publish.ts'
 import { closeTelemetry, perToken } from './telemetry.ts'
 
@@ -1047,10 +1047,13 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
   const c = { ...admitted.review, ...(phase.findings && !('findings' in admitted.review) ? { findings_missing: true } : {}) }
   const admittedLaunch = admitted.effectiveLaunch ?? r.current
   const effectiveSession = sessionOf(ctx.family, admittedLaunch.args, admitted.last.facts)
-  const effectiveLaunch = documentOpeningLaunch(ctx.family, admittedLaunch, effectiveSession)
+  let effectiveLaunch: EffectiveLaunch | undefined
+  try { effectiveLaunch = documentOpeningLaunch(ctx.family, admittedLaunch, effectiveSession) } catch { /* La procedencia auxiliar no altera el contrato de creación. */ }
   if (effectiveSession) extras.session_id = effectiveSession
   // El intento admitido puede haber cambiado de sesión durante la recuperación de admisión.
-  writeJsonAtomic(join(dir, 'producer.json'), { launch: effectiveLaunch, ...(effectiveSession ? { session_id: effectiveSession } : {}) })
+  try {
+    if (effectiveLaunch) writeJsonAtomic(join(dir, 'producer.json'), { launch: effectiveLaunch, ...(effectiveSession ? { session_id: effectiveSession } : {}) })
+  } catch { effectiveLaunch = undefined /* La creación conserva su publicación aunque falle esta metadata. */ }
   writeJsonAtomic(join(dir, 'contract.json'), c)
   // Un cancel que llegó mientras se admitía corta antes de escribir nada en el flujo.
   if (existsSync(cancelFile)) return finish({ state: 'cancelled', ...extras })
@@ -1087,17 +1090,20 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
       path: name === 'request' ? (phase.request_path && relativePath(phase.root, phase.request_path)) || `.sdd-ai/runs/${run}/request.md` : `.plans/${phase.flow}/${name}.md`,
       digest, copy: `.sdd-ai/runs/${run}/${name}.md`, role: name,
     }))
-    const earlier: import('./sdd/revision-record.ts').MaterialReference[] = []
-    const amendments = phase.inputs.context ? [...earlier, {
+    const amendments = phase.inputs.context ? [{
       path: phase.context_path ? relativePath(phase.root, phase.context_path) : `.sdd-ai/runs/${run}/context.md`,
       digest: phase.inputs.context, copy: `.sdd-ai/runs/${run}/context.md`, role: 'context',
-    }] : earlier
-    writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry }, documents: {
-      ...rec.documents, [step]: { phase: step, artifact, run, family: ctx.family,
-        ...(effectiveSession ? { session_id: effectiveSession } : {}), launch: effectiveLaunch, sources, amendments,
-        ...(phase.task_actors ? { task_actors: true } : {}),
-      },
-    } })
+    }] : []
+    writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry } })
+    // Registrar procedencia es auxiliar: nunca convierte una creación publicada en fallo.
+    if (effectiveLaunch) {
+      try { writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry }, documents: {
+        ...rec.documents, [step]: { phase: step, artifact, run, family: ctx.family,
+          ...(effectiveSession ? { session_id: effectiveSession } : {}), launch: effectiveLaunch, sources, amendments,
+          ...(phase.task_actors ? { task_actors: true } : {}),
+        },
+      } }) } catch { /* La evidencia de la corrida sigue disponible para adopción heredada. */ }
+    }
   })
   if (out.kind === 'published') return finish({ state: 'done', ...extras }, { outcome: 'published', artifact: out.artifact, ...lists })
   if (out.kind === 'no_changes') return finish({ state: 'done', ...extras }, { outcome: 'no_changes', artifact: out.artifact, ...lists })
@@ -1116,6 +1122,7 @@ async function superviseRevision(ctx: RunContext, resumeSec: number): Promise<St
   const artifact = entry?.artifact ?? `.plans/${phase.flow}/${phase.revision!.artifact}.md`
   const attempts = new Map<string, Attempt>()
   let deliverySaved = false
+  let deliveredAnswer: RevisionAttemptResult | undefined
   let answer: RevisionAttemptResult
   try {
   if (!entry || !argv.launch) throw reservationError ?? new Error('la corrección no tiene reserva o lanzamiento')
@@ -1143,6 +1150,7 @@ async function superviseRevision(ctx: RunContext, resumeSec: number): Promise<St
     correctionPrompt: (error) => renderCorrectionPrompt(readFileSync(join(dir, 'prompt.md'), 'utf8'), error),
     closingPrompt: closingMessage('run'),
     publish: (delivered) => {
+      deliveredAnswer = delivered
       writeJsonAtomic(join(dir, 'contract.json'), delivered.contract)
       writeJsonAtomic(join(dir, 'revision-result.json'), { session_id: delivered.session_id, launch: documentOpeningLaunch(ctx.family, delivered.launch!, delivered.session_id) })
       deliverySaved = true
@@ -1154,22 +1162,36 @@ async function superviseRevision(ctx: RunContext, resumeSec: number): Promise<St
     }
     },
   })
-  } catch (e) { answer = { result: { state: 'failed', cause: 'revision_execution_failed', detail: (e as Error).message } } }
+  } catch (e) {
+    let result: RevisionResult = { state: 'failed', cause: entry ? 'revision_execution_failed' : 'reservation_missing', detail: (e as Error).message }
+    if (deliverySaved) {
+      result = { state: 'not_published', cause: 'write_failed', detail: (e as Error).message, registry_pending: true }
+      try {
+        const record = readPhaseRecord(phase.root, phase.flow, true)
+        const intent = record.revisions?.intent
+        if (intent?.run === run) {
+          const current = existsSync(join(phase.root, intent.artifact)) ? `sha256:${createHash('sha256').update(readFileSync(join(phase.root, intent.artifact))).digest('hex')}` : undefined
+          if (revisionPublicationFacts(phase.root, intent, current).published) result = { ...result, state: 'published', cause: undefined, digest: intent.result_digest }
+        }
+      } catch { /* La intención queda para la recuperación bajo lock. */ }
+    }
+    answer = { ...deliveredAnswer, result }
+  }
   let result = answer.result
   const c = answer.contract
   try {
-  if (!deliverySaved) {
+  if (entry && !deliverySaved) {
   if (c) writeJsonAtomic(join(dir, 'contract.json'), c)
   writeJsonAtomic(join(dir, 'revision-result.json'), { ...(answer.session_id ? { session_id: answer.session_id } : {}), launch: documentOpeningLaunch(ctx.family, answer.launch ?? entry!.launch, answer.session_id) })
   }
   } catch (e) { result = { state: 'failed', cause: 'revision_publication_failed', detail: (e as Error).message } }
   // Una publicación consumada con finalización fallida conserva la reserva para la recuperación.
-  if (!result.registry_pending) {
+  if (entry && !result.registry_pending) {
     try { withFlowLock(phase.root, phase.flow, () => {
-      finishRevision(phase.root, phase.flow, run, result, {
+      result = finishRevision(phase.root, phase.flow, run, result, {
         ...(answer.session_id ? { session_id: answer.session_id } : {}), launch: documentOpeningLaunch(ctx.family, answer.launch ?? entry!.launch, answer.session_id),
       })
-    }) } catch (e) { result = { ...result, registry_pending: true, detail: (e as Error).message } }
+    }) } catch (e) { result = { ...result, registry_pending: true, detail: [result.detail, `registro: ${(e as Error).message}`].filter(Boolean).join('; ') } }
   }
   const lists = { assumptions: c?.assumptions ?? [], blocking_questions: c?.blocking_questions ?? [], missing_context: c?.missing_context ?? [] }
   const report: PhaseResult = { ...result, outcome: result.state, artifact, ...lists,

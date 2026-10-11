@@ -8,7 +8,7 @@ import { isRunId } from './runs.ts'
 import { type DocumentContract, admitPlan, admitSpecify, admitTasks, renderPlan, renderSpec, renderTasks } from './sdd/phase.ts'
 import { criteriaIds, readHeader } from './sdd/markdown.ts'
 import { bytesHash } from './sdd/read.ts'
-import { type DocumentOrigin, type EffectiveLaunch, readRegularBytes, readRevisionFile } from './sdd/revision-record.ts'
+import { type DocumentOrigin, type EffectiveLaunch, launchValid, repositoryLaunch, readRegularBytes, readRevisionFile } from './sdd/revision-record.ts'
 import { type Family, type LaunchSpec, type RunState, type WorkerTask, SddError } from './types.ts'
 import { claudeLaunch, claudeResume } from './workers/claude.ts'
 import { codexLaunch, codexResume, withResultFile } from './workers/codex.ts'
@@ -138,44 +138,45 @@ function legacyOrigins(root: string, flow: string, step: DocumentOrigin['phase']
         else sources.push(ref)
       }
       if (!compatible) continue
-      let effective = argv.launch
+      let effective = repositoryLaunch(root, argv.launch)
       let session: string | undefined
       try {
         const p = json<{ launch: EffectiveLaunch; session_id?: string }>(join(dir, 'producer.json'))
-        if (p.launch.cmd !== argv.family) continue
-        effective = p.launch; session = p.session_id
+        if (!p || !launchValid(p.launch) || p.launch.cmd !== argv.family) unreadable(new Error('producer.json no acredita el lanzamiento'))
+        effective = repositoryLaunch(root, p.launch); session = p.session_id
       } catch (e) {
-        if (ioFailure(e)) unreadable(e)
+        if (e instanceof SddError) throw e
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') unreadable(e)
         try {
-        let metrics: { attempts: { admission?: string; suffix: string; outcome: string; raw: { stdout: string; result: string | null } }[] } | undefined
-        try { metrics = json(join(dir, 'metrics.json')) } catch (e) { if (ioFailure(e)) unreadable(e); /* Familia comprobada sin sesión atribuible. */ }
-        const admittedAttempt = metrics?.attempts?.filter((a) => a.admission === 'ok').at(-1)
-        if (admittedAttempt && admittedAttempt.raw.result) {
-          const raw = bytes(join(dir, admittedAttempt.raw.result)).toString('utf8')
-          const check = admitDocumentContract(step, raw, criteria, argv.phase.task_actors === true)
-          if (check.kind !== 'admitted' || renderContract(check.review) !== rendered) continue
-          // El stream puede identificar Codex. Claude solo se atribuye si el argv acredita ese intento.
-          if (admittedAttempt.suffix) {
-            try { effective = json<{ launch: EffectiveLaunch }>(join(dir, `argv${admittedAttempt.suffix}.json`)).launch } catch (e) {
-              if (ioFailure(e)) unreadable(e)
-              // Recupera el perfil anterior al intento de admisión si se conservó su argv.
-              const index = metrics!.attempts.indexOf(admittedAttempt)
-              const previous = metrics!.attempts.slice(0, index).reverse().find((a) => a.suffix && a.suffix !== '-fix')
-              if (previous) effective = json<{ launch: EffectiveLaunch }>(join(dir, `argv${previous.suffix}.json`)).launch
+          let metrics: { attempts: { admission?: string; suffix: string; outcome: string; raw: { stdout: string; result: string | null } }[] } | undefined
+          try { metrics = json(join(dir, 'metrics.json')) } catch (e) { if (ioFailure(e)) unreadable(e); /* Familia comprobada sin sesión atribuible. */ }
+          const admittedAttempt = metrics?.attempts?.filter((a) => a.admission === 'ok').at(-1)
+          if (admittedAttempt && admittedAttempt.raw.result) {
+            const raw = bytes(join(dir, admittedAttempt.raw.result)).toString('utf8')
+            const check = admitDocumentContract(step, raw, criteria, argv.phase.task_actors === true)
+            if (check.kind !== 'admitted' || renderContract(check.review) !== rendered) continue
+            // El stream puede identificar Codex. Claude solo se atribuye si el argv acredita ese intento.
+            if (admittedAttempt.suffix) {
+              try { effective = json<{ launch: EffectiveLaunch }>(join(dir, `argv${admittedAttempt.suffix}.json`)).launch } catch (e) {
+                if (ioFailure(e)) unreadable(e)
+                // Recupera el perfil anterior al intento de admisión si se conservó su argv.
+                const index = metrics!.attempts.indexOf(admittedAttempt)
+                const previous = metrics!.attempts.slice(0, index).reverse().find((a) => a.suffix && a.suffix !== '-fix')
+                if (previous) effective = json<{ launch: EffectiveLaunch }>(join(dir, `argv${previous.suffix}.json`)).launch
+              }
             }
+            session = sessionFrom(argv.family, effective, bytes(join(dir, admittedAttempt.raw.stdout)).toString('utf8'))
+          } else if (metrics?.attempts?.length === 1 && metrics.attempts[0].outcome === 'done') {
+            session = sessionFrom(argv.family, effective, bytes(join(dir, metrics.attempts[0].raw.stdout)).toString('utf8'))
           }
-          session = sessionFrom(argv.family, effective, bytes(join(dir, admittedAttempt.raw.stdout)).toString('utf8'))
-        } else if (metrics?.attempts?.length === 1 && metrics.attempts[0].outcome === 'done') {
-          session = sessionFrom(argv.family, effective, bytes(join(dir, metrics.attempts[0].raw.stdout)).toString('utf8'))
-        }
       // Evidencia de sesión ausente conserva la familia demostrada por el contrato publicado.
-      } catch (e) { if (e instanceof SddError || ioFailure(e)) unreadable(e); session = undefined }
+      } catch (e) { if (e instanceof SddError) throw e; if (ioFailure(e)) unreadable(e); session = undefined }
       }
       origins.push({ phase: step, artifact, run, family: argv.family, launch: documentOpeningLaunch(argv.family, effective, session),
         ...(session ? { session_id: session } : {}), sources, amendments,
         ...(argv.phase.task_actors ? { task_actors: true } : {}) })
     } catch (e) {
-      if (e instanceof SddError) throw e
+      if (e instanceof SddError && e.code !== 'origin_mismatch') throw e
       if (ioFailure(e)) unreadable(e)
       // Una corrida sin evidencia suficiente no demuestra procedencia.
     }
@@ -202,7 +203,7 @@ export function resolveDocumentProducer(root: string, flow: string, step: Docume
         || origin.launch.cwd !== root) throw new Error('la corrida no acredita el origen registrado')
       try {
         const proof = json<{ launch: EffectiveLaunch; session_id?: string }>(join(dir, 'producer.json'))
-        const opening = documentOpeningLaunch(origin.family, proof.launch, proof.session_id)
+        const opening = documentOpeningLaunch(origin.family, repositoryLaunch(root, proof.launch), proof.session_id)
         if (JSON.stringify(opening) !== JSON.stringify(origin.launch) || proof.session_id !== origin.session_id) throw new Error('producer.json no acredita el lanzamiento registrado')
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
@@ -286,7 +287,10 @@ export async function runRevisionAttempts(o: RevisionAttemptOptions): Promise<Re
   let session = o.session.session_id ?? last.facts.sessionId
   const initial = last
   const rejected = (a: RevisionAttempt) => o.session.mode === 'same' && a.outcome.state !== 'done'
-    && a === initial && !a.facts.started && /(?:session|thread)(?:\s+(?:id|with id))?\s*[:=]?\s*[\w-]*\s+(?:not found|does not exist|is invalid|is unknown)|no se encontr[oó] la sesi[oó]n/i.test(`${a.stderr}\n${a.outcome.detail ?? ''}`)
+    && a === initial && !a.facts.started && session !== undefined
+    && `${a.stderr}\n${a.outcome.detail ?? ''}`.includes(session)
+    && /(?:session|thread|conversation|sesi[oó]n)/i.test(`${a.stderr}\n${a.outcome.detail ?? ''}`)
+    && /(?:not found|does not exist|is invalid|is unknown|no conversation found|no se encontr[oó])/i.test(`${a.stderr}\n${a.outcome.detail ?? ''}`)
   const failure = (): RevisionAttemptResult => ({ last, launch, ...(session ? { session_id: session } : {}), result: {
     state: rejected(last) ? 'resume_rejected' : revisionFailureState(last.outcome.state),
     ...(last.outcome.reason ? { cause: last.outcome.reason } : {}), ...(last.outcome.detail ? { detail: last.outcome.detail } : {}),

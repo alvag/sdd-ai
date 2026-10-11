@@ -66,6 +66,20 @@ export function launchValid(v: unknown): v is EffectiveLaunch {
   return isPlainObject(v) && isFamily(v.cmd) && Array.isArray(v.args) && v.args.every((a) => typeof a === 'string')
     && isText(v.cwd) && isText(v.stdinFile)
 }
+/** El registro viaja con el flujo; las rutas del lanzamiento se ligan a su raíz original. */
+export function portableLaunch(launch: EffectiveLaunch): EffectiveLaunch {
+  const stdin = isAbsolute(launch.stdinFile) ? relative(launch.cwd, launch.stdinFile) : launch.stdinFile
+  if ((!isAbsolute(launch.cwd) && launch.cwd !== '.') || !isInternalPath(stdin) || !stdin.startsWith('.sdd-ai/runs/')) {
+    return invalid('launch', 'lanzamiento fuera del repositorio o de las corridas')
+  }
+  return { ...launch, cwd: '.', stdinFile: stdin }
+}
+
+export function repositoryLaunch(root: string, launch: EffectiveLaunch): EffectiveLaunch {
+  const stored = portableLaunch(launch)
+  return { ...stored, cwd: root, stdinFile: resolve(root, stored.stdinFile) }
+}
+
 function referenceValid(v: unknown): v is MaterialReference {
   return isPlainObject(v) && isInternalPath(v.path) && isDigest(v.digest) && (v.copy === undefined || isInternalPath(v.copy))
     && (v.role === undefined || isText(v.role))
@@ -160,22 +174,26 @@ export function readRegularBytes(file: string): Buffer {
   } finally { closeSync(fd) }
 }
 
+/** La lectura del flujo y la de fases validan la misma evidencia ya abierta. */
+export function readRevisionData(file: string, value: unknown): Pick<RevisionFileRead, 'documents' | 'revisions'> {
+  if (!isPlainObject(value) || value.schema_version !== 1) return invalid(file, 'schema_version no es 1')
+  const documents = readDocumentOrigins(value.documents)
+  const revisions = readRevisions(value.revisions)
+  const root = dirname(dirname(dirname(file)))
+  const flow = dirname(file).split(/[\\/]/).at(-1)
+  for (const entry of [...Object.values(documents ?? {}).filter((e): e is DocumentOrigin => e !== undefined), ...(revisions?.entries ?? [])]) {
+    if (entry.artifact !== `.plans/${flow}/${entry.phase === 'specify' ? 'spec' : entry.phase}.md`) invalid(file, 'artefacto de otro flujo')
+    entry.launch = repositoryLaunch(root, entry.launch)
+  }
+  return { documents, revisions }
+}
+
 /** Solo ENOENT acredita ausencia. */
 export function readRevisionFile(file: string): RevisionFileRead {
   try {
     const bytes = readRegularBytes(file)
     const value: unknown = JSON.parse(bytes.toString('utf8'))
-    if (!isPlainObject(value) || value.schema_version !== 1) return invalid(file, 'schema_version no es 1')
-    const documents = readDocumentOrigins(value.documents)
-    const revisions = readRevisions(value.revisions)
-    const root = dirname(dirname(dirname(file)))
-    const flow = dirname(file).split(/[\\/]/).at(-1)
-    for (const entry of [...Object.values(documents ?? {}).filter((e): e is DocumentOrigin => e !== undefined), ...(revisions?.entries ?? [])]) {
-      if (entry.artifact !== `.plans/${flow}/${entry.phase === 'specify' ? 'spec' : entry.phase}.md`) invalid(file, 'artefacto de otro flujo')
-      const launch = entry.launch
-      const stdin = relative(root, resolve(root, launch.stdinFile))
-      if (resolve(root, launch.cwd) !== root || !isInternalPath(stdin) || !stdin.startsWith('.sdd-ai/runs/')) invalid(file, 'lanzamiento fuera del repositorio o de las corridas')
-    }
+    const { documents, revisions } = readRevisionData(file, value)
     return { documents, revisions, digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` }
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { digest: 'absent' }
@@ -207,3 +225,13 @@ export function revisionPublicationFacts(root: string, intent: RevisionIntent, c
     barrier: renamed || current !== intent.previous_digest || detail !== undefined, digest, terminal, ...(detail ? { detail } : {}) }
 }
 
+
+/** El PID separado cubre el tramo de launching anterior al primer status del supervisor. */
+export function revisionSupervisorPid(root: string, run: string, pid?: number): number | undefined {
+  if (pid === undefined) {
+    try { pid = Number(readRegularBytes(join(root, '.sdd-ai', 'runs', run, 'supervisor.pid')).toString('utf8').trim()) } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+    }
+  }
+  return pid !== undefined && Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
+}

@@ -19,6 +19,11 @@ test('el encargo conserva fuentes distingue aceptados decisiones y aporte del co
       l.next_id = 4; put(runFile(s, s.review, 'ledger.json'), l)
       const contribution = 'Max aclara el resultado sin cambiar el alcance.\n'
       writeFileSync(`${s.repo}/decisions.md`, contribution)
+      const historical = 'Ampliación histórica presente.\n'
+      const originRecord = record(s)
+      writeFileSync(runFile(s, s.origin, 'historical.md'), historical)
+      originRecord.documents![artifact === 'spec' ? 'specify' : artifact]!.amendments.push({ path: 'historical.md', copy: `.sdd-ai/runs/${s.origin}/historical.md`, digest: bytesHash(historical), role: 'context' })
+      saveRecord(s, originRecord)
       const document = readFileSync(`${s.repo}/${s.selection.artifact}`, 'utf8')
       const start = revise(s, decisions ? ['--decisions', 'decisions.md'] : [])
       assert.equal(start.code, 0, JSON.stringify(start.out)); await settle(s, start.out.id)
@@ -37,7 +42,12 @@ test('el encargo conserva fuentes distingue aceptados decisiones y aporte del co
       }
       for (const input of s.selection.inputs) assert.ok(prompt.includes(readFileSync(`${s.repo}/${input.path}`, 'utf8')))
       assert.equal(entry.conductor?.digest, decisions ? bytesHash(contribution) : undefined)
-      if (decisions) assert.match(prompt, /Aporte del conductor; sin autoridad sobre pedido ni insumos aprobados/)
+      assert.ok(prompt.includes(historical)); assert.ok(prompt.includes(readFileSync(`${s.repo}/context.md`, 'utf8')))
+      assert.ok(prompt.includes('Defecto contextual.')); assert.ok(!orders.includes('Defecto contextual.'))
+      if (decisions) {
+        assert.match(prompt, /Aporte del conductor; sin autoridad sobre pedido ni insumos aprobados/)
+        assert.ok(prompt.split('Aporte del conductor; sin autoridad sobre pedido ni insumos aprobados')[1].includes(contribution))
+      } else assert.ok(!prompt.includes('Aporte del conductor; sin autoridad sobre pedido ni insumos aprobados'))
       assert.equal(readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8'), `${JSON.stringify(l, null, 2)}\n`)
     } finally { await cleanup(s) }
   }

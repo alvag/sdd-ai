@@ -6,6 +6,7 @@ import test from 'node:test'
 import { calls, cleanup, cli, corrected, entries, flowFile, makeFixture, record, revise, runFile, script, settle, snapshotFiles, waitFor } from './phase-revision-fixture.ts'
 
 test('los fallos conservan el documento y el contexto permite continuar con el productor', async (t) => {
+  // Contrato inadmisible y timeout invocan una vez más al mismo productor para recuperar.
   const scenarios = { startup: { outcome: 'launch_failed', count: 1 }, execution: { outcome: 'failed', count: 1 },
     contract: { outcome: 'not_admitted', count: 2 }, cancel: { outcome: 'cancelled', count: 1 }, timeout: { outcome: 'timeout', count: 2 } }
   for (const [mode, expected] of Object.entries(scenarios)) {
@@ -23,11 +24,16 @@ test('los fallos conservan el documento y el contexto permite continuar con el p
       // El cierre de timeout usa el límite real del supervisor; no crea otra sesión.
       const result = mode === 'timeout' ? cli(s, ['wait', start.out.id, '--max', '15']) : await settle(s, start.out.id)
       assert.equal(result.out.outcome, expected.outcome, JSON.stringify(result.out))
+      if (mode === 'startup') { assert.equal(result.out.cause, 'unknown'); assert.match(result.out.detail, /fake-cli: startup failed/) }
+      if (mode === 'execution') assert.equal(result.out.cause, 'exit_1')
+      if (mode === 'contract') assert.match(result.out.cause, /JSON|contrato|inadmisible|fase/i)
+      if (mode === 'cancel' || mode === 'timeout') assert.equal(result.out.cause, undefined)
       assert.deepEqual(snapshotFiles(s), before)
       assert.equal(record(s).revisions!.barriers.length, 0)
       assert.equal(record(s).revisions!.active, undefined)
       assert.equal(calls(s).length, expected.count)
-      assert.ok(calls(s).every((args) => args[args.length - 2] === s.session))
+      // El productor Codex usa exec resume ... <thread> -; Claude usa --resume <id>.
+      assert.ok(calls(s).every((args) => s.family === 'claude' ? args.indexOf('--resume') >= 0 && args[args.indexOf('--resume') + 1] === s.session : args[0] === 'exec' && args[1] === 'resume' && args.at(-1) === '-' && args.at(-2) === s.session))
     } finally { writeFileSync(barrier, ''); await cleanup(s) }
   }
   // Impedimento real al escribir el destino, después de tomar los locks y admitir el contrato.
@@ -45,7 +51,7 @@ test('los fallos conservan el documento y el contexto permite continuar con el p
     const mark = flag(true); marked = mark.status === 0
     if (!marked) {
       assert.notEqual(process.platform, 'darwin', `chflags obligatorio en macOS: ${mark.stderr}`)
-      t.diagnostic('omitido: impedimento de escritura con marca inmutable sin permiso o soporte')
+      t.diagnostic('pendiente V10; omitido: impedimento de escritura con marca inmutable sin permiso o soporte')
     } else {
       writeFileSync(barrier, '')
       const failed = await settle(unwritable, start.out.id)

@@ -43,10 +43,10 @@ test('cada material cambiado impide reemplazar el documento', async () => {
       const finished = await settle(s, start.out.id)
       assert.equal(finished.out.outcome, mutation === 'handoff-body' ? 'published' : 'conflict', JSON.stringify(finished.out))
       if (mutation !== 'handoff-body') {
-        assert.equal(finished.out.cause, 'material_changed')
-        const details: Record<string, RegExp> = { target: /candidato|documento/, ledger: /ledger/, round: /ronda|entrega completada/,
-          decisions: /aporte|decisions/, source: /insumos|fuentes/, context: /insumos|contexto/, 'handoff-header': /header/,
-          depth: /normal|completa|profundidad/, step: /paso/, implementation: /implement/ }
+        assert.equal(finished.out.cause, mutation === 'implementation' ? 'implementation_started' : 'material_changed')
+        const details: Record<string, RegExp> = { target: /cambió el documento objetivo/, ledger: /cambió el ledger/, round: /la última ronda no acredita una entrega completada/,
+          decisions: /cambió decisions\.md/, source: /cambió \.plans\/f\/spec\.md/, context: /cambió context\.md/, 'handoff-header': /cambió el header del handoff/,
+          depth: /cambió la profundidad del flujo/, step: /cambió el paso del flujo/, implementation: /existe evidencia de un writer de implement lanzado/ }
         assert.match(finished.out.detail, details[mutation], JSON.stringify(finished.out))
         assert.deepEqual(snapshotFiles(s), afterMutation)
         assert.equal(entries(s).at(-1)!.result!.state, 'conflict')

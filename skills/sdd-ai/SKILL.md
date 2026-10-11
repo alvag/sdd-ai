@@ -1144,7 +1144,9 @@ un plan dependiente necesita una revisión nueva contra esa spec antes de devolv
 
 El productor continúa su sesión y familia, incluidas devoluciones sucesivas. Si falta evidencia del
 origen, se rechaza: el flag no permite inventarlo. Si el productor es conocido pero su sesión no es
-recuperable, el comando explica la causa y no lanza nada. Para abrir otra sesión:
+recuperable, rechaza con `session_unrecoverable` y no lanza nada. `--context` sin una corrección
+en espera rechaza con `context_not_expected`; si cambió la revisión o sus decisiones desde el pedido
+de contexto, rechaza con `review_changed`. Para abrir otra sesión:
 
 ```
 ./bin/sdd-ai sdd phase <flow> --revise plan --review <review-id> --new-session
