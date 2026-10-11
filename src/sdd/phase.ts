@@ -167,7 +167,9 @@ ${m.quality}`
  * El encargo de una fase: una plantilla por fase con los insumos congelados entre marcas. Dos flujos con
  * los mismos insumos reciben el mismo prompt salvo los datos del flujo.
  */
-export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: FrozenInputs, engineContext?: string, correction?: { material: string }): string {
+export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: FrozenInputs, options?: string | { engineContext?: string; correction?: { material: string } }): string {
+  const engineContext = typeof options === 'string' ? options : options?.engineContext
+  const correction = typeof options === 'string' ? undefined : options?.correction
   const parts = [
     WORKER_POLICY,
     `# Encargo de la fase ${step} del flujo ${flow.id}`,

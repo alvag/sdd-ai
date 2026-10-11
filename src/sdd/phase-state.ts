@@ -115,7 +115,6 @@ function readPhaseRecordFile(root: string, id: string, strict: boolean): PhaseRe
   const st = lstatOrNull(file)
   if (st === null) return { schema_version: 1, last_run: null, phases: {} }
   if (st.isSymbolicLink()) throw pathInvalid(`.plans/${id}/${PHASES_FILE}`, 'es un enlace simbólico')
-  if (!st.isFile()) throw pathInvalid(`.plans/${id}/${PHASES_FILE}`, 'no es un archivo regular')
   let data: unknown
   try {
     data = strict ? readActivityJson(file) : JSON.parse(readFileSync(file, 'utf8'))
@@ -495,13 +494,12 @@ export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'de
  * se puede leer no tumba a quien lista: queda dicho en `detail`.
  */
 export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root: string, id: string, status: T): Next {
+  let record: PhaseRecord | undefined; let recordError: unknown
   try {
-    const r = readPhaseRecord(root, id)
-    const revision = r.revisions?.active ?? pendingIntent(r)
-    if (revision) return { ...status.next, command: `./bin/sdd-ai wait ${revision.run}`, detail: `la corrección de ${revision.artifact} sigue activa` }
-  } catch (e) {
-    return { ...status.next, detail: `no se pudo leer el registro de fases: ${(e as Error).message}` }
-  }
+    record = readPhaseRecord(root, id)
+    const activity = phaseNext(root, id, status, record)
+    if (record.revisions?.active || pendingIntent(record)) return { ...status.next, ...activity }
+  } catch (e) { recordError = e }
   if (status.next.step === 'branch') return { ...status.next, command: `./bin/sdd-ai sdd branch ${id}` }
   const chained = chainNext(root, id, status)
   if (status.next.step === 'review_and_commit') {
@@ -523,7 +521,8 @@ export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root
   if (status.next.step === 'verify') return { ...status.next, command: `./bin/sdd-ai sdd verify ${id}` }
   if ((status.depth !== 'normal' && status.depth !== 'completa') || !PHASE_STEPS.includes(status.next.step)) return status.next
   try {
-    const phase = phaseNext(root, id, status, readPhaseRecord(root, id))
+    if (recordError) throw recordError
+    const phase = phaseNext(root, id, status, record!)
     return phase ? { ...status.next, ...phase } : status.next
   } catch (e) {
     return { ...status.next, detail: `no se pudo leer el registro de fases: ${(e as Error).message}` }

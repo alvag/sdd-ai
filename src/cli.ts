@@ -315,6 +315,7 @@ interface ProcessRun {
   root: string; env: Env; resolution: Resolution; prompt: string; request: Record<string, unknown>; deadline: number
   conductor: Conductor; web?: boolean; argvExtra?: Partial<ArgvFile>; files?: Record<string, string | Buffer>
   launchFor?: (dir: string) => LaunchSpec
+  beforeLaunch?: (run: { id: string; dir: string }, launch: LaunchSpec) => void
 }
 
 function executionContext(root: string, run: string, flow: string | undefined, step: string | null, role: string | null, resolution: Resolution): ExecutionContext {
@@ -334,9 +335,10 @@ function reviewExecution(root: string, id: string, req: ReviewRequest, resolutio
  */
 function startProcessRun(o: ProcessRun): { id: string; dir: string; launched: boolean } {
   const revision = o.request.revision === true
-  if (revision && !inPath(o.resolution.family, o.env)) throw new SddError('cli_missing', `${o.resolution.family} no está en PATH`)
+  const available = inPath(o.resolution.family, o.env)
+  if (revision && !available) throw new SddError('cli_missing', `${o.resolution.family} no está en PATH`)
   const { id, dir } = prepareRun(o.root, o.prompt, o.request, o.resolution, o.files)
-  if (!inPath(o.resolution.family, o.env)) {
+  if (!available) {
     const detail = `${o.resolution.family} no está en PATH`
     markDelivered(dir, setStatus(dir, { state: 'launch_failed', reason: 'cli_missing', detail, fallback: o.conductor }), o.env)
     return { id, dir, launched: false }
@@ -348,6 +350,7 @@ function startProcessRun(o: ProcessRun): { id: string; dir: string; launched: bo
   const launch = o.launchFor?.(dir) ?? (o.resolution.family === 'claude' ? claudeLaunch(task) : codexLaunch(task))
   const execution = executionContext(o.root, id, typeof o.request.flow === 'string' ? o.request.flow : undefined,
     typeof o.request.step === 'string' ? o.request.step : null, typeof o.request.role === 'string' ? o.request.role : null, o.resolution)
+  o.beforeLaunch?.({ id, dir }, launch)
   try {
     launchSupervisor(dir, { family: o.resolution.family, launch, deadline_sec: o.deadline, execution, ...o.argvExtra }, o.env, revision ? {} : { fallback: o.conductor })
   } catch (e) {
@@ -1297,9 +1300,10 @@ async function reviewRoundArtifact(o: {
   if (flow) {
     try { withFlowLock(root, flow, () => {
       recoverRevisionPublication(root, flow)
-      if (pendingIntent(readPhaseRecord(root, flow, true))) throw new Error('la intención sigue pendiente')
+      if (pendingIntent(readPhaseRecord(root, flow, true))) throw new SddError('revision_pending', 'la intención sigue pendiente')
     }) } catch (e) {
-      throw new SddError('revision_pending', 'no se pudo aclarar la publicación de una corrección antes de la ronda', { detail: (e as Error).message })
+      if (e instanceof SddError) throw e
+      throw new SddError('revisions_invalid', 'no se pudo leer o cerrar el registro antes de la ronda', { detail: (e as Error).message })
     }
   }
   const ledgerFile = join(dir, 'ledger.json')
@@ -1665,6 +1669,17 @@ function phaseView(root: string, id: string, dir: string, s: Status, req: PhaseR
   return { code: s.state === 'done' ? 0 : 1, out }
 }
 
+/** El terminal se consulta aunque el registro estricto no admita su cierre. */
+function pendingRevisionView(root: string, id: string, dir: string, s: Status, req: PhaseRequest, error: unknown): Result {
+  let result: Result
+  try { result = phaseView(root, id, dir, s, req) } catch {
+    let phase: Record<string, unknown> = {}
+    try { phase = readJson(join(dir, 'phase.json')) } catch { /* El estado conserva el terminal aun sin entrega legible. */ }
+    result = { code: s.state === 'done' ? 0 : 1, out: { ...phase, id, state: s.state, flow: req.flow, next: `./bin/sdd-ai wait ${id}` } }
+  }
+  return { ...result, out: { ...(result.out as Record<string, unknown>), registry_pending: true, detail: (error as Error).message } }
+}
+
 function reportOf(root: string, id: string, dir: string, s: Status, env: Env): Result {
   const request = existsSync(join(dir, 'request.json')) ? readJson<{ kind?: string }>(join(dir, 'request.json')) : {}
   if (request.kind === 'review' && TERMINAL.has(s.state)) return reviewView(root, id, dir, s, env)
@@ -1706,19 +1721,15 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
   if (isWriterRun(root, id)) return waitWriter(root, id, max, env)
   if (ownReservation(root, 'writer', id)) return releaseOrphan(root, id)
   const dir = runDir(root, id)
-  const correctionRequest = readJson<PhaseRequest | ReviewRequest>(join(dir, 'request.json'))
-  const correction = correctionRequest.kind === 'phase' && correctionRequest.revision ? correctionRequest : undefined
+  const correctionRequest = existsSync(join(dir, 'request.json')) ? readJson<PhaseRequest | ReviewRequest>(join(dir, 'request.json')) : undefined
+  const correction = correctionRequest?.kind === 'phase' && correctionRequest.revision ? correctionRequest : undefined
   const until = Date.now() + max * 1000
   for (;;) {
     const observed = withGitQueryScope('iteration', (): Result | undefined => {
     let s = readStatus(dir)
     if (correction) {
-      try { withFlowLock(root, correction.flow, () => recoverRevisionResult(root, correction.flow)) } catch {
-        if (TERMINAL.has(s.state)) {
-          const result = phaseView(root, id, dir, s, correction)
-          if (typeof result.out === 'object' && result.out !== null) result.out = { ...result.out, registry_pending: true }
-          return result
-        }
+      try { withFlowLock(root, correction.flow, () => recoverRevisionResult(root, correction.flow)) } catch (e) {
+        return pendingRevisionView(root, id, dir, s, correction, e)
       }
       s = readStatus(dir)
     }
@@ -1780,17 +1791,18 @@ async function cancel(args: string[], cwd: string): Promise<Result> {
   if (ownReservation(root, 'writer', id)) return releaseOrphan(root, id)
   if (values['writer-gone']) throw new SddError('usage', '--writer-gone solo se usa con la corrida de un writer')
   const dir = runDir(root, id)
-  const req = readJson<PhaseRequest | ReviewRequest>(join(dir, 'request.json'))
-  if (req.kind === 'phase' && req.revision) {
-    withFlowLock(root, req.flow, () => recoverRevisionResult(root, req.flow))
+  const req = existsSync(join(dir, 'request.json')) ? readJson<PhaseRequest | ReviewRequest>(join(dir, 'request.json')) : undefined
+  if (req?.kind === 'phase' && req.revision) {
+    let registryError: unknown
+    try { withFlowLock(root, req.flow, () => recoverRevisionResult(root, req.flow)) } catch (e) { registryError = e }
     const status = readStatus(dir)
     const pid = status.supervisor_pid ?? readSupervisorPid(dir)
-    if (!TERMINAL.has(status.state) && (pid === undefined || !isAlive(pid))) {
+    if (!TERMINAL.has(status.state) && pid !== undefined && !isAlive(pid)) {
       setStatus(dir, { state: 'cancelled', ended_at: new Date().toISOString() })
-      withFlowLock(root, req.flow, () => recoverRevisionResult(root, req.flow))
+      try { withFlowLock(root, req.flow, () => recoverRevisionResult(root, req.flow)) } catch (e) { return pendingRevisionView(root, id, dir, readStatus(dir), req, e) }
       return phaseView(root, id, dir, readStatus(dir), req)
     }
-    if (TERMINAL.has(status.state)) return phaseView(root, id, dir, status, req)
+    if (TERMINAL.has(status.state)) return registryError ? pendingRevisionView(root, id, dir, status, req, registryError) : phaseView(root, id, dir, status, req)
   }
   if (existsSync(join(dir, 'native.json')) && cancelNative(dir)) return { code: 0, out: { id, state: 'cancelled' } }
   const s = readStatus(dir)
@@ -2346,7 +2358,6 @@ async function phaseImplement(p: ImplementPhase): Promise<Result> {
 
 async function chainLaunch(p: ImplementPhase): Promise<Result> {
   const { root, id, read } = p
-  recoverRevisionResult(root, id)
   const record = readPhaseRecord(root, id, true)
   const revision = record.revisions?.active ?? pendingIntent(record)
   if (revision) throw new SddError('revision_running', `la corrección de ${revision.artifact} sigue activa`, { next: `./bin/sdd-ai wait ${revision.run}` })
@@ -2729,13 +2740,14 @@ function flowBytes(root: string, read: FlowRead, name: 'spec' | 'plan' | 'tasks'
   return bytes
 }
 
-/**
- * `sdd phase <id>`: lanza por proceso la fase que dice `sdd status`, con el encargo que escribe el
- * binario. Todas las negativas van antes de crear nada y en este orden: un worker, `corta`, un paso que
- * no es fase, el registro de la fase y los flags, el material, el header del plan, los criterios de la
- * spec y la gramática de las tasks. La comprobación del registro, la corrida y el alta de la corrida en
- * el registro van juntas bajo el lock del flujo: dos invocaciones a la vez no pueden lanzar las dos.
- */
+/** Una sola negativa para las reservas documentales y sus intenciones pendientes. */
+function assertPhaseIdle(root: string, id: string, record: ReturnType<typeof readPhaseRecord>): void {
+  const running = activeRun(root, record, true)
+  if (!running) return
+  const revision = record.revisions?.active ?? pendingIntent(record)
+  throw new SddError(revision ? 'revision_running' : 'phase_running', revision ? `la corrección de ${revision.artifact} sigue activa` : `el flujo ${id} tiene una corrida de fase activa: ${running}`, { next: `./bin/sdd-ai wait ${running}` })
+}
+
 async function phaseRevision(o: {
   root: string; env: Env; id: string; artifact: RevisionArtifact; review?: string; context?: string; decisions?: string
   new_session: boolean; deadline: number; conductor: Conductor
@@ -2753,6 +2765,7 @@ async function phaseRevision(o: {
   const started = withRevisionLocks(root, id, review, () => {
     recoverRevisionResult(root, id)
     const record = readPhaseRecord(root, id, true)
+    assertPhaseIdle(root, id, record)
     const history = record.revisions?.entries.filter((e) => e.artifact === path) ?? []
     let parent = history.at(-1)
     if (o.context !== undefined && (!parent || parent.state !== 'awaiting_context' || parent.run !== awaiting!.run)) {
@@ -2761,20 +2774,19 @@ async function phaseRevision(o: {
     const producer = resolveDocumentProducer(root, id, step, env)
     const v = validateRevision(root, id, artifact, review, producer, o.decisions)
     if (o.context !== undefined) {
-      if (!parent) throw new SddError('context_not_expected', 'la corrección que esperaba contexto ya fue reemplazada')
-      if (parent.ledger_digest !== v.ledger_digest || parent.candidate !== v.candidate.hash || parent.round !== v.round) throw new SddError('review_changed', 'la revisión o sus decisiones cambiaron desde el pedido de contexto')
-      if (parent.conductor && o.decisions === undefined) {
-        if (!parent.conductor.copy) throw new SddError('material_missing', 'no está la copia congelada del aporte del conductor')
-        const bytes = readMaterial(root, parent.conductor.copy, 'la copia congelada del aporte del conductor', true).bytes
-        if (bytesHash(bytes) !== parent.conductor.digest) throw new SddError('material_missing', 'la copia del aporte no conserva su huella')
-        v.decisions = { ref: parent.conductor, bytes }
+      if (parent!.ledger_digest !== v.ledger_digest || parent!.candidate !== v.candidate.hash || parent!.round !== v.round) throw new SddError('review_changed', 'la revisión o sus decisiones cambiaron desde el pedido de contexto')
+      if (parent!.conductor && o.decisions === undefined) {
+        if (!parent!.conductor.copy) throw new SddError('material_missing', 'no está la copia congelada del aporte del conductor')
+        const bytes = readMaterial(root, parent!.conductor.copy, 'la copia congelada del aporte del conductor', true).bytes
+        if (bytesHash(bytes) !== parent!.conductor.digest) throw new SddError('material_missing', 'la copia del aporte no conserva su huella')
+        v.decisions = { ref: parent!.conductor, bytes }
       }
-      if (o.decisions !== undefined && v.decisions?.ref.digest !== parent.conductor?.digest) throw new SddError('review_changed', 'una continuación conserva el aporte del conductor registrado')
+      if (o.decisions !== undefined && v.decisions?.ref.digest !== parent!.conductor?.digest) throw new SddError('review_changed', 'una continuación conserva el aporte del conductor registrado')
     }
     const proof = authorizeNewSession(v, producer, o.new_session, record.revisions?.entries ?? [], env, o.conductor.family)
     const context = o.context === undefined ? undefined : readMaterial(root, o.context, 'las respuestas o el contexto de la corrección', true)
     const session = proof ? prepareNewDocumentSession(producer, 'prompt.md', 'result.md')
-      : prepareDocumentResume(producer, 'prompt.md', 'result.md', false)
+      : prepareDocumentResume(producer, 'prompt.md', 'result.md')
     const material = freezeRevisionMaterial(root, v, producer, session, history, context)
     const frozen: NonNullable<ArgvFile['phase']> = {
       root, flow: id, step, depth: v.depth, amended: false, findings: true,
@@ -2783,25 +2795,21 @@ async function phaseRevision(o: {
       revision: { review, round: v.round, artifact, document_digest: bytesHash(v.document), ledger_digest: v.ledger_digest,
         candidate: v.candidate.hash, step_at_launch: v.step_at_launch, ...(o.context !== undefined ? { continuation: true } : {}) },
     }
-    const profile = readJson<Resolution>(join(root, '.sdd-ai', 'runs', producer.origin.run, 'resolved.json'))
+    const profile = readJson<Resolution>(join(runDir(root, producer.origin.run), 'resolved.json'))
     const resolution: Resolution = { ...profile, family: producer.family, via: 'process' }
     const s = startProcessRun({ root, env, resolution, prompt: material.prompt, deadline: o.deadline, conductor: o.conductor,
       request: { kind: 'phase', flow: id, step, role: step, amended: false, revision: true, conductor: o.conductor,
         overrides: { deadline_sec: o.deadline } }, files: { ...material.files, 'inputs.json': `${JSON.stringify(frozen, null, 2)}\n` },
       argvExtra: { kind: 'phase', phase: frozen },
-      launchFor: (dir) => ({ ...session.launch, stdinFile: join(dir, 'prompt.md'),
-        args: producer.family === 'codex' ? withResultFile(session.launch.args, join(dir, 'result.md')) : session.launch.args }),
-    })
-    const argv = readJson<ArgvFile>(join(s.dir, 'argv.json'))
-    const refs = material.refs.map((ref) => ({ ...ref, copy: `.sdd-ai/runs/${s.id}/${ref.copy}` }))
+      beforeLaunch: (s, launch) => {
+    const refs = material.refs.map((ref) => ({ ...ref, copy: relative(root, join(s.dir, ref.copy!)).split(sep).join('/') }))
     const entry: RevisionEntry = { run: s.id, origin_run: producer.origin.run, parent_run: parent?.run ?? null,
       phase: step, artifact: path, family: producer.family, session_mode: session.mode,
-      ...(session.mode === 'same' && session.session_id ? { session_id: session.session_id } : {}),
-      ...(producer.family === 'claude' ? { session_id: argv.launch!.args[argv.launch!.args.findIndex((a) => a === '--session-id' || a === '--resume') + 1] } : {}),
-      launch: session.mode === 'new' ? argv.launch! : producer.launch, review, round: v.round, candidate: v.candidate.hash,
+      ...(session.session_id ? { session_id: session.session_id } : {}),
+      launch: session.mode === 'new' ? launch : producer.launch, review, round: v.round, candidate: v.candidate.hash,
       ledger_digest: v.ledger_digest, accepted: v.accepted, decisions: v.ledger.entries as unknown as Record<string, unknown>[],
       history: history as unknown as Record<string, unknown>[], materials: refs, at: new Date().toISOString(), state: 'active',
-      ...(v.decisions ? { conductor: { ...v.decisions.ref, copy: `.sdd-ai/runs/${s.id}/decisions.md` } } : {}),
+      ...(v.decisions ? { conductor: { ...v.decisions.ref, copy: relative(root, join(s.dir, 'decisions.md')).split(sep).join('/') } } : {}),
       ...(proof ? { authorization: proof } : {}), ...(o.context !== undefined ? { continuation: true } : {}),
     }
     const previous = record.revisions ?? { entries: [], barriers: [] }
@@ -2810,12 +2818,23 @@ async function phaseRevision(o: {
         && (o.context === undefined || e.run === parent?.run) ? { ...e, state: 'superseded' as const } : e), entry],
       active: { run: s.id, artifact: path },
     } })
+      },
+      launchFor: (dir) => ({ ...session.launch, stdinFile: join(dir, 'prompt.md'),
+        args: producer.family === 'codex' ? withResultFile(session.launch.args, join(dir, 'result.md')) : session.launch.args }),
+    })
     return { ...s, family: producer.family }
   })
   return { code: started.launched ? 0 : 1, out: { id: started.id, flow: id, step, revision: true, family: started.family,
     state: started.launched ? 'active' : 'launch_failed', next: `./bin/sdd-ai wait ${started.id}` } }
 }
 
+/**
+ * `sdd phase <id>`: lanza por proceso la fase que dice `sdd status`, con el encargo que escribe el
+ * binario. Todas las negativas van antes de crear nada y en este orden: un worker, `corta`, un paso que
+ * no es fase, el registro de la fase y los flags, el material, el header del plan, los criterios de la
+ * spec y la gramática de las tasks. La comprobación del registro, la corrida y el alta de la corrida en
+ * el registro van juntas bajo el lock del flujo: dos invocaciones a la vez no pueden lanzar las dos.
+ */
 async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> {
   const { values, positionals } = parseArgs({
     args, strict: true, allowPositionals: true,
@@ -2845,8 +2864,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   if (values.review !== undefined || values.decisions !== undefined || values['new-session'] !== undefined) throw phaseUsage('--review, --decisions y --new-session requieren --revise')
   withFlowLock(root, id, () => recoverRevisionResult(root, id))
   const record = readPhaseRecord(root, id, true)
-  const running = activeRun(root, record, true)
-  if (running) throw new SddError(record.revisions?.active?.run === running ? 'revision_running' : 'phase_running', record.revisions?.active?.run === running ? `la corrección de ${record.revisions.active.artifact} sigue activa` : `el flujo ${id} tiene una corrida de fase activa: ${running}`, { next: `./bin/sdd-ai wait ${running}` })
+  assertPhaseIdle(root, id, record)
   const read = readFlow(root, id, loadJiraMode(root))
   const status = resolveFlow(read.facts)
   if (status.depth === 'corta') {

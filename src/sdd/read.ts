@@ -11,7 +11,7 @@ import {
 } from './markdown.ts'
 import { type Approval, type ApprovalLog, type Depth, type FileState, type FlowFacts, GATES, type GateId, type Next, type Reason, isDepth, resolve } from './status.ts'
 import { verifyFacts } from './verify-state.ts'
-import { pendingIntent, readRevisionFile } from './revision-record.ts'
+import { pendingIntent, readRevisionFile, revisionPublicationFacts } from './revision-record.ts'
 
 /** El registro de aprobaciones vive en el flujo: viaja con él al archivarlo. */
 export const APPROVALS_FILE = 'sdd-ai-approvals.json'
@@ -243,23 +243,13 @@ export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode
     // Una intención puede acreditar el rename antes de la finalización del registro. Status solo lee.
     if (intent) {
       const key = ARTIFACTS.find((a) => intent.artifact === `.plans/${id}/${a}.md`)
-      let renamed = false
-      const terminal = join(root, '.sdd-ai', 'runs', intent.run, 'phase.json')
-      try {
-        if (!lstatSync(terminal).isFile()) throw new Error('el resultado de corrección no es regular')
-        const fd = openSync(terminal, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-        try {
-          if (!fstatSync(fd).isFile()) throw new Error('el resultado de corrección no es regular')
-          renamed = JSON.parse(readFileSync(fd, 'utf8')).outcome === 'published'
-        } finally { closeSync(fd) }
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
-      }
-      if (renamed || key && files[key].text !== null && bytesHash(files[key].text) === intent.result_digest) {
-        barriers.push({ run: intent.run, artifact: intent.artifact, gates: intent.gates, digest: intent.result_digest })
-      }
+      const publication = revisionPublicationFacts(root, intent, key ? files[key].digest.replace(/^(?:present|empty):/, 'sha256:') : undefined)
+      phasesDigest = bytesHash(`${phasesDigest}\n${publication.digest}`)
+      if (publication.barrier) barriers.push({ run: intent.run, artifact: intent.artifact, gates: intent.gates, digest: intent.result_digest })
+      if (publication.detail) revisionFacts = { barriers, pending: intent, invalid: publication.detail }
+
     }
-    if (record.revisions) revisionFacts = { barriers, ...(intent ? { pending: intent } : {}) }
+    if (record.revisions && !revisionFacts) revisionFacts = { barriers, ...(intent ? { pending: intent } : {}) }
   } catch (e) {
     phasesDigest = `unreadable:${sha256((e as Error).message)}`
     revisionFacts = { barriers: [], invalid: (e as Error).message }

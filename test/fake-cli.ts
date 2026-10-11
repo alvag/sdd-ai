@@ -35,14 +35,17 @@ async function documentScript(): Promise<void> {
   const entry = entries[callCount() - 1] ?? entries.at(-1) ?? {}
   const prompt = readFileSync(0, 'utf8')
   if (process.env.FAKE_CALLS_FILE) appendFileSync(`${process.env.FAKE_CALLS_FILE}.prompts`, `${JSON.stringify(prompt)}\n`)
-  if (entry.startup_failure || entry.reject_resume) {
-    process.stderr.write(entry.reject_resume ? 'session not found: resume rejected\n' : 'fake-cli: startup failed\n')
+  const codex = args[0] === 'exec'
+  const sessionOption = (flag: string) => { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : undefined }
+  // codexResume termina con <thread> -; Claude nombra la sesión con un flag.
+  const resume = codex ? (args[1] === 'resume' && args.at(-1) === '-' ? args.at(-2) : undefined) : sessionOption('--resume')
+  if (entry.startup_failure || (entry.reject_resume && resume !== undefined)) {
+    process.stderr.write(entry.reject_resume && resume !== undefined ? 'session not found: resume rejected\n' : 'fake-cli: startup failed\n')
     process.exitCode = 1
     return
   }
-  const codex = args[0] === 'exec'
-  const resume = codex ? args[1] === 'resume' ? args.at(-2) : undefined : args.includes('--resume') ? args[args.indexOf('--resume') + 1] : undefined
-  const session = entry.session ?? resume ?? (codex ? `DOCUMENT_THREAD_${callCount()}` : args[args.indexOf('--session-id') + 1])
+  const session = entry.session ?? resume ?? (codex ? `DOCUMENT_THREAD_${callCount()}` : sessionOption('--session-id'))
+  if (!session) throw new Error('fake-cli: falta la sesión documental en argv')
   // Archivos de sesión sintéticos para que sessionFile use su camino normal.
   const locate = (dir: string): string | undefined => {
     if (!existsSync(dir)) return undefined
@@ -62,18 +65,21 @@ async function documentScript(): Promise<void> {
     : { type: 'system', subtype: 'init', session_id: session, model: 'fake-document', tools: [] })}\n`)
   if (entry.barrier) {
     writeFileSync(`${entry.barrier}.ready`, '')
-    while (!existsSync(entry.barrier)) await sleep(10)
+    const until = Date.now() + 60000
+    while (!existsSync(entry.barrier) && Date.now() < until) await sleep(10)
+    if (!existsSync(entry.barrier)) throw new Error(`fake-cli: barrera sin liberar ${entry.barrier}`)
   }
-  if (entry.hang) { setInterval(() => {}, 1000); return }
+  if (entry.hang) { const timer = setInterval(() => {}, 1000); setTimeout(() => { clearInterval(timer); process.exitCode = 1 }, 60000); return }
   if (entry.execution_failure) {
     process.stdout.write(`${JSON.stringify(codex ? { type: 'item.started', item: { type: 'agent_message' } }
       : { type: 'assistant', message: { content: [{ type: 'text', text: 'Trabajo iniciado.' }] } })}\n`)
     process.stderr.write('fake-cli: execution failed\n'); process.exitCode = 1; return
   }
-  const memory = `${process.env.FAKE_CALLS_FILE}.document-memory`
-  let hash = /sha256:[0-9a-f]{64}/.exec(prompt)?.[0]
-  if (hash) writeFileSync(memory, hash)
-  else if (existsSync(memory)) hash = readFileSync(memory, 'utf8')
+  // $HASH es la huella del candidato de la ronda; los reintentos solo traen la orden de cierre.
+  const memory = process.env.FAKE_CALLS_FILE ? `${process.env.FAKE_CALLS_FILE}.document-candidate` : undefined
+  let hash = /`candidate_hash` es exactamente (sha256:[0-9a-f]{64})/.exec(prompt)?.[1]
+  if (memory && hash) writeFileSync(memory, hash)
+  else if (memory && existsSync(memory)) hash = readFileSync(memory, 'utf8')
   const answer = (entry.answer ?? '{}').replaceAll('$HASH', hash ?? '')
   if (codex) {
     const i = args.indexOf('--output-last-message')
@@ -101,7 +107,9 @@ async function telemetryScript(): Promise<void> {
   const entry = script[callCount() - 1] ?? {}
   if (entry.barrier) {
     writeFileSync(`${entry.barrier}.ready`, '')
-    while (!existsSync(entry.barrier)) await sleep(10)
+    const until = Date.now() + 60000
+    while (!existsSync(entry.barrier) && Date.now() < until) await sleep(10)
+    if (!existsSync(entry.barrier)) throw new Error(`fake-cli: barrera sin liberar ${entry.barrier}`)
   }
   if (entry.reject) {
     fail(entry.reject === 'model' ? 'codex-modelo-rechazado.jsonl' : 'codex-esfuerzo-rechazado.jsonl')

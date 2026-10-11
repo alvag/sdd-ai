@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { withLockAsync } from '../src/lock.ts'
-import { SddError } from '../src/types.ts'
+import { type Family, SddError } from '../src/types.ts'
 import { type Question } from '../src/approval/question.ts'
 import { type ArtifactSelection, freezeArtifact } from '../src/review/artifact.ts'
 import { snapshot } from '../src/review/candidate.ts'
@@ -15,7 +15,6 @@ import { type DocumentContract, type SpecifyContract, type PlanContract, type Ta
 import { type PhaseRecord, readPhaseRecord } from '../src/sdd/phase-state.ts'
 import { type RevisionArtifact, type RevisionEntry } from '../src/sdd/revision-record.ts'
 import { bytesHash } from '../src/sdd/read.ts'
-import { type Family } from '../src/types.ts'
 import { claudeLaunch } from '../src/workers/claude.ts'
 import { codexLaunch } from '../src/workers/codex.ts'
 import { askPair, makeFakeBin, makeRepo, telemetryOff, writeClaudeTranscript, writeCodexRollout } from './helpers.ts'
@@ -67,20 +66,28 @@ export function assertProviders(s: RevisionFixture, env: Record<string, string> 
     if (resolved) assert.ok(readFileSync(resolved, 'utf8').includes(`"${join(import.meta.dirname, 'fake-cli.ts')}"`), `${name} no apunta al CLI falso`)
   }
 }
-export function cli(s: RevisionFixture, args: string[], env: Record<string, string> = {}) {
+export function cli(s: RevisionFixture, args: string[], env: Record<string, string> = {}, timeoutMs = 20000) {
   const effectiveEnv = { ...s.env, ...env }
   assertProviders(s, effectiveEnv)
   const r = spawnSync(process.execPath, ['--import', join(import.meta.dirname, 'no-subprocess.ts'), BIN, ...args],
-    { cwd: s.repo, env: effectiveEnv, encoding: 'utf8', timeout: 20000 })
-  return { code: r.status, out: JSON.parse(r.stdout || 'null') as any, stderr: r.stderr }
+    { cwd: s.repo, env: effectiveEnv, encoding: 'utf8', timeout: timeoutMs })
+  if (r.error) throw new Error(`CLI ${args.join(' ')}: ${r.error.message}; stdout=${r.stdout}; stderr=${r.stderr}`, { cause: r.error })
+  try { return { code: r.status, out: JSON.parse(r.stdout || 'null') as any, stderr: r.stderr } } catch (e) {
+    throw new Error(`CLI ${args.join(' ')} terminó con ${r.status}; stdout=${r.stdout}; stderr=${r.stderr}`, { cause: e })
+  }
 }
 export function concurrentCli(s: RevisionFixture, args: string[]) {
   assertProviders(s)
   const p = spawn(process.execPath, ['--import', join(import.meta.dirname, 'no-subprocess.ts'), BIN, ...args], { cwd: s.repo, env: s.env })
   return new Promise<ReturnType<typeof cli>>((resolve, reject) => {
     let stdout = ''; let stderr = ''
+    const timer = setTimeout(() => { p.kill('SIGKILL'); reject(new Error(`CLI agotó 20 s: ${args.join(' ')}; stdout=${stdout}; stderr=${stderr}`)) }, 20000)
     p.stdout.on('data', (b) => { stdout += b }); p.stderr.on('data', (b) => { stderr += b })
-    p.on('error', reject); p.on('close', (code) => resolve({ code, out: JSON.parse(stdout || 'null'), stderr }))
+    p.on('error', (e) => { clearTimeout(timer); reject(e) })
+    p.on('close', (code) => {
+      clearTimeout(timer)
+      try { resolve({ code, out: JSON.parse(stdout || 'null'), stderr }) } catch (e) { reject(new Error(`CLI terminó con ${code}; stdout=${stdout}; stderr=${stderr}`, { cause: e })) }
+    })
   })
 }
 export async function waitFor(file: string, timeout = 10000): Promise<void> {
@@ -102,9 +109,12 @@ export function revise(s: RevisionFixture, extra: string[] = []) {
   return cli(s, ['sdd', 'phase', 'f', '--revise', s.artifact, '--review', s.review, ...extra])
 }
 export async function settle(s: RevisionFixture, run: string) {
-  const until = Date.now() + 12000
+  // El plazo total incluye cada consulta; ninguna puede exceder el tiempo restante.
+  const until = Date.now() + 30000
   for (;;) {
-    const r = cli(s, ['wait', run, '--max', '1'])
+    const remaining = until - Date.now()
+    assert.ok(remaining > 0, `la corrida ${run} no terminó en 30 s`)
+    const r = cli(s, ['wait', run, '--max', '1'], {}, Math.min(20000, remaining))
     assert.ok(r.out, r.stderr)
     if (['done', 'failed', 'timeout', 'launch_failed', 'cancelled'].includes(r.out.state)) return r
     assert.ok(Date.now() < until, JSON.stringify(r.out))
@@ -133,11 +143,13 @@ export function questionFrom(out: { next?: string }): Question {
   const marker = 'selección simple: '
   const begin = text.indexOf(marker)
   assert.ok(begin >= 0, text)
-  return JSON.parse(text.slice(begin + marker.length, text.indexOf('. En Codex', begin))) as Question
+  const end = text.indexOf('. En Codex', begin)
+  assert.ok(end > begin + marker.length, `falta el cierre de la pregunta canónica: ${text}`)
+  return JSON.parse(text.slice(begin + marker.length, end)) as Question
 }
-export function directedAnswer(s: RevisionFixture, answer: 'resolved' | 'unresolved' = 'unresolved'): string {
+export function directedAnswer(s: RevisionFixture, reviewerAnswer: 'resolved' | 'unresolved' = 'unresolved'): string {
   return JSON.stringify({ candidate_hash: '$HASH', inspection: { status: 'completed', paths: [s.selection.artifact] },
-    responses: [{ id: 'F-1', answer, evidence: `${s.selection.artifact}:5` }], findings: [], unverifiable: [] })
+    responses: [{ id: 'F-1', answer: reviewerAnswer, evidence: `${s.selection.artifact}:5` }], findings: [], unverifiable: [] })
 }
 export function holdFlowLock<T>(s: RevisionFixture, action: () => Promise<T>): Promise<T> {
   return withLockAsync(flowFile(s, 'sdd-ai-approvals.lock'), () => new SddError('fixture_lock_busy', 'lock del fixture ocupado'), action)
@@ -152,11 +164,12 @@ export function interrupted(s: RevisionFixture, template: RevisionEntry, o: {
   const run = `interrupted-${randomUUID()}`
   const entry: RevisionEntry = { ...structuredClone(template), run, parent_run: template.run, state: 'active', result: undefined }
   put(runFile(s, run, 'request.json'), { kind: 'phase', flow: 'f', step: entry.phase, role: entry.phase, revision: true })
-  put(runFile(s, run, 'status.json'), { state: o.terminal === 'cancelled' ? 'cancelled' : o.terminal ? 'done' : 'running', supervisor_pid: 99999999 })
+  put(runFile(s, run, 'status.json'), { state: o.terminal === 'cancelled' ? 'cancelled' : o.terminal ? 'done' : 'running', supervisor_pid: 99999999 /* PID fuera del rango del host: simula un supervisor muerto. */ })
   if (o.terminal) put(runFile(s, run, 'phase.json'), { outcome: o.terminal, state: o.terminal, artifact: entry.artifact,
     assumptions: [], blocking_questions: [], missing_context: [], ...(o.registry_pending ? { registry_pending: true } : {}) })
   const r = record(s)
-  const gates = s.depth === 'normal' ? ['spec', 'plan-tasks'] : ['spec', 'plan', 'tasks']
+  const gates = s.depth === 'normal' ? (s.artifact === 'spec' ? ['spec', 'plan-tasks'] : ['plan-tasks'])
+    : s.artifact === 'spec' ? ['spec', 'plan', 'tasks'] : s.artifact === 'plan' ? ['plan', 'tasks'] : ['tasks']
   saveRecord(s, { ...r, revisions: { entries: [entry], active: { run, artifact: entry.artifact }, barriers: [],
     intent: { run, artifact: entry.artifact, previous_digest: bytesHash(previous), result_digest: bytesHash(result), gates } } })
   writeFileSync(flowFile(s, `${s.artifact}.md`), o.current === 'previous' ? previous : o.current === 'result' ? result : third)
@@ -182,7 +195,7 @@ export function makeFixture(o: { artifact?: RevisionArtifact; family?: Family; d
   execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'base'], { cwd: repo })
   const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim()
   const branch = execFileSync('git', ['branch', '--show-current'], { cwd: repo, encoding: 'utf8' }).trim()
-  put(join(repo, '.sdd-ai', 'config.yml'), {})
+  mkdirSync(join(repo, '.sdd-ai'), { recursive: true })
   writeFileSync(join(repo, '.sdd-ai', 'config.yml'), 'cross_model:\n  schema_version: 1\n  families: [claude, codex]\n  selection: full\n')
   mkdirSync(join(repo, '.plans', 'f'), { recursive: true })
   const approved = o.approved ?? true
@@ -224,6 +237,14 @@ export function makeFixture(o: { artifact?: RevisionArtifact; family?: Family; d
   return s
 }
 export async function cleanup(s: RevisionFixture): Promise<void> {
-  for (const e of entries(s)) if (e.state === 'active') { try { cli(s, ['cancel', e.run]); await settle(s, e.run) } catch { /* El fallo de prueba conserva su diagnóstico. */ } }
-  rmSync(s.repo, { recursive: true, force: true }); rmSync(s.work, { recursive: true, force: true })
+  // El registro puede estar roto: se consultan todas las corridas, también las de creación.
+  try {
+    for (const run of readdirSync(join(s.repo, '.sdd-ai', 'runs'))) {
+      try {
+        const status = json<{ state: string }>(runFile(s, run, 'status.json'))
+        if (['launching', 'running'].includes(status.state)) { cli(s, ['cancel', run]); await settle(s, run) }
+      } catch { /* La limpieza no reemplaza el diagnóstico de la prueba. */ }
+    }
+  } catch { /* El caso pudo haber retirado el directorio de corridas. */ }
+  try { rmSync(s.repo, { recursive: true, force: true }) } finally { rmSync(s.work, { recursive: true, force: true }) }
 }

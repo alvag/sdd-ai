@@ -1150,7 +1150,7 @@ recuperable, el comando explica la causa y no lanza nada. Para abrir otra sesió
 ./bin/sdd-ai sdd phase <flow> --revise plan --review <review-id> --new-session
 ```
 
-El binario exige la respuesta de Max a su pregunta canónica, ligada a ese uso, sus huellas, revisión
+El binario exige la respuesta del usuario a su pregunta canónica, ligada a ese uso, sus huellas, revisión
 y ronda; presenta la pregunta como indica `next` y repite el comando solo después de obtenerla.
 El conductor no puede suplirla. La sesión autorizada conserva familia, perfil, aislamiento y material,
 y su autorización queda registrada. El flag se rechaza con `session_recoverable` si la sesión sigue
@@ -1159,13 +1159,13 @@ esa sesión no recuperable, incluso si su archivo local existe; nunca abre otra 
 
 El encargo incluye el documento completo, fuentes vigentes, fuentes y ampliaciones conservadas,
 ledger y decisiones. Solo los aceptados son órdenes; rechazos con motivo, disputas e informativos
-son contexto. `--decisions` congela un archivo UTF-8 del repositorio con respuestas de Max y su
+son contexto. `--decisions` congela un archivo UTF-8 del repositorio con respuestas del usuario y su
 huella: es aporte del conductor, sin autoridad sobre pedido ni insumos aprobados. No autoriza
 ampliar alcance, editar otros artefactos ni implementar. Una copia histórica ausente se declara al
 reanudar; si es necesaria para una sesión nueva, se rechaza con `material_missing`.
 
 Si el productor devuelve preguntas o faltantes, `awaiting_context` conserva el documento y libera
-la reserva. Max responde las preguntas de producto; el conductor obtiene los faltantes del repo.
+la reserva. El usuario responde las preguntas de producto; el conductor obtiene los faltantes del repo.
 Guárdalos en un archivo y continúa explícitamente, sin sustituir al productor:
 
 ```
@@ -1194,7 +1194,9 @@ finalizar; usa `wait`, no canceles una publicación consumada. Una recuperación
 La publicación reemplaza todo el cuerpo y conserva literalmente el frontmatter existente. No cambia
 otros artefactos, ledger ni headers de aprobación. Después de `published` continúa `review round
 <review-id>`: la misma revisión independiente verifica aceptados, responde rechazos y puede señalar
-regresiones ligadas a CAMBIOS. La ronda declara productor y familia solo para su publicación exacta;
+regresiones ligadas a CAMBIOS. Si la ronda devuelve `revision_pending`, consulta `wait <corrida>`
+para aclarar la intención de publicación y repite la ronda después de cerrar el registro.
+Si `wait` informa `registry_pending`, atiende su causa de lectura o escritura antes de continuar. La ronda declara productor y familia solo para su publicación exacta;
 un retoque posterior se declara como autoría mezclada. La devolución no reinicia rondas ni autoriza
 `--extra` o disputas. Los gates afectados y posteriores requieren la aprobación humana de las huellas
 vigentes; un header heredado que aún diga aprobado se informa como divergencia, sin acreditarlo.
@@ -1252,7 +1254,7 @@ falta; el paso siguiente lo sigue decidiendo `sdd status`, no el hijo.
 - **El artefacto.** El binario escribe `spec.md`, `plan.md` o `tasks.md` desde los campos validados, solo
   si no existe y si nada cambió desde el lanzamiento: el paso, la profundidad, los insumos, el header de
   `handoff.md` y, en `plan`, la rama y `HEAD`. La creación inicial no reemplaza un destino existente;
-  para corregir un documento delegado usa la devolución explícita descrita abajo.
+  para corregir un documento delegado usa la devolución explícita descrita arriba.
 - **Lo que trae `wait`**: el estado, `outcome` (`published`, `awaiting_context`, `closed_inline`,
   `not_published` o `not_admitted`), el `artifact` escrito, los `assumptions` del hijo y, si no se
   escribió, las `blocking_questions` y el `missing_context`, o la `cause`. Entrega también `findings`, `findings_rejected` y `findings_missing` presentes,

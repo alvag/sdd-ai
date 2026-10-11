@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
-import { calls, cleanup, cli, corrected, directedAnswer, entries, flowFile, interrupted, makeFixture, record, revise, saveRecord, script, settle, waitFor } from './phase-revision-fixture.ts'
+import { calls, cleanup, cli, corrected, directedAnswer, entries, flowFile, interrupted, makeFixture, record, revise, saveRecord, script, settle, snapshotFiles, waitFor } from './phase-revision-fixture.ts'
 
 test('las consultas recuperan procedencia y publicacion sin repetir efectos', async (t) => {
   const s = makeFixture()
@@ -32,22 +32,22 @@ test('las consultas recuperan procedencia y publicacion sin repetir efectos', as
     }
     assert.equal(calls(s).length, count); assert.equal(readFileSync(flowFile(s, 'spec.md'), 'utf8'), bytes)
     for (const scenario of [
-      { current: 'previous' as const }, { current: 'result' as const }, { current: 'third' as const },
-      { current: 'third' as const, terminal: 'published' as const, registry_pending: true as const },
-      { current: 'previous' as const, terminal: 'cancelled' as const }, { current: 'third' as const, terminal: 'cancelled' as const },
+      { current: 'previous' as const, expected: 'not_published' }, { current: 'result' as const, expected: 'published' }, { current: 'third' as const, expected: 'conflict' },
+      { current: 'third' as const, terminal: 'published' as const, registry_pending: true as const, expected: 'published' },
+      { current: 'previous' as const, terminal: 'cancelled' as const, expected: 'not_published' }, { current: 'third' as const, terminal: 'cancelled' as const, expected: 'conflict' },
     ]) {
       const point = interrupted(s, template, scenario)
       const frozenRegistry = readFileSync(flowFile(s, 'sdd-ai-phases.json'), 'utf8')
       const observed = cli(s, ['sdd', 'status', 'f'])
       assert.equal(readFileSync(flowFile(s, 'sdd-ai-phases.json'), 'utf8'), frozenRegistry)
       assert.ok(observed.out.blocked_reasons.some((r: { code: string }) => r.code === 'revision_pending'))
-      const expected = scenario.terminal === 'published' || scenario.current === 'result' ? 'published' : scenario.current === 'previous' ? 'not_published' : 'conflict'
+      const expected = scenario.expected
       const recovered = cli(s, ['wait', point.run, '--max', '0']).out
       assert.equal(recovered.outcome, expected, JSON.stringify(recovered))
       assert.equal(record(s).revisions!.intent!.resolved, true); assert.equal(record(s).revisions!.active, undefined)
       assert.equal(entries(s)[0].result!.state, expected)
       assert.equal(record(s).revisions!.barriers.length, expected === 'not_published' ? 0 : 1)
-      const current = scenario.current === 'previous' ? point.previous : scenario.current === 'result' ? point.result : point.third
+      const current = point[scenario.current]
       assert.equal(readFileSync(flowFile(s, 'spec.md'), 'utf8'), current)
       if (scenario.terminal && scenario.terminal !== expected) {
         assert.deepEqual(recovered.terminal_superseded, { terminal: scenario.terminal, registered: expected })
@@ -79,10 +79,14 @@ test('las consultas recuperan procedencia y publicacion sin repetir efectos', as
     }
     // Los verbos recuperan antes de decidir una aprobación o una escritura nueva.
     interrupted(s, template, { current: 'result' })
-    cli(s, ['sdd', 'approve', 'f', 'spec'])
+    const beforeApprove = snapshotFiles(s); const callsBefore = calls(s).length
+    const approved = cli(s, ['sdd', 'approve', 'f', 'spec'])
+    assert.equal(approved.out.code, 'approval_missing', JSON.stringify(approved.out))
+    assert.deepEqual(snapshotFiles(s), beforeApprove); assert.equal(calls(s).length, callsBefore)
     assert.equal(entries(s)[0].result!.state, 'published'); assert.equal(record(s).revisions!.active, undefined)
     interrupted(s, template, { current: 'result' })
-    revise(s)
+    const refused = revise(s)
+    assert.equal(refused.out.code, 'review_candidate_changed', JSON.stringify(refused.out)); assert.equal(calls(s).length, callsBefore)
     assert.equal(entries(s)[0].result!.state, 'published'); assert.equal(record(s).revisions!.active, undefined)
     // review round recupera la intención, pero cancel posterior conserva ese resultado.
     const reviewPoint = interrupted(s, template, { current: 'result' })
@@ -95,7 +99,7 @@ test('las consultas recuperan procedencia y publicacion sin repetir efectos', as
   } finally { await cleanup(s) }
 
   const flag = (file: string, on: boolean) => spawnSync(process.platform === 'darwin' ? 'chflags' : 'chattr',
-    [process.platform === 'darwin' ? on ? 'uchg' : 'nouchg' : on ? '+i' : '-i', file], { encoding: 'utf8' })
+    [process.platform === 'darwin' ? (on ? 'uchg' : 'nouchg') : (on ? '+i' : '-i'), file], { encoding: 'utf8' })
   for (const immutable of ['target', 'registry']) {
     const fixture = makeFixture()
     const barrier = join(fixture.work, 'release')
@@ -103,7 +107,7 @@ test('las consultas recuperan procedencia y publicacion sin repetir efectos', as
     let marked = false
     try {
       script(fixture, [{ barrier, answer: JSON.stringify(corrected('spec')) }])
-      const start = revise(fixture); await waitFor(`${barrier}.ready`)
+      const start = revise(fixture); assert.equal(start.code, 0, JSON.stringify(start.out)); await waitFor(`${barrier}.ready`)
       const before = readFileSync(flowFile(fixture, 'spec.md'), 'utf8')
       const mark = flag(file, true)
       marked = mark.status === 0
@@ -125,7 +129,7 @@ test('las consultas recuperan procedencia y publicacion sin repetir efectos', as
       script(fixture, [{ answer: JSON.stringify(corrected('spec')) }])
       const next = revise(fixture); assert.equal(next.code, 0, JSON.stringify(next.out)); await settle(fixture, next.out.id)
     } finally {
-      if (marked) assert.equal(flag(file, false).status, 0)
+      if (marked) flag(file, false)
       writeFileSync(barrier, ''); await cleanup(fixture)
     }
   }

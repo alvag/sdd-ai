@@ -1,23 +1,25 @@
 import assert from 'node:assert/strict'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import test from 'node:test'
 import { type Ledger } from '../src/review/ledger.ts'
 import { disputeQuestion, extraQuestion } from '../src/approval/question.ts'
 import { answer, calls, cleanup, cli, contracts, corrected, directedAnswer, entries, flowFile, json, makeFixture, put, refreshReview, revise, runFile, script, settle } from './phase-revision-fixture.ts'
 
 test('la ronda conserva el ledger y distingue productor conductor y autoria mezclada', async () => {
-  for (const author of ['producer', 'mixed', 'mixed-multiple', 'conductor', 'no_changes', 'failed']) {
+  for (const scenario of ['producer', 'mixed', 'mixed-multiple', 'conductor', 'no_changes', 'failed']) {
     const s = makeFixture()
     try {
       const before = readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8')
       const original = readFileSync(flowFile(s, 'spec.md'), 'utf8')
       const reviewer = readFileSync(runFile(s, s.review, 'resolved.json'), 'utf8')
-      if (author !== 'conductor') {
-        script(s, author === 'failed' ? [{ execution_failure: true }] : [{ answer: JSON.stringify(author === 'no_changes' ? contracts.spec : corrected('spec')) }])
-        const start = revise(s); assert.equal(start.code, 0, JSON.stringify(start.out)); await settle(s, start.out.id)
+      if (scenario !== 'conductor') {
+        script(s, scenario === 'failed' ? [{ execution_failure: true }] : [{ answer: JSON.stringify(scenario === 'no_changes' ? contracts.spec : corrected('spec')) }])
+        const start = revise(s); assert.equal(start.code, 0, JSON.stringify(start.out))
+        const outcome = (await settle(s, start.out.id)).out.outcome
+        assert.equal(outcome, scenario === 'failed' ? 'failed' : scenario === 'no_changes' ? 'no_changes' : 'published')
         assert.equal(readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8'), before)
       }
-      if (author === 'mixed-multiple') {
+      if (scenario === 'mixed-multiple') {
         // Una intervención entre publicaciones rompe la cadena de huellas del productor.
         writeFileSync(flowFile(s, 'spec.md'), original)
         script(s, [{ answer: JSON.stringify(corrected('spec', 'Segunda publicación')) }])
@@ -26,30 +28,31 @@ test('la ronda conserva el ledger y distingue productor conductor y autoria mezc
         assert.equal(entries(s).filter((e) => e.result?.state === 'published' && e.result.digest).length, 2)
         assert.equal(readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8'), before)
       }
-      if (author !== 'producer') writeFileSync(flowFile(s, 'spec.md'), readFileSync(flowFile(s, 'spec.md'), 'utf8').replace('Publicar un resultado.', 'Publicar un resultado. Retoque inline.'))
+      if (scenario !== 'producer' && scenario !== 'mixed-multiple') writeFileSync(flowFile(s, 'spec.md'), readFileSync(flowFile(s, 'spec.md'), 'utf8').replace('Publicar un resultado.', 'Publicar un resultado. Retoque inline.'))
       const response = JSON.parse(directedAnswer(s, 'resolved'))
-      if (author === 'producer') response.findings = [{ of: '.plans/f/spec.md', axis: 'quality', severity: 'WARNING', location: '.plans/f/spec.md:9',
+      // La línea 9 pertenece al cuerpo corregido y +5 identifica la adición en CAMBIOS.
+      if (scenario === 'producer') response.findings = [{ of: '.plans/f/spec.md', axis: 'quality', severity: 'WARNING', location: '.plans/f/spec.md:9',
         claim: 'La corrección introdujo una incoherencia.', evidence: 'deterministic', cause: '+5' }]
       script(s, [{ answer: JSON.stringify(response) }])
       const start = cli(s, ['review', 'round', s.review]); assert.equal(start.code, 0, JSON.stringify(start.out))
       await settle(s, s.review)
       const rounds = json<{ rounds: Array<{ correction_provenance: { author: string; family?: string }; jobs: Array<{ prompt: string }> }> }>(runFile(s, s.review, 'rounds.json'))
       const latest = rounds.rounds.at(-1)!
-      assert.equal(latest.correction_provenance.author, author === 'producer' ? 'producer' : author.startsWith('mixed') ? 'mixed' : 'conductor')
-      if (author === 'producer') assert.equal(latest.correction_provenance.family, s.family)
+      assert.equal(latest.correction_provenance.author, scenario === 'producer' ? 'producer' : scenario.startsWith('mixed') ? 'mixed' : 'conductor')
+      if (scenario === 'producer') assert.equal(latest.correction_provenance.family, s.family)
       const promptFiles = ['prompt-r2-l1-base-b1.md', 'prompt-r2-l1.md']
-      const { readdirSync } = await import('node:fs')
-      const promptFile = readdirSync(`${s.repo}/.sdd-ai/runs/${s.review}`).find((p) => p.startsWith('prompt-r2') && p.endsWith('.md'))!
-      assert.ok(promptFile, JSON.stringify(promptFiles))
+      const actual = readdirSync(`${s.repo}/.sdd-ai/runs/${s.review}`).filter((p) => p.startsWith('prompt-r2') && p.endsWith('.md'))
+      assert.ok(actual.length > 0 && actual.every((p) => promptFiles.includes(p)), JSON.stringify(actual))
+      const promptFile = actual[0]
       const prompt = readFileSync(runFile(s, s.review, promptFile), 'utf8')
-      assert.match(prompt, author === 'producer' ? /productor.*codex/ : author.startsWith('mixed') ? /mezclada/ : /conductor/)
+      assert.match(prompt, scenario === 'producer' ? /productor.*codex/ : scenario.startsWith('mixed') ? /mezclada/ : /conductor/)
       assert.match(prompt, /CAMBIOS/)
       const ledger = json<Ledger>(runFile(s, s.review, 'ledger.json'))
       assert.equal(ledger.completed, 2); assert.equal(ledger.entries[0].id, 'F-1'); assert.equal(ledger.entries[0].state, 'resuelto')
       assert.deepEqual(ledger.entries[0].decision, JSON.parse(before).entries[0].decision)
       assert.equal(ledger.entries[0].responses.at(-1)!.answer, 'resolved')
       assert.equal(readFileSync(runFile(s, s.review, 'resolved.json'), 'utf8'), reviewer)
-      if (author === 'producer') { assert.equal(ledger.entries[1].id, 'F-2'); assert.equal(ledger.entries[1].cause, '+5') }
+      if (scenario === 'producer') { assert.equal(ledger.entries[1].id, 'F-2'); assert.equal(ledger.entries[1].cause, '+5') }
     } finally { await cleanup(s) }
   }
 })
@@ -59,7 +62,8 @@ test('devolver al productor no concede rondas extra ni resuelve disputas', async
   try {
     refreshReview(s, 3)
     const ledger = readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8')
-    const start = revise(s); assert.equal(start.code, 0, JSON.stringify(start.out)); await settle(s, start.out.id)
+    script(s, [{ answer: JSON.stringify(corrected('spec')) }])
+    const start = revise(s); assert.equal(start.code, 0, JSON.stringify(start.out)); assert.equal((await settle(s, start.out.id)).out.outcome, 'published')
     assert.equal(readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8'), ledger)
     const count = calls(s).length
     const capped = cli(s, ['review', 'round', s.review])
@@ -67,6 +71,7 @@ test('devolver al productor no concede rondas extra ni resuelve disputas', async
     const extra = cli(s, ['review', 'round', s.review, '--extra'])
     assert.equal(extra.out.code, 'approval_missing'); assert.equal(calls(s).length, count)
     assert.equal(readFileSync(runFile(s, s.review, 'ledger.json'), 'utf8'), ledger)
+    // El tope conserva tres rondas; se autoriza únicamente la cuarta.
     answer(s, extraQuestion(s.review, 4))
     script(s, [{ answer: directedAnswer(s, 'unresolved') }])
     const authorized = cli(s, ['review', 'round', s.review, '--extra'])
@@ -96,7 +101,7 @@ test('devolver al productor no concede rondas extra ni resuelve disputas', async
     assert.ok(decided.entries[0].decision!.proof); assert.equal(decided.entries[0].superseded!.at(-1)!.reason, 'Ya está descrito.')
     assert.deepEqual(decided.entries[0].responses, ledger.entries[0].responses)
     const correction = revise(dispute); assert.equal(correction.code, 0, JSON.stringify(correction.out))
-    await settle(dispute, correction.out.id)
+    assert.equal((await settle(dispute, correction.out.id)).out.outcome, 'published')
     assert.deepEqual(json<Ledger>(runFile(dispute, dispute.review, 'ledger.json')), decided)
   } finally { await cleanup(dispute) }
 })

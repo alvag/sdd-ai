@@ -32,10 +32,10 @@ export interface FrozenLaunch {
   criteria?: string[]
 }
 
-export type PublishCause = 'artifact_exists' | 'inputs_changed' | 'step_changed' | 'candidate_blocked' | 'write_failed' | 'intent_unwritable' | 'publish_interrupted'
+export type PublishCause = 'artifact_exists' | 'inputs_changed' | 'step_changed' | 'candidate_blocked' | 'write_failed' | 'intent_unwritable' | 'publish_interrupted' | 'publication_busy'
 export type PublishOutcome = { kind: 'published'; artifact: string; digest?: string; registry_pending?: true; detail?: string; blocked_reasons?: { code: string; detail: string }[] }
   | { kind: 'no_changes'; artifact: string; cause?: undefined; detail?: undefined; blocked_reasons?: { code: string; detail: string }[] }
-  | { kind: 'conflict'; cause: string; detail: string }
+  | { kind: 'conflict'; cause: 'reservation_changed' | 'origin_missing' | 'material_changed' | 'target_changed_during_publish'; detail: string; registry_pending?: true }
   | { kind: 'not_published'; cause: PublishCause; detail: string; registry_pending?: true }
 
 const ARTIFACT_OF: Record<DocumentStep, 'spec' | 'plan' | 'tasks'> = { specify: 'spec', plan: 'plan', tasks: 'tasks' }

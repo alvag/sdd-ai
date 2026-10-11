@@ -1,6 +1,6 @@
 import { gateQuestionFor } from '../approval/question.ts'
 import type { Question } from '../approval/question.ts'
-import { readPhaseRecord, withPhaseNext } from './phase-state.ts'
+import { activeRun, readPhaseRecord, withPhaseNext } from './phase-state.ts'
 import { revisionView } from './revision.ts'
 import { readFlow } from './read.ts'
 import type { FlowRead } from './read.ts'
@@ -16,7 +16,8 @@ export type DetailedFlowView = Omit<FlowStatus, 'next'> & { next: DetailedNext; 
  */
 export function nextOf(root: string, status: FlowStatus, facts: FlowRead['facts']): DetailedNext {
   const next = withPhaseNext(root, status.id, status)
-  if (next.command?.startsWith('./bin/sdd-ai wait ')) return next
+  const record = readPhaseRecord(root, status.id)
+  if (activeRun(root, record)) return next
   if (status.next.step === 'gate' && status.next.gate !== undefined && status.depth !== null) {
     return { ...status.next, question: gateQuestionFor(status.id, status.depth, status.next.gate, facts.fingerprints) }
   }

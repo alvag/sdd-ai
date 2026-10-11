@@ -33,8 +33,8 @@ import {
 } from './writer-store.ts'
 import { type DocumentContract, admitPlan, admitSpecify, admitTasks } from './sdd/phase.ts'
 import { readPhaseRecord, withFlowLock, writePhaseRecord } from './sdd/phase-state.ts'
-import { documentOpeningLaunch, runRevisionAttempts } from './phase-session.ts'
-import { finishRevision } from './sdd/revision.ts'
+import { admitDocumentContract, documentArtifactPath, documentOpeningLaunch, relativePath, revisionRunState, runRevisionAttempts, type RevisionAttemptResult } from './phase-session.ts'
+import { type CorrectionProvenance, finishRevision } from './sdd/revision.ts'
 import type { RevisionResult } from './sdd/revision-record.ts'
 import { type FrozenLaunch, type PublishOutcome, publishPhase } from './sdd/publish.ts'
 import { closeTelemetry, perToken } from './telemetry.ts'
@@ -58,7 +58,7 @@ export interface JobRecord {
 }
 
 export interface ArgvFile {
-  correction_provenance?: { author: 'producer' | 'conductor' | 'mixed'; family?: Family; runs: string[] }
+  correction_provenance?: CorrectionProvenance
   execution?: ExecutionContext
   family: Family; deadline_sec: number; grace_ms?: number
   /** El worker de `run`. Una revisión arma el de cada trabajo, con su propio temporal. */
@@ -1082,14 +1082,14 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
     const entry = { ...rec.phases[step] }
     delete entry.awaiting
     if (entry.amended) entry.amended = { ...entry.amended, consumed: true }
-    const artifact = `.plans/${phase.flow}/${step === 'specify' ? 'spec' : step}.md`
+    const artifact = documentArtifactPath(phase.flow, step)
     const sources = Object.entries(phase.inputs).filter(([name]) => name !== 'context').map(([name, digest]) => ({
-      path: name === 'request' ? (phase.request_path && relative(phase.root, phase.request_path).split(sep).join('/')) || `.sdd-ai/runs/${run}/request.md` : `.plans/${phase.flow}/${name}.md`,
+      path: name === 'request' ? (phase.request_path && relativePath(phase.root, phase.request_path)) || `.sdd-ai/runs/${run}/request.md` : `.plans/${phase.flow}/${name}.md`,
       digest, copy: `.sdd-ai/runs/${run}/${name}.md`, role: name,
     }))
-    const earlier = rec.documents?.[step]?.amendments ?? []
+    const earlier: import('./sdd/revision-record.ts').MaterialReference[] = []
     const amendments = phase.inputs.context ? [...earlier, {
-      path: phase.context_path ? relative(phase.root, phase.context_path).split(sep).join('/') : `.sdd-ai/runs/${run}/context.md`,
+      path: phase.context_path ? relativePath(phase.root, phase.context_path) : `.sdd-ai/runs/${run}/context.md`,
       digest: phase.inputs.context, copy: `.sdd-ai/runs/${run}/context.md`, role: 'context',
     }] : earlier
     writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry }, documents: {
@@ -1110,10 +1110,16 @@ async function superviseRevision(ctx: RunContext, resumeSec: number): Promise<St
   const { dir, argv, cancelFile } = ctx
   const phase = argv.phase!
   const run = basename(dir)
-  const entry = withFlowLock(phase.root, phase.flow, () => readPhaseRecord(phase.root, phase.flow, true).revisions?.entries.find((e) => e.run === run))
-  if (!entry || !argv.launch) throw new Error('la corrección no tiene reserva o lanzamiento')
+  let reservationError: unknown
+  let entry: import('./sdd/revision-record.ts').RevisionEntry | undefined
+  try { entry = withFlowLock(phase.root, phase.flow, () => readPhaseRecord(phase.root, phase.flow, true).revisions?.entries.find((e) => e.run === run)) } catch (e) { reservationError = e }
+  const artifact = entry?.artifact ?? `.plans/${phase.flow}/${phase.revision!.artifact}.md`
   const attempts = new Map<string, Attempt>()
-  const answer = await runRevisionAttempts({
+  let deliverySaved = false
+  let answer: RevisionAttemptResult
+  try {
+  if (!entry || !argv.launch) throw reservationError ?? new Error('la corrección no tiene reserva o lanzamiento')
+  answer = await runRevisionAttempts({
     session: { family: ctx.family, launch: argv.launch, mode: entry.session_mode, session_id: entry.session_id },
     deadline: Date.now() + argv.deadline_sec * 1000, recovery_seconds: Math.min(resumeSec, argv.deadline_sec),
     cancelled: () => existsSync(cancelFile),
@@ -1133,37 +1139,44 @@ async function superviseRevision(ctx: RunContext, resumeSec: number): Promise<St
       writeFileSync(stdinFile, prompt)
       return { ...launch, args, stdinFile }
     },
-    admit: (text) => phase.step === 'specify' ? admitSpecify(text) : phase.step === 'plan' ? admitPlan(text, phase.criteria ?? []) : admitTasks(text, phase.criteria ?? [], { taskActors: phase.task_actors === true }),
+    admit: (text) => admitDocumentContract(phase.step, text, phase.criteria ?? [], phase.task_actors === true),
     correctionPrompt: (error) => renderCorrectionPrompt(readFileSync(join(dir, 'prompt.md'), 'utf8'), error),
     closingPrompt: closingMessage('run'),
-  })
-  let result = answer.result
-  const c = answer.contract
-  if (c) writeJsonAtomic(join(dir, 'contract.json'), c)
-  writeJsonAtomic(join(dir, 'revision-result.json'), { ...(answer.session_id ? { session_id: answer.session_id } : {}), launch: entry.launch })
-  if (c && result.state === 'active') {
-    const out = publishPhase(phase.root, { ...phase, revision: { ...phase.revision!, run } }, c)
-    result = { ...result, state: out.kind,
+    publish: (delivered) => {
+      writeJsonAtomic(join(dir, 'contract.json'), delivered.contract)
+      writeJsonAtomic(join(dir, 'revision-result.json'), { session_id: delivered.session_id, launch: documentOpeningLaunch(ctx.family, delivered.launch!, delivered.session_id) })
+      deliverySaved = true
+    const out = publishPhase(phase.root, { ...phase, revision: { ...phase.revision!, run } }, delivered.contract!)
+    return { ...delivered.result, state: out.kind,
       ...('cause' in out ? { cause: out.cause } : {}), ...('detail' in out ? { detail: out.detail } : {}),
       ...('digest' in out ? { digest: out.digest } : {}), ...('registry_pending' in out ? { registry_pending: out.registry_pending } : {}),
       ...('blocked_reasons' in out ? { blocked_reasons: out.blocked_reasons } : {}),
     }
+    },
+  })
+  } catch (e) { answer = { result: { state: 'failed', cause: 'revision_execution_failed', detail: (e as Error).message } } }
+  let result = answer.result
+  const c = answer.contract
+  try {
+  if (!deliverySaved) {
+  if (c) writeJsonAtomic(join(dir, 'contract.json'), c)
+  writeJsonAtomic(join(dir, 'revision-result.json'), { ...(answer.session_id ? { session_id: answer.session_id } : {}), launch: documentOpeningLaunch(ctx.family, answer.launch ?? entry!.launch, answer.session_id) })
   }
+  } catch (e) { result = { state: 'failed', cause: 'revision_publication_failed', detail: (e as Error).message } }
   // Una publicación consumada con finalización fallida conserva la reserva para la recuperación.
   if (!result.registry_pending) {
     try { withFlowLock(phase.root, phase.flow, () => {
       finishRevision(phase.root, phase.flow, run, result, {
-        ...(answer.session_id ? { session_id: answer.session_id } : {}), launch: entry.launch,
+        ...(answer.session_id ? { session_id: answer.session_id } : {}), launch: documentOpeningLaunch(ctx.family, answer.launch ?? entry!.launch, answer.session_id),
       })
-    }) } catch { result = { ...result, registry_pending: true } }
+    }) } catch (e) { result = { ...result, registry_pending: true, detail: (e as Error).message } }
   }
   const lists = { assumptions: c?.assumptions ?? [], blocking_questions: c?.blocking_questions ?? [], missing_context: c?.missing_context ?? [] }
-  const report: PhaseResult = { ...result, outcome: result.state, artifact: entry.artifact, ...lists,
+  const report: PhaseResult = { ...result, outcome: result.state, artifact, ...lists,
     ...(c && 'findings' in c ? { findings: c.findings } : {}), ...(c && 'findings_rejected' in c ? { findings_rejected: c.findings_rejected } : {}),
   }
   writeJsonAtomic(join(dir, 'phase.json'), report)
-  const state = result.state === 'published' || result.state === 'no_changes' || result.state === 'awaiting_context' ? 'done'
-    : result.state === 'cancelled' ? 'cancelled' : result.state === 'timeout' ? 'timeout' : result.state === 'launch_failed' ? 'launch_failed' : 'failed'
+  const state = revisionRunState(result.state)
   return setStatus(dir, { state, reason: result.cause ?? (state === 'failed' ? result.state : undefined), detail: result.detail,
     ...(answer.session_id ? { session_id: answer.session_id } : {}), ended_at: new Date().toISOString() })
 }

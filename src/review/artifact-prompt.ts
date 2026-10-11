@@ -1,3 +1,4 @@
+import type { CorrectionProvenance } from '../sdd/revision.ts'
 import type { ArtifactKind } from './artifact.ts'
 import type { Candidate } from './candidate.ts'
 import type { LedgerEntry, RoundPlan } from './ledger.ts'
@@ -205,7 +206,7 @@ function changes(plan: RoundPlan, path: string, before: string, after: string): 
  * en CAMBIOS.
  */
 export function renderArtifactRoundPrompt(c: Candidate, material: string, plan: RoundPlan, entries: LedgerEntry[], cap: number,
-  before: string, after: string, provenance?: { author: 'producer' | 'conductor' | 'mixed'; family?: 'claude' | 'codex'; runs: string[] }): string {
+  before: string, after: string, provenance?: CorrectionProvenance): string {
   const h = c.hash
   const path = artifactPath(c)
   const pick = (kind: 'verify' | 'respond') => plan.targets.filter((t) => t.kind === kind)

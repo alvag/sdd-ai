@@ -1,15 +1,15 @@
 import { createHash } from 'node:crypto'
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs'
-import { isAbsolute } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
-/** Contrato aditivo: una corrida anterior no trae ni documents ni revisions. */
 export type RevisionArtifact = 'spec' | 'plan' | 'tasks'
 export type RevisionPhase = 'specify' | 'plan' | 'tasks'
 export type RevisionFamily = 'claude' | 'codex'
-export type RevisionState = 'active' | 'published' | 'no_changes' | 'awaiting_context' | 'conflict'
-  | 'not_admitted' | 'not_published' | 'resume_rejected' | 'launch_failed' | 'failed'
-  | 'timeout' | 'cancelled' | 'superseded'
-export interface MaterialReference { path: string; digest: string; copy?: string; role?: string }
+export const REVISION_STATES = ['active', 'published', 'no_changes', 'awaiting_context', 'conflict',
+  'not_admitted', 'not_published', 'resume_rejected', 'launch_failed', 'failed', 'timeout', 'cancelled', 'superseded'] as const
+export type RevisionState = typeof REVISION_STATES[number]
+export type MaterialKind = 'document' | 'source' | 'historical' | 'conductor' | 'continuation' | 'historical_context'
+export interface MaterialReference { path: string; digest: string; copy?: string; role?: string; kind?: MaterialKind }
 export interface EffectiveLaunch { cmd: string; args: string[]; cwd: string; stdinFile: string }
 export interface RevisionProof {
   runner: RevisionFamily; source: 'ask_user_question' | 'rollout_message'
@@ -46,55 +46,56 @@ export interface RevisionRecord {
 }
 
 const PHASES = ['specify', 'plan', 'tasks']
-const STATES: readonly string[] = ['active', 'published', 'no_changes', 'awaiting_context', 'conflict',
-  'not_admitted', 'not_published', 'resume_rejected', 'launch_failed', 'failed', 'timeout', 'cancelled', 'superseded']
+const STATES: readonly string[] = REVISION_STATES
+// No se importa status: el lector de registros no debe depender del resolver que lo consume.
 const GATES = ['spec', 'plan', 'tasks', 'plan-tasks', 'single']
-const map = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
-const text = (v: unknown): v is string => typeof v === 'string' && v.trim() !== ''
-const texts = (v: unknown): v is string[] => Array.isArray(v) && v.every(text)
-const digest = (v: unknown) => typeof v === 'string' && /^sha256:[a-f0-9]{64}$/.test(v)
-const date = (v: unknown) => text(v) && /^\d{4}-\d{2}-\d{2}T/.test(v) && !Number.isNaN(Date.parse(v))
-const family = (v: unknown) => v === 'claude' || v === 'codex'
-const run = (v: unknown) => text(v) && /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(v)
-const path = (v: unknown) => text(v) && !isAbsolute(v) && !v.includes('\\') && !v.split('/').some((p) => p === '..' || p === '.' || p === '')
-const artifact = (v: unknown) => typeof v === 'string' && path(v) && /^\.plans\/[^/]+\/(spec|plan|tasks)\.md$/.test(v)
-const gates = (v: unknown) => texts(v) && v.length > 0 && new Set(v).size === v.length && v.every((g) => GATES.includes(g))
-const list = (v: unknown) => Array.isArray(v) && v.every(map)
+const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+const isText = (v: unknown): v is string => typeof v === 'string' && v.trim() !== ''
+const isTextList = (v: unknown): v is string[] => Array.isArray(v) && v.every(isText)
+const isDigest = (v: unknown) => typeof v === 'string' && /^sha256:[a-f0-9]{64}$/.test(v)
+const isDate = (v: unknown) => isText(v) && /^\d{4}-\d{2}-\d{2}T/.test(v) && !Number.isNaN(Date.parse(v))
+const isFamily = (v: unknown) => v === 'claude' || v === 'codex'
+const isRunId = (v: unknown) => isText(v) && /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(v)
+const isInternalPath = (v: unknown) => isText(v) && !isAbsolute(v) && !v.includes('\\') && !v.split('/').some((p) => p === '..' || p === '.' || p === '')
+const isArtifactPath = (v: unknown) => typeof v === 'string' && isInternalPath(v) && /^\.plans\/[^/]+\/(spec|plan|tasks)\.md$/.test(v)
+const isGateList = (v: unknown) => isTextList(v) && v.length > 0 && new Set(v).size === v.length && v.every((g) => GATES.includes(g))
+const isObjectList = (v: unknown) => Array.isArray(v) && v.every(isPlainObject)
 const invalid = (where: string, why: string): never => { throw new Error(`${where}: ${why}`) }
 
-function launchValid(v: unknown): v is EffectiveLaunch {
-  return map(v) && family(v.cmd) && Array.isArray(v.args) && v.args.every((a) => typeof a === 'string')
-    && text(v.cwd) && text(v.stdinFile)
+export function launchValid(v: unknown): v is EffectiveLaunch {
+  return isPlainObject(v) && isFamily(v.cmd) && Array.isArray(v.args) && v.args.every((a) => typeof a === 'string')
+    && isText(v.cwd) && isText(v.stdinFile)
 }
 function referenceValid(v: unknown): v is MaterialReference {
-  return map(v) && path(v.path) && digest(v.digest) && (v.copy === undefined || path(v.copy))
-    && (v.role === undefined || text(v.role))
+  return isPlainObject(v) && isInternalPath(v.path) && isDigest(v.digest) && (v.copy === undefined || isInternalPath(v.copy))
+    && (v.role === undefined || isText(v.role))
+    && (v.kind === undefined || ['document', 'source', 'historical', 'conductor', 'continuation', 'historical_context'].includes(String(v.kind)))
 }
 const references = (v: unknown) => Array.isArray(v) && v.every(referenceValid)
 function proofValid(v: unknown): v is RevisionProof {
-  return map(v) && family(v.runner) && v.source === (v.runner === 'claude' ? 'ask_user_question' : 'rollout_message')
-    && text(v.ref) && text(v.session) && date(v.answered_at)
+  return isPlainObject(v) && isFamily(v.runner) && v.source === (v.runner === 'claude' ? 'ask_user_question' : 'rollout_message')
+    && isText(v.ref) && isText(v.session) && isDate(v.answered_at)
 }
 function resultValid(v: unknown): v is RevisionResult {
-  return map(v) && STATES.includes(String(v.state)) && (v.cause === undefined || text(v.cause))
-    && (v.detail === undefined || typeof v.detail === 'string') && (v.digest === undefined || digest(v.digest))
+  return isPlainObject(v) && STATES.includes(String(v.state)) && (v.cause === undefined || isText(v.cause))
+    && (v.detail === undefined || typeof v.detail === 'string') && (v.digest === undefined || isDigest(v.digest))
     && (v.registry_pending === undefined || v.registry_pending === true)
-    && ['assumptions', 'blocking_questions', 'missing_context'].every((k) => v[k] === undefined || texts(v[k]))
+    && ['assumptions', 'blocking_questions', 'missing_context'].every((k) => v[k] === undefined || isTextList(v[k]))
     && (v.blocked_reasons === undefined || Array.isArray(v.blocked_reasons)
-      && v.blocked_reasons.every((r) => map(r) && text(r.code) && typeof r.detail === 'string'))
+      && v.blocked_reasons.every((r) => isPlainObject(r) && isText(r.code) && typeof r.detail === 'string'))
 }
 function phaseMatches(phase: unknown, file: unknown): boolean {
-  return PHASES.includes(String(phase)) && artifact(file)
+  return PHASES.includes(String(phase)) && isArtifactPath(file)
     && (file as string).endsWith(`/${phase === 'specify' ? 'spec' : phase}.md`)
 }
 
 export function readDocumentOrigins(value: unknown): Partial<Record<RevisionPhase, DocumentOrigin>> | undefined {
   if (value === undefined) return undefined
-  if (!map(value)) return invalid('documents', 'no es un mapa')
+  if (!isPlainObject(value)) return invalid('documents', 'no es un mapa')
   for (const [key, v] of Object.entries(value)) {
-    if (!map(v) || key !== v.phase || !phaseMatches(v.phase, v.artifact) || !run(v.run) || !family(v.family)
+    if (!isPlainObject(v) || key !== v.phase || !phaseMatches(v.phase, v.artifact) || !isRunId(v.run) || !isFamily(v.family)
       || !launchValid(v.launch) || v.launch.cmd !== v.family || !references(v.sources) || !references(v.amendments)
-      || (v.session_id !== undefined && (!text(v.session_id) || /[/\\]/.test(v.session_id)))
+      || (v.session_id !== undefined && (!isText(v.session_id) || /[/\\]/.test(v.session_id)))
       || (v.task_actors !== undefined && v.task_actors !== true)) invalid(`documents.${key}`, 'productor inválido')
   }
   return value as unknown as Partial<Record<RevisionPhase, DocumentOrigin>>
@@ -103,17 +104,17 @@ export function readDocumentOrigins(value: unknown): Partial<Record<RevisionPhas
 /** Valida campos presentes; ausencia no equivale a un registro ilegible o inválido. */
 export function readRevisions(value: unknown): RevisionRecord | undefined {
   if (value === undefined) return undefined
-  if (!map(value) || !Array.isArray(value.entries) || !Array.isArray(value.barriers)) return invalid('revisions', 'faltan entries o barriers')
+  if (!isPlainObject(value) || !Array.isArray(value.entries) || !Array.isArray(value.barriers)) return invalid('revisions', 'faltan entries o barriers')
   const ids = new Set<string>()
   for (const [i, e] of value.entries.entries()) {
-    if (!map(e) || !run(e.run) || !run(e.origin_run) || !(e.parent_run === null || run(e.parent_run))
-      || !phaseMatches(e.phase, e.artifact) || !family(e.family) || !['same', 'new'].includes(String(e.session_mode))
-      || !launchValid(e.launch) || e.launch.cmd !== e.family || !run(e.review) || !Number.isSafeInteger(e.round) || Number(e.round) < 1
-      || !digest(e.candidate) || !digest(e.ledger_digest) || !texts(e.accepted) || e.accepted.length === 0
+    if (!isPlainObject(e) || !isRunId(e.run) || !isRunId(e.origin_run) || !(e.parent_run === null || isRunId(e.parent_run))
+      || !phaseMatches(e.phase, e.artifact) || !isFamily(e.family) || !['same', 'new'].includes(String(e.session_mode))
+      || !launchValid(e.launch) || e.launch.cmd !== e.family || !isRunId(e.review) || !Number.isSafeInteger(e.round) || Number(e.round) < 1
+      || !isDigest(e.candidate) || !isDigest(e.ledger_digest) || !isTextList(e.accepted) || e.accepted.length === 0
       || new Set(e.accepted).size !== e.accepted.length || !e.accepted.every((id) => /^F-\d+$/.test(id))
-      || !list(e.decisions) || !list(e.history) || !references(e.materials) || !date(e.at) || !STATES.includes(String(e.state))
-      || (e.session_id !== undefined && (!text(e.session_id) || /[/\\]/.test(e.session_id)))
-      || (e.session_mode === 'same' && !text(e.session_id))
+      || !isObjectList(e.decisions) || !isObjectList(e.history) || !references(e.materials) || !isDate(e.at) || !STATES.includes(String(e.state))
+      || (e.session_id !== undefined && (!isText(e.session_id) || /[/\\]/.test(e.session_id)))
+      || (e.session_mode === 'same' && !isText(e.session_id))
       || (e.session_recoverable !== undefined && typeof e.session_recoverable !== 'boolean')
       || (e.conductor !== undefined && !referenceValid(e.conductor))
       || (e.authorization !== undefined && !proofValid(e.authorization))
@@ -125,16 +126,16 @@ export function readRevisions(value: unknown): RevisionRecord | undefined {
   }
   if (value.active !== undefined) {
     const a = value.active
-    if (!map(a) || !run(a.run) || !artifact(a.artifact)
-      || !value.entries.some((e) => map(e) && e.run === a.run && e.artifact === a.artifact)) invalid('revisions.active', 'reserva sin entrada')
+    if (!isPlainObject(a) || !isRunId(a.run) || !isArtifactPath(a.artifact)
+      || !value.entries.some((e) => isPlainObject(e) && e.run === a.run && e.artifact === a.artifact && (e.state === 'active' || isPlainObject(e.result)))) invalid('revisions.active', 'reserva sin entrada')
   }
   if (value.intent !== undefined) {
     const i = value.intent
-    if (!map(i) || !run(i.run) || !ids.has(i.run as string) || !artifact(i.artifact) || !digest(i.previous_digest)
-      || !digest(i.result_digest) || !gates(i.gates) || (i.resolved !== undefined && i.resolved !== true)) invalid('revisions.intent', 'intención inválida')
+    if (!isPlainObject(i) || !isRunId(i.run) || !ids.has(i.run as string) || !isArtifactPath(i.artifact) || !isDigest(i.previous_digest)
+      || !isDigest(i.result_digest) || !value.entries.some((e) => e.run === i.run && e.artifact === i.artifact) || !isGateList(i.gates) || (i.resolved !== undefined && i.resolved !== true)) invalid('revisions.intent', 'intención inválida')
   }
   for (const [i, b] of value.barriers.entries()) {
-    if (!map(b) || !run(b.run) || !ids.has(b.run as string) || !artifact(b.artifact) || !gates(b.gates) || !digest(b.digest)) invalid(`revisions.barriers[${i}]`, 'barrera inválida')
+    if (!isPlainObject(b) || !isRunId(b.run) || !ids.has(b.run as string) || !isArtifactPath(b.artifact) || !isGateList(b.gates) || !isDigest(b.digest) || !value.entries.some((e) => e.run === b.run && e.artifact === b.artifact)) invalid(`revisions.barriers[${i}]`, 'barrera inválida')
   }
   return value as unknown as RevisionRecord
 }
@@ -144,27 +145,65 @@ export function pendingIntent(record: { revisions?: RevisionRecord }): RevisionI
   return intent?.resolved === true ? undefined : intent
 }
 
+/** Contrato aditivo: una corrida anterior no trae ni documents ni revisions. */
 export interface RevisionFileRead {
   documents?: Partial<Record<RevisionPhase, DocumentOrigin>>; revisions?: RevisionRecord; digest: string
 }
 
-/** Solo ENOENT acredita ausencia. Se abre sin enlaces y sin bloquear ante rutas especiales. */
-export function readRevisionFile(file: string): RevisionFileRead {
-  let fd: number | undefined
+/** Apertura segura compartida para registros y evidencia auxiliar. */
+export function readRegularBytes(file: string): Buffer {
+  if (!lstatSync(file).isFile()) return invalid(file, 'no es un archivo regular sin enlaces')
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try {
-    const st = lstatSync(file)
-    if (!st.isFile() || st.isSymbolicLink()) return invalid(file, 'no es un archivo regular sin enlaces')
-    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     if (!fstatSync(fd).isFile()) return invalid(file, 'no es un archivo regular')
-    const bytes = readFileSync(fd)
+    return readFileSync(fd)
+  } finally { closeSync(fd) }
+}
+
+/** Solo ENOENT acredita ausencia. */
+export function readRevisionFile(file: string): RevisionFileRead {
+  try {
+    const bytes = readRegularBytes(file)
     const value: unknown = JSON.parse(bytes.toString('utf8'))
-    if (!map(value) || value.schema_version !== 1) return invalid(file, 'schema_version no es 1')
-    return { documents: readDocumentOrigins(value.documents), revisions: readRevisions(value.revisions),
-      digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` }
+    if (!isPlainObject(value) || value.schema_version !== 1) return invalid(file, 'schema_version no es 1')
+    const documents = readDocumentOrigins(value.documents)
+    const revisions = readRevisions(value.revisions)
+    const root = dirname(dirname(dirname(file)))
+    const flow = dirname(file).split(/[\\/]/).at(-1)
+    for (const entry of [...Object.values(documents ?? {}).filter((e): e is DocumentOrigin => e !== undefined), ...(revisions?.entries ?? [])]) {
+      if (entry.artifact !== `.plans/${flow}/${entry.phase === 'specify' ? 'spec' : entry.phase}.md`) invalid(file, 'artefacto de otro flujo')
+      const launch = entry.launch
+      const stdin = relative(root, resolve(root, launch.stdinFile))
+      if (resolve(root, launch.cwd) !== root || !isInternalPath(stdin) || !stdin.startsWith('.sdd-ai/runs/')) invalid(file, 'lanzamiento fuera del repositorio o de las corridas')
+    }
+    return { documents, revisions, digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` }
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT' && fd === undefined) return { digest: 'absent' }
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { digest: 'absent' }
     throw new Error(`no se pudo leer el registro de correcciones ${file}: ${(e as Error).message}`, { cause: e })
-  } finally {
-    if (fd !== undefined) closeSync(fd)
   }
 }
+
+/** La lectura informativa y la recuperación comparten la misma regla, sin efectos. */
+export function revisionPublicationFacts(root: string, intent: RevisionIntent, current?: string): {
+  published: boolean; barrier: boolean; digest: string; terminal?: Record<string, unknown>; detail?: string
+} {
+  const file = join(root, '.sdd-ai', 'runs', intent.run, 'phase.json')
+  let terminal: Record<string, unknown> | undefined
+  let digest = 'absent'; let detail: string | undefined
+  try {
+    const data = readRegularBytes(file)
+    digest = `sha256:${createHash('sha256').update(data).digest('hex')}`
+    const value: unknown = JSON.parse(data.toString('utf8'))
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('el terminal no es un objeto')
+    terminal = value as Record<string, unknown>
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      detail = `${file}: ${(e as Error).message}`
+      digest = `unreadable:${createHash('sha256').update(detail).digest('hex')}`
+    }
+  }
+  const renamed = terminal?.outcome === 'published'
+  return { published: renamed || current === intent.result_digest,
+    barrier: renamed || current !== intent.previous_digest || detail !== undefined, digest, terminal, ...(detail ? { detail } : {}) }
+}
+

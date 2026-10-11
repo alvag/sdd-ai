@@ -127,7 +127,7 @@ export function assertNoActivity(root: string, id: string): void {
   const record = readPhaseRecord(root, id, true)
   const run = activeRun(root, record, true)
   const revision = record.revisions?.active ?? pendingIntent(record)
-  if (run && revision?.run === run) {
+  if (revision) {
     throw new SddError('revision_running', `la corrección de ${revision.artifact} sigue activa`, { next: `./bin/sdd-ai wait ${run}` })
   }
   if (run) throw new SddError('phase_running', `la fase ${run} sigue activa`, { next: `./bin/sdd-ai wait ${run}` })

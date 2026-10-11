@@ -1,4 +1,4 @@
-import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { isAbsolute, join, relative } from 'node:path'
 import { type Proof, askNext, prove } from '../approval/proof.ts'
@@ -10,12 +10,12 @@ import type { Candidate } from '../review/candidate.ts'
 import { type Ledger, targets, undecided } from '../review/ledger.ts'
 import { REVIEW_LOCK, type ReviewRequest } from '../review/standing.ts'
 import { isAlive, isRunId, readStatus, writeJsonAtomic } from '../runs.ts'
-import { type Family, type Resolution, SddError, TERMINAL, type Status } from '../types.ts'
+import { type Family, type RunState, type Resolution, SddError, TERMINAL, type Status } from '../types.ts'
 import { type DocumentContract, type FrozenInputs, type PlanHeader, renderPhasePrompt, renderPlan, renderSpec, renderTasks } from './phase.ts'
 import { criteriaIds } from './markdown.ts'
 import { activeRun, readPhaseRecord, withFlowLock, writePhaseRecord } from './phase-state.ts'
 import { bytesHash, flowDir, headerHash, readFlow } from './read.ts'
-import { type RevisionArtifact, type RevisionEntry, type MaterialReference, type RevisionResult, pendingIntent } from './revision-record.ts'
+import { type RevisionArtifact, type RevisionEntry, type MaterialReference, type RevisionResult, type RevisionIntent, type RevisionRecord, launchValid, pendingIntent, readRegularBytes, revisionPublicationFacts } from './revision-record.ts'
 import { GATES, GATE_ARTIFACTS, type FlowStatus, type Reason, resolve } from './status.ts'
 import type { FrozenLaunch, PublishOutcome } from './publish.ts'
 import { flowWriterRuns } from '../writer-store.ts'
@@ -36,14 +36,7 @@ export interface FrozenRevision {
   candidate: string; step_at_launch: FlowStatus['next']['step']; continuation?: true
 }
 
-function regularBytes(file: string): Buffer {
-  if (!lstatSync(file).isFile()) throw new Error('la ruta no es un archivo regular')
-  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-  try {
-    if (!fstatSync(fd).isFile()) throw new Error('la ruta no es un archivo regular')
-    return readFileSync(fd)
-  } finally { closeSync(fd) }
-}
+const regularBytes = readRegularBytes
 function evidence<T>(file: string, code: string): T {
   try { return JSON.parse(regularBytes(file).toString('utf8')) as T } catch (e) {
     throw new SddError(code, 'no se pudo leer la evidencia de la revisión', { detail: (e as Error).message })
@@ -83,10 +76,17 @@ export function assertBeforeImplementation(root: string, flow: string): void {
     return fail('activity_unknown', 'no se puede descartar un writer de implement lanzado')
   }
   for (const run of names.filter(isRunId)) {
-    let req: { kind?: string; flow?: string; step?: string; role?: string }
-    try { req = evidence(join(runs, run, 'request.json'), 'activity_unknown') } catch {
-      return fail('activity_unknown', 'una corrida no permite descartar implementación iniciada')
+    const file = join(runs, run, 'request.json')
+    if (!existsSync(file)) continue // Una corrida recién creada todavía no tiene solicitud.
+    let req: { kind?: string; flow?: string; step?: string; role?: string } | null
+    try { req = evidence(file, 'activity_unknown') } catch (e) {
+      // La ilegibilidad ajena al flujo no impide su devolución.
+      let related = record.last_run?.id === run
+      try { related ||= evidence<{ phase?: { flow?: string } }>(join(runs, run, 'argv.json'), 'activity_unknown').phase?.flow === flow } catch { /* Sin asociación al flujo. */ }
+      if (related) throw e
+      continue
     }
+    if (req === null || typeof req !== 'object') return fail('activity_unknown', `la solicitud de ${run} no es un objeto`)
     if (req.flow === flow && (req.step === 'implement' || req.role === 'implement')) return fail('implementation_started', 'existe evidencia de un writer de implement lanzado')
   }
 }
@@ -102,7 +102,7 @@ export function validateRevision(root: string, flow: string, artifact: RevisionA
   const active = activeRun(root, record, true)
   if (active && active !== ownRun) {
     const revision = record.revisions?.active?.run === active || pendingIntent(record)?.run === active
-    throw new SddError(revision ? 'revision_running' : 'phase_running', revision ? `la corrección de ${record.revisions?.active?.artifact ?? artifact} sigue activa` : `la fase ${active} sigue activa`, { next: `./bin/sdd-ai wait ${active}` })
+    throw new SddError(revision ? 'revision_running' : 'phase_running', revision ? `la corrección de ${record.revisions?.active?.artifact ?? pendingIntent(record)?.artifact ?? artifact} sigue activa` : `la fase ${active} sigue activa`, { next: `./bin/sdd-ai wait ${active}` })
   }
   if (!isRunId(review)) return fail('review_missing', 'el id de revisión no es válido')
   const dir = join(root, '.sdd-ai', 'runs', review)
@@ -123,23 +123,29 @@ export function validateRevision(root: string, flow: string, artifact: RevisionA
   if (sel.kind !== artifact) return fail('review_kind_mismatch', 'el tipo de revisión no corresponde a la fase')
   for (const role of artifact === 'tasks' ? ['spec', 'plan'] : artifact === 'plan' ? ['spec'] : ['request']) {
     const input = sel.inputs?.filter((i) => i.role === role)
-    if (input?.length !== 1 || role !== 'request' && rel(input[0].path) !== `.plans/${flow}/${role}.md`) return fail('review_flow_mismatch', 'los insumos no acreditan pertenencia inequívoca al flujo')
+    if (input?.length !== 1 || (role !== 'request' && rel(input[0].path) !== `.plans/${flow}/${role}.md`)) return fail('review_flow_mismatch', 'los insumos no acreditan pertenencia inequívoca al flujo')
   }
   const terminal = evidence<Status>(join(dir, 'status.json'), 'review_unreadable')
-  if (!terminal || !['launching', 'running', 'done', 'failed', 'launch_failed', 'timeout', 'cancelled', 'delegated', 'unavailable', 'cessation_uncertain'].includes(terminal.state)) return fail('review_unreadable', 'el estado de la revisión es ilegible')
+  const runStates = ['launching', 'running', 'done', 'failed', 'launch_failed', 'timeout', 'cancelled', 'delegated', 'unavailable', 'cessation_uncertain'] satisfies RunState[]
+  if (!terminal || !runStates.includes(terminal.state)) return fail('review_unreadable', 'el estado de la revisión es ilegible')
   if (!TERMINAL.has(terminal.state)) return fail('review_active', 'la revisión todavía no terminó')
   const ledger = evidence<Ledger>(join(dir, 'ledger.json'), 'review_unreadable')
-  const states = ['abierto', 'aceptado', 'rechazado', 'en-disputa', 'resuelto', 'cerrado', 'refutado', 'fuera-de-alcance', 'informativo']
-  if (!ledger || !Number.isSafeInteger(ledger.completed) || ledger.completed < 1 || !Number.isSafeInteger(ledger.next_id) || ledger.next_id < 1 || !Array.isArray(ledger.entries)
-    || new Set(ledger.entries.map((e) => e?.id)).size !== ledger.entries.length
-    || ledger.entries.some((e) => !e || !/^F-\d+$/.test(e.id) || !states.includes(e.state) || !Number.isSafeInteger(e.round) || e.round < 1 || e.round > ledger.completed
-      || typeof e.claim !== 'string' || !e.claim.trim() || typeof e.location !== 'string' || !['scope', 'spec', 'quality'].includes(e.axis)
-      || !['BLOCKER', 'CRITICAL', 'WARNING', 'SUGGESTION'].includes(e.severity) || !Array.isArray(e.responses)
-      || e.decision !== undefined && (!['accept', 'reject'].includes(e.decision.action) || !states.includes(e.decision.from)
-        || !Number.isSafeInteger(e.decision.after_round) || e.decision.after_round < 1 || e.decision.after_round > ledger.completed)
-      || e.superseded !== undefined && (!Array.isArray(e.superseded) || e.superseded.some((d) => !d || !['accept', 'reject'].includes(d.action) || !states.includes(d.from)))
-      || e.responses.some((r) => !r || !Number.isSafeInteger(r.round) || !['resolved', 'unresolved', 'withdrawn', 'maintained'].includes(r.answer))
-      || (e.state === 'rechazado' && (e.decision?.action !== 'reject' || !e.decision.reason?.trim())))) return fail('review_unreadable', 'el ledger es ilegible')
+  const states = ['abierto', 'aceptado', 'rechazado', 'en-disputa', 'resuelto', 'cerrado', 'refutado', 'fuera-de-alcance', 'informativo'] satisfies Ledger['entries'][number]['state'][]
+  const axes = ['scope', 'spec', 'quality'] satisfies Ledger['entries'][number]['axis'][]
+  const severities = ['BLOCKER', 'CRITICAL', 'WARNING', 'SUGGESTION'] satisfies Ledger['entries'][number]['severity'][]
+  if (!ledger || !Number.isSafeInteger(ledger.completed) || ledger.completed < 1 || !Number.isSafeInteger(ledger.next_id) || ledger.next_id < 1 || !Array.isArray(ledger.entries)) return fail('review_unreadable', 'el header del ledger es ilegible')
+  if (new Set(ledger.entries.map((e) => e?.id)).size !== ledger.entries.length) return fail('review_unreadable', 'el ledger repite IDs')
+  for (const e of ledger.entries) {
+    const reject = (field: string): never => fail('review_unreadable', `el ledger contiene un hallazgo inválido en ${field}`)
+    if (!e || !/^F-\d+$/.test(e.id) || !states.includes(e.state)) reject('id/state')
+    if (!Number.isSafeInteger(e.round) || e.round < 1 || e.round > ledger.completed) reject(`${e.id}.round`)
+    if (typeof e.claim !== 'string' || !e.claim.trim() || typeof e.location !== 'string' || !axes.includes(e.axis) || !severities.includes(e.severity)) reject(`${e.id}.finding`)
+    if (e.decision !== undefined && (!['accept', 'reject'].includes(e.decision.action) || !states.includes(e.decision.from)
+      || !Number.isSafeInteger(e.decision.after_round) || e.decision.after_round < 1 || e.decision.after_round > ledger.completed)) reject(`${e.id}.decision`)
+    if (e.superseded !== undefined && (!Array.isArray(e.superseded) || e.superseded.some((d) => !d || !['accept', 'reject'].includes(d.action) || !states.includes(d.from)))) reject(`${e.id}.superseded`)
+    if (!Array.isArray(e.responses) || e.responses.some((r) => !r || !Number.isSafeInteger(r.round) || !['resolved', 'unresolved', 'withdrawn', 'maintained'].includes(r.answer))) reject(`${e.id}.responses`)
+    if (e.state === 'rechazado' && (e.decision?.action !== 'reject' || !e.decision.reason?.trim())) reject(`${e.id}.rejection_reason`)
+  }
   if (!ledger.artifact) return fail('review_diff', 'el ledger no es de una revisión de artefacto')
   if (terminal.state !== 'done' || (terminal.round ?? 1) !== ledger.completed) return fail('review_incomplete', 'la última ronda no acredita una entrega completada')
   const pending = undecided(ledger)
@@ -203,17 +209,17 @@ export function freezeRevisionMaterial(root: string, v: ValidatedRevision, produ
   const save = (name: string, bytes: Buffer, ref: MaterialReference) => {
     files[name] = bytes; refs.push({ ...ref, copy: name }); sections.push(block(ref.role ?? ref.path, bytes.toString('utf8')))
   }
-  save('document.md', v.document, { path: v.path, digest: bytesHash(v.document), role: 'Documento vigente completo' })
+  save('document.md', v.document, { path: v.path, digest: bytesHash(v.document), kind: 'document', role: 'Documento vigente completo' })
   for (const x of v.candidate.context) {
     const bytes = v.sources.get(x.path)!
-    save(`source-${refs.length}.md`, bytes, { path: x.path, digest: bytesHash(bytes), role: x.role ?? 'Contexto de revisión vigente' })
+    save(`source-${refs.length}.md`, bytes, { path: x.path, digest: bytesHash(bytes), kind: 'source', role: x.role ?? 'Contexto de revisión vigente' })
     if (x.role === 'request' || x.role === 'spec' || x.role === 'plan') inputs[x.role] = bytes.toString('utf8')
   }
   for (const ref of [...producer.origin.sources, ...producer.origin.amendments]) {
     try {
       const bytes = regularBytes(join(root, ref.copy ?? ref.path))
       if (bytesHash(bytes) !== ref.digest) throw new Error('la copia no conserva su huella')
-      save(`historical-${refs.length}.md`, bytes, { ...ref, role: `Material histórico (${ref.role ?? ref.path}); no sustituye insumos vigentes` })
+      save(`historical-${refs.length}.md`, bytes, { ...ref, kind: 'historical', role: `Material histórico (${ref.role ?? ref.path}); no sustituye insumos vigentes` })
     } catch {
       if (session.mode === 'new') return fail('material_missing', `no está la copia histórica necesaria de ${ref.path}`)
       sections.push(`Copia histórica ausente: ${ref.path}. Ya estuvo en el contexto del productor; no se resume ni se inventa.`)
@@ -225,19 +231,20 @@ export function freezeRevisionMaterial(root: string, v: ValidatedRevision, produ
   const orders = v.ledger.entries.filter((e) => v.accepted.includes(e.id))
   sections.push(`## Únicas órdenes de corrección — revisión ${v.review}, ronda ${v.round}`, block('ACEPTADOS', JSON.stringify(orders, null, 2)))
   if (v.decisions) {
-    save('decisions.md', v.decisions.bytes, { ...v.decisions.ref, role: 'Aporte del conductor; sin autoridad sobre pedido ni insumos aprobados' })
+    save('decisions.md', v.decisions.bytes, { ...v.decisions.ref, kind: 'conductor', role: 'Aporte del conductor; sin autoridad sobre pedido ni insumos aprobados' })
   }
-  if (context) save('context.md', context.bytes, { path: context.path, digest: bytesHash(context.bytes), role: 'Respuestas de Max y contexto aportado por el conductor' })
+  if (context) save('context.md', context.bytes, { path: context.path, digest: bytesHash(context.bytes), kind: 'continuation', role: 'Respuestas de Max y contexto aportado por el conductor' })
   for (const previous of history) {
-    for (const ref of previous.materials.filter((r) => r.role === 'Respuestas de Max y contexto aportado por el conductor')) {
+    for (const ref of previous.materials.filter((r) => r.kind === 'continuation')) {
       if (!ref.copy) return fail('material_missing', 'falta una copia del contexto de una corrección anterior')
-      const bytes = regularBytes(join(root, ref.copy))
+      let bytes: Buffer
+      try { bytes = regularBytes(join(root, ref.copy)) } catch { return fail('material_missing', `falta la copia del contexto anterior ${ref.copy}`) }
       if (bytesHash(bytes) !== ref.digest) return fail('material_missing', 'cambió una copia del contexto anterior')
-      save(`historical-context-${refs.length}.md`, bytes, { ...ref, role: 'Material histórico de continuación; respuestas y contexto ya aportados' })
+      save(`historical-context-${refs.length}.md`, bytes, { ...ref, kind: 'historical_context', role: 'Material histórico de continuación; respuestas y contexto ya aportados' })
     }
   }
   if (history.length) sections.push(block('HISTORIAL de correcciones', JSON.stringify(history, null, 2)))
-  const prompt = renderPhasePrompt(v.step, { id: v.flow, depth: v.depth, step: v.step }, inputs, undefined, { material: sections.join('\n\n') })
+  const prompt = renderPhasePrompt(v.step, { id: v.flow, depth: v.depth, step: v.step }, inputs, { correction: { material: sections.join('\n\n') } })
   return { inputs, files, refs, prompt }
 }
 
@@ -258,6 +265,7 @@ export function prepareRevisionCandidate(root: string, v: ValidatedRevision, con
   if (contract.phase === 'specify') rendered = renderSpec(contract)
   else if (contract.phase === 'tasks') rendered = renderTasks(contract)
   else {
+    // renderPlan usa estos campos exclusivamente en el frontmatter que aquí se descarta.
     const header: PlanHeader = { id: v.flow, branch: 'preserved', base_commit: 'preserved', change_type: 'feat', profundidad: v.depth, risk: 'high', status: 'planned', created_at: '1970-01-01T00:00:00Z' }
     rendered = splitHeader(renderPlan(contract, header, v.criteria)).body
   }
@@ -297,34 +305,46 @@ function affectedGates(depth: 'normal' | 'completa', artifact: RevisionArtifact)
   return [...gates.slice(first)]
 }
 
+/** La metadata auxiliar solo puede actualizar sesión y lanzamiento, nunca procedencia ni autorización. */
+function revisionMetadata(root: string, run: string): { session_id?: string; launch?: RevisionEntry['launch'] } {
+  const file = join(root, '.sdd-ai', 'runs', run, 'revision-result.json')
+  if (!existsSync(file)) return {}
+  const value = evidence<Record<string, unknown>>(file, 'revision_pending')
+  if (!value || typeof value !== 'object') return fail('revision_pending', 'la metadata de sesión no es un objeto')
+  if (value.session_id !== undefined && (typeof value.session_id !== 'string' || !value.session_id || /[/\\]/.test(value.session_id))) return fail('revision_pending', 'la sesión auxiliar no es válida')
+  if (value.launch !== undefined && !launchValid(value.launch)) return fail('revision_pending', 'el lanzamiento auxiliar no es válido')
+  if (value.launch && (value.launch as RevisionEntry['launch']).cwd !== root) return fail('revision_pending', 'el lanzamiento auxiliar cambió de directorio')
+  return { ...(typeof value.session_id === 'string' ? { session_id: value.session_id } : {}),
+    ...(value.launch ? { launch: value.launch as RevisionEntry['launch'] } : {}) }
+}
+
+function finalizedPublication(revisions: RevisionRecord, intent: RevisionIntent, result: RevisionResult,
+  barrier: boolean, metadata: ReturnType<typeof revisionMetadata>): RevisionRecord {
+  return { ...revisions, intent: { ...intent, resolved: true },
+    barriers: barrier && !revisions.barriers.some((b) => b.run === intent.run) ? [...revisions.barriers,
+      { run: intent.run, artifact: intent.artifact, gates: intent.gates, digest: intent.result_digest }] : revisions.barriers,
+    entries: revisions.entries.map((e) => e.run === intent.run ? { ...e, ...metadata, state: result.state, result } : e) }
+}
+
 /** Recuperación única; no vuelve a hacer rename. El llamador tiene el lock del flujo. */
-export function recoverRevisionPublication(root: string, flow: string): void {
+export function recoverRevisionPublication(root: string, flow: string, livePublisher = false): void {
   const record = readPhaseRecord(root, flow, true)
   const intent = pendingIntent(record)
   if (!intent || !record.revisions) return
   const dir = join(root, '.sdd-ai', 'runs', intent.run)
-  let terminal: { outcome?: string; registry_pending?: boolean } | undefined
-  try { terminal = evidence(join(dir, 'phase.json'), 'revision_pending') } catch { /* Sin terminal decide el destino. */ }
-  const current = bytesHash(regularBytes(join(root, intent.artifact)))
-  const renamed = terminal?.outcome === 'published'
-  const published = renamed || current === intent.result_digest
-  const barrier = renamed || current !== intent.previous_digest
-  const result: RevisionResult = published ? { state: 'published', digest: intent.result_digest }
+  let current: string | undefined; let targetError: string | undefined
+  try { current = bytesHash(regularBytes(join(root, intent.artifact))) } catch (e) { targetError = (e as Error).message }
+  const facts = revisionPublicationFacts(root, intent, current)
+  const result: RevisionResult = facts.published ? { state: 'published', digest: intent.result_digest }
     : current === intent.previous_digest ? { state: 'not_published', cause: 'publish_interrupted' }
-      : { state: 'conflict', cause: 'target_changed_during_publish', digest: current }
-  const revisions = record.revisions
-  let metadata: { session_id?: string; launch?: RevisionEntry['launch'] } = {}
-  try { metadata = evidence(join(dir, 'revision-result.json'), 'revision_pending') } catch { /* Las corridas fabricadas o anteriores pueden no traerla. */ }
-  writePhaseRecord(root, flow, { ...record, revisions: { ...revisions,
-    intent: { ...intent, resolved: true },
-    barriers: barrier && !revisions.barriers.some((b) => b.run === intent.run) ? [...revisions.barriers,
-      { run: intent.run, artifact: intent.artifact, gates: intent.gates, digest: intent.result_digest }] : revisions.barriers,
-    entries: revisions.entries.map((e) => e.run === intent.run ? { ...e, ...metadata, state: result.state, result } : e),
-  } })
+      : { state: 'conflict', cause: 'target_changed_during_publish', ...(current ? { digest: current } : {}), ...(targetError ? { detail: targetError } : {}) }
+  let metadata: ReturnType<typeof revisionMetadata> = {}
+  try { metadata = revisionMetadata(root, intent.run) } catch (e) { result.detail = (e as Error).message }
+  writePhaseRecord(root, flow, { ...record, revisions: finalizedPublication(record.revisions, intent, result, facts.barrier, metadata) })
+  if (livePublisher) return // El supervisor vivo es el único dueño de su terminal.
   const status = readStatus(dir)
-  // Un terminal previo conserva su resultado: las vistas declaran la divergencia con la entrada.
   if (!TERMINAL.has(status.state)) {
-    writeJsonAtomic(join(dir, 'phase.json'), { ...(terminal ?? {}), outcome: result.state, ...result, registry_pending: undefined })
+    writeJsonAtomic(join(dir, 'phase.json'), { ...(facts.terminal ?? {}), outcome: result.state, ...result, registry_pending: undefined })
     writeJsonAtomic(join(dir, 'status.json'), { ...status, state: result.state === 'published' ? 'done' : 'failed', reason: result.cause, ended_at: new Date().toISOString() })
   }
 }
@@ -350,12 +370,12 @@ export function recoverRevisionResult(root: string, flow: string): void {
   if (!result) {
     let phase: RevisionResult & { outcome?: RevisionResult['state'] }
     try { phase = evidence(join(dir, 'phase.json'), 'revision_pending') } catch {
-      phase = { state: status.state === 'cancelled' ? 'cancelled' : 'failed', cause: status.reason }
+      phase = { state: status.state === 'cancelled' ? 'cancelled' : status.state === 'timeout' ? 'timeout' : status.state === 'launch_failed' ? 'launch_failed' : 'failed', cause: status.reason }
     }
     result = { ...phase, state: phase.outcome ?? phase.state, registry_pending: undefined }
   }
   let metadata: { session_id?: string; launch?: RevisionEntry['launch'] } = {}
-  try { metadata = evidence(join(dir, 'revision-result.json'), 'revision_pending') } catch { /* Cancel previo al primer intento. */ }
+  try { metadata = revisionMetadata(root, run) } catch (e) { result.detail = (e as Error).message }
   finishRevision(root, flow, run, result, metadata)
 }
 
@@ -373,13 +393,18 @@ export function publishRevision(root: string, launch: FrozenLaunch, contract: Do
       const origin = record.documents?.[launch.step]
       if (!origin) return { kind: 'conflict', cause: 'origin_missing', detail: 'desapareció el productor registrado' }
       v = validateRevision(root, launch.flow, frozen.artifact, frozen.review,
-        { origin, launch: entry.launch, family: entry.family, recoverable: true }, undefined, run)
-      if (bytesHash(v.document) !== frozen.document_digest || v.ledger_digest !== frozen.ledger_digest || v.round !== frozen.round
-        || v.candidate.hash !== frozen.candidate || v.step_at_launch !== frozen.step_at_launch || v.handoff_header !== launch.handoff_header
-        || v.depth !== launch.depth) throw new Error('cambiaron documento, revisión, ledger, header, profundidad o paso')
+        // La revalidación usa la familia; no decide ni abre una sesión.
+        { origin, launch: entry.launch, family: entry.family, recoverable: false }, undefined, run)
+      if (bytesHash(v.document) !== frozen.document_digest) throw new Error('cambió el documento')
+      if (v.round !== frozen.round) throw new Error('cambió la ronda de la revisión')
+      if (v.ledger_digest !== frozen.ledger_digest) throw new Error('cambió el ledger')
+      if (v.candidate.hash !== frozen.candidate) throw new Error('cambió el candidato')
+      if (v.depth !== launch.depth) throw new Error('cambió la profundidad')
+      if (v.step_at_launch !== frozen.step_at_launch) throw new Error('cambió el paso del flujo')
+      if (v.handoff_header !== launch.handoff_header) throw new Error('cambió el header del handoff')
       for (const ref of entry.materials) {
         // Las copias históricas se congelan; sus originales pueden divergir de los insumos vigentes.
-        if (ref.role?.startsWith('Material histórico')) continue
+        if (ref.kind === 'historical' || ref.kind === 'historical_context') continue
         if (bytesHash(regularBytes(join(root, ref.path))) !== ref.digest) throw new Error(`cambió ${ref.path}`)
       }
       if (entry.conductor && bytesHash(regularBytes(join(root, entry.conductor.path))) !== entry.conductor.digest) throw new Error('cambió el aporte del conductor')
@@ -400,11 +425,15 @@ export function publishRevision(root: string, launch: FrozenLaunch, contract: Do
       try { writePhaseRecord(root, launch.flow, { ...record, revisions: { ...record.revisions!, intent } }) } catch (e) {
         return { kind: 'not_published', cause: 'intent_unwritable', detail: (e as Error).message, registry_pending: true }
       }
+      let currentDigest: string | undefined
+      try { currentDigest = bytesHash(regularBytes(target)) } catch { /* Ausencia o ruta especial es un conflicto, no un rename fallido. */ }
+      if (currentDigest !== candidate.previous_digest) {
+        let detail = 'cambió el destino después de registrar la intención; se conservó ese contenido'
+        let registry_pending: true | undefined
+        try { recoverRevisionPublication(root, launch.flow, true) } catch (e) { detail += `: ${(e as Error).message}`; registry_pending = true }
+        return { kind: 'conflict', cause: 'target_changed_during_publish', detail, ...(registry_pending ? { registry_pending } : {}) }
+      }
       try {
-        if (bytesHash(regularBytes(target)) !== candidate.previous_digest) {
-          recoverRevisionPublication(root, launch.flow)
-          return { kind: 'conflict', cause: 'target_changed_during_publish', detail: 'cambió el destino después de registrar la intención; se conservó ese contenido' }
-        }
         renameSync(tmp, target)
       } catch (e) {
         const current = readPhaseRecord(root, launch.flow, true)
@@ -413,21 +442,23 @@ export function publishRevision(root: string, launch: FrozenLaunch, contract: Do
       }
       try {
         const current = readPhaseRecord(root, launch.flow, true)
-        const metadata = evidence<{ session_id?: string; launch?: RevisionEntry['launch'] }>(join(root, '.sdd-ai', 'runs', run, 'revision-result.json'), 'revision_pending')
+        const metadata = revisionMetadata(root, run)
         const result: RevisionResult = { state: 'published', digest: candidate.result_digest, blocked_reasons: candidate.blocked_reasons }
-        writePhaseRecord(root, launch.flow, { ...current, revisions: { ...current.revisions!, intent: { ...intent, resolved: true },
-          barriers: [...current.revisions!.barriers, { run, artifact: v.path, gates: intent.gates, digest: candidate.result_digest }],
-          entries: current.revisions!.entries.map((e) => e.run === run ? { ...e, ...metadata, state: 'published', result } : e),
-        } })
+        writePhaseRecord(root, launch.flow, { ...current, revisions: finalizedPublication(current.revisions!, intent, result, true, metadata) })
         return { kind: 'published', artifact: v.path, digest: candidate.result_digest, blocked_reasons: candidate.blocked_reasons }
       } catch (e) { return { kind: 'published', artifact: v.path, digest: candidate.result_digest, registry_pending: true, detail: (e as Error).message } }
     } finally { rmSync(tmp, { force: true }) }
   }
-  return withRevisionLocks(root, launch.flow, frozen.review, () => {
-    const outcome = decide()
-    then?.(outcome)
-    return outcome
-  })
+  try {
+    return withRevisionLocks(root, launch.flow, frozen.review, () => {
+      const outcome = decide()
+      then?.(outcome)
+      return outcome
+    })
+  } catch (e) {
+    if (e instanceof SddError && (e.code === 'review_active' || e.code === 'flow_busy')) return { kind: 'not_published', cause: 'publication_busy', detail: e.message }
+    throw e
+  }
 }
 
 /** Vista sin efectos; el resultado del registro prevalece sobre un terminal anterior de la corrida. */
@@ -441,9 +472,10 @@ export function revisionView(root: string, entry: RevisionEntry): Record<string,
     orphan = !TERMINAL.has(status.state) && status.supervisor_pid !== undefined && !isAlive(status.supervisor_pid)
   } catch { /* La reserva ilegible sigue pendiente. */ }
   const out: Record<string, unknown> = { ...entry }
-  if (entry.result) out.state = entry.state
-  else if (terminal?.outcome) out.state = terminal.outcome
-  else if (orphan) out.state = 'orphan'
+  if (!entry.result) {
+    if (terminal?.outcome) out.state = terminal.outcome
+    else if (orphan) out.state = 'orphan'
+  }
   if (terminal?.registry_pending && entry.state === 'active') {
     out.registry_pending = true
     out.detail = terminal.outcome === 'published' ? 'publicación pendiente de finalizar' : 'cierre pendiente del registro'
@@ -451,13 +483,14 @@ export function revisionView(root: string, entry: RevisionEntry): Record<string,
   if (entry.result && terminal?.outcome && entry.result.state !== terminal.outcome) {
     out.terminal_superseded = { terminal: terminal.outcome, registered: entry.result.state }
   }
-  if (entry.state === 'awaiting_context') out.next = `./bin/sdd-ai sdd phase ${entry.artifact.split('/')[1]} --revise ${entry.phase === 'specify' ? 'spec' : entry.phase} --context <archivo>`
+  if (entry.state === 'awaiting_context') out.next = `./bin/sdd-ai sdd phase ${relative(join(root, '.plans'), join(root, entry.artifact)).split('/')[0]} --revise ${entry.phase === 'specify' ? 'spec' : entry.phase} --context <archivo>`
   else if (orphan && !entry.result) out.next = `./bin/sdd-ai cancel ${entry.run}`
   else if (entry.state === 'active') out.next = `./bin/sdd-ai wait ${entry.run}`
   return out
 }
 
-export interface CorrectionProvenance { author: 'producer' | 'conductor' | 'mixed'; family?: Family; runs: string[] }
+export type CorrectionProvenance = { author: 'producer'; family: Family; runs: string[] }
+  | { author: 'conductor' | 'mixed'; family?: never; runs: string[] }
 
 /** Clasifica publicaciones por sus huellas completas y las versiones intermedias de la secuencia. */
 export function roundRevisionProvenance(root: string, flow: string, review: string, round: number,
@@ -468,7 +501,7 @@ export function roundRevisionProvenance(root: string, flow: string, review: stri
   let expected = bytesHash(before)
   let intervened = false
   for (const e of entries) {
-    const input = e.materials.find((m) => m.path === e.artifact && m.role === 'Documento vigente completo')
+    const input = e.materials.find((m) => m.path === e.artifact && m.kind === 'document')
     if (input?.digest !== expected) intervened = true
     expected = e.result!.digest!
   }

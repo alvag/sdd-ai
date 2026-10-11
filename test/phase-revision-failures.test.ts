@@ -3,25 +3,30 @@ import { spawnSync } from 'node:child_process'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
-import { calls, cleanup, cli, corrected, entries, flowFile, makeFixture, record, revise, script, settle, snapshotFiles, waitFor } from './phase-revision-fixture.ts'
+import { calls, cleanup, cli, corrected, entries, flowFile, makeFixture, record, revise, runFile, script, settle, snapshotFiles, waitFor } from './phase-revision-fixture.ts'
 
 test('los fallos conservan el documento y el contexto permite continuar con el productor', async (t) => {
-  for (const mode of ['startup', 'execution', 'contract', 'cancel', 'timeout']) {
+  const scenarios = { startup: { outcome: 'launch_failed', count: 1 }, execution: { outcome: 'failed', count: 1 },
+    contract: { outcome: 'not_admitted', count: 2 }, cancel: { outcome: 'cancelled', count: 1 }, timeout: { outcome: 'timeout', count: 2 } }
+  for (const [mode, expected] of Object.entries(scenarios)) {
     const s = makeFixture()
     const barrier = join(s.work, 'release')
     try {
-      script(s, mode === 'startup' ? [{ startup_failure: true }] : mode === 'execution' ? [{ execution_failure: true }]
-        : mode === 'contract' ? [{ answer: 'inadmisible' }, { answer: 'inadmisible' }]
-          : [{ ...(mode === 'cancel' ? { barrier } : { hang: true }), answer: JSON.stringify(corrected('spec')) }, { hang: true }])
+      const scripts = { startup: [{ startup_failure: true }], execution: [{ execution_failure: true }],
+        contract: [{ answer: 'inadmisible' }, { answer: 'inadmisible' }], cancel: [{ barrier, answer: JSON.stringify(corrected('spec')) }],
+        timeout: [{ hang: true }, { hang: true }] }
+      script(s, scripts[mode as keyof typeof scripts])
       const before = snapshotFiles(s)
       const start = revise(s, mode === 'timeout' ? ['--deadline', '1'] : [])
       assert.equal(start.code, 0, JSON.stringify(start.out))
       if (mode === 'cancel') { await waitFor(`${barrier}.ready`); cli(s, ['cancel', start.out.id]); writeFileSync(barrier, '') }
       // El cierre de timeout usa el límite real del supervisor; no crea otra sesión.
       const result = mode === 'timeout' ? cli(s, ['wait', start.out.id, '--max', '15']) : await settle(s, start.out.id)
-      assert.equal(result.out.outcome, mode === 'startup' ? 'launch_failed' : mode === 'execution' ? 'failed' : mode === 'contract' ? 'not_admitted' : mode === 'cancel' ? 'cancelled' : 'timeout', JSON.stringify(result.out))
+      assert.equal(result.out.outcome, expected.outcome, JSON.stringify(result.out))
       assert.deepEqual(snapshotFiles(s), before)
       assert.equal(record(s).revisions!.barriers.length, 0)
+      assert.equal(record(s).revisions!.active, undefined)
+      assert.equal(calls(s).length, expected.count)
       assert.ok(calls(s).every((args) => args[args.length - 2] === s.session))
     } finally { writeFileSync(barrier, ''); await cleanup(s) }
   }
@@ -51,7 +56,7 @@ test('los fallos conservan el documento y el contexto permite continuar con el p
       assert.equal(record(unwritable).revisions!.intent!.resolved, true)
     }
   } finally {
-    if (marked) assert.equal(flag(false).status, 0)
+    if (marked) flag(false)
     writeFileSync(barrier, ''); await cleanup(unwritable)
   }
   const s = makeFixture()
@@ -75,7 +80,7 @@ test('los fallos conservan el documento y el contexto permite continuar con el p
     script(s, [{ answer: JSON.stringify(corrected('spec')) }])
     const third = cli(s, ['sdd', 'phase', 'f', '--revise', 'spec', '--context', 'context-two.md'])
     assert.equal(third.code, 0, JSON.stringify(third.out)); assert.equal((await settle(s, third.out.id)).out.outcome, 'published')
-    const prompt = readFileSync(`${s.repo}/.sdd-ai/runs/${third.out.id}/prompt.md`, 'utf8')
+    const prompt = readFileSync(runFile(s, third.out.id, 'prompt.md'), 'utf8')
     assert.ok(prompt.includes('Max: resultado público.')); assert.ok(prompt.includes('Max confirma'))
     assert.deepEqual(record(s).phases, creation)
     assert.equal(cli(s, ['sdd', 'phase', 'f', '--revise', 'spec', '--context', 'context-two.md']).out.code, 'context_not_expected')

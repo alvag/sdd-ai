@@ -18,6 +18,7 @@ test('la publicacion vence gates dependientes y desactiva la acreditacion por he
       const first = GATES[depth].findIndex((g) => GATE_ARTIFACTS[g].includes(artifact))
       const affected = GATES[depth].slice(first)
       assert.deepEqual(record(s).revisions!.barriers[0].gates, affected)
+      // Cada consulta usa un proceso nuevo: comprueba que la barrera persiste entre sesiones.
       for (let query = 0; query < 2; query++) {
         const status = cli(s, ['sdd', 'status', 'f']).out
         for (const gate of affected) assert.ok(!['approved', 'approved_unfingerprinted'].includes(status.gates.find((g: { gate: string }) => g.gate === gate).state))
@@ -43,7 +44,7 @@ test('la publicacion vence gates dependientes y desactiva la acreditacion por he
     put(flowFile(logged, 'sdd-ai-approvals.json'), { schema_version: 1, approvals })
     const history = readFileSync(flowFile(logged, 'sdd-ai-approvals.json'), 'utf8')
     assert.ok(cli(logged, ['sdd', 'status', 'f']).out.notes.some((n: { code: string }) => n.code === 'approval_unproven'))
-    const start = revise(logged); await settle(logged, start.out.id)
+    const start = revise(logged); assert.equal(start.code, 0, JSON.stringify(start.out)); await settle(logged, start.out.id)
     const status = cli(logged, ['sdd', 'status', 'f']).out
     assert.ok(status.gates.every((g: { state: string }) => g.state === 'stale'))
     assert.equal(readFileSync(flowFile(logged, 'sdd-ai-approvals.json'), 'utf8'), history)
