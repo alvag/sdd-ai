@@ -7,6 +7,7 @@ import { SddError } from '../types.ts'
 import { flowWriterOpen } from '../writer-store.ts'
 import { readHeader } from './markdown.ts'
 import { activeRun, readPhaseRecord } from './phase-state.ts'
+import { pendingIntent } from './revision-record.ts'
 import { type FlowRead } from './read.ts'
 import { ACCREDITED_FROM, GATES, STATUSES, type FlowFacts, type FlowStatus, type GateId, headerData, planStatus, resolveGates } from './status.ts'
 import { writeTextAtomic } from './verify.ts'
@@ -123,7 +124,12 @@ export function pendingFields(root: string, fields: SyncField[]): SyncField[] {
 }
 /** Lanza si el flujo tiene una fase o un writer abiertos, o si no se puede descartar actividad; si no, vuelve sin más. */
 export function assertNoActivity(root: string, id: string): void {
-  const run = activeRun(root, readPhaseRecord(root, id, true), true)
+  const record = readPhaseRecord(root, id, true)
+  const run = activeRun(root, record, true)
+  const revision = record.revisions?.active ?? pendingIntent(record)
+  if (run && revision?.run === run) {
+    throw new SddError('revision_running', `la corrección de ${revision.artifact} sigue activa`, { next: `./bin/sdd-ai wait ${run}` })
+  }
   if (run) throw new SddError('phase_running', `la fase ${run} sigue activa`, { next: `./bin/sdd-ai wait ${run}` })
   const writer = flowWriterOpen(root, id, true)
   if (writer) throw new SddError('writer_open', `el writer ${writer} sigue abierto`, { next: `./bin/sdd-ai wait ${writer}` })

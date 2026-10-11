@@ -13,6 +13,7 @@ import { commitNext, isCommitSha } from './commit.ts'
 import { type ChainState, classesPath, orientation } from './chain.ts'
 import { chainBaseOf, chainView, classificationDetail, redProposals } from './chain-facts.ts'
 import type { AttestationRef, VerifyReceipt, VerifyReceiptRef } from './verify-receipt.ts'
+import { type DocumentOrigin, type RevisionRecord, pendingIntent, readDocumentOrigins, readRevisions } from './revision-record.ts'
 
 // El estado de las fases de un flujo que no se lee de sus artefactos: la última corrida, la ampliación
 // y el cierre inline, por fase. Vive en el flujo, junto al registro de aprobaciones, y se escribe bajo
@@ -38,6 +39,8 @@ export interface PhaseRecord {
   implement?: ImplementRecord
   commit?: CommitRecord
   reviews?: string[]
+  documents?: Partial<Record<DocumentStep, DocumentOrigin>>
+  revisions?: RevisionRecord
 }
 
 /** Una corrida de writer de la cadena. `implement` es el writer inicial; `fix`, una corrección desde un recibo rojo. */
@@ -112,6 +115,7 @@ function readPhaseRecordFile(root: string, id: string, strict: boolean): PhaseRe
   const st = lstatOrNull(file)
   if (st === null) return { schema_version: 1, last_run: null, phases: {} }
   if (st.isSymbolicLink()) throw pathInvalid(`.plans/${id}/${PHASES_FILE}`, 'es un enlace simbólico')
+  if (!st.isFile()) throw pathInvalid(`.plans/${id}/${PHASES_FILE}`, 'no es un archivo regular')
   let data: unknown
   try {
     data = strict ? readActivityJson(file) : JSON.parse(readFileSync(file, 'utf8'))
@@ -144,6 +148,12 @@ function readPhaseRecordFile(root: string, id: string, strict: boolean): PhaseRe
   if (data.commit !== undefined) {
     const problem = commitProblem(data.commit)
     if (problem !== null) throw invalid(id, `commit ${problem}`)
+  }
+  try {
+    readDocumentOrigins(data.documents)
+    readRevisions(data.revisions)
+  } catch (e) {
+    throw invalid(id, (e as Error).message)
   }
   return data as unknown as PhaseRecord
 }
@@ -431,6 +441,11 @@ function runActive(root: string, run: string, strict = false): boolean {
 
 /** La corrida de fase del flujo que todavía no terminó, o `null`. */
 export function activeRun(root: string, r: PhaseRecord, strict = false): string | null {
+  // La reserva no se libera por observar un terminal: puede faltar finalizar su publicación.
+  // Solo un verbo que recupera bajo lock cierra la entrada y libera active.
+  if (r.revisions?.active) return r.revisions.active.run
+  const intent = pendingIntent(r)
+  if (intent) return intent.run
   return r.last_run !== null && runActive(root, r.last_run.id, strict) ? r.last_run.id : null
 }
 
@@ -455,6 +470,8 @@ const diskProbe = (root: string): PhaseProbe => ({
 export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'depth' | 'next'>, r: PhaseRecord,
   probe: PhaseProbe = diskProbe(root)): { command?: string; detail?: string } | null {
   const step = status.next.step
+  const revision = r.revisions?.active ?? pendingIntent(r)
+  if (revision) return { command: `./bin/sdd-ai wait ${revision.run}`, detail: `la corrección de ${revision.artifact} sigue activa` }
   if ((status.depth !== 'normal' && status.depth !== 'completa') || !PHASE_STEPS.includes(step)) return null
   const launch = `./bin/sdd-ai sdd phase ${id}`
   if (r.last_run !== null && probe.active(r.last_run.id)) return { command: `./bin/sdd-ai wait ${r.last_run.id}` }
@@ -478,6 +495,13 @@ export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'de
  * se puede leer no tumba a quien lista: queda dicho en `detail`.
  */
 export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root: string, id: string, status: T): Next {
+  try {
+    const r = readPhaseRecord(root, id)
+    const revision = r.revisions?.active ?? pendingIntent(r)
+    if (revision) return { ...status.next, command: `./bin/sdd-ai wait ${revision.run}`, detail: `la corrección de ${revision.artifact} sigue activa` }
+  } catch (e) {
+    return { ...status.next, detail: `no se pudo leer el registro de fases: ${(e as Error).message}` }
+  }
   if (status.next.step === 'branch') return { ...status.next, command: `./bin/sdd-ai sdd branch ${id}` }
   const chained = chainNext(root, id, status)
   if (status.next.step === 'review_and_commit') {

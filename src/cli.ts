@@ -23,6 +23,9 @@ import { type InitAnswers, applyInit, planInit } from './init.ts'
 import { reuseWorktreeConfig } from './worktree-config.ts'
 import { withLock, withLockAsync } from './lock.ts'
 import { inPath } from './cli-path.ts'
+import { prepareDocumentResume, prepareNewDocumentSession, resolveDocumentProducer } from './phase-session.ts'
+import { authorizeNewSession, freezeRevisionMaterial, recoverRevisionResult, recoverRevisionPublication, revisionView, roundRevisionProvenance, validateRevision, withRevisionLocks } from './sdd/revision.ts'
+import { type RevisionArtifact, type RevisionEntry, pendingIntent } from './sdd/revision-record.ts'
 import { cancelNative } from './native-launch.ts'
 import { loadCodexRoot, loadWorkers } from './profiles.ts'
 import { DEFAULT_KEEP_DAYS, type EntryKind, applyPrune, planPrune, pruneContext } from './prune.ts'
@@ -51,12 +54,12 @@ import {
 } from './supervisor.ts'
 import {
   type Conductor, DISPATCHABLE_ROLES, type Family, type NativeProfile, type Profile, READ_ONLY_ROLES, RETIRED_ROLES, type RejectedField, type RetryInfo,
-  type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, isDispatchableRole, isFamily, isPhaseRole, opposite, toNativeEffort,
+  type Resolution, SddError, type Status, TERMINAL, WEB_ROLES, type WorkerTask, type LaunchSpec, isDispatchableRole, isFamily, isPhaseRole, opposite, toNativeEffort,
 } from './types.ts'
 import { type Freshness, type ReviewRequest, REVIEW_LOCK, converged, freshness, untrackedOf } from './review/standing.ts'
 import { applyCommit, planCommit } from './sdd/commit.ts'
 import { approve } from './sdd/approve.ts'
-import { type ApproveDeps, ApprovalSyncPending } from './sdd/approve-sync.ts'
+import { type ApproveDeps, ApprovalSyncPending, assertNoActivity } from './sdd/approve-sync.ts'
 import { assertBranchApplicable, branchApply, branchPreview } from './sdd/branch.ts'
 import { criteriaIds, readTaskResponsibilities } from './sdd/markdown.ts'
 import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, phaseTouchesMods, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
@@ -311,6 +314,7 @@ function prepareRun(root: string, prompt: string, request: Record<string, unknow
 interface ProcessRun {
   root: string; env: Env; resolution: Resolution; prompt: string; request: Record<string, unknown>; deadline: number
   conductor: Conductor; web?: boolean; argvExtra?: Partial<ArgvFile>; files?: Record<string, string | Buffer>
+  launchFor?: (dir: string) => LaunchSpec
 }
 
 function executionContext(root: string, run: string, flow: string | undefined, step: string | null, role: string | null, resolution: Resolution): ExecutionContext {
@@ -329,6 +333,8 @@ function reviewExecution(root: string, id: string, req: ReviewRequest, resolutio
  * familia resuelta, queda en `launch_failed` con la caída al conductor, que decide el usuario.
  */
 function startProcessRun(o: ProcessRun): { id: string; dir: string; launched: boolean } {
+  const revision = o.request.revision === true
+  if (revision && !inPath(o.resolution.family, o.env)) throw new SddError('cli_missing', `${o.resolution.family} no está en PATH`)
   const { id, dir } = prepareRun(o.root, o.prompt, o.request, o.resolution, o.files)
   if (!inPath(o.resolution.family, o.env)) {
     const detail = `${o.resolution.family} no está en PATH`
@@ -339,10 +345,15 @@ function startProcessRun(o: ProcessRun): { id: string; dir: string; launched: bo
   if (o.resolution.model) task.model = o.resolution.model
   if (o.resolution.effort) task.effort = o.resolution.effort
   if (o.web) task.web = true
-  const launch = o.resolution.family === 'claude' ? claudeLaunch(task) : codexLaunch(task)
+  const launch = o.launchFor?.(dir) ?? (o.resolution.family === 'claude' ? claudeLaunch(task) : codexLaunch(task))
   const execution = executionContext(o.root, id, typeof o.request.flow === 'string' ? o.request.flow : undefined,
     typeof o.request.step === 'string' ? o.request.step : null, typeof o.request.role === 'string' ? o.request.role : null, o.resolution)
-  launchSupervisor(dir, { family: o.resolution.family, launch, deadline_sec: o.deadline, execution, ...o.argvExtra }, o.env, { fallback: o.conductor })
+  try {
+    launchSupervisor(dir, { family: o.resolution.family, launch, deadline_sec: o.deadline, execution, ...o.argvExtra }, o.env, revision ? {} : { fallback: o.conductor })
+  } catch (e) {
+    if (revision && e instanceof SddError && e.code === 'launch_failed') return { id, dir, launched: false }
+    throw e
+  }
   return { id, dir, launched: true }
 }
 
@@ -1282,6 +1293,15 @@ async function reviewRoundArtifact(o: {
   if (o.head !== undefined) {
     throw new SddError('usage', 'una ronda de artefacto no acepta --head: el artefacto se revisa desde el árbol')
   }
+  const flow = req.flow ?? /^\.plans\/([^/]+)\/(?:spec|plan|tasks)\.md$/.exec(sel.artifact)?.[1]
+  if (flow) {
+    try { withFlowLock(root, flow, () => {
+      recoverRevisionPublication(root, flow)
+      if (pendingIntent(readPhaseRecord(root, flow, true))) throw new Error('la intención sigue pendiente')
+    }) } catch (e) {
+      throw new SddError('revision_pending', 'no se pudo aclarar la publicación de una corrección antes de la ronda', { detail: (e as Error).message })
+    }
+  }
   const ledgerFile = join(dir, 'ledger.json')
   const ledger = existsSync(ledgerFile) ? readJson<Ledger>(ledgerFile) : undefined
   const completed = ledger?.completed ?? 0
@@ -1326,18 +1346,20 @@ async function reviewRoundArtifact(o: {
   const resolved = readJson<Resolution>(join(dir, 'resolved.json'))
   const path = candidate.files[0].path
   let plan: RoundPlan | undefined
+  let correctionProvenance: ReturnType<typeof roundRevisionProvenance> | undefined
   let jobsPlanned: PlannedJob[]
   try {
     if (ledger) {
       const before = readFileSync(join(dir, 'blobs', prev.files[0].sha256 ?? '')).toString('utf8')
       const after = bytes.get(path)?.toString('utf8') ?? ''
+      if (flow) correctionProvenance = withFlowLock(root, flow, () => roundRevisionProvenance(root, flow, id, completed, before, after, resolved.family))
       const delta = identical ? { added: [], removed: [] } : artifactDelta(before, after)
       plan = { n, prev_hash: prev.hash, identical, targets: goals, changed: delta.added.length > 0 ? { [path]: delta.added } : {}, removed: delta.removed }
       const material = renderArtifactMaterial(candidate, bytes)
-      const text = renderArtifactRoundPrompt(candidate, material, plan, ledger.entries, ROUND_CAP, before, after)
+      const text = renderArtifactRoundPrompt(candidate, material, plan, ledger.entries, ROUND_CAP, before, after, correctionProvenance)
       if (!fits(text)) {
         // Sin los pendientes: si así entra, lo que no entra son ellos, y la corrida queda como estaba.
-        if (fits(renderArtifactRoundPrompt(candidate, material, { ...plan, targets: [] }, ledger.entries, ROUND_CAP, before, after))) {
+        if (fits(renderArtifactRoundPrompt(candidate, material, { ...plan, targets: [] }, ledger.entries, ROUND_CAP, before, after, correctionProvenance))) {
           throw new SddError('prompt_too_large', 'los hallazgos pendientes no entran en el presupuesto', {
             detail: `${Buffer.byteLength(text)} bytes con los pendientes`,
             next: 'review no puede verificar esos pendientes en un solo prompt: pregunta al usuario cómo seguir',
@@ -1372,14 +1394,14 @@ async function reviewRoundArtifact(o: {
   writeJsonAtomic(join(dir, `candidate${tag}.json`), candidate)
   writeFileSync(join(dir, `material${tag}.md`), renderArtifactMaterial(candidate, bytes))
   const jobs = writeJobs(dir, `${tag}-l${k}`, toRun)
-  if (plan) writeJsonAtomic(join(dir, `round${tag}.json`), plan)
+  if (plan) writeJsonAtomic(join(dir, `round${tag}.json`), { ...plan, ...(correctionProvenance ? { correction_provenance: correctionProvenance } : {}) })
   writeJsonAtomic(join(dir, 'status.json'), { state: 'launching', round: n, launch: k })
   rmSync(join(dir, 'cancel.request'), { force: true })
   launchSupervisor(dir, {
     family: resolved.family, deadline_sec: req.overrides?.deadline_sec ?? 1800, kind: 'review',
     candidate: join(dir, `candidate${tag}.json`), round: n, tag, ...(plan ? { plan: join(dir, `round${tag}.json`) } : {}), launch_n: k,
     reviewer_resolution: resolved, jobs, kept, extra: o.extra,
-    execution: reviewExecution(root, id, req, resolved),
+    execution: reviewExecution(root, id, req, resolved), ...(correctionProvenance ? { correction_provenance: correctionProvenance } : {}),
   }, o.env, { round: n, launch: k }, `argv${tag}-l${k}.json`)
   return {
     code: 0,
@@ -1625,7 +1647,16 @@ function phaseView(root: string, id: string, dir: string, s: Status, req: PhaseR
   }
   const warnings = profileWarnings(s)
   if (warnings.length > 0) out.warnings = warnings
-  if (s.state === 'launch_failed' && s.fallback) {
+  if (req.revision) {
+    const entry = readPhaseRecord(root, req.flow, true).revisions?.entries.find((e) => e.run === id)
+    if (entry) {
+      const view = revisionView(root, entry)
+      Object.assign(out, { revision: view, ...(view.terminal_superseded ? { terminal_superseded: view.terminal_superseded } : {}) })
+      if (entry.result) out.outcome = entry.result.state
+      if (view.registry_pending) { out.registry_pending = true; out.detail = view.detail }
+    }
+    out.next = flowNext(root, req.flow)
+  } else if (s.state === 'launch_failed' && s.fallback) {
     out.fallback = s.fallback
     out.next = phaseFallbackNext(req, s.fallback)
   } else {
@@ -1675,21 +1706,38 @@ async function wait(args: string[], env: Env, cwd: string): Promise<Result> {
   if (isWriterRun(root, id)) return waitWriter(root, id, max, env)
   if (ownReservation(root, 'writer', id)) return releaseOrphan(root, id)
   const dir = runDir(root, id)
+  const correctionRequest = readJson<PhaseRequest | ReviewRequest>(join(dir, 'request.json'))
+  const correction = correctionRequest.kind === 'phase' && correctionRequest.revision ? correctionRequest : undefined
   const until = Date.now() + max * 1000
   for (;;) {
     const observed = withGitQueryScope('iteration', (): Result | undefined => {
     let s = readStatus(dir)
+    if (correction) {
+      try { withFlowLock(root, correction.flow, () => recoverRevisionResult(root, correction.flow)) } catch {
+        if (TERMINAL.has(s.state)) {
+          const result = phaseView(root, id, dir, s, correction)
+          if (typeof result.out === 'object' && result.out !== null) result.out = { ...result.out, registry_pending: true }
+          return result
+        }
+      }
+      s = readStatus(dir)
+    }
     if (TERMINAL.has(s.state)) return report(root, id, dir, s, env)
     const supervisorPid = s.supervisor_pid ?? readSupervisorPid(dir)
     if (supervisorPid !== undefined && !isAlive(supervisorPid)) {
       // El supervisor pudo escribir el estado final justo antes de terminar.
       s = readStatus(dir)
       if (TERMINAL.has(s.state)) return report(root, id, dir, s, env)
+      if (correction) return { code: 1, out: { id, state: 'orphan', flow: correction.flow, next: `./bin/sdd-ai cancel ${id}` } }
       s = setStatus(dir, { state: 'failed', reason: 'supervisor_lost', detail: `el supervisor ${supervisorPid} terminó sin escribir un estado final` })
       return report(root, id, dir, s, env)
     }
     if (Date.now() >= until) {
       const out: Record<string, unknown> = { id, state: s.state }
+      if (correction) {
+        const entry = readPhaseRecord(root, correction.flow, true).revisions?.entries.find((e) => e.run === id)
+        if (entry) out.revision = revisionView(root, entry)
+      }
       // Una revisión en curso dice su nivel, qué ronda, qué revisores y lotes, y qué trabajo va de cuántos.
       const request = join(dir, 'request.json')
       const req = existsSync(request) ? readJson<ReviewRequest>(request) : undefined
@@ -1732,6 +1780,18 @@ async function cancel(args: string[], cwd: string): Promise<Result> {
   if (ownReservation(root, 'writer', id)) return releaseOrphan(root, id)
   if (values['writer-gone']) throw new SddError('usage', '--writer-gone solo se usa con la corrida de un writer')
   const dir = runDir(root, id)
+  const req = readJson<PhaseRequest | ReviewRequest>(join(dir, 'request.json'))
+  if (req.kind === 'phase' && req.revision) {
+    withFlowLock(root, req.flow, () => recoverRevisionResult(root, req.flow))
+    const status = readStatus(dir)
+    const pid = status.supervisor_pid ?? readSupervisorPid(dir)
+    if (!TERMINAL.has(status.state) && (pid === undefined || !isAlive(pid))) {
+      setStatus(dir, { state: 'cancelled', ended_at: new Date().toISOString() })
+      withFlowLock(root, req.flow, () => recoverRevisionResult(root, req.flow))
+      return phaseView(root, id, dir, readStatus(dir), req)
+    }
+    if (TERMINAL.has(status.state)) return phaseView(root, id, dir, status, req)
+  }
   if (existsSync(join(dir, 'native.json')) && cancelNative(dir)) return { code: 0, out: { id, state: 'cancelled' } }
   const s = readStatus(dir)
   if (TERMINAL.has(s.state)) return { code: 0, out: { id, state: s.state } }
@@ -2236,6 +2296,7 @@ function flowNext(root: string, flow: string): Record<string, unknown> {
 interface PhaseRequest {
   kind: 'phase'; flow: string; step: PhaseStep; amended: boolean; role: string; conductor: Conductor; session?: string
   request_file?: string; context_file?: string
+  revision?: true
   overrides: { families?: string; deadline_sec: number }
 }
 
@@ -2285,6 +2346,10 @@ async function phaseImplement(p: ImplementPhase): Promise<Result> {
 
 async function chainLaunch(p: ImplementPhase): Promise<Result> {
   const { root, id, read } = p
+  recoverRevisionResult(root, id)
+  const record = readPhaseRecord(root, id, true)
+  const revision = record.revisions?.active ?? pendingIntent(record)
+  if (revision) throw new SddError('revision_running', `la corrección de ${revision.artifact} sigue activa`, { next: `./bin/sdd-ai wait ${revision.run}` })
   let view = chainView(root, id, read)
   // Un writer anterior a las cadenas queda en el registro como una cadena cerrada: su cosecha no es padre.
   if (view.legacy && view.state.chain?.terminal) {
@@ -2671,12 +2736,93 @@ function flowBytes(root: string, read: FlowRead, name: 'spec' | 'plan' | 'tasks'
  * spec y la gramática de las tasks. La comprobación del registro, la corrida y el alta de la corrida en
  * el registro van juntas bajo el lock del flujo: dos invocaciones a la vez no pueden lanzar las dos.
  */
+async function phaseRevision(o: {
+  root: string; env: Env; id: string; artifact: RevisionArtifact; review?: string; context?: string; decisions?: string
+  new_session: boolean; deadline: number; conductor: Conductor
+}): Promise<Result> {
+  const { root, id, artifact, env } = o
+  const step = artifact === 'spec' ? 'specify' : artifact
+  const path = `.plans/${id}/${artifact}.md`
+  const initial = readPhaseRecord(root, id, true)
+  const latest = initial.revisions?.entries.findLast((e) => e.artifact === path)
+  const awaiting = latest?.state === 'awaiting_context' ? latest : undefined
+  if (o.context !== undefined && !awaiting) throw new SddError('context_not_expected', 'el artefacto no tiene una corrección esperando contexto')
+  if (o.context !== undefined && o.review !== undefined && o.review !== awaiting!.review) throw new SddError('review_mismatch', '--review no coincide con la corrección que espera contexto')
+  const review = o.context !== undefined ? awaiting!.review : o.review
+  if (!review) throw phaseUsage('una devolución nueva requiere --review <review-id>')
+  const started = withRevisionLocks(root, id, review, () => {
+    recoverRevisionResult(root, id)
+    const record = readPhaseRecord(root, id, true)
+    const history = record.revisions?.entries.filter((e) => e.artifact === path) ?? []
+    let parent = history.at(-1)
+    if (o.context !== undefined && (!parent || parent.state !== 'awaiting_context' || parent.run !== awaiting!.run)) {
+      throw new SddError('context_not_expected', 'la corrección que esperaba contexto ya fue reemplazada')
+    }
+    const producer = resolveDocumentProducer(root, id, step, env)
+    const v = validateRevision(root, id, artifact, review, producer, o.decisions)
+    if (o.context !== undefined) {
+      if (!parent) throw new SddError('context_not_expected', 'la corrección que esperaba contexto ya fue reemplazada')
+      if (parent.ledger_digest !== v.ledger_digest || parent.candidate !== v.candidate.hash || parent.round !== v.round) throw new SddError('review_changed', 'la revisión o sus decisiones cambiaron desde el pedido de contexto')
+      if (parent.conductor && o.decisions === undefined) {
+        if (!parent.conductor.copy) throw new SddError('material_missing', 'no está la copia congelada del aporte del conductor')
+        const bytes = readMaterial(root, parent.conductor.copy, 'la copia congelada del aporte del conductor', true).bytes
+        if (bytesHash(bytes) !== parent.conductor.digest) throw new SddError('material_missing', 'la copia del aporte no conserva su huella')
+        v.decisions = { ref: parent.conductor, bytes }
+      }
+      if (o.decisions !== undefined && v.decisions?.ref.digest !== parent.conductor?.digest) throw new SddError('review_changed', 'una continuación conserva el aporte del conductor registrado')
+    }
+    const proof = authorizeNewSession(v, producer, o.new_session, record.revisions?.entries ?? [], env, o.conductor.family)
+    const context = o.context === undefined ? undefined : readMaterial(root, o.context, 'las respuestas o el contexto de la corrección', true)
+    const session = proof ? prepareNewDocumentSession(producer, 'prompt.md', 'result.md')
+      : prepareDocumentResume(producer, 'prompt.md', 'result.md', false)
+    const material = freezeRevisionMaterial(root, v, producer, session, history, context)
+    const frozen: NonNullable<ArgvFile['phase']> = {
+      root, flow: id, step, depth: v.depth, amended: false, findings: true,
+      inputs: Object.fromEntries(v.candidate.context.filter((x) => x.role).map((x) => [x.role!, `sha256:${x.sha256}`])),
+      handoff_header: v.handoff_header, criteria: v.criteria, ...(producer.origin.task_actors ? { task_actors: true } : {}),
+      revision: { review, round: v.round, artifact, document_digest: bytesHash(v.document), ledger_digest: v.ledger_digest,
+        candidate: v.candidate.hash, step_at_launch: v.step_at_launch, ...(o.context !== undefined ? { continuation: true } : {}) },
+    }
+    const profile = readJson<Resolution>(join(root, '.sdd-ai', 'runs', producer.origin.run, 'resolved.json'))
+    const resolution: Resolution = { ...profile, family: producer.family, via: 'process' }
+    const s = startProcessRun({ root, env, resolution, prompt: material.prompt, deadline: o.deadline, conductor: o.conductor,
+      request: { kind: 'phase', flow: id, step, role: step, amended: false, revision: true, conductor: o.conductor,
+        overrides: { deadline_sec: o.deadline } }, files: { ...material.files, 'inputs.json': `${JSON.stringify(frozen, null, 2)}\n` },
+      argvExtra: { kind: 'phase', phase: frozen },
+      launchFor: (dir) => ({ ...session.launch, stdinFile: join(dir, 'prompt.md'),
+        args: producer.family === 'codex' ? withResultFile(session.launch.args, join(dir, 'result.md')) : session.launch.args }),
+    })
+    const argv = readJson<ArgvFile>(join(s.dir, 'argv.json'))
+    const refs = material.refs.map((ref) => ({ ...ref, copy: `.sdd-ai/runs/${s.id}/${ref.copy}` }))
+    const entry: RevisionEntry = { run: s.id, origin_run: producer.origin.run, parent_run: parent?.run ?? null,
+      phase: step, artifact: path, family: producer.family, session_mode: session.mode,
+      ...(session.mode === 'same' && session.session_id ? { session_id: session.session_id } : {}),
+      ...(producer.family === 'claude' ? { session_id: argv.launch!.args[argv.launch!.args.findIndex((a) => a === '--session-id' || a === '--resume') + 1] } : {}),
+      launch: session.mode === 'new' ? argv.launch! : producer.launch, review, round: v.round, candidate: v.candidate.hash,
+      ledger_digest: v.ledger_digest, accepted: v.accepted, decisions: v.ledger.entries as unknown as Record<string, unknown>[],
+      history: history as unknown as Record<string, unknown>[], materials: refs, at: new Date().toISOString(), state: 'active',
+      ...(v.decisions ? { conductor: { ...v.decisions.ref, copy: `.sdd-ai/runs/${s.id}/decisions.md` } } : {}),
+      ...(proof ? { authorization: proof } : {}), ...(o.context !== undefined ? { continuation: true } : {}),
+    }
+    const previous = record.revisions ?? { entries: [], barriers: [] }
+    writePhaseRecord(root, id, { ...record, documents: { ...record.documents, [step]: producer.origin }, revisions: { ...previous,
+      entries: [...previous.entries.map((e) => e.artifact === path && e.state === 'awaiting_context'
+        && (o.context === undefined || e.run === parent?.run) ? { ...e, state: 'superseded' as const } : e), entry],
+      active: { run: s.id, artifact: path },
+    } })
+    return { ...s, family: producer.family }
+  })
+  return { code: started.launched ? 0 : 1, out: { id: started.id, flow: id, step, revision: true, family: started.family,
+    state: started.launched ? 'active' : 'launch_failed', next: `./bin/sdd-ai wait ${started.id}` } }
+}
+
 async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> {
   const { values, positionals } = parseArgs({
     args, strict: true, allowPositionals: true,
     options: {
       request: { type: 'string' }, context: { type: 'string' }, families: { type: 'string' }, conductor: { type: 'string' }, deadline: { type: 'string' },
       classes: { type: 'string' }, blocks: { type: 'boolean' },
+      revise: { type: 'string' }, review: { type: 'string' }, decisions: { type: 'string' }, 'new-session': { type: 'boolean' },
     },
   })
   if (positionals.length !== 1) {
@@ -2689,6 +2835,18 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   if (!Number.isFinite(deadline) || deadline <= 0) throw new SddError('usage', `--deadline inválido: ${deadlineArg}`)
 
   const root = repoRoot(cwd)
+  if (values.revise !== undefined) {
+    if (values.request !== undefined || values.classes !== undefined || values.blocks !== undefined || values.families !== undefined) throw phaseUsage('--revise no se combina con --request, --classes, --blocks ni --families')
+    if (!['spec', 'plan', 'tasks'].includes(values.revise)) throw phaseUsage('--revise solo admite spec, plan o tasks')
+    return phaseRevision({ root, env, id, artifact: values.revise as RevisionArtifact, review: values.review,
+      context: values.context, decisions: values.decisions, new_session: values['new-session'] === true, deadline,
+      conductor: detectConductor(env, { conductor: values.conductor }) })
+  }
+  if (values.review !== undefined || values.decisions !== undefined || values['new-session'] !== undefined) throw phaseUsage('--review, --decisions y --new-session requieren --revise')
+  withFlowLock(root, id, () => recoverRevisionResult(root, id))
+  const record = readPhaseRecord(root, id, true)
+  const running = activeRun(root, record, true)
+  if (running) throw new SddError(record.revisions?.active?.run === running ? 'revision_running' : 'phase_running', record.revisions?.active?.run === running ? `la corrección de ${record.revisions.active.artifact} sigue activa` : `el flujo ${id} tiene una corrida de fase activa: ${running}`, { next: `./bin/sdd-ai wait ${running}` })
   const read = readFlow(root, id, loadJiraMode(root))
   const status = resolveFlow(read.facts)
   if (status.depth === 'corta') {
@@ -2706,9 +2864,6 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     })
   }
   const depth = status.depth
-  const record = readPhaseRecord(root, id)
-  const running = activeRun(root, record)
-  if (running) throw new SddError('phase_running', `el flujo ${id} tiene una corrida de fase activa: ${running}`, { next: `./bin/sdd-ai wait ${running}` })
   const conductor = detectConductor(env, { conductor: values.conductor })
   if (step === 'implement' || chainStep) {
     if (values.request !== undefined || values.context !== undefined) throw phaseUsage('--request y --context no se usan en implement')
@@ -2797,6 +2952,9 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     overrides: { families: values.families, deadline_sec: deadline },
   }
   const files: Record<string, string | Buffer> = { 'inputs.json': `${JSON.stringify(launch, null, 2)}\n` }
+  for (const name of PHASE_INPUTS[doc]) {
+    if (inputs[name] !== undefined) files[`${name}.md`] = inputs[name]!
+  }
   if (requestFile) files['request.md'] = requestFile.bytes
   if (context) files['context.md'] = context.bytes
   const prompt = renderPhasePrompt(doc, { id, depth, step: doc }, inputs, engine?.context)
@@ -2808,7 +2966,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     }
     const rec = readPhaseRecord(root, id)
     const busy = activeRun(root, rec)
-    if (busy) throw new SddError('phase_running', `el flujo ${id} tiene una corrida de fase activa: ${busy}`, { next: `./bin/sdd-ai wait ${busy}` })
+    if (busy) throw new SddError(rec.revisions?.active?.run === busy ? 'revision_running' : 'phase_running', rec.revisions?.active?.run === busy ? `la corrección de ${rec.revisions.active.artifact} sigue activa` : `el flujo ${id} tiene una corrida de fase activa: ${busy}`, { next: `./bin/sdd-ai wait ${busy}` })
     if (JSON.stringify(rec.phases[doc] ?? null) !== JSON.stringify(entry ?? null)) {
       throw new SddError('flow_busy', `el registro de la fase ${doc} cambió mientras se lanzaba`, { next: `./bin/sdd-ai sdd status ${id}` })
     }
@@ -2853,6 +3011,10 @@ async function sdd(args: string[], env: Env, cwd: string, deps?: { approve?: App
     const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { conductor: { type: 'string' } } })
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
     const root = repoRoot(cwd)
+    withFlowLock(root, positionals[0], () => {
+      recoverRevisionResult(root, positionals[0])
+      assertNoActivity(root, positionals[0])
+    })
     try {
       const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor), deps?.approve)
       const { facts } = readFlow(root, status.id)

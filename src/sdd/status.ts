@@ -1,6 +1,7 @@
 import type { Proof } from '../approval/proof.ts'
 import type { JiraMode } from '../config.ts'
 import type { HeaderResult, SectionState, TaskCount, TaskResponsibilities, TaskAssignment } from './markdown.ts'
+import type { RevisionBarrier, RevisionIntent } from './revision-record.ts'
 
 // El estado de un flujo SDD como función pura de sus hechos: no lee el disco, no mira el reloj y no
 // escribe. Por eso este módulo solo importa tipos.
@@ -26,6 +27,7 @@ export type FileState = 'absent' | 'empty' | 'present' | 'unreadable'
 export interface Approval { gate: GateId; depth: Depth; fingerprint: string; previous: Partial<Record<GateId, string>>; at: string; proof?: Proof }
 export type ApprovalLog = { state: 'absent' } | { state: 'invalid'; detail: string } | { state: 'ok'; approvals: Approval[] }
 export interface FlowFacts {
+  revisions?: { barriers: RevisionBarrier[]; pending?: RevisionIntent; invalid?: string }
   id: string
   files: Record<'spec' | 'plan' | 'tasks' | 'handoff', FileState>
   /** `null` sin un plan presente. */
@@ -138,6 +140,8 @@ function isFresh(a: Approval, fingerprints: FlowFacts['fingerprints']): boolean 
 export function resolveGates(facts: FlowFacts): GateResolution {
   const blocked: Reason[] = []
   const notes: Reason[] = []
+  if (facts.revisions?.invalid) blocked.push({ code: 'revisions_invalid', detail: facts.revisions.invalid })
+  if (facts.revisions?.pending) blocked.push({ code: 'revision_pending', detail: `la publicación de la corrección ${facts.revisions.pending.run} está pendiente de finalizar; consulta ./bin/sdd-ai wait ${facts.revisions.pending.run}` })
   for (const { row, paths } of facts.revertPathsNotInBase ?? []) {
     blocked.push({ code: 'revert_path_not_in_base', detail: `la fila ${row} revierte ${paths.join(', ')}, que no existe en base_commit: verify no puede confirmarla; pon en implementation_paths un archivo de la base que conecte lo nuevo` })
   }
@@ -168,6 +172,7 @@ export function resolveGates(facts: FlowFacts): GateResolution {
   const status = planStatus(facts, depth)
   const gates = GATES[depth].map((gate): GateView => {
     const byHeader = headerAccredits(facts, gate, status)
+    const barred = facts.revisions?.invalid !== undefined || facts.revisions?.barriers.some((b) => b.gates.includes(gate)) === true
     const last = approvals.findLast((a) => a.gate === gate)
     let state: GateState
     if (last) {
@@ -181,6 +186,11 @@ export function resolveGates(facts: FlowFacts): GateResolution {
       if (state === 'stale' && byHeader) {
         notes.push({ code: 'header_ahead', detail: `el header de sdd-flow da por aprobado el gate ${gate}, pero su aprobación registrada venció: sdd-flow retomaría más adelante de lo que el registro sostiene` })
       }
+    } else if (byHeader && barred) {
+      state = 'stale'
+      const header = gate === 'spec' && headerData(facts.handoffHeader)?.spec_approved_at != null
+        ? 'handoff.md: spec_approved_at' : 'plan.md: status'
+      notes.push({ code: 'header_ahead', detail: `${header} todavía acredita el gate ${gate}, pero una corrección publicada exige la aprobación humana de las huellas vigentes` })
     } else if (byHeader && (escalatedFrom === null || GATES[escalatedFrom].includes(gate))) {
       // Un gate aprobado cuyo artefacto quedó vacío vence; si lo que falta son las tasks, lo dice tasks_empty.
       state = missingParts(facts, gate).some((p) => p.step !== 'tasks') ? 'stale' : 'approved_unfingerprinted'
