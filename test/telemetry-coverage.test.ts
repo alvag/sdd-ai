@@ -1,9 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { setup, firstRound, grave, startAndWait } from './rounds-cli-fixture.ts'
-import { metrics, preference, runAttempt, telemetryFixture, telemetryLines } from './telemetry-fixture.ts'
+import { metrics, preference, runAttempt, telemetryFixture, telemetryLines, prepareAttempt, launchAttempt } from './telemetry-fixture.ts'
+import { awaitObservation, ownProcesses, withOwned } from './scenario-readiness.ts'
 import { chainSetup, runBin } from './helpers.ts'
 import { storeOf, promptFile } from './chain-cli-fixture.ts'
 
@@ -11,6 +12,9 @@ test('every recorded attempt uses its own role and requested profile', async () 
   const s = setup(['invalid',firstRound([{ ...grave,evidence: 'inferential' }]),'invalid',
     '{"candidate_hash":"$HASH","results":[{"id":"F-1","result":"corroborated","evidence":"a.txt:5"}]}'])
   const f = telemetryFixture(s.repo)
+  const owned = ownProcesses()
+  owned.directory(f.home)
+  await withOwned(owned, async () => {
   try {
     preference(f,'telemetry: on\n'); s.env.HOME=f.home; delete s.env.SDD_AI_TELEMETRY
     const id = startAndWait(s)
@@ -27,9 +31,42 @@ test('every recorded attempt uses its own role and requested profile', async () 
     }
     for (const field of ['model','effort']) {
       const args = field === 'model' ? ['exec','-m','requested-model'] : ['exec','-c','model_reasoning_effort=high']
-      const r = await runAttempt(f,{ deadline_sec: 1 },'telemetry-script',args,{ FAKE_TELEMETRY_SCRIPT: JSON.stringify([{ reject: field },{ usage: { input_tokens: 2 },hang: true },{ usage: { input_tokens: 4 } }]) })
+      const r = prepareAttempt(f, { deadline_sec: 10 }, args)
+      const barriers = [0, 1, 2].map((i) => join(r.dir, `attempt-${i}`))
+      const launched = launchAttempt(f, r, 'telemetry-script', { FAKE_TELEMETRY_SCRIPT: JSON.stringify([
+        { reject: field, barrier: barriers[0] }, { usage: { input_tokens: 2 }, hang: true, barrier: barriers[1] },
+        { usage: { input_tokens: 4 }, barrier: barriers[2] },
+      ]) }, owned)
+      for (const [i, barrier] of barriers.entries()) {
+        await awaitObservation(`intento guionado ${i} de ${field}`, () => {
+          const ready = existsSync(`${barrier}.ready`)
+          const status = join(r.dir, 'status.json')
+          const pid = existsSync(status) ? JSON.parse(readFileSync(status, 'utf8')).worker_pid : undefined
+          if (ready && pid) owned.add(pid)
+          const prior = existsSync(join(r.dir, 'metrics.json')) ? metrics(r.dir) : []
+          const value = ready && pid && (i === 0 || prior.length === i) ? true : undefined
+          return { value, detail: { ready, pid, prior: prior.map((a) => ({ kind: a.kind, outcome: a.outcome })) } }
+        })
+        if (i === 1) assert.equal(metrics(r.dir)[0].outcome, 'launch_failed', 'se observó el rechazo inicial')
+        writeFileSync(barrier, '')
+        if (i === 1) {
+          await awaitObservation('sesión abierta del segundo intento antes del vencimiento', () => {
+            const stdout = join(r.dir, 'stdout-2.log')
+            const session = existsSync(stdout) && readFileSync(stdout, 'utf8').includes('thread.started')
+            const attempts = metrics(r.dir)
+            return { value: session && attempts.length === 1 ? true : undefined, detail: { session, attempts: attempts.map((a) => a.kind) } }
+          })
+        }
+        if (i === 2) assert.equal(metrics(r.dir)[1].outcome, 'timeout', 'se observó el vencimiento del segundo intento')
+      }
+      const result = await launched.done
+      assert.equal(result.code, 0, result.stderr)
       const lines = telemetryLines(f.home).filter((l) => l.run === r.id).sort((a,b) => a.attempt-b.attempt)
       assert.equal(lines.length,metrics(r.dir).length); assert.equal(lines.length,3)
+      for (const [i, attempt] of metrics(r.dir).entries()) {
+        assert.equal(lines[i].attempt, i)
+        assert.equal(lines[i].attempt_kind, attempt.kind)
+      }
       assert.equal(lines[0][`${field}_requested`],field === 'model' ? 'requested-model' : 'high')
       assert.equal(lines[1][`${field}_requested`],null); assert.equal(lines[1].attempt_kind,'profile_retry')
       assert.equal(lines[2][`${field}_requested`],null); assert.equal(lines[2].attempt_kind,'resume')
@@ -55,5 +92,6 @@ test('every recorded attempt uses its own role and requested profile', async () 
     const wlines = telemetryLines(f.home).filter((l) => l.run === w.out.id)
     assert.equal(wlines.length,metrics(storeOf(writer,w.out.id)).length)
     for (const l of wlines) assert.deepEqual([l.role,l.family,l.flow,l.step],['implement','codex',null,null])
-  } finally { f.dispose() }
+  } finally { owned.completion(() => f.dispose()) }
+  })
 })
