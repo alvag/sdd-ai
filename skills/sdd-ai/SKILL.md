@@ -420,9 +420,24 @@ Cada hallazgo `abierto` (los de `pending`) espera tu decisión:
 ./bin/sdd-ai review decide <id> reject <F-n>... --reason "<motivo>"
 ```
 
-- `accept` si lo vas a corregir.
-- `reject` si no, con un motivo que el revisor pueda verificar en el código ("la línea 12 ya valida
-  el caso vacío"), no una opinión. El revisor va a responder ese motivo.
+Antes de aceptar una corrección, contrástala con el pedido o los AC aprobados: lo que el pedido o un
+AC no sostiene no es exigencia. Las decisiones ya aprobadas en el plan y las tasks siguen siendo vinculantes.
+
+- `accept` y corrige los hallazgos sustentados por el pedido o un AC y los defectos o riesgos
+  concretos que introduce el propio cambio, dentro del alcance autorizado.
+- `reject` las ampliaciones y las decisiones que ni el pedido ni los AC sostienen: «falta decidir»
+  no equivale a «falta exigir». Usa el motivo literal «fuera de lo pedido» y explica qué pedido o AC
+  no sostiene esa exigencia, de forma comprobable contra esos insumos.
+- `reject` si no lo vas a corregir, con un motivo que el revisor pueda verificar en el código
+  ("la línea 12 ya valida el caso vacío") o en el pedido y los AC aprobados, no una opinión.
+  El revisor va a responder ese motivo.
+- Solo si propones incorporar una ampliación como conductor, consulta a Max ofreciendo excluirla
+  o diferirla y espera su respuesta antes de incorporarla.
+- Un defecto o riesgo sustentado fuera de alcance que no impide cumplir un AC se rechaza en el ledger
+  con «fuera de lo pedido» y se registra en el registro transversal. Si impide cumplir un AC, conserva
+  su tratamiento bloqueante: registra el hallazgo, declara el AC afectado, detén su avance y pide una
+  decisión humana de alcance o continuidad. Registrar o aceptar un hallazgo no autoriza ampliar el
+  alcance ni sustituye los gates humanos de spec y plan-tasks.
 - Una decisión se puede cambiar hasta que lances la ronda siguiente.
 - Lo grave que ya estaba antes del cambio queda `fuera-de-alcance`: no se decide y no hace fallar
   ningún eje.

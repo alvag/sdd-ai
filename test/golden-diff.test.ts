@@ -3,20 +3,25 @@ import assert from 'node:assert/strict'
 import { cpSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { freeze, readContext } from '../src/review/candidate.ts'
-import { renderReviewPrompt } from '../src/review/prompt.ts'
+import { SCOPE_DISCIPLINE, renderReviewPrompt } from '../src/review/prompt.ts'
 import { WORKER_POLICY } from '../src/worker-policy.ts'
 import { GOLDEN_DIR, RELAUNCH_ANSWERS, cli, goldenRepo, reviewEnv, roundTwo } from './fixtures/golden-diff/capture.ts'
 
 const golden = (name: string) => readFileSync(join(GOLDEN_DIR, name), 'utf8')
 /** El prompt de revisión de 4a95927 con la política del delegado delante de «## Acceso», donde la pone `access`. */
 const withPolicy = (prompt: string) => prompt.replace('## Acceso\n', `${WORKER_POLICY}\n\n## Acceso\n`)
+/** Adaptación explícita de las instrucciones; conserva los bytes del material del golden. */
+const withScopeDiscipline = (prompt: string) => withPolicy(prompt)
+  .replace('## Qué revisar, en este orden\n', `${SCOPE_DISCIPLINE}\n\n## Qué revisar, en este orden\n`)
+  .replace('## Qué hacer\n', `${SCOPE_DISCIPLINE}\n\n## Qué hacer\n`)
+  .replace('Código que ningún criterio de aceptación pide,', 'Código que ni el pedido ni los AC sostienen,')
 
-test('el prompt de ronda 1, el de ronda N y el hash de un diff son los del golden de 4a95927 con la política del delegado', () => {
+test('el prompt de ronda 1, el de ronda N y el hash de un diff son los del golden de 4a95927 con la política del delegado y la pauta de alcance', () => {
   const { repo, base } = goldenRepo()
   const c = freeze(repo, { base, context: [] })
   assert.equal(`${c.hash}\n`, golden('hash.txt'))
-  assert.equal(renderReviewPrompt(c, readContext(repo, c)), withPolicy(golden('prompt-r1.md')))
-  assert.equal(roundTwo(repo, base, c.hash), withPolicy(golden('prompt-rN.md')))
+  assert.equal(renderReviewPrompt(c, readContext(repo, c)), withScopeDiscipline(golden('prompt-r1.md')))
+  assert.equal(roundTwo(repo, base, c.hash), withScopeDiscipline(golden('prompt-rN.md')))
 })
 
 // Con la política del delegado, los prompts de una revisión anterior a ella cambian de hash: relanzarla vuelve a lanzar

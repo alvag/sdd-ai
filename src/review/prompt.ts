@@ -6,6 +6,10 @@ import type { LedgerEntry, Reviewer, RoundPlan } from './ledger.ts'
 /** Tope del prompt de revisión. Un candidato que no entra se rechaza entero: truncarlo dejaría revisar una parte como si fuera todo. */
 export const REVIEW_PROMPT_BUDGET = 200 * 1024
 
+/** Pauta común para crear y revisar sin convertir recomendaciones en obligaciones. */
+export const SCOPE_DISCIPLINE: string = `## Disciplina de alcance
+Resuelve y revisa el mínimo necesario para cumplir el pedido y sus AC: lo que el pedido o un AC no sostiene no es exigencia. Las decisiones ya aprobadas en el plan y las tasks siguen siendo vinculantes. Distingue un incumplimiento de un borde especulativo o de una decisión no tomada: «falta decidir» no equivale a «falta exigir». Una ausencia no pedida no se convierte por sí sola en obligación. Conserva la revisión de defectos reales y seguridad necesaria con evidencia concreta, incluidos los defectos o riesgos concretos que introduce el propio cambio. Esta pauta no autoriza correcciones fuera de alcance.`
+
 /** Qué rutas pide `inspection.paths`: las del manifiesto, las del lote, o ninguna en un lote sin rutas. */
 function pathsSchema(lot?: string[]): string {
   if (lot === undefined) return '["<cada ruta cambiada del manifiesto, una vez>"]'
@@ -122,7 +126,7 @@ export function renderMaterial(c: Candidate, contextTexts: Map<string, string>, 
 }
 
 const BASE_REVIEW = `## Qué revisar, en este orden
-1. SCOPE — ¿sobra algo? Código que ningún criterio de aceptación pide, validaciones para casos que nadie pidió, abstracciones de un solo uso, comentarios que repiten lo que el código dice, mejoras o refactors de código que no estaba roto, defectos que ya estaban y se arreglaron de paso, y archivos tocados que el plan no nombra.
+1. SCOPE — ¿sobra algo? Código que ni el pedido ni los AC sostienen, validaciones para casos que nadie pidió, abstracciones de un solo uso, comentarios que repiten lo que el código dice, mejoras o refactors de código que no estaba roto, defectos que ya estaban y se arreglaron de paso, y archivos tocados que el plan no nombra.
 2. SPEC — ¿el diff cumple lo que pide el contexto (spec, plan, tareas)? Evalúalo contra el contexto que haya; si no hay contexto, no reportes hallazgos de SPEC.
 3. QUALITY — ¿sigue los patrones del código que ves, sin código muerto, placeholders ni deuda evidente?`
 
@@ -138,7 +142,7 @@ export const LENS_MANDATES: Record<Exclude<Reviewer, 'base'>, string> = {
 const lensReview = (lens: Exclude<Reviewer, 'base'>) => `## Qué revisar
 ${LENS_MANDATES[lens]}
 
-Clasifica cada hallazgo en el eje que le corresponda: \`scope\` si sobra algo que ningún criterio pide, \`spec\` si no cumple lo que pide el contexto, \`quality\` en cualquier otro caso.`
+Clasifica cada hallazgo en el eje que le corresponda: \`scope\` si sobra algo que ni el pedido ni los AC sostienen, \`spec\` si no cumple lo que pide el contexto, \`quality\` en cualquier otro caso.`
 
 /**
  * Prompt autosuficiente del revisor: reglas, esquema y todo el material congelado, sin nada que buscar
@@ -153,6 +157,8 @@ export function renderReviewPrompt(c: Candidate, contextTexts: Map<string, strin
   const instructions = `Eres un revisor de código aislado. Revisas un único candidato congelado: un diff y el contexto que lo acompaña.
 
 ${access(h)}
+
+${SCOPE_DISCIPLINE}
 
 ${reviewer === 'base' ? BASE_REVIEW : lensReview(reviewer)}
 
@@ -240,6 +246,8 @@ export function renderRoundPrompt(c: Candidate, material: string, plan: RoundPla
 
 ${access(h)}
 
+${SCOPE_DISCIPLINE}
+
 ## Qué hacer
 1. VERIFICAR — cada hallazgo de este bloque se aceptó y se corrigió. Contesta \`resolved\` si el candidato actual ya no lo tiene, o \`unresolved\` si sigue ahí.
 2. RESPONDER — cada hallazgo de este bloque se rechazó, con el motivo del conductor en \`reason\`. Contesta \`withdrawn\` si el motivo te convence, o \`maintained\` si el defecto sigue siendo real.
@@ -283,6 +291,8 @@ export function renderLensRoundPrompt(c: Candidate, material: string, plan: Roun
   const instructions = `Eres un revisor de código aislado. Esta es la ronda ${plan.n} de ${cap} de una revisión: la revisión tiene hasta ${cap} rondas. En una ronda anterior se emitieron hallazgos y el conductor corrigió el candidato. La corrección introdujo riesgo alto: revisas lo que cambió con tu lente.
 
 ${access(h)}
+
+${SCOPE_DISCIPLINE}
 
 ${lensReview(lens)}
 
