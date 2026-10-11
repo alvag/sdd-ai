@@ -3,6 +3,7 @@ import { parse, parseDocument, isMap as isYamlMap, isSeq, isScalar } from 'yaml'
 import { WORKER_POLICY } from '../worker-policy.ts'
 import { type Admission, Rejection, admitWith, extractObjects } from '../review/admit.ts'
 import { ARTIFACT_MANDATES } from '../review/artifact-prompt.ts'
+import { SCOPE_DISCIPLINE } from '../review/prompt.ts'
 import { WRITER_END_MARK, hasEndMark } from '../writer.ts'
 import { TASK_ACTORS, type TaskActor, countTasks, criteriaIds, proseProblems, taskLines, projectTaskBlocks } from './markdown.ts'
 import { type VerificationContract, admitVerification, renderVerification, roundTrips } from './verification-contract.ts'
@@ -81,7 +82,7 @@ Responde con un único objeto JSON con la clave \`"phase": "${step}"\` y exactam
 
 const TASK_OF: Record<PhaseStep, (f: FlowData) => string> = {
   specify: (f) => `Escribe la spec del flujo ${f.id}: el QUÉ y el por qué del INSUMO request, con criterios de aceptación verificables y sin detalles de implementación. Lee el código que haga falta para separar lo que se sabe de lo que supones.`,
-  plan: (f) => `Escribe el plan técnico del flujo ${f.id}: el CÓMO que cumple la spec del INSUMO spec. El enfoque es la solución más simple que cumple sus criterios; lo que vaya por encima se nombra en decisiones y trade-offs.`,
+  plan: (f) => `Escribe el plan técnico del flujo ${f.id}: el CÓMO que cumple la spec del INSUMO spec. El enfoque es la solución más simple que cumple sus criterios; las alternativas o trade-offs que el pedido o un AC no necesitan se nombran en decisiones y trade-offs sin convertirse en trabajo obligatorio.`,
   tasks: (f) => `Descompón en tasks el plan del flujo ${f.id} (INSUMOS spec y plan): tareas atómicas, ordenadas y autosuficientes, cada una de un solo actor. Los productos preceden a sus consumidores. Asigna cambios delegables al writer, comprobaciones con Claude y capacidades reservadas al conductor, y observaciones personales o decisiones humanas al user. Todas las tasks deben poder completarse antes de la verificación final. Excluye como tasks sdd verify final, la acreditación de sus filas y la aprobación de gates; conserva esas obligaciones en su momento vigente. Una observación previa de user no sustituye la prueba humana posterior.`,
   implement: (f) => `Implementa las tasks pendientes del flujo ${f.id} en esta corrida: ${(f.pending ?? []).join(', ')}. Sigue el plan y las tasks de los INSUMOS. Una task que no termines va con \`completion: pending\`; no marques las tasks, eso lo hace el conductor.`,
 }
@@ -173,6 +174,7 @@ export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: Froze
     `# Encargo de la fase ${step} del flujo ${flow.id}`,
     `Eres el worker de la fase ${step} de un flujo SDD en profundidad ${flow.depth}. ${TASK_OF[step](flow)}`,
     SOURCES,
+    SCOPE_DISCIPLINE,
     '## Insumos',
     ...PHASE_INPUTS[step].map((name) => block(`INSUMO ${name}`, step === 'implement' && name === 'tasks'
       ? projectTaskBlocks(inputs.tasks ?? '', flow.pending ?? []) : inputs[name] ?? '')),

@@ -1,18 +1,18 @@
 import type { ArtifactKind } from './artifact.ts'
 import type { Candidate } from './candidate.ts'
 import type { LedgerEntry, RoundPlan } from './ledger.ts'
-import { EVIDENCE_ONLY, access, block, previous } from './prompt.ts'
+import { EVIDENCE_ONLY, SCOPE_DISCIPLINE, access, block, previous } from './prompt.ts'
 
 const KIND_NAME: Record<ArtifactKind, string> = { spec: 'una spec', plan: 'un plan', tasks: 'unas tasks' }
 
 // Las dimensiones por tipo y los encargos de forma son los de la revisión de artefactos de sdd-flow.
-const SCOPE = `SCOPE — ¿sobra algo? Lo que el artefacto manda hacer y ningún criterio de arriba reclama: alcance, abstracciones de un solo uso, configurabilidad, validaciones y manejo de errores que nadie pidió, o comentarios que repiten lo que ya se dice.`
+const SCOPE = `SCOPE — ¿sobra algo? Lo que el artefacto manda hacer y ni el pedido ni los AC sostienen: alcance, abstracciones de un solo uso, configurabilidad, validaciones y manejo de errores que nadie pidió, o comentarios que repiten lo que ya se dice.`
 
 const SHAPE = `Y además, en QUALITY:
-- Dry run: no lo revises, ejecútalo. Empieza a hacer lo que el artefacto ordena y reporta dónde te trabas por algo que no decidió.
+- Dry run: no lo revises, ejecútalo. Empieza a hacer lo que el artefacto ordena y reporta dónde te trabas por una decisión que el pedido o un AC necesitan para ejecutar el encargo.
 - Implementación más floja: ¿cuál es la implementación más floja que satisface todo lo que pide y no resuelve el problema? Nómbrala concretamente.
 - Malentendido de buena fe: ¿qué malentendería quien lo ejecute de buena fe, sin haber estado en la conversación que lo produjo?
-- Ausencia no pedida: ¿qué falta que nadie pidió? Despliegue, migración, interacción con lo que ya existe.`
+- Ausencia no pedida: revisa despliegue, migración o interacción con lo que ya existe solo cuando sean necesarios para cumplir el pedido o un AC; su ausencia por sí sola no es una exigencia.`
 
 // Lo que el revisor no puede comprobar con el material no se da por bueno ni por falso: se declara.
 const CODE_CLAIMS = `- Una afirmación sobre el código (una ruta, una función, un comportamiento) se comprueba solo contra los bloques CONTEXTO. Si lo que viajó no alcanza para comprobarla —porque ese código no está, o está solo una parte, como una función sin sus llamadores—, no la des por buena ni por falsa: decláralo en \`unverifiable\` con su línea del artefacto.`
@@ -24,9 +24,9 @@ export const ARTIFACT_MANDATES: Record<ArtifactKind, { spec: string; quality: st
 - Cobertura del objetivo: cada resultado declarado tiene al menos un AC.
 - Observabilidad: cada AC tiene un resultado distinguible de su negación.
 - Consistencia de alcance: ningún AC exige algo excluido ni contradice a otro.
-- Bordes del dominio: las precondiciones, los límites y los fallos tienen un comportamiento decidido.
+- Bordes del dominio: las precondiciones, los límites y los fallos tienen un comportamiento decidido cuando son necesarios para cumplir el pedido o un AC.
 - Autoridad y actores: cada decisión o escritura tiene responsable y gate.
-- Adopción: los estados preexistentes o las corridas vivas tienen un resultado definido.`,
+- Adopción: los estados preexistentes o las corridas vivas tienen un resultado definido cuando son necesarios para cumplir el pedido o un AC.`,
   },
   plan: {
     spec: 'SPEC — ¿el plan cumple la spec del INSUMO spec? Un AC sin un mecanismo que lo cumpla, un mecanismo que contradice la spec, o una decisión de la spec que el plan ignora.',
@@ -35,7 +35,7 @@ export const ARTIFACT_MANDATES: Record<ArtifactKind, { spec: string; quality: st
 - Reúso: ninguna pieza existente aplicable se reinventa.
 - Orden y dependencias: cada paso consume artefactos ya producidos.
 - Contratos entre componentes: productor y consumidor coinciden en forma y autoridad.
-- Efectos colaterales: las mutaciones, la compatibilidad y el rollback están tratados.
+- Efectos colaterales: las mutaciones están tratadas; la compatibilidad y el rollback se exigen cuando son necesarios para cumplir el pedido o un AC.
 - Verificación: cada prueba distingue el cumplimiento del incumplimiento.
 - Pertinencia por fila: ¿el esperado se cumpliría aunque el requisito fuera falso? ¿fallaría aunque el requisito fuera verdadero? Una fila formalmente válida puede ser impertinente y debe señalarse.
 ${CODE_CLAIMS}`,
@@ -140,7 +140,9 @@ const inspectionSchema = (c: Candidate) => `"inspection": {
 
 function axes(kind: ArtifactKind): string {
   const m = ARTIFACT_MANDATES[kind]
-  return `## Qué revisar, en este orden
+  return `${SCOPE_DISCIPLINE}
+
+## Qué revisar, en este orden
 1. ${SCOPE}
 2. ${m.spec}
 3. ${m.quality}
