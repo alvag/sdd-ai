@@ -77,7 +77,7 @@ test('la adopcion heredada exige origen verificable y no transforma corridas viv
     put(join(dir, 'resolved.json'), json(runFile(live, live.origin, 'resolved.json')))
     put(join(dir, 'status.json'), { state: 'launching' })
     writeFileSync(join(dir, 'prompt.md'), 'Pedido heredado: publica un resultado.')
-    put(join(dir, 'argv.json'), { family: live.family, launch, deadline_sec: 30, phase: {
+    put(join(dir, 'argv.json'), { kind: 'phase', family: live.family, launch, deadline_sec: 30, phase: {
       root: live.repo, flow: 'f', step: 'specify', depth: live.depth, amended: false,
       inputs: { request: bytesHash(readFileSync(join(live.repo, 'request.md'))) }, request_path: join(live.repo, 'request.md'),
       handoff_header: headerHash(readFlow(live.repo, 'f').facts.handoffHeader),

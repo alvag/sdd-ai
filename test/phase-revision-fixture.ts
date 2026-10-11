@@ -241,8 +241,10 @@ export async function cleanup(s: RevisionFixture): Promise<void> {
   try {
     for (const run of readdirSync(join(s.repo, '.sdd-ai', 'runs'))) {
       try {
-        const status = json<{ state: string }>(runFile(s, run, 'status.json'))
-        if (['launching', 'running'].includes(status.state)) { cli(s, ['cancel', run]); await settle(s, run) }
+        const status = json<{ state: string; supervisor_pid?: number; worker_pid?: number }>(runFile(s, run, 'status.json'))
+        // Los estados activos fabricados no tienen un proceso que atienda cancel ni escriba el terminal.
+        const launched = status.supervisor_pid !== undefined || status.worker_pid !== undefined || existsSync(runFile(s, run, 'supervisor.pid'))
+        if (launched && ['launching', 'running'].includes(status.state)) { cli(s, ['cancel', run]); await settle(s, run) }
       } catch { /* La limpieza no reemplaza el diagnóstico de la prueba. */ }
     }
   } catch { /* El caso pudo haber retirado el directorio de corridas. */ }

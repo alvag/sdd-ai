@@ -1659,7 +1659,8 @@ function phaseView(root: string, id: string, dir: string, s: Status, req: PhaseR
       if (entry.result) out.outcome = entry.result.state
       if (view.registry_pending) { out.registry_pending = true; out.detail = view.detail }
     }
-    out.next = flowNext(root, req.flow)
+    // El conflicto puede dejar el destino ilegible: eso no oculta el terminal de la corrección.
+    out.next = flowNextOrStatus(root, req.flow)
   } else if (s.state === 'launch_failed' && s.fallback) {
     out.fallback = s.fallback
     out.next = phaseFallbackNext(req, s.fallback)
