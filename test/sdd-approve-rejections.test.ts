@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { accept, answer, cli, fixture, snapshot, SPEC, logged } from './sdd-approve-fixture.ts'
+import { acceptInProcess, answer, runInProcess, fixture, snapshot, SPEC, logged } from './sdd-approve-fixture.ts'
 
-test('una decision nueva conserva los rechazos humanos de precondiciones y de worker sin mutaciones', () => {
+test('una decision nueva conserva los rechazos humanos de precondiciones y de worker sin mutaciones', async () => {
   for (const kind of ['missing', 'negative', 'fingerprint', 'artifact', 'blocked', 'worker', 'reused']) {
     const f = fixture()
     try {
@@ -15,15 +15,15 @@ test('una decision nueva conserva los rechazos humanos de precondiciones y de wo
       if (kind === 'blocked') { answer(f, gate); writeFileSync(join(f.dir, 'handoff.md'), '---\nprofundidad: [\n---\n'); code = 'approve_rejected' }
       if (kind === 'worker') { answer(f, gate); f.env.SDD_AI_WORKER = '1'; code = 'runner_required' }
       if (kind === 'reused') {
-        accept(f, gate)
+        await acceptInProcess(f, gate)
         writeFileSync(join(f.dir, 'spec.md'), SPEC + '\nOtra versión.\n')
-        accept(f, gate)
+        await acceptInProcess(f, gate)
         writeFileSync(join(f.dir, 'spec.md'), SPEC)
         assert.equal(logged(f).length, 2)
         code = 'approval_reused'
       }
       const before = snapshot(f)
-      const r = cli(f, 'approve', 'f', gate)
+      const r = await runInProcess(f, ['approve', 'f', gate])
       assert.equal(r.code, 2, kind)
       assert.equal(r.out.code, code, `${kind}: ${JSON.stringify(r.out)}`)
       assert.deepEqual(snapshot(f), before, kind)
@@ -35,11 +35,11 @@ test('una decision nueva conserva los rechazos humanos de precondiciones y de wo
   // en disco, su header ya acredita la spec, así que la spec tiene que estar registrada y vencida.
   const f = fixture()
   try {
-    accept(f, 'spec')
+    await acceptInProcess(f, 'spec')
     writeFileSync(join(f.dir, 'spec.md'), readFileSync(join(f.dir, 'spec.md'), 'utf8') + '\nCambio.\n')
     answer(f, 'plan-tasks')
     const before = snapshot(f)
-    const r = cli(f, 'approve', 'f', 'plan-tasks')
+    const r = await runInProcess(f, ['approve', 'f', 'plan-tasks'])
     assert.equal(r.out.code, 'approve_rejected')
     assert.match(r.out.detail, /antes hay que aprobar spec/)
     assert.deepEqual(snapshot(f), before)

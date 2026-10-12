@@ -8,7 +8,7 @@ import { main } from '../src/cli.ts'
 import { REAL_DEPS } from '../src/sdd/approve-sync.ts'
 import { gitDirs } from '../src/git.ts'
 import { storeDir } from '../src/writer-store.ts'
-import { accept, answer, barrierProcess, behind, cli, fixture, logged, snapshot, type Fixture } from './sdd-approve-fixture.ts'
+import { acceptInProcess, runInProcess, answer, barrierProcess, behind, cli, fixture, logged, snapshot, type Fixture } from './sdd-approve-fixture.ts'
 
 const RUN = '20261006-1200-activity'
 const phasePath = (f: Fixture) => join(f.dir, 'sdd-ai-phases.json')
@@ -78,7 +78,7 @@ test('actividad activa o incierta impide registrar o recuperar con su codigo y p
       try {
         alive = await barrierProcess(f.sessionDir)
         const pid = alive.child.pid!
-        if (recovery) { accept(f, 'spec'); behind(f) } else answer(f, 'spec')
+        if (recovery) { await acceptInProcess(f, 'spec'); behind(f) } else answer(f, 'spec')
         let route: string, code = 'activity_unknown'
         // Lo que vuelve inaccesible una ruta corre después de tomar los insumos, para poder compararlos.
         let lockdown = () => {}
@@ -138,7 +138,7 @@ test('actividad activa o incierta impide registrar o recuperar con su codigo y p
         rmSync(dirname(storeDir(f.root, RUN)), { recursive: true, force: true })
         await alive.release()
         const entries = logged(f)
-        assert.equal(cli(f, 'approve', 'f', 'spec').code, 0, `${label}: el reintento acepta la misma respuesta o recupera sin preguntar`)
+        assert.equal((await runInProcess(f, ['approve', 'f', 'spec'])).code, 0, `${label}: el reintento acepta la misma respuesta o recupera sin preguntar`)
         assert.equal(logged(f).length, recovery ? entries.length : entries.length + 1, label)
       } finally { restore(); if (alive && alive.child.exitCode === null) await alive.release(); f.cleanup() }
     }
@@ -152,7 +152,7 @@ test('actividad activa o incierta impide registrar o recuperar con su codigo y p
       if (shape === 'no-phase') writeFileSync(join(dir, 'control.json'), JSON.stringify({ id: RUN, family: 'claude', request: { role: 'explore' } }))
       const original = readFileSync(join(dir, 'control.json'), 'utf8')
       harvest(dir)
-      accept(other, 'spec')
+      await acceptInProcess(other, 'spec')
       assert.equal(readFileSync(join(dir, 'control.json'), 'utf8'), original, shape)
     } finally { other.cleanup() }
   }
@@ -160,7 +160,7 @@ test('actividad activa o incierta impide registrar o recuperar con su codigo y p
   const pruned = fixture()
   try {
     writeFileSync(phasePath(pruned), JSON.stringify({ schema_version: 1, last_run: { id: RUN, step: 'specify' }, phases: {} }))
-    accept(pruned, 'spec')
+    await acceptInProcess(pruned, 'spec')
   } finally { pruned.cleanup() }
 })
 
@@ -172,7 +172,7 @@ test('actividad sobrevenida deja la decision registrada pendiente y conserva los
       try {
         alive = await barrierProcess(f.sessionDir)
         const pid = alive.child.pid!
-        accept(f, 'spec'); behind(f); answer(f, 'plan-tasks')
+        await acceptInProcess(f, 'spec'); behind(f); answer(f, 'plan-tasks')
         const at = logged(f)[0].at
         const introduce = () => {
           if (kind === 'phase') phase(f, pid)
