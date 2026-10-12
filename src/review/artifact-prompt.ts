@@ -20,38 +20,38 @@ const CODE_CLAIMS = `- Una afirmación sobre el código (una ruta, una función,
 
 export const ARTIFACT_MANDATES: Record<ArtifactKind, { spec: string; quality: string }> = {
   spec: {
-    spec: 'SPEC — ¿la spec cumple el pedido del INSUMO request? Un criterio que el pedido no sostiene, algo del pedido que ningún criterio cubre, o una decisión del pedido que la spec contradice.',
+    spec: 'SPEC — ¿la spec cumple el pedido del INSUMO request? Un criterio que el pedido no sostiene, un resultado del producto sin AC, una obligación posterior al commit sin cobertura en la sección Entrega posterior al commit, o una decisión del pedido que la spec contradice. La entrega futura no requiere AC, filas de Verification ni tasks; el trabajo precommit conserva su cobertura sin excepciones por actor. Es un incumplimiento trasladar entrega a AC, filas o tasks recreando la dependencia circular del commit, publicación del PR o revisión externa habilitados por la propia verificación.',
     quality: `QUALITY — recorre estas dimensiones:
-- Cobertura del objetivo: cada resultado declarado tiene al menos un AC.
+- Cobertura del objetivo: cada resultado del producto tiene al menos un AC; cada obligación de entrega futura está cubierta por la sección Entrega posterior al commit, sin AC, filas de Verification ni tasks. Es un incumplimiento trasladarla a esa cobertura precommit recreando la dependencia circular del commit, publicación del PR o revisión externa habilitados por la propia verificación.
 - Observabilidad: cada AC tiene un resultado distinguible de su negación.
 - Consistencia de alcance: ningún AC exige algo excluido ni contradice a otro.
 - Bordes del dominio: las precondiciones, los límites y los fallos tienen un comportamiento decidido cuando son necesarios para cumplir el pedido o un AC.
-- Autoridad y actores: cada decisión o escritura tiene responsable y gate.
+- Autoridad y actores: cada decisión o escritura precommit tiene responsable y gate, sin excepciones por actor; describir entrega futura no acredita su cumplimiento ni concede gates o autorización para ejecutarla.
 - Adopción: los estados preexistentes o las corridas vivas tienen un resultado definido cuando son necesarios para cumplir el pedido o un AC.`,
   },
   plan: {
-    spec: 'SPEC — ¿el plan cumple la spec del INSUMO spec? Un AC sin un mecanismo que lo cumpla, un mecanismo que contradice la spec, o una decisión de la spec que el plan ignora.',
+    spec: 'SPEC — ¿el plan cumple la spec del INSUMO spec? Un AC sin un mecanismo que lo cumpla, un mecanismo que contradice la spec, o una decisión de implementación precommit de la spec que el plan ignora. Estas decisiones requieren mecanismos; las obligaciones de entrega futura permanecen cubiertas por la sección Entrega posterior al commit de la spec, sin AC, filas de Verification ni tasks. Es un incumplimiento trasladar entrega a AC, filas o tasks recreando la dependencia circular del commit, publicación del PR o revisión externa habilitados por la propia verificación.',
     quality: `QUALITY — recorre estas dimensiones:
-- Satisfacción AC→mecanismo: cada AC tiene un mecanismo causal concreto.
+- Satisfacción AC→mecanismo: cada AC del producto tiene un mecanismo causal concreto y cobertura completa en Verification; la entrega futura queda en su sección de la spec, fuera de AC, filas y tasks.
 - Reúso: ninguna pieza existente aplicable se reinventa.
-- Orden y dependencias: cada paso consume artefactos ya producidos.
-- Contratos entre componentes: productor y consumidor coinciden en forma y autoridad.
+- Orden y dependencias: cada paso precommit consume artefactos ya producidos y puede terminar antes de verify final, para cualquier actor; no depende de entrega futura.
+- Contratos entre componentes: los productores y consumidores del trabajo precommit coinciden en forma y autoridad; las obligaciones de entrega no generan contratos de evidencia precommit.
 - Efectos colaterales: las mutaciones están tratadas; la compatibilidad y el rollback se exigen cuando son necesarios para cumplir el pedido o un AC.
-- Verificación: cada prueba distingue el cumplimiento del incumplimiento.
+- Verificación: cada prueba del trabajo precommit distingue el cumplimiento del incumplimiento; no exige acreditar entrega futura. Es un incumplimiento trasladar entrega a AC, filas o tasks recreando la dependencia circular del commit, publicación del PR o revisión externa habilitados por la propia verificación.
 - Pertinencia por fila: ¿el esperado se cumpliría aunque el requisito fuera falso? ¿fallaría aunque el requisito fuera verdadero? Una fila formalmente válida puede ser impertinente y debe señalarse.
 ${CODE_CLAIMS}`,
   },
   tasks: {
-    spec: 'SPEC — ¿las tasks cumplen la spec y el plan de los INSUMOS spec y plan? Un AC sin task, una task que contradice el plan, o una decisión del plan que ninguna task ejecuta.',
+    spec: 'SPEC — ¿las tasks cumplen la spec y el plan de los INSUMOS spec y plan? Un AC sin task, una task que contradice el plan, o una decisión precommit del plan que ninguna task ejecuta. Las decisiones precommit requieren ejecución; las menciones de entrega futura en decisiones del plan no requieren tasks: permanecen cubiertas por la sección Entrega posterior al commit de la spec, sin AC, filas de Verification ni tasks. Es un incumplimiento trasladar entrega a AC, filas o tasks recreando la dependencia circular del commit, publicación del PR o revisión externa habilitados por la propia verificación.',
     quality: `QUALITY — recorre estas dimensiones:
-- Cobertura bidireccional AC↔task: sin huérfanos en ningún sentido.
+- Cobertura bidireccional AC↔task: cobertura completa del trabajo del producto, sin huérfanos en ningún sentido; la entrega futura queda en su sección, fuera de AC, filas de Verification y tasks, aunque el plan la mencione.
 - Autosuficiencia: cada task tiene sus rutas, sus entradas y sus decisiones.
 - Atomicidad: ninguna task mezcla cambios separables con finalizaciones distintas.
 - Responsabilidad única: cada task declara writer, conductor o user; revisa las capacidades y autoridad de todos sus pasos, no solo el enum. Claude y capacidades reservadas son del conductor; observaciones personales y decisiones humanas, del user.
 - Secuencia final: ninguna task contiene sdd verify final, acreditaciones de sus filas ni aprobación de gates. Todas pueden terminar antes de verify; las observaciones previas del user no sustituyen la prueba humana posterior.
-- Orden ejecutable: los productos van antes que sus consumidores.
-- Interfaces Produce/Consume: los nombres y las firmas coinciden.
-- Evidencia: cada task referencia una verificación capaz de probar su resultado.
+- Orden ejecutable: los productos precommit van antes que sus consumidores, para cualquier actor, sin dependencias de entrega futura.
+- Interfaces Produce/Consume: los nombres y las firmas del trabajo precommit coinciden; la entrega futura no exige productos ni evidencia precommit.
+- Evidencia: cada task precommit referencia una verificación capaz de probar su resultado; no exige evidencia de entrega futura. Es un incumplimiento trasladar entrega a AC, filas o tasks recreando la dependencia circular del commit, publicación del PR o revisión externa habilitados por la propia verificación.
 ${CODE_CLAIMS}`,
   },
 }

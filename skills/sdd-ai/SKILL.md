@@ -1254,10 +1254,17 @@ falta; el paso siguiente lo sigue decidiendo `sdd status`, no el hijo.
   pendiente no sigue la línea `- [ ] **T<n> — <título>**` de la plantilla. En esos tres casos la fase va
   inline.
 - **Los contratos.** Un único objeto JSON con `phase` igual al paso; un `next` se descarta, cualquier
-  otra clave de más se rechaza y las listas van aunque estén vacías, que es "ninguno":
+  otra clave de más se rechaza y las listas van aunque estén vacías, que es "ninguno", salvo
+  `delivery` en specify, que es opcional:
   - `specify`: `known_facts` (hecho y puntero al código), `assumptions`, `blocking_questions`,
     `missing_context`, `acceptance_criteria` (id `AC-<n>`, texto, autoridad y método de verificación) y
-    la prosa de `problem`, `background` y `scope`;
+    la prosa de `problem`, `background` y `scope`, y `delivery` opcional (lista de textos no vacíos).
+    Ausencia y `[]` significan ninguna obligación de entrega. Se representa como viñetas de texto en
+    `## Entrega posterior al commit`, después de los AC, sin checkboxes ni certificaciones añadidas.
+    Se rechaza cualquier línea de delivery que empiece, tras espacios o tabulaciones y un marcador
+    de lista opcional (`-`, `*`, `+` o `<n>.`), con `[ ]`, `[x]` o `[X]`; también headings reservados
+    de spec o estado (incluido el título de entrega) y cercas sin cerrar. La causa identifica el
+    elemento inválido; otros símbolos y menciones de checkbox dentro de una frase se admiten;
   - `plan`: las tres listas y `approach`, `decisions` (admite "ninguno"), `files` y `verification`, que
     va bajo `## Verification`; el header de `plan.md` lo arma el binario con las claves de `sdd-flow`;
   - `tasks`: las tres listas y cada task con id `T<n>`, título, `actor` obligatorio (`writer`,
@@ -1268,6 +1275,15 @@ falta; el paso siguiente lo sigue decidiendo `sdd status`, no el hijo.
     `refactor`), qué cambió, la desviación del plan o `null` y la comprobación que te toca correr.
   En `specify`, `plan` y `tasks` una salida que no se admite tiene una sola corrección; si la segunda
   tampoco, la corrida falla sin artefacto.
+- **Entrega posterior al commit:** las obligaciones que solo pueden cumplirse después del commit
+  van en `delivery`, fuera de `acceptance_criteria`, filas de Verification y tasks, incluso si se
+  mencionan entre las decisiones del plan. Ninguna fila o task exige el commit, la publicación del PR
+  o la revisión externa posteriores que esa misma verificación habilita. La clasificación depende del
+  momento, sin excepciones por actor: las comprobaciones reales del conductor anteriores al commit
+  siguen siendo trabajo precommit. Se conserva la cobertura completa de todos los AC del producto.
+  Los contratos anteriores sin delivery siguen admitiéndose como ausencia de entrega; esto no elimina
+  obligaciones ya aprobadas, concede gates ni autoriza acciones de entrega. Los controles vigentes de
+  status, verify, takeover y commit se conservan.
 - **El artefacto.** El binario escribe `spec.md`, `plan.md` o `tasks.md` desde los campos validados, solo
   si no existe y si nada cambió desde el lanzamiento: el paso, la profundidad, los insumos, el header de
   `handoff.md` y, en `plan`, la rama y `HEAD`. La creación inicial no reemplaza un destino existente;
