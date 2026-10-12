@@ -77,11 +77,19 @@ por otro motivo.
 
 ## Tests
 
-- `npm test` corre la suite completa. `node --test` corre cada archivo en su propio proceso, en
-  paralelo, y los tests de un mismo archivo en serie: la suite tarda lo que tarda su archivo más
-  lento.
-- Un archivo que corre el binario, `git` u otro proceso tarda segundos por test. Conviene que ninguno
-  pase de unos 50 s dentro de la suite completa: si crece más, se parte por tema y lo común va a un
+- `npm test` corre la suite completa. `node --test` corre cada archivo en su propio proceso y los
+  tests de un mismo archivo en serie. Corre a la vez un número finito de archivos: por defecto, las
+  CPU disponibles menos una.
+- La pared de la suite tiene dos cotas: no baja de lo que tarda su archivo más lento, ni de la suma
+  de lo que tardan todos los archivos dividida por esa concurrencia, que solo se alcanza con un
+  reparto perfecto. Cuál manda depende del host y de la carga: con muchos archivos de duración
+  parecida suele mandar la segunda. El uso de CPU, en especial el de `sys` al lanzar procesos, y la
+  contención con otros procesos de la máquina estiran la pared por encima de las dos.
+- Un archivo que corre el binario, `git` u otro proceso tarda segundos por test. Partirlo por tema
+  puede mejorar el reparto y acortar la cola del más lento, pero no baja el trabajo total ni la CPU,
+  puede sumar contención y no garantiza una pared menor; bajar el costo por test, por ejemplo
+  lanzando menos procesos, sí reduce el trabajo. Unos 50 s por archivo dentro de la suite completa
+  sirven como orientación para considerar partirlo, no como un límite. Al partir, lo común va a un
   módulo `<prefijo>-fixture.ts`, que no termina en `.test.ts`.
 - `npm run test:unit` corre solo los `*.unit.test.ts`, en segundos. Esos archivos no pueden lanzar
   subprocesos, ni directamente ni a través de `src/`: con `npm test` y con `npm run test:unit`,
