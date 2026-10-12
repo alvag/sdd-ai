@@ -59,7 +59,7 @@ import {
 import { type Freshness, type ReviewRequest, REVIEW_LOCK, converged, freshness, untrackedOf } from './review/standing.ts'
 import { applyCommit, planCommit } from './sdd/commit.ts'
 import { approve } from './sdd/approve.ts'
-import { type ApproveDeps, ApprovalSyncPending, REAL_DEPS } from './sdd/approve-sync.ts'
+import { type ApproveDeps, ApprovalSyncPending, REAL_DEPS, assertNoActivity } from './sdd/approve-sync.ts'
 import { assertBranchApplicable, branchApply, branchPreview } from './sdd/branch.ts'
 import { criteriaIds, readTaskResponsibilities } from './sdd/markdown.ts'
 import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, phaseTouchesMods, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
@@ -3040,10 +3040,12 @@ async function sdd(args: string[], env: Env, cwd: string, deps?: { approve?: App
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
     const root = repoRoot(cwd)
     // Una corrección interrumpida se recupera antes de decidir; sin nada que recuperar, un rechazo no toma el lock.
-    const pending = (() => { try { const r = readPhaseRecord(root, readFlow(root, positionals[0]).facts.id); return r.revisions?.active ?? pendingIntent(r) } catch { return undefined } })()
+    const pending = (() => { try { const r = readPhaseRecord(root, readFlow(root, positionals[0]).facts.id, true); return r.revisions?.active ?? pendingIntent(r) } catch { return undefined } })()
     if (pending) withFlowLock(root, positionals[0], () => recoverRevisionResult(root, positionals[0]))
+    // La actividad se descarta antes de validar el gate, sin lock: un registro ilegible es actividad incierta.
+    assertNoActivity(root, readFlow(root, positionals[0]).facts.id)
     try {
-      // La exclusión de actividad y la revalidación de la recuperación corren bajo el lock de approve, después de validar el gate.
+      // La exclusión de actividad se repite bajo el lock de approve, con la revalidación de la recuperación.
       const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor),
         deps?.approve ?? { ...REAL_DEPS, prepare: recoverRevisionResult })
       const { facts } = readFlow(root, status.id)
