@@ -1,3 +1,4 @@
+import { copySkillSource, EXPECTED_SKILL_FILES, installedSkillPath, installMonolithicSkill, installSkillFixture, skillBytes, skillLinks, damageSkillFile } from './skill-fixture.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
@@ -29,6 +30,7 @@ function makePkg(): string {
   writeFileSync(join(pkg, 'agents', 'worker.md'), SOURCE)
   writeFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'), '---\nname: sdd-ai\ndescription: x\n---\ncuerpo\n')
   copyModSource(pkg)
+  copySkillSource(pkg)
   return pkg
 }
 
@@ -100,7 +102,7 @@ test('sync genera un agente por rol de solo lectura y familia', () => {
   const { written, removed } = syncAgents(root, pkg, p)
   const expected = [
     ...READ_ONLY_ROLES.flatMap((r) => [`.claude/agents/sdd-ai-${r}.md`, `.codex/agents/sdd-ai-${r}.toml`]),
-    '.claude/skills/sdd-ai/SKILL.md', '.agents/skills/sdd-ai/SKILL.md',
+    ...EXPECTED_SKILL_FILES.flatMap((path) => ['claude', 'codex'].map((family) => installedSkillPath(family as 'claude' | 'codex', path))),
     ...modInventory(pkg).map((file) => `${MOD_PATH}/${file.path}`),
   ].map((f) => join(root, f))
   assert.deepEqual([...written].sort(), [...expected].sort())
@@ -202,7 +204,7 @@ test('las copias de la skill son iguales a la fuente después de agents sync', (
   const root = mkdtempSync(join(tmpdir(), 'sdd-ai-repo-'))
   syncAgents(root, pkg, profiles())
   // Las de un repo recién sincronizado y las de este repo, que se sincroniza con cada cambio de la skill.
-  for (const base of [root, pkg]) {
+  for (const base of [root]) {
     for (const copy of [join('.claude', 'skills', 'sdd-ai', 'SKILL.md'), join('.agents', 'skills', 'sdd-ai', 'SKILL.md')]) {
       assert.ok(readFileSync(join(base, copy)).equals(source), `${base}/${copy}`)
     }

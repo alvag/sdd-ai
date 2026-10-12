@@ -1,3 +1,4 @@
+import { copySkillSource, EXPECTED_SKILL_FILES, installedSkillPath, installMonolithicSkill, installSkillFixture, skillBytes, skillLinks, damageSkillFile } from './skill-fixture.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
@@ -5,8 +6,11 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
 import { parse } from 'yaml'
+import fs from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
+import * as init from '../src/init.ts'
 import { makeFakeBin, makeRepo } from './helpers.ts'
-import { copyModSource } from './mod-fixture.ts'
+import { copyModSource, exec as fakeExec } from './mod-fixture.ts'
 
 const ROOT = join(import.meta.dirname, '..')
 const BIN = join(ROOT, 'bin', 'sdd-ai')
@@ -50,6 +54,7 @@ function checkout(o: Options = {}): Checkout {
   const repo = makeRepo()
   if (o.sources !== false) {
     copyModSource(repo)
+    copySkillSource(repo)
     for (const rel of SOURCES) {
       mkdirSync(dirname(join(repo, rel)), { recursive: true })
       copyFileSync(join(ROOT, rel), join(repo, rel))
@@ -122,6 +127,133 @@ function stamps(repo: string): Map<string, string> {
 const read = (c: Checkout, rel: string) => readFileSync(join(c.repo, rel), 'utf8')
 const fileOf = (plan: Out, path: string): Out => plan.files.find((f: Out) => f.path === path)
 const codes = (plan: Out): string[] => plan.notes.map((n: Out) => n.code)
+
+test('init instala y actualiza la skill modular sin modificar un flujo existente', () => {
+  for (const monolithic of [false, true]) {
+    const c = checkout()
+    if (monolithic) installMonolithicSkill(c.repo)
+    const state: Record<string, string> = {
+      '.plans/existing/handoff.md': '---\nprofundidad: normal\nstatus: implementing\n---\n# Handoff existente\n',
+      '.plans/existing/spec.md': '# Spec existente\n\n- **AC-1:** comportamiento aprobado. (pedido)\n',
+      '.plans/existing/plan.md': '---\nstatus: tasks-ready\n---\n# Plan existente\n',
+      '.plans/existing/tasks.md': '# Tasks\n\n- [ ] **T1 — Trabajo existente** · actor: writer\n',
+      '.plans/existing/sdd-ai-approvals.json': '{"schema_version":1,"approvals":[]}\n',
+      '.plans/existing/sdd-ai-phases.json': '{"schema_version":1,"phases":[]}\n',
+      '.sdd-ai/runs/existing/request.json': '{"role":"implement","session":"fixture-session"}\n',
+      '.sdd-ai/runs/existing/status.json': '{"state":"running"}\n',
+    }
+    for (const [path, content] of Object.entries(state)) {
+      mkdirSync(dirname(join(c.repo, path)), { recursive: true })
+      writeFileSync(join(c.repo, path), content)
+    }
+    const preserved = Object.fromEntries(Object.keys(state).map((path) => [path, readFileSync(join(c.repo, path)).toString('base64')]))
+    const before = snapshot(c.repo)
+    const { dry, applied } = initAndApply(c, ['--telemetry', 'off'])
+    assert.equal(applied.code, 0, JSON.stringify(applied.out))
+    for (const family of ['claude', 'codex'] as const) {
+      assert.deepEqual(skillBytes(c.repo, dirname(installedSkillPath(family))), skillBytes(c.repo))
+      for (const path of EXPECTED_SKILL_FILES) {
+        const installed = installedSkillPath(family, path)
+        assert.ok(dry.agents.some((change: Out) => change.path === installed), installed)
+        assert.ok(applied.out.agents.written.includes(installed), installed)
+        for (const target of skillLinks(path, read(c, installed))) {
+          assert.ok(readFileSync(join(c.repo, installedSkillPath(family, target))).length > 0, target)
+        }
+      }
+    }
+    assert.deepEqual(Object.fromEntries(Object.keys(state).map((path) => [path, readFileSync(join(c.repo, path)).toString('base64')])), preserved)
+    for (const [path, content] of before) if (path.startsWith('.plans/') || path.startsWith('.sdd-ai/runs/')) assert.equal(read(c, path), content)
+    assert.match(applied.out.closing, /Reabre la sesión/)
+    assert.ok(applied.out.doctor.skill.copies.every((copy: Out) => copy.state === 'ok'))
+    assert.equal(applied.out.doctor.skill.copies.length, EXPECTED_SKILL_FILES.length * 2)
+  }
+})
+
+test('init vincula todos los archivos de la skill al ensayo y al digest antes de escribir', (t) => {
+  const c = checkout()
+  const answers = { telemetry: 'off' as const }
+  const options = { exec: fakeExec, command: (digest?: string) => `./bin/sdd-ai init${digest ? ` --apply --digest ${digest}` : ''}` }
+  const before = snapshot(c.repo)
+  const homeBefore = snapshot(c.env.HOME)
+  const baseline = init.planInit(c.repo, answers, c.env, options)
+  assert.deepEqual(snapshot(c.repo), before, 'el ensayo no escribe')
+  assert.deepEqual(snapshot(c.env.HOME), homeBefore)
+  for (const family of ['claude', 'codex'] as const) for (const path of EXPECTED_SKILL_FILES) {
+    assert.ok(baseline.agents.some((change) => change.path === installedSkillPath(family, path)), path)
+  }
+  // Incluso si los destinos siguen missing, cada fuente participa en la huella.
+  for (const path of EXPECTED_SKILL_FILES) {
+    const file = join(c.repo, 'skills/sdd-ai', path)
+    const bytes = readFileSync(file)
+    writeFileSync(file, Buffer.concat([bytes, Buffer.from('\ncambio después del ensayo\n')]))
+    const changed = snapshot(c.repo)
+    const plan = init.planInit(c.repo, answers, c.env, options)
+    assert.notEqual(plan.digest, baseline.digest, path)
+    assert.throws(() => init.applyInit(c.repo, answers, baseline.digest, c.env, options), (error: unknown) =>
+      (error as { code?: string }).code === 'digest_mismatch', path)
+    assert.deepEqual(snapshot(c.repo), changed, `${path}: rechazo antes de escribir`)
+    assert.deepEqual(snapshot(c.env.HOME), homeBefore)
+    writeFileSync(file, bytes)
+  }
+  const source = 'skills/sdd-ai/procedures/start.md'
+  const sourceBytes = readFileSync(join(c.repo, source))
+  for (const damage of ['missing', 'unreadable'] as const) {
+    damageSkillFile(c.repo, source, damage)
+    const damaged = snapshot(c.repo)
+    assert.throws(() => init.planInit(c.repo, answers, c.env, options), /procedures\/start\.md/)
+    assert.throws(() => init.applyInit(c.repo, answers, baseline.digest, c.env, options), /procedures\/start\.md/)
+    assert.deepEqual(snapshot(c.repo), damaged)
+    fs.rmSync(join(c.repo, source), { recursive: true, force: true })
+    writeFileSync(join(c.repo, source), sourceBytes)
+  }
+  for (const family of ['claude', 'codex'] as const) {
+    const copy = installedSkillPath(family, 'procedures/start.md')
+    mkdirSync(join(c.repo, copy), { recursive: true })
+    const damaged = snapshot(c.repo)
+    assert.throws(() => init.applyInit(c.repo, answers, baseline.digest, c.env, options), /No se pudo comprobar/)
+    assert.deepEqual(snapshot(c.repo), damaged)
+    fs.rmSync(join(c.repo, copy), { recursive: true })
+  }
+  const expected = skillBytes(c.repo)
+  const reads = new Map<string, number>()
+  const originalRead = fs.readFileSync
+  const originalWrite = fs.writeFileSync
+  const reader = t.mock.method(fs, 'readFileSync', (...args: any[]) => {
+    const path = relative(join(c.repo, 'skills/sdd-ai'), String(args[0])).split('\\').join('/')
+    if (EXPECTED_SKILL_FILES.includes(path)) reads.set(path, (reads.get(path) ?? 0) + 1)
+    return Reflect.apply(originalRead, fs, args)
+  })
+  let changedDuringApply = false
+  const writer = t.mock.method(fs, 'writeFileSync', (...args: any[]) => {
+    // Cambiar la fuente después de compute no debe cambiar los bytes del snapshot aplicado.
+    if (!changedDuringApply && String(args[0]).startsWith(join(c.repo, '.sdd-ai/config.yml.'))) {
+      changedDuringApply = true
+      originalWrite(join(c.repo, source), Buffer.concat([sourceBytes, Buffer.from('\nfuente modificada después de compute\n')]))
+    }
+    return Reflect.apply(originalWrite, fs, args)
+  })
+  syncBuiltinESMExports()
+  try {
+    const plan = init.planInit(c.repo, answers, c.env, options)
+    assert.equal(plan.digest, baseline.digest)
+    assert.deepEqual(Object.fromEntries(reads), Object.fromEntries(EXPECTED_SKILL_FILES.map((path) => [path, 1])), 'un snapshot por compute')
+    reads.clear()
+    const result = init.applyInit(c.repo, answers, plan.digest, c.env, options)
+    assert.equal(result.mode, 'applied')
+    assert.equal(changedDuringApply, true)
+    assert.deepEqual(Object.fromEntries(reads), Object.fromEntries(EXPECTED_SKILL_FILES.map((path) => [path, 1])), 'apply no relee las fuentes')
+  } finally {
+    reader.mock.restore()
+    writer.mock.restore()
+    syncBuiltinESMExports()
+  }
+  for (const family of ['claude', 'codex'] as const) assert.deepEqual(skillBytes(c.repo, dirname(installedSkillPath(family))), expected)
+  writeFileSync(join(c.repo, source), sourceBytes)
+  const stable = init.planInit(c.repo, answers, c.env, options)
+  const stampsBefore = stamps(c.repo)
+  init.applyInit(c.repo, answers, stable.digest, c.env, options)
+  assert.deepEqual(stamps(c.repo), stampsBefore, 'aplicación idempotente')
+})
 
 test('init se niega fuera de un checkout de sdd-ai sin escribir nada', () => {
   const c = checkout({ sources: false })
@@ -427,7 +559,7 @@ test('init --apply crea el gitignore, sincroniza los agentes y trae el reporte d
   assert.equal(read(c, '.agents/skills/sdd-ai/SKILL.md'), skill)
   assert.ok(applied.out.agents.written.length > 0)
   assert.deepEqual(applied.out.doctor.clis.map((r: Out) => r.family), ['claude', 'codex'])
-  assert.deepEqual(applied.out.doctor.skill.copies.map((s: Out) => s.state), ['ok', 'ok'])
+  assert.deepEqual(applied.out.doctor.skill.copies.map((s: Out) => s.state), EXPECTED_SKILL_FILES.flatMap(() => ['ok', 'ok']))
   assert.match(applied.out.closing, /workers\.yml/)
 
   // Un agente generado para un rol que ya no existe sale en el ensayo, y la aplicación lo borra aunque

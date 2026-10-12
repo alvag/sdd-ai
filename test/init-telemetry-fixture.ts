@@ -1,3 +1,4 @@
+import { copySkillSource, EXPECTED_SKILL_FILES, installedSkillPath, installMonolithicSkill, installSkillFixture, skillBytes, skillLinks, damageSkillFile } from './skill-fixture.ts'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -10,6 +11,7 @@ export function initTelemetryFixture(sharedHome?: string) {
   const home = sharedHome ?? realpathSync(mkdtempSync(join(tmpdir(), 'sdd-ai-init-telemetry-')))
   const source = join(import.meta.dirname, '..')
   copyModSource(root)
+  copySkillSource(root)
   for (const rel of ['agents/worker.md','skills/sdd-ai/SKILL.md']) {
     mkdirSync(dirname(join(root, rel)), { recursive: true }); copyFileSync(join(source, rel), join(root, rel))
   }

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { parse } from 'yaml'
 import { type ModFile, assertModCopyInside, modInventory, syncModCopy } from './mod-copies.ts'
@@ -17,6 +17,57 @@ const AGENT_EXT: Record<Family, string> = { claude: '.md', codex: '.toml' }
 // Claude Code descubre skills en .claude/skills; Codex, en .agents/skills del repo. Son rutas del repo con `/`,
 // que salen así en init y doctor; para el sistema de archivos se resuelven con join(root, path).
 const SKILL_PATHS = ['.claude/skills/sdd-ai/SKILL.md', '.agents/skills/sdd-ai/SKILL.md']
+
+/** Material distribuible obligatorio, relativo al directorio de la skill. */
+export const SKILL_FILES: readonly string[] = [
+  'SKILL.md',
+  'procedures/start.md',
+  'procedures/recovery.md',
+  'procedures/specify.md',
+  'procedures/branch.md',
+  'procedures/plan.md',
+  'procedures/tasks.md',
+  'procedures/approvals.md',
+  'procedures/implement.md',
+  'procedures/verify.md',
+  'procedures/review-and-commit.md',
+  'procedures/close.md',
+  'references/dispatch.md',
+  'references/reception.md',
+  'references/document-phases.md',
+  'references/document-revision.md',
+  'references/artifact-review.md',
+  'references/diff-review.md',
+  'references/writer.md',
+  'references/errors.md',
+  'references/hooks.md',
+  'references/init.md',
+  'references/prune.md',
+  'references/recall.md',
+  'references/findings.md',
+  'references/mod.md',
+]
+
+export interface SkillFile { path: string; bytes: Buffer; sha256: string }
+
+/** Snapshot estricto: ninguna escritura puede comenzar con fuentes incompletas. */
+export function skillInventory(pkgDir: string): SkillFile[] {
+  return SKILL_FILES.map((path) => {
+    const source = join(pkgDir, 'skills', 'sdd-ai', path)
+    let bytes: Buffer
+    try { bytes = readFileSync(source) } catch (error) {
+      throw new SddError('skill_source_unavailable', `No se pudo leer skills/sdd-ai/${path}: ${error instanceof Error ? error.message : String(error)}`, {
+        next: `restaura o revisa primero skills/sdd-ai/${path} y repite el ensayo`,
+      })
+    }
+    return { path, bytes, sha256: createHash('sha256').update(bytes).digest('hex') }
+  })
+}
+
+/** Destino de un material, relativo al checkout y con barras normales. */
+export function skillFileRelPath(family: Family, path: string): string {
+  return `${skillRelPath(family).slice(0, -'SKILL.md'.length)}${path}`
+}
 
 export function agentName(role: ReadOnlyRole): string {
   return `sdd-ai-${role}`
@@ -141,7 +192,7 @@ function removeLeftovers(root: string): string[] {
  * Genera un agente por rol de solo lectura para los dos CLIs, borra los que sobran e instala la skill y la copia del mod.
  * `inventory` es el del mod que ya leyó quien llama (init, el mismo de su digest); sin él, se lee de `pkgDir`.
  */
-export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles, inventory: readonly ModFile[] = modInventory(pkgDir)): { written: string[]; removed: string[] } {
+export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles, inventory: readonly ModFile[] = modInventory(pkgDir), snapshot: readonly SkillFile[] = skillInventory(pkgDir)): { written: string[]; removed: string[] } {
   const src = readSource(pkgDir)
   // Antes de escribir nada: la copia del mod no puede salir del checkout.
   assertModCopyInside(root)
@@ -154,18 +205,21 @@ export function syncAgents(root: string, pkgDir: string, profiles: RoleProfiles,
     }
   }
   const removed = removeLeftovers(root)
-  for (const rel of SKILL_PATHS) {
-    const dest = join(root, rel)
-    mkdirSync(dirname(dest), { recursive: true })
-    copyFileSync(join(pkgDir, 'skills', 'sdd-ai', 'SKILL.md'), dest)
-    written.push(dest)
+  // Apoyos antes del bootstrap: la entrada se publica cuando sus destinos ya están escritos.
+  for (const item of [...snapshot.filter((file) => file.path !== 'SKILL.md'), ...snapshot.filter((file) => file.path === 'SKILL.md')]) {
+    for (const family of FAMILIES) {
+      const dest = join(root, skillFileRelPath(family, item.path))
+      mkdirSync(dirname(dest), { recursive: true })
+      writeFileSync(dest, item.bytes)
+      written.push(dest)
+    }
   }
   const mod = syncModCopy(root, inventory)
   return { written: [...written, ...mod.written], removed: [...removed, ...mod.removed] }
 }
 
 /** Una copia instalada de la skill, con su ruta relativa a la raíz del repo. */
-export interface SkillCopy { path: string; state: 'ok' | 'stale' | 'missing' }
+export interface SkillCopy { path: string; state: 'ok' | 'stale' | 'missing' | 'unchecked'; cause?: string; source_path?: string }
 
 export interface AgentCopy { path: string; family: Family; role: ReadOnlyRole; state: 'ok' | 'stale' | 'missing' }
 
@@ -204,9 +258,34 @@ export function agentCopies(root: string, pkgDir: string, profiles: RoleProfiles
  * `agents sync` deja al conductor con la versión anterior.
  * Se lee en `latin1` para que cada byte sea un carácter y la comparación siga siendo exacta.
  */
-export function skillCopies(root: string, pkgDir: string): SkillCopy[] {
-  const source = readSkillSource(pkgDir)
-  return FAMILIES.map((family) => skillCopy(root, family, source))
+export function skillCopies(root: string, pkgDir: string, families: readonly Family[] = FAMILIES, snapshot?: readonly SkillFile[]): SkillCopy[] {
+  const sources = SKILL_FILES.map((path) => {
+    const source_path = `skills/sdd-ai/${path}`
+    try {
+      const item = snapshot?.find((file) => file.path === path)
+      if (snapshot && !item) throw new Error('archivo obligatorio ausente del snapshot')
+      const bytes = item ? item.bytes : readFileSync(join(pkgDir, source_path))
+      return { path, source_path, text: toLf(bytes.toString('latin1')) }
+    } catch (error) {
+      return { path, source_path, cause: error instanceof Error ? error.message : String(error) }
+    }
+  })
+  return families.flatMap((family) => sources.map((source): SkillCopy => {
+    const path = skillFileRelPath(family, source.path)
+    // Se examina la copia aun si falla su fuente para conservar ambas incidencias.
+    let actual: string | undefined
+    let absent = false
+    let copyCause: string | undefined
+    try { actual = toLf(readFileSync(join(root, path), 'latin1')) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') absent = true
+      else copyCause = error instanceof Error ? error.message : String(error)
+    }
+    if (source.cause !== undefined) return { path, state: 'unchecked', source_path: source.source_path,
+      cause: `depende de ${source.source_path}: ${source.cause}${copyCause ? `; copia: ${copyCause}` : absent ? '; copia ausente' : ''}` }
+    if (copyCause !== undefined) return { path, state: 'unchecked', cause: copyCause }
+    if (absent) return { path, state: 'missing' }
+    return { path, state: actual === source.text ? 'ok' : 'stale' }
+  }))
 }
 
 /**

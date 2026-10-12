@@ -143,7 +143,7 @@ test('las revisiones distinguen requisitos, especulación y decisiones sin perde
 })
 
 test('la skill contrasta el alcance antes de aceptar o proponer una ampliación', () => {
-  const source = readFileSync(new URL('../skills/sdd-ai/SKILL.md', import.meta.url), 'utf8')
+  const source = readFileSync(new URL('../skills/sdd-ai/references/diff-review.md', import.meta.url), 'utf8') + readFileSync(new URL('../skills/sdd-ai/references/findings.md', import.meta.url), 'utf8')
   const decision = source.split('### Decidir cada hallazgo\n')[1]?.split('### La ronda siguiente\n')[0]
   assert.ok(decision)
   assert.match(decision, /Antes de aceptar una corrección, contrástala con el pedido o los AC aprobados/)

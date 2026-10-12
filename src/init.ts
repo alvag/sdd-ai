@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFil
 import { dirname, join, relative, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { Scalar, isMap, parse, parseDocument } from 'yaml'
-import { agentName, agentsState, leftoverAgents, skillCopies, syncAgents } from './agents.ts'
+import { type SkillFile, agentName, agentsState, leftoverAgents, skillCopies, skillInventory, syncAgents } from './agents.ts'
 import { parseCrossModel, parseJiraMode } from './config.ts'
 import { type Exec, cliVersion, defaultExec, detectClis, doctor, olderVersion } from './doctor.ts'
 import { gitDirs } from './git.ts'
@@ -75,7 +75,7 @@ export interface InitResult {
 
 /** El plan y lo que la aplicación necesita de él. */
 /** El plan, los workers y el inventario del mod que lo respaldan: el mismo alimenta la comparación, el digest y la copia. */
-interface Planned { plan: InitPlan; workers: WorkersFile | null; inventory: ModFile[] }
+interface Planned { plan: InitPlan; workers: WorkersFile | null; inventory: ModFile[]; skillSnapshot: SkillFile[] }
 
 function readText(path: string): string | null {
   try {
@@ -396,7 +396,7 @@ function plansIgnored(root: string): boolean | null {
  * Las copias de agentes y de la skill que `agents sync` cambiaría, desde las fuentes del checkout, y los
  * agentes sobrantes que borraría.
  */
-function agentChanges(root: string, workers: WorkersFile, env: Env, inventory: readonly ModFile[]): AgentChange[] {
+function agentChanges(root: string, workers: WorkersFile, env: Env, inventory: readonly ModFile[], skillSnapshot: readonly SkillFile[]): AgentChange[] {
   const profiles = roleProfiles(workers, loadCodexRoot(env))
   const out: AgentChange[] = []
   for (const role of READ_ONLY_ROLES) {
@@ -405,7 +405,12 @@ function agentChanges(root: string, workers: WorkersFile, env: Env, inventory: r
       if (state !== 'ok') out.push({ path: AGENT_FILES[family](agentName(role)), state })
     }
   }
-  for (const copy of skillCopies(root, root)) if (copy.state !== 'ok') out.push({ path: copy.path, state: copy.state })
+  for (const copy of skillCopies(root, root, FAMILIES, skillSnapshot)) {
+    if (copy.state === 'unchecked') throw new SddError('skill_copy_unchecked', `No se pudo comprobar ${copy.path}: ${copy.cause}`, {
+      next: 'revisa o quita la copia antes de sincronizar y repite el ensayo',
+    })
+    if (copy.state !== 'ok') out.push({ path: copy.path, state: copy.state })
+  }
   for (const file of leftoverAgents(root)) out.push({ path: repoPath(root, file), state: 'leftover' })
   out.push(...modChanges(root, inventory))
   return out
@@ -422,6 +427,7 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
   assertCheckout(root)
   // Una sola lectura de la fuente del mod: la comparación, el digest y la aplicación usan los mismos bytes.
   const inventory = modInventory(root)
+  const skillSnapshot = skillInventory(root)
   assertModCopyInside(root)
   const userSnapshot = readUserConfig(env.HOME ?? homedir())
   const user_config = planUserTelemetry(userSnapshot, answers.telemetry)
@@ -482,7 +488,7 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
   const ignoreText = readText(join(root, IGNORE_PATH))
   files.push(ignoreText === null ? { path: IGNORE_PATH, action: 'create', content: '*\n' } : { path: IGNORE_PATH, action: 'unchanged' })
 
-  const agents = workers === null ? [] : agentChanges(root, workers, env, inventory)
+  const agents = workers === null ? [] : agentChanges(root, workers, env, inventory, skillSnapshot)
   const notes: Note[] = [...hookNotes(root)]
   notes.push({ code: 'codex_hooks_approval', detail: 'Codex ejecuta los hooks del proyecto recién después de aprobarlos en /hooks, y vuelve a pedirlo cuando cambian' })
   if (!existsSync(join(root, 'node_modules'))) {
@@ -528,7 +534,8 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
       user_config_path: userSnapshot.path, user_config_bytes: userSnapshot.bytes,
       source_config: sha(sourceConfig), source_workers: sha(sourceWorkers),
       catalog: loaded === null ? null : [...loaded.slugs].sort(), catalog_client: loaded?.clientVersion ?? null, codex_version: codexVersion, detected,
-      agent_sources: AGENT_SOURCES.map((rel) => sha(readText(join(root, rel)))), codex_root: loadCodexRoot(env),
+      agent_sources: [sha(readText(join(root, 'agents/worker.md')))],
+      skill_sources: skillSnapshot.map(({ path, sha256 }) => ({ path, sha256 })), codex_root: loadCodexRoot(env),
       mod_sources: inventory.map(({ path, sha256 }) => ({ path, sha256 })),
       hooks: FAMILIES.map((f) => sha(readQuiet(join(root, HOOK_FILES[f])))),
     },
@@ -548,7 +555,7 @@ function compute(root: string, answers: InitAnswers, env: Env, o: InitOptions): 
       { label: 'on', description: 'Una línea privada por intento cerrado.', value: 'on' },
     ],
   })
-  return { plan, workers, inventory }
+  return { plan, workers, inventory, skillSnapshot }
 }
 
 /** El ensayo: el plan completo, sin escribir nada. */
@@ -565,7 +572,7 @@ function writeAtomic(file: string, content: string): void {
 
 /** Valida el digest antes de escribir el checkout; un fallo de preferencia se informa por separado. */
 export function applyInit(root: string, answers: InitAnswers, digest: string, env: Env, o: InitOptions): InitResult {
-  const { plan, workers, inventory } = compute(root, answers, env, o)
+  const { plan, workers, inventory, skillSnapshot } = compute(root, answers, env, o)
   if (plan.digest !== digest) {
     throw new SddError('digest_mismatch', `el plan cambió desde el ensayo: su digest es ${plan.digest}, no ${digest}`, {
       next: `vuelve a ensayar y muéstrale el plan nuevo al usuario: ${o.command()}`,
@@ -578,7 +585,7 @@ export function applyInit(root: string, answers: InitAnswers, digest: string, en
       written.push(f.path)
     }
   }
-  const synced = plan.agents.length > 0 && workers !== null ? syncAgents(root, root, roleProfiles(workers, loadCodexRoot(env)), inventory) : null
+  const synced = plan.agents.length > 0 && workers !== null ? syncAgents(root, root, roleProfiles(workers, loadCodexRoot(env)), inventory, skillSnapshot) : null
   const agents = synced === null ? null : { written: synced.written.map((f) => repoPath(root, f)), removed: synced.removed.map((f) => repoPath(root, f)) }
   let userWritten = false
   try {
@@ -596,6 +603,6 @@ export function applyInit(root: string, answers: InitAnswers, digest: string, en
   return {
     mode: 'applied', root, written, agents, workers: plan.workers, notes: plan.notes,
     user_config: { path: plan.user_config.path, action: plan.user_config.action, written: userWritten },
-    doctor: doctor(o.exec, { copies: skillCopies(root, root) }, { copies: [modCopy(root, inventory)] }), closing,
+    doctor: doctor(o.exec, { copies: skillCopies(root, root, FAMILIES, skillSnapshot) }, { copies: [modCopy(root, inventory)] }), closing,
   }
 }

@@ -125,7 +125,7 @@ export function doctor(exec: Exec = defaultExec, skill?: SkillCheck, mod?: ModCh
   const modOk = !mod || 'skipped' in mod || ('copies' in mod && mod.copies.every((c) => c.state === 'ok'))
   return {
     ok: cliOk && skillOk && modOk, clis,
-    ...(skill ? { skill: skillOk ? skill : { ...skill, next: SYNC_NEXT } } : {}),
+    ...(skill ? { skill: skillOk ? skill : { ...skill, next: skillRecovery(skill) } } : {}),
     ...(mod ? { mod: modReport(mod, modOk) } : {}),
     ...(agents ? { agents } : {}),
     ...(engine || agents ? { warnings: [...(!engine || engine.state === 'available' ? [] : [{
@@ -142,4 +142,16 @@ export function doctor(exec: Exec = defaultExec, skill?: SkillCheck, mod?: ModCh
 function modReport(mod: ModCheck, ok: boolean): ModReport {
   if ('unavailable' in mod) return { ...mod, next: 'restaura mods/sdd-ai en el checkout de sdd-ai (git checkout -- mods/sdd-ai) y repite doctor' }
   return ok || 'skipped' in mod ? mod : { ...mod, next: SYNC_NEXT }
+}
+
+/** La reparación de una fuente o copia ilegible precede a la sincronización. */
+function skillRecovery(skill: SkillCheck): string {
+  if ('skipped' in skill) return SYNC_NEXT
+  const sources = [...new Set(skill.copies.filter((copy) => copy.source_path).map((copy) => copy.source_path!))]
+  const unreadable = skill.copies.filter((copy) => copy.state === 'unchecked' && !copy.source_path).map((copy) => copy.path)
+  return [
+    ...(sources.length ? [`restaura o revisa primero las fuentes: ${sources.join(', ')}`] : []),
+    ...(unreadable.length ? [`revisa o quita las copias no comprobables antes de sincronizar: ${unreadable.join(', ')}`] : []),
+    SYNC_NEXT,
+  ].join('; ')
 }
