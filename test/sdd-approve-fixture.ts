@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { answerGate, makeRepo } from './helpers.ts'
 import { type Approval, type Depth } from '../src/sdd/status.ts'
+import { main } from '../src/cli.ts'
 
 export const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 export const SPEC = '# Spec\n\n## Criterios de aceptación\n\n- **AC-1:** resultado observable. (pedido)\n'
@@ -39,6 +40,54 @@ export function cli(f: Fixture, ...args: string[]): { code: number | null; out: 
   assert.equal(r.error, undefined, r.error?.message ?? '')
   assert.ok(r.stdout, r.stderr)
   return { code: r.status, out: JSON.parse(r.stdout) }
+}
+let inProcessActive = false
+/** El contexto equivale al del CLI del fixture; nunca se hereda el entorno exterior. */
+export async function runInProcess(f: Fixture, args: string[], deps?: Parameters<typeof main>[3]): Promise<{ code: number; out: any }> {
+  if (inProcessActive) throw new Error('runInProcess no admite llamadas superpuestas')
+  const cwd = process.cwd(), env = { ...process.env }, exitCode = process.exitCode
+  inProcessActive = true
+  try {
+    for (const key of Object.keys(process.env)) if (!Object.hasOwn(f.env, key)) delete process.env[key]
+    for (const [key, value] of Object.entries(f.env)) process.env[key] = value
+    process.chdir(f.root)
+    const result = await main(['sdd', ...args], f.env, f.root, deps)
+    return { code: result.code, out: JSON.parse(JSON.stringify(result.out)) }
+  } finally {
+    try {
+      for (const key of Object.keys(process.env)) if (!Object.hasOwn(env, key)) delete process.env[key]
+      for (const [key, value] of Object.entries(env)) process.env[key] = value
+      process.exitCode = exitCode
+      process.chdir(cwd)
+    } finally { inProcessActive = false }
+  }
+}
+export async function acceptInProcess(f: Fixture, gate: string) {
+  answer(f, gate)
+  const r = await runInProcess(f, ['approve', 'f', gate])
+  assert.equal(r.code, 0, JSON.stringify(r.out))
+  return r.out
+}
+/** Captura completa fuera del repo y la sesión; reset también elimina residuos de otras variantes. */
+export function checkpoint(f: Fixture): { reset(): void; cleanup(): void } {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'sdd-approve-checkpoint-')))
+  const env = { ...f.env }
+  const copy = (source: string, destination: string) => cpSync(source, destination, {
+    recursive: true, preserveTimestamps: true, verbatimSymlinks: true,
+  })
+  const cleanup = () => rmSync(directory, { recursive: true, force: true })
+  try {
+    copy(f.root, join(directory, 'repo'))
+    copy(f.sessionDir, join(directory, 'session'))
+  } catch (error) { cleanup(); throw error }
+  return { cleanup, reset: () => {
+    rmSync(f.root, { recursive: true, force: true })
+    rmSync(f.sessionDir, { recursive: true, force: true })
+    copy(join(directory, 'repo'), f.root)
+    copy(join(directory, 'session'), f.sessionDir)
+    for (const key of Object.keys(f.env)) if (!Object.hasOwn(env, key)) delete f.env[key]
+    Object.assign(f.env, env)
+  } }
 }
 export function logged(f: Fixture): Approval[] {
   const file = join(f.dir, 'sdd-ai-approvals.json')

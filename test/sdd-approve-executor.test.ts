@@ -6,24 +6,24 @@ import { approve } from '../src/sdd/approve.ts'
 import { readFlow } from '../src/sdd/read.ts'
 import { runHook } from '../src/hooks.ts'
 import { SddError } from '../src/types.ts'
-import { accept, behind, cli, fixture, logged, snapshot } from './sdd-approve-fixture.ts'
+import { acceptInProcess, behind, runInProcess, fixture, logged, snapshot } from './sdd-approve-fixture.ts'
 
-test('la recuperacion omite prove para el conductor y rechaza al worker con runner_required', () => {
+test('la recuperacion omite prove para el conductor y rechaza al worker con runner_required', async () => {
   const f = fixture()
   try {
-    accept(f, 'spec'); behind(f)
+    await acceptInProcess(f, 'spec'); behind(f)
     const original = logged(f)
     const noProof = () => { throw new Error('recuperación no debe llamar prove') }
     const pending = snapshot(f)
     f.env.SDD_AI_WORKER = '1'
-    assert.equal(cli(f, 'approve', 'f', 'spec').out.code, 'runner_required')
+    assert.equal((await runInProcess(f, ['approve', 'f', 'spec'])).out.code, 'runner_required')
     assert.deepEqual(snapshot(f), pending)
     delete f.env.SDD_AI_WORKER
     assert.equal(approve(f.root, 'f', 'spec', new Date(), readFlow, noProof, f.env).gates[0].state, 'approved')
     assert.deepEqual(logged(f), original)
     const synced = snapshot(f)
     f.env.SDD_AI_WORKER = '1'
-    assert.equal(cli(f, 'approve', 'f', 'spec').out.code, 'runner_required')
+    assert.equal((await runInProcess(f, ['approve', 'f', 'spec'])).out.code, 'runner_required')
     assert.deepEqual(snapshot(f), synced)
     delete f.env.SDD_AI_WORKER
     assert.throws(() => approve(f.root, 'f', 'spec', new Date(), readFlow, noProof, {}), (e: unknown) => e instanceof SddError && e.code === 'runner_required')

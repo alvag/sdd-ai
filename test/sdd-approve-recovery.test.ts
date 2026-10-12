@@ -7,7 +7,7 @@ import { approve } from '../src/sdd/approve.ts'
 import { type ApproveDeps, ApprovalSyncPending, REAL_DEPS } from '../src/sdd/approve-sync.ts'
 import { LOCK_FILE, readFlow } from '../src/sdd/read.ts'
 import { SddError } from '../src/types.ts'
-import { accept, answer, behind, cli, fixture, logged, snapshot, SPEC } from './sdd-approve-fixture.ts'
+import { acceptInProcess, answer, behind, runInProcess, fixture, logged, snapshot, SPEC } from './sdd-approve-fixture.ts'
 import { readHeader } from '../src/sdd/markdown.ts'
 
 const data = (file: string) => { const h = readHeader(readFileSync(file, 'utf8')); assert.ok(h.ok); return h.data }
@@ -19,7 +19,7 @@ test('los fallos de cada escritura respetan registro antes de headers y recupera
   for (const point of Object.keys(failingHeader)) {
     const f = fixture()
     try {
-      accept(f, 'spec'); behind(f); answer(f, 'plan-tasks')
+      await acceptInProcess(f, 'spec'); behind(f); answer(f, 'plan-tasks')
       const before = snapshot(f), previous = logged(f)
       let registered = false
       const deps: ApproveDeps = { ...REAL_DEPS,
@@ -56,7 +56,7 @@ test('los fallos de cada escritura respetan registro antes de headers y recupera
         { path: '.plans/f/plan.md', field: 'status', expected: 'tasks-ready', current: 'planned' }]
       assert.deepEqual(out.pending_headers, point === 'plan' ? expected.slice(1) : expected)
       assert.ok(out.status)
-      const state = cli(f, 'status', 'f').out
+      const state = (await runInProcess(f, ['status', 'f'])).out
       assert.ok(state.gates.every((g: any) => g.state !== 'approved_unfingerprinted'))
       assert.ok(state.notes.some((n: any) => n.code === 'header_behind'))
       assert.equal(readFileSync(join(f.dir, 'plan.md'), 'utf8'), before['plan.md']!.text)
@@ -76,25 +76,25 @@ test('los fallos de cada escritura respetan registro antes de headers y recupera
       assert.deepEqual(logged(f), entries)
       if (point === 'plan') assert.deepEqual(snapshot(f)['handoff.md'], partial['handoff.md'])
       const synced = snapshot(f)
-      assert.equal(cli(f, 'approve', 'f', 'plan-tasks').code, 0)
+      assert.equal((await runInProcess(f, ['approve', 'f', 'plan-tasks'])).code, 0)
       assert.deepEqual(snapshot(f), synced)
       writeFileSync(join(f.dir, 'plan.md'), synced['plan.md']!.text + '\nCambio sustantivo.\n')
-      assert.equal(cli(f, 'approve', 'f', 'plan-tasks').out.code, 'approval_missing')
+      assert.equal((await runInProcess(f, ['approve', 'f', 'plan-tasks'])).out.code, 'approval_missing')
     } finally { f.cleanup() }
   }
   // Fecha anterior que ya acredita spec: la pendiente no depende de header_behind.
   const dated = fixture()
   try {
-    accept(dated, 'spec')
+    await acceptInProcess(dated, 'spec')
     const at = logged(dated)[0].at
     writeFileSync(join(dated.dir, 'spec.md'), SPEC + '\nNueva versión.\n')
     answer(dated, 'spec')
     const r = await main(['sdd', 'approve', 'f', 'spec'], dated.env, dated.root, { approve: { ...REAL_DEPS, writeText: failure } })
     assert.equal(r.code, 3)
     assert.equal((r.out as any).pending_headers[0].current, at)
-    assert.ok(!cli(dated, 'status', 'f').out.notes.some((n: any) => n.code === 'header_behind'))
+    assert.ok(!(await runInProcess(dated, ['status', 'f'])).out.notes.some((n: any) => n.code === 'header_behind'))
     const entries = logged(dated)
-    assert.equal(cli(dated, 'approve', 'f', 'spec').code, 0)
+    assert.equal((await runInProcess(dated, ['approve', 'f', 'spec'])).code, 0)
     // La recuperación completa la fecha nueva sin agregar entradas.
     assert.deepEqual(logged(dated), entries)
     assert.equal(data(join(dated.dir, 'handoff.md')).spec_approved_at, entries.at(-1)!.at)
@@ -103,13 +103,13 @@ test('los fallos de cada escritura respetan registro antes de headers y recupera
   // Cambio ajeno entre headers detiene el siguiente; no revierte handoff.
   const changed = fixture()
   try {
-    accept(changed, 'spec'); behind(changed); answer(changed, 'plan-tasks')
+    await acceptInProcess(changed, 'spec'); behind(changed); answer(changed, 'plan-tasks')
     const r = await main(['sdd', 'approve', 'f', 'plan-tasks'], changed.env, changed.root, { approve: { ...REAL_DEPS,
       writeText: (file, text) => { REAL_DEPS.writeText(file, text); writeFileSync(join(changed.dir, 'tasks.md'), '# Tasks\n\n- [ ] **T1 — cambió** · cubre: AC-1\n') },
     } })
     assert.equal(r.code, 3)
     assert.deepEqual((r.out as any).pending_headers, [{ path: '.plans/f/plan.md', field: 'status', expected: 'tasks-ready', current: 'planned' }])
-    assert.equal(cli(changed, 'status', 'f').out.next.gate, 'plan-tasks')
+    assert.equal((await runInProcess(changed, ['status', 'f'])).out.next.gate, 'plan-tasks')
   } finally { changed.cleanup() }
   // Todas las escrituras completas, pero confirmación incierta y sin flujo releíble.
   const gone = fixture()
