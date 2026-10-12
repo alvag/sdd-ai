@@ -5,7 +5,8 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } fro
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { cli, git, storeOf, lockOf, readJsonFile, writerSetup, whenRunning, implement, EDITS } from './cli-run-fixture.ts'
+import { cli, git, storeOf, lockOf, readJsonFile, writerSetup, whenRunning, implement, EDITS, ownWriter } from './cli-run-fixture.ts'
+import { awaitObservation, ownProcesses, requireTerminal, withOwned } from './scenario-readiness.ts'
 
 test('wait de un writer trae base, archivos con estado y líneas, binarios, modos, enlaces y renombres', () => {
   const s = writerSetup({ script: { actions: EDITS, report: 'Cambié los archivos.\nSTATUS: done' } })
@@ -149,28 +150,42 @@ test('después de lanzar, sdd-ai no escribe nada en .sdd-ai/runs/<id>: enlaces p
 
 test('un writer que falla, vence o se cancela entrega la cosecha tras el cese y next remite a preguntar', async () => {
   const edit = { write: 'nuevo.txt', content: 'n\n' }
-  const failed = writerSetup({ script: { actions: [edit], exit: 1, report: '' } })
-  const f = cli(failed, ['wait', implement(failed).out.id, '--max', '20'])
-  assert.equal(f.out.state, 'failed')
-
-  const late = writerSetup({ script: { actions: [edit], hang: true, resumeFail: true } })
-  const t = cli(late, ['wait', implement(late, ['--deadline', '1']).out.id, '--max', '40'])
-  assert.equal(t.out.state, 'timeout')
-
-  const stopped = writerSetup({ script: { actions: [edit], hang: true } })
-  const id = implement(stopped).out.id
-  await whenRunning(stopped.repo, id)
-  await sleep(300)
-  assert.equal(cli(stopped, ['cancel', id]).code, 0)
-  const c = cli(stopped, ['wait', id, '--max', '20'])
-  assert.equal(c.out.state, 'cancelled')
-
-  for (const w of [f, t, c]) {
+  for (const expected of ['failed', 'timeout', 'cancelled']) {
+    const owned = ownProcesses()
+    const barriers = mkdtempSync(join(tmpdir(), 'sdd-ai-harvest-barrier-'))
+    owned.directory(barriers)
+    const afterBarrier = join(barriers, 'written')
+    const s = writerSetup({ script: { actions: [edit], afterBarrier,
+      ...(expected === 'failed' ? { exit: 1, report: '' } : { hang: true, resumeFail: expected === 'timeout' }) } })
+    for (const dir of [s.repo, s.bin, s.env.CODEX_HOME]) owned.directory(dir)
+    await withOwned(owned, async () => {
+    const id = implement(s, expected === 'timeout' ? ['--deadline', '10'] : []).out.id
+    await ownWriter(s, id, owned)
+    const acknowledged = await awaitObservation('nuevo.txt escrito antes del terminal', () => {
+      const arrived = existsSync(`${afterBarrier}.arrived`)
+      const content = existsSync(join(s.repo, 'nuevo.txt')) ? readFileSync(join(s.repo, 'nuevo.txt'), 'utf8') : null
+      return { value: arrived && content === 'n\n' ? Date.now() : undefined, detail: { arrived, content } }
+    })
+    if (expected === 'failed') writeFileSync(`${afterBarrier}.release`, '')
+    if (expected === 'cancelled') assert.equal(cli(s, ['cancel', id]).code, 0)
+    const w = cli(s, ['wait', id, '--max', '40'])
+    requireTerminal(w.out.state, expected)
+    await owned.ceased()
+    if (expected === 'timeout') {
+      const attempts = readJsonFile(join(storeOf(s.repo, id), 'metrics.json')).attempts
+      assert.ok(attempts.length >= 2, 'se ejecutó la reanudación fallida')
+      assert.equal(attempts.at(-1).kind, 'resume')
+      // La reanudación del guion falla y no entrega: el intento queda en el vencimiento original.
+      assert.ok(!['done', 'cancelled'].includes(attempts.at(-1).outcome), attempts.at(-1).outcome)
+      assert.equal(readJsonFile(join(storeOf(s.repo, id), 'status.json')).resume.outcome, attempts.at(-1).outcome)
+      assert.ok(Date.parse(attempts[0].ended_at) >= acknowledged, 'el acuse precede al vencimiento registrado')
+    }
     assert.deepEqual(w.out.files.map((x: { path: string }) => x.path), ['nuevo.txt'], w.out.state)
     assert.match(w.out.next, /pregunta al usuario si conserva el cambio o lo revierte; sdd-ai no revierte nada/i, w.out.state)
     assert.equal(w.code, 1)
+    assert.equal(existsSync(lockOf(s.repo)), false)
+    })
   }
-  for (const s of [failed, late, stopped]) assert.equal(existsSync(lockOf(s.repo)), false)
 })
 
 test('sin cambios, next dice que no hay nada que conservar y ofrece relanzar', () => {

@@ -19,6 +19,7 @@ import { type PhaseRecord, readPhaseRecord, withFlowLock, writePhaseRecord } fro
 import { freezeLaunch } from '../src/sdd/publish.ts'
 import { readFlow } from '../src/sdd/read.ts'
 import { makeFakeBin, makeRepo } from './helpers.ts'
+import { awaitObservation, ownProcesses, readyPids, withOwned } from './scenario-readiness.ts'
 
 const FAKE = join(import.meta.dirname, 'fake-cli.ts')
 
@@ -101,22 +102,45 @@ function alive(pid: number): boolean {
 /** Espera hasta 2 s a que ninguno de los PIDs del archivo `pids` (worker e hijo) siga vivo. */
 async function pidsGone(dir: string): Promise<void> {
   const pids = readFileSync(join(dir, 'pids'), 'utf8').split(',').map(Number)
-  await waitFor(() => (pids.some(alive) ? undefined : true), 2000)
+  await awaitObservation('cese del worker y su hijo', () => ({ value: pids.some(alive) ? undefined : true, detail: pids.map((pid) => ({ pid, alive: alive(pid) })) }), 2000)
+}
+
+function ownedSupervisor(dir: string, running: ReturnType<typeof supervise>) {
+  const owned = ownProcesses()
+  owned.directory(dir)
+  owned.terminate(() => {
+    const worker = existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined
+    if (worker) owned.add(worker)
+    if (existsSync(join(dir, 'pids'))) {
+      for (const pid of readFileSync(join(dir, 'pids'), 'utf8').split(',').map(Number)) if (Number.isInteger(pid) && pid > 1) owned.add(pid)
+    }
+    writeFileSync(join(dir, 'cancel.request'), '')
+  })
+  owned.completion(() => running)
+  return owned
 }
 
 test('el tope mata el grupo', async () => {
   const dir = prepare('claude', 'hang-child', { deadline_sec: 1, grace_ms: 200 })
   const started = Date.now()
-  const s = await supervise(dir)
-  assert.equal(s.state, 'timeout')
-  assert.ok(Date.now() - started < 6000, 'el tope tardó demasiado en terminar al worker')
-  await pidsGone(dir)
+  const running = supervise(dir)
+  const owned = ownedSupervisor(dir, running)
+  await withOwned(owned, async () => {
+    await readyPids(dir, () => readStatus(dir).worker_pid, owned)
+    const s = await running
+    assert.equal(s.state, 'timeout')
+    assert.ok(Date.now() - started < 6000, 'el tope tardó demasiado en terminar al worker')
+    await pidsGone(dir)
+    await owned.ceased()
+  })
 })
 
 test('una cancelación termina en cancelled', async () => {
   const dir = prepare('claude', 'hang-child')
   const running = supervise(dir)
-  const pid = await waitFor(() => (existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined))
+  const owned = ownedSupervisor(dir, running)
+  await withOwned(owned, async () => {
+  const [pid] = await readyPids(dir, () => existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined, owned)
   await sleep(300)
   const requested = Date.now()
   writeFileSync(join(dir, 'cancel.request'), '')
@@ -126,6 +150,8 @@ test('una cancelación termina en cancelled', async () => {
   assert.equal(s.state, 'cancelled')
   assert.ok(Date.now() - requested < 5000, 'la cancelación tardó demasiado')
   await pidsGone(dir)
+  await owned.ceased()
+  })
 })
 
 test('una cancelación pedida antes de lanzar no llega a lanzar al worker', async () => {
@@ -139,13 +165,17 @@ test('una cancelación pedida antes de lanzar no llega a lanzar al worker', asyn
 test('el supervisor atiende una cancelación sin que nadie mate al worker', async () => {
   const dir = prepare('claude', 'hang-child')
   const running = supervise(dir)
-  await waitFor(() => (existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined))
+  const owned = ownedSupervisor(dir, running)
+  await withOwned(owned, async () => {
+  await readyPids(dir, () => existsSync(join(dir, 'status.json')) ? readStatus(dir).worker_pid : undefined, owned)
   const requested = Date.now()
   writeFileSync(join(dir, 'cancel.request'), '')
   const s = await running
   assert.equal(s.state, 'cancelled')
   assert.ok(Date.now() - requested < 5000, 'la cancelación tardó demasiado')
   await pidsGone(dir)
+  await owned.ceased()
+  })
 })
 
 test('una cancelación que el worker ignora termina con SIGKILL tras la gracia', async () => {

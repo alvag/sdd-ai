@@ -7,6 +7,8 @@ import { join } from 'node:path'
 import { LENSES } from '../src/review/ledger.ts'
 import { LENS_MANDATES } from '../src/review/prompt.ts'
 import { makeFakeBin, makeRepo, telemetryOff } from './helpers.ts'
+import { awaitObservation, ownProcesses, requireTerminal, withOwned } from './scenario-readiness.ts'
+import { ownWriter } from './cli-run-fixture.ts'
 
 const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 const lines = (n: number) => Array.from({ length: n }, (_, i) => `línea ${i + 1}\n`).join('')
@@ -466,19 +468,36 @@ function runNext(s: Setup, next: string, env: Record<string, string> = {}) {
   return { code: r.status, out: JSON.parse(r.stdout || 'null'), args }
 }
 
-test('review start --harvest revisa la cosecha con los nuevos y se niega ante otro árbol, otra base, otro autor o una cosecha pendiente', () => {
+test('review start --harvest revisa la cosecha con los nuevos y se niega ante otro árbol, otra base, otro autor o una cosecha pendiente', async () => {
   const s = setup({ families: '[codex, claude]', bins: ['codex', 'claude'] })
-  const id = harvested(s, { actions: [{ write: 'nuevo.txt', content: 'nuevo\n' }, { append: 'a.txt', content: 'once\n' }], hang: true })
+  const owned = ownProcesses()
+  owned.directory(s.repo)
+  const barriers = mkdtempSync(join(tmpdir(), 'sdd-ai-barriers-'))
+  owned.directory(barriers)
+  const beforeBarrier = join(barriers, 'before'), afterBarrier = join(barriers, 'after')
+  await withOwned(owned, async () => {
+  const id = harvested(s, { beforeBarrier, afterBarrier, actions: [{ write: 'nuevo.txt', content: 'nuevo\n' }, { append: 'a.txt', content: 'once\n' }], hang: true })
+  await ownWriter({ ...s, prompt: '', bin: '' }, id, owned)
+  await awaitObservation('writer retenido antes de actuar', () => ({ value: existsSync(`${beforeBarrier}.arrived`) ? true : undefined, detail: { arrived: existsSync(`${beforeBarrier}.arrived`) } }))
   const pending = cli(s, ['review', 'start', '--harvest', id, '--base', s.base, '--author', 'codex'])
   assert.deepEqual([pending.code, pending.out.code, pending.out.next], [2, 'harvest_pending', `./bin/sdd-ai wait ${id}`])
   assert.equal(runs(s).length, 1)
-  const until = Date.now() + 15_000
-  while (!existsSync(join(s.repo, 'nuevo.txt')) && Date.now() < until) spawnSync('sleep', ['0.05'])
+  writeFileSync(`${beforeBarrier}.release`, '')
+  await awaitObservation('cambios completos de la cosecha de revisión', () => {
+    const arrived = existsSync(`${afterBarrier}.arrived`)
+    const added = existsSync(join(s.repo, 'nuevo.txt')) ? readFileSync(join(s.repo, 'nuevo.txt'), 'utf8') : null
+    const modified = readFileSync(join(s.repo, 'a.txt'), 'utf8')
+    return { value: arrived && added === 'nuevo\n' && modified === lines(10) + 'once\n' ? true : undefined, detail: { arrived, added, modified } }
+  })
   spawnSync(process.execPath, [BIN, 'cancel', id], { cwd: s.repo, env: s.env })
-  assert.equal(waitFor(s, id).state, 'cancelled')
+  requireTerminal(waitFor(s, id).state, 'cancelled')
+  await owned.ceased()
 
   const r = cli(s, ['review', 'start', '--harvest', id, '--base', s.base, '--author', 'codex'])
   assert.equal(r.code, 0, JSON.stringify(r.out))
+  owned.terminate(() => cli(s, ['cancel', r.out.id]))
+  owned.completion(() => waitFor(s, r.out.id))
+  await waitFor(s, r.out.id)
   assert.deepEqual([[...r.out.files].sort(), r.out.left_out, r.out.family], [['a.txt', 'nuevo.txt'], [], 'claude'])
   assert.deepEqual(runJson(s, r.out.id, 'request.json').selection, { base: s.base, context: [], untracked: true, harvest: id })
 
@@ -492,6 +511,7 @@ test('review start --harvest revisa la cosecha con los nuevos y se niega ante ot
   assert.deepEqual([stale.code, stale.out.code], [2, 'harvest_stale'])
   assert.match(stale.out.next, new RegExp(`review start --base ${s.base} --author codex --untracked\\)`))
   assert.doesNotMatch(stale.out.next, /--harvest/)
+  })
 })
 
 test('--untracked sobrevive a las rondas, a la vigencia y a los next de reinicio, y el next de una cosecha vencida lanza sin --harvest', () => {

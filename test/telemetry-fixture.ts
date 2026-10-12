@@ -7,6 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { createRun, newRunId, writeJsonAtomic } from '../src/runs.ts'
 import type { ArgvFile } from '../src/supervisor.ts'
 import { makeFakeBin, makeRepo } from './helpers.ts'
+import { awaitObservation, type OwnedProcesses } from './scenario-readiness.ts'
 
 export const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 export const FAKE = join(import.meta.dirname, 'fake-cli.ts')
@@ -84,9 +85,16 @@ export function prepareAttempt(f: TelemetryFixture, extra: Partial<ArgvFile> = {
   return { id, dir, argv }
 }
 
-export function launchAttempt(f: TelemetryFixture, prepared: ReturnType<typeof prepareAttempt>, mode = 'ok-codex', extraEnv: Record<string, string> = {}) {
+export function launchAttempt(f: TelemetryFixture, prepared: ReturnType<typeof prepareAttempt>, mode = 'ok-codex', extraEnv: Record<string, string> = {}, owned?: OwnedProcesses) {
   const env = { ...f.env, FAKE_MODE: mode, FAKE_CALLS_FILE: join(prepared.dir, 'calls'), ...extraEnv }
   const child = spawn(process.execPath, [BIN, '__supervise', prepared.dir], { env, cwd: f.root, stdio: ['ignore', 'pipe', 'pipe'] })
+  if (child.pid) owned?.add(child.pid)
+  owned?.terminate(() => {
+    const status = join(prepared.dir, 'status.json')
+    const pid = existsSync(status) ? JSON.parse(readFileSync(status, 'utf8')).worker_pid : undefined
+    if (pid) owned.add(pid)
+    writeFileSync(join(prepared.dir, 'cancel.request'), '')
+  })
   let stdout = ''; let stderr = ''
   child.stdout.on('data', (b) => { stdout += String(b) })
   child.stderr.on('data', (b) => { stderr += String(b) })
@@ -96,12 +104,13 @@ export function launchAttempt(f: TelemetryFixture, prepared: ReturnType<typeof p
       try { resolve({ code, out: JSON.parse(stdout || 'null') as Line, stderr }) } catch (e) { reject(e) }
     })
   })
+  owned?.completion(() => done)
   return { child, done }
 }
 
-export async function runAttempt(f: TelemetryFixture, extra: Partial<ArgvFile> = {}, mode = 'ok-codex', args: string[] = [], extraEnv: Record<string, string> = {}) {
+export async function runAttempt(f: TelemetryFixture, extra: Partial<ArgvFile> = {}, mode = 'ok-codex', args: string[] = [], extraEnv: Record<string, string> = {}, owned?: OwnedProcesses) {
   const prepared = prepareAttempt(f, extra, args)
-  const result = await launchAttempt(f, prepared, mode, extraEnv).done
+  const result = await launchAttempt(f, prepared, mode, extraEnv, owned).done
   assert.equal(result.code, 0, result.stderr)
   return { ...prepared, ...result }
 }

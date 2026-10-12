@@ -12,6 +12,7 @@ import { gitDirs } from '../src/git.ts'
 import { codexWriterLaunch } from '../src/workers/codex.ts'
 import { type WriterControl, readProcess, runDirIdentity, runInventory, sensitiveInventory, writeControl } from '../src/writer-store.ts'
 import { makeFakeBin, makeRepo, telemetryOff } from './helpers.ts'
+import { awaitObservation, ScenarioError, type OwnedProcesses } from './scenario-readiness.ts'
 
 export const BIN = join(import.meta.dirname, '..', 'bin', 'sdd-ai')
 
@@ -107,6 +108,32 @@ export async function whenRunning(repo: string, id: string): Promise<{ pid: numb
 
 export const implement = (s: Setup, extra: string[] = [], env: Record<string, string> = {}) =>
   cli(s, ['run', '--role', 'implement', '--prompt-file', s.prompt, ...extra], env)
+
+/** Registra los acuses del writer y conserva cancel como recuperación si falta alguno. */
+export async function ownWriter(s: Setup, id: string, owned: OwnedProcesses) {
+  const register = () => {
+    const dir = storeOf(s.repo, id)
+    const control = join(dir, 'control.json')
+    const group = existsSync(control) ? readJsonFile(control).group : undefined
+    if (group) owned.add(group.pid, true, group)
+    const supervisor = join(dir, 'supervisor.pid')
+    if (existsSync(supervisor)) owned.add(Number(readFileSync(supervisor, 'utf8')))
+    return group
+  }
+  owned.terminate(() => { try { register() } finally { cli(s, ['cancel', id]) } })
+  owned.completion(async () => {
+    const result = cli(s, ['wait', id, '--max', '60'])
+    if (!['done', 'failed', 'timeout', 'cancelled'].includes(result.out?.state)) {
+      throw new ScenarioError('cleanup_uncertain', `El writer ${id} no acredita cese: ${result.out?.state}`)
+    }
+    register()
+    await owned.ceased()
+  })
+  return awaitObservation(`grupo del writer ${id}`, () => {
+    const group = register()
+    return { value: group, detail: group ?? 'control sin grupo' }
+  })
+}
 
 export const EDITS = [
   { append: 'a.txt', content: 'tres\n' }, { delete: 'borrar.txt' }, { rename: ['mover.txt', 'movido.txt'] },

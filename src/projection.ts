@@ -70,6 +70,8 @@ export interface ProjectionPublicationOptions {
    * termine y vuelve a pedir, como `publishNow`. Sin él, lee igual.
    */
   queue?: boolean
+  /** Presupuesto interno inyectable por el fixture; sin él rige el default. */
+  pendingWaitMs?: number
   /** Barreras sincrónicas para las pruebas; el recolector siempre corre fuera de la sección relativa. */
   stage?: (stage: ProjectionStage, context: { root: string; attempt: number; id: string | null }) => void
 }
@@ -265,7 +267,7 @@ interface Claim { name: string; created: Stats; live: Stats }
  * siguiente publicación lo aparta.
  */
 function coveringClaim(boot: string, own: bigint, requested: bigint, monotonic: () => bigint,
-  stage: (s: ProjectionStage) => void): string | null {
+  stage: (s: ProjectionStage) => void, pendingWaitMs: number): string | null {
   const names = entries()
   if (names.length > PROJECTION_MAX_ENTRIES) return null
   let candidates = names.filter((name) => {
@@ -283,7 +285,7 @@ function coveringClaim(boot: string, own: bigint, requested: bigint, monotonic: 
       if (found !== null) pending.push(name)
     }
     if (pending.length === 0) return null
-    if (elapsed(started) >= PENDING_WAIT_MS) { stage('pending_expired'); return null }
+    if (elapsed(started) >= pendingWaitMs) { stage('pending_expired'); return null }
     if (!waiting) { stage('pending_wait'); waiting = true }
     candidates = pending
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1)
@@ -325,7 +327,7 @@ type ClaimPolicy = 'read' | 'yield' | 'queue'
  * cualquier proceso que muere mientras publica; su reserva deja de contar cuando el proceso ya no existe o a los 60 s.
  */
 function claim(root: string, live: Stats, boot: string, m0: string, requested: bigint, policy: ClaimPolicy, monotonic: () => bigint,
-  stage: (s: ProjectionStage) => void): { kind: 'yield'; id: string } | { kind: 'queue'; id: string } | { kind: 'claimed'; claim: Claim } {
+  stage: (s: ProjectionStage) => void, pendingWaitMs: number): { kind: 'yield'; id: string } | { kind: 'queue'; id: string } | { kind: 'claimed'; claim: Claim } {
   return inside(root, false, (_projection, current) => {
     if (!same(current, live)) return invalidated()
     const name = `claim-${m0}-${boot}-${process.pid}-${random()}`
@@ -333,7 +335,7 @@ function claim(root: string, live: Stats, boot: string, m0: string, requested: b
     let kept = false
     try {
       stage('reserved')
-      const covering = policy === 'read' ? null : coveringClaim(boot, BigInt(m0), requested, monotonic, stage)
+      const covering = policy === 'read' ? null : coveringClaim(boot, BigInt(m0), requested, monotonic, stage, pendingWaitMs)
       if (covering !== null) return { kind: 'yield' as const, id: covering }
       // No lee en paralelo con un publicador que empezó antes del pedido y no lo cubre: quien llama espera a que
       // termine, y así leen a lo sumo el que corre y el siguiente.
@@ -411,7 +413,7 @@ export function publishProjection(root: string, build: ProjectionBuilder, option
           // Solo cede o queda en la cola el primer intento: en el segundo, otros pudieron haber cedido ya ante la
           // reserva del primero.
           const policy: ClaimPolicy = attempt > 1 ? 'read' : options.queue === true ? 'queue' : 'yield'
-          const claimed = claim(root, live, boot, m0, options.requested, policy, monotonic, stage)
+          const claimed = claim(root, live, boot, m0, options.requested, policy, monotonic, stage, options.pendingWaitMs ?? PENDING_WAIT_MS)
           if (claimed.kind === 'yield') return { kind: 'skipped', id: claimed.id }
           if (claimed.kind === 'queue') return { kind: 'queued', id: claimed.id }
           own = claimed.claim
@@ -835,7 +837,8 @@ function awaitClaim(root: string, boot: string, name: string, deadline: bigint):
  * que la pidió; un pedido cubierto o que cedió queda como `skipped`, con la observación o la reserva que lo cubre, y uno
  * que esperó en la cola anota ante qué reservas (`queued`) y cuánto (`queued_ms`).
  */
-export function publishNow(root: string, origin: string, publisher: PublisherKind, triggerAt: number, requested: bigint | null = null): void {
+export function publishNow(root: string, origin: string, publisher: PublisherKind, triggerAt: number, requested: bigint | null = null,
+  budgets?: { queueWaitMs?: number; pendingWaitMs?: number }): void {
   try {
     // La traza vive aparte: `measure` sigue apareciendo solo cuando terminó el pedido.
     const file = process.env.SDD_AI_PROJECTION_MEASURE
@@ -849,8 +852,8 @@ export function publishNow(root: string, origin: string, publisher: PublisherKin
     }
     const started = clock()
     const boot = requested === null ? null : systemBootId()
-    const deadline = started + QUEUE_WAIT_NS
-    trace('started', { deadline: deadline.toString() })
+    const deadline = started + (budgets?.queueWaitMs === undefined ? QUEUE_WAIT_NS : BigInt(budgets.queueWaitMs) * 1_000_000n)
+    trace('started', { started: started.toString(), deadline: deadline.toString() })
     const queued: string[] = []
     let waited = 0n
     let result: ProjectionPublication
@@ -863,6 +866,7 @@ export function publishNow(root: string, origin: string, publisher: PublisherKin
       const queue = boot !== null && queued.length < QUEUE_ROUNDS && clock() < deadline
       trace('attempt', { queue, rounds: queued.length, deadline: deadline.toString() })
       result = publishProjection(root, collectProjection, { publisher, ...(requested === null ? {} : { requested, queue }),
+        ...(budgets?.pendingWaitMs === undefined ? {} : { pendingWaitMs: budgets.pendingWaitMs }),
         ...(file ? { stage: (stage: ProjectionStage, context: { attempt: number; id: string | null }) => trace(stage, context) } : {}) })
       trace('returned', { result: result.kind, ...('id' in result ? { id: result.id } : {}) })
       if (result.kind !== 'queued' || boot === null) break
