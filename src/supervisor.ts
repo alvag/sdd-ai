@@ -35,7 +35,7 @@ import { type DocumentContract, admitPlan, admitSpecify, admitTasks } from './sd
 import { readPhaseRecord, withFlowLock, writePhaseRecord } from './sdd/phase-state.ts'
 import { admitDocumentContract, documentArtifactPath, documentOpeningLaunch, relativePath, revisionRunState, runRevisionAttempts, type RevisionAttemptResult } from './phase-session.ts'
 import { type CorrectionProvenance, finishRevision } from './sdd/revision.ts'
-import { type RevisionResult, type EffectiveLaunch, revisionPublicationFacts } from './sdd/revision-record.ts'
+import { type RevisionResult, type EffectiveLaunch, readDocumentOrigins, revisionPublicationFacts } from './sdd/revision-record.ts'
 import { type FrozenLaunch, type PublishOutcome, publishPhase } from './sdd/publish.ts'
 import { closeTelemetry, perToken } from './telemetry.ts'
 
@@ -1097,12 +1097,15 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
     writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry } })
     // Registrar procedencia es auxiliar: nunca convierte una creación publicada en fallo.
     if (effectiveLaunch) {
-      try { writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry }, documents: {
-        ...rec.documents, [step]: { phase: step, artifact, run, family: ctx.family,
-          ...(effectiveSession ? { session_id: effectiveSession } : {}), launch: effectiveLaunch, sources, amendments,
-          ...(phase.task_actors ? { task_actors: true } : {}),
-        },
-      } }) } catch { /* La evidencia de la corrida sigue disponible para adopción heredada. */ }
+      const origin = { phase: step, artifact, run, family: ctx.family,
+        ...(effectiveSession ? { session_id: effectiveSession } : {}), launch: effectiveLaunch, sources, amendments,
+        ...(phase.task_actors ? { task_actors: true } : {}),
+      }
+      try {
+        // Se valida con el predicado del lector: una procedencia que no leería dejaría el registro ilegible.
+        readDocumentOrigins({ [step]: origin })
+        writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry }, documents: { ...rec.documents, [step]: origin } })
+      } catch { /* La evidencia de la corrida sigue disponible para adopción heredada. */ }
     }
   })
   if (out.kind === 'published') return finish({ state: 'done', ...extras }, { outcome: 'published', artifact: out.artifact, ...lists })

@@ -59,7 +59,7 @@ import {
 import { type Freshness, type ReviewRequest, REVIEW_LOCK, converged, freshness, untrackedOf } from './review/standing.ts'
 import { applyCommit, planCommit } from './sdd/commit.ts'
 import { approve } from './sdd/approve.ts'
-import { type ApproveDeps, ApprovalSyncPending, assertNoActivity } from './sdd/approve-sync.ts'
+import { type ApproveDeps, ApprovalSyncPending, REAL_DEPS } from './sdd/approve-sync.ts'
 import { assertBranchApplicable, branchApply, branchPreview } from './sdd/branch.ts'
 import { criteriaIds, readTaskResponsibilities } from './sdd/markdown.ts'
 import { type DocumentStep, type FrozenInputs, PHASE_INPUTS, type PhaseStep, admitFix, admitImplement, phaseTouchesMods, planHeaderFrom, renderPhasePrompt } from './sdd/phase.ts'
@@ -3032,19 +3032,20 @@ async function sdd(args: string[], env: Env, cwd: string, deps?: { approve?: App
     if (positionals.length > 1) throw new SddError('usage', 'sdd status recibe un solo id', { next: './bin/sdd-ai sdd status [<id>]' })
     const root = repoRoot(cwd)
     if (positionals.length === 0) return { code: 0, out: { flows: listFlows(root).map((e) => ({ ...e, next: withPhaseNext(root, e.id, e) })) } }
-    return { code: 0, out: detailedFlowView(root, positionals[0]) }
+    const view = detailedFlowView(root, positionals[0])
+    return { code: view.blocked_reasons.some((r) => r.code === 'revisions_invalid') ? 1 : 0, out: view }
   }
   if (sub === 'approve') {
     const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { conductor: { type: 'string' } } })
     if (positionals.length !== 2) throw new SddError('usage', 'sdd approve recibe el id y el gate', { next: './bin/sdd-ai sdd approve <id> <gate> [--conductor claude|codex]' })
     const root = repoRoot(cwd)
-    const approvalFlow = readFlow(root, positionals[0]).facts.id
-    withFlowLock(root, approvalFlow, () => {
-      recoverRevisionResult(root, approvalFlow)
-      assertNoActivity(root, approvalFlow)
-    })
+    // Una corrección interrumpida se recupera antes de decidir; sin nada que recuperar, un rechazo no toma el lock.
+    const pending = (() => { try { const r = readPhaseRecord(root, readFlow(root, positionals[0]).facts.id); return r.revisions?.active ?? pendingIntent(r) } catch { return undefined } })()
+    if (pending) withFlowLock(root, positionals[0], () => recoverRevisionResult(root, positionals[0]))
     try {
-      const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor), deps?.approve)
+      // La exclusión de actividad y la revalidación de la recuperación corren bajo el lock de approve, después de validar el gate.
+      const status = approve(root, positionals[0], positionals[1], new Date(), readFlow, prove, env, conductorFlag(values.conductor),
+        deps?.approve ?? { ...REAL_DEPS, prepare: recoverRevisionResult })
       const { facts } = readFlow(root, status.id)
       return { code: 0, out: { ...status, next: nextOf(root, status, facts) } }
     } catch (e) {

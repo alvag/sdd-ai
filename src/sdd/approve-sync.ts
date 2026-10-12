@@ -16,6 +16,8 @@ export interface ApproveDeps {
   writeJson: typeof writeJsonAtomic
   writeText: typeof writeTextAtomic
   activity: (root: string, id: string) => void
+  /** Corre bajo el lock de la aprobación antes de leer el flujo, como recuperar una corrección terminada. */
+  prepare?: (root: string, id: string) => void
 }
 export interface SyncField { path: string; field: 'spec_approved_at' | 'status'; expected: string; current: unknown }
 export interface SyncEdit extends SyncField { text: string; key: 'handoff' | 'plan' }

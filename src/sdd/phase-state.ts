@@ -7,7 +7,7 @@ import { type Family, type RunState, SddError, TERMINAL } from '../types.ts'
 import { activityPath, activityUnknown, harvestTreeHolds, isWriterRun, readActivityJson, readControl, readHarvest, writerRunOpenStrict } from '../writer-store.ts'
 import type { DocumentStep, PhaseStep } from './phase.ts'
 import { LOCK_FILE, flowDir, lstatOrNull, pathInvalid, readFlow } from './read.ts'
-import { type FlowStatus, type Next, headerData } from './status.ts'
+import { type FlowStatus, type Next, headerData, resolve } from './status.ts'
 import { reviewStartCommand } from '../review/standing.ts'
 import { commitNext, isCommitSha } from './commit.ts'
 import { type ChainState, classesPath, orientation } from './chain.ts'
@@ -150,8 +150,8 @@ function readPhaseRecordFile(root: string, id: string, strict: boolean): PhaseRe
   }
   try {
     const revision = readRevisionData(file, data)
-    data.documents = revision.documents
-    data.revisions = revision.revisions
+    if (revision.documents !== undefined) data.documents = revision.documents
+    if (revision.revisions !== undefined) data.revisions = revision.revisions
   } catch (e) {
     throw invalid(id, (e as Error).message)
   }
@@ -504,7 +504,16 @@ export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'de
  * El `next` de un flujo con el comando de su fase o de `sdd verify`, o con el motivo por el que no hay. Un registro que no
  * se puede leer no tumba a quien lista: queda dicho en `detail`.
  */
-export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root: string, id: string, status: T, snapshot?: PhaseRecord): Next {
+export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'> & Partial<Pick<FlowStatus, 'blocked_reasons'>>>(root: string, id: string, status: T, snapshot?: PhaseRecord): Next {
+  const reasons = status.blocked_reasons ?? []
+  if (status.next.step === 'resolve_blockers' && reasons.length > 0 && reasons.every((r) => r.code === 'revisions_invalid')) {
+    // El registro ilegible sigue bloqueando gates y avance; next conserva el diagnóstico del paso, nunca un comando.
+    let step = status.next
+    try { step = resolve({ ...readFlow(root, id).facts, revisions: undefined }).next } catch { /* Queda el bloqueo. */ }
+    const diagnosed = { ...withPhaseNext(root, id, { depth: status.depth, next: step }, snapshot) }
+    delete diagnosed.command
+    return { ...diagnosed, detail: diagnosed.detail ?? reasons[0].detail }
+  }
   let record: PhaseRecord | undefined; let recordError: unknown
   try {
     record = snapshot ?? readPhaseRecord(root, id)
