@@ -2,11 +2,12 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type Question, disputeQuestion, extraQuestion } from '../src/approval/question.ts'
 import { askPair, writeClaudeTranscript } from './helpers.ts'
+import { awaitObservation } from './scenario-readiness.ts'
 import {
   BIN, lines, setup, cli, runFile, states, grave, grave2, firstRound, nextRound, startAndWait, waitRound, answerReview,
   ARTIFACT_AT_CAP, artifactAtCap, diffAtCap, unresolved, cliAsync, pause, holdLock, twoDisputes, ledgerText, entryOf,
@@ -211,16 +212,45 @@ test('dos decide sobre la misma disputa con pruebas distintas registran uno y el
   const other = { ...s.env, CLAUDE_CODE_SESSION_ID: randomUUID(), CLAUDE_CONFIG_DIR: mkdtempSync(join(tmpdir(), 'sdd-ai-claude-')) }
   const q = cli(s, ['review', 'status', id]).out.questions.find((x: Question) => x.question.includes('disputa F-1'))
   writeClaudeTranscript(other.CLAUDE_CONFIG_DIR, other.CLAUDE_CODE_SESSION_ID, askPair(other.CLAUDE_CODE_SESSION_ID, 'tu-other', q, 'Aceptar el hallazgo'))
-  const hold = await holdLock(runFile(s, id, 'review.lock'))
+  const lock = runFile(s, id, 'review.lock')
+  const initial = ledgerText(s, id)
+  const initialEntry = entryOf(s, id, 'F-1')
+  const observations = mkdtempSync(join(tmpdir(), 'sdd-ai-decide-observations-'))
+  const hold = await holdLock(lock)
+  const holder = readFileSync(lock, 'utf8')
+  const environments: Record<string, string>[] = [s.env, other].map((env, i) => ({ ...env,
+    NODE_OPTIONS: `--import ${join(import.meta.dirname, 'telemetry-fault-preload.ts')}`,
+    SDD_AI_TEST_FAULT_TARGET: lock, SDD_AI_TEST_FAULT_OBSERVATIONS: join(observations, String(i)),
+  }))
+  const both = Promise.all(environments.map((env) => cliAsync(s, ['review', 'decide', id, 'accept', 'F-1'], env)))
   try {
-    const both = Promise.all([cliAsync(s, ['review', 'decide', id, 'accept', 'F-1']), cliAsync(s, ['review', 'decide', id, 'accept', 'F-1'], other)])
-    await pause(1000)
+    await Promise.all(environments.map((env) => awaitObservation('llegada independiente de decide al lock exacto', () => {
+      const path = env.SDD_AI_TEST_FAULT_OBSERVATIONS
+      const events = existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []
+      // El preload publica antes de linkSync: acredita llegada, no adquisición ni resultado de ps.
+      const arrived = events.some((e) => e.operation === 'linkSync' && e.path.startsWith(`${lock}.`) && /^\d+\.[a-f0-9]+\.tmp$/.test(e.path.slice(lock.length + 1)))
+      return { value: arrived ? true : undefined, detail: events }
+    })))
+    assert.equal(readFileSync(lock, 'utf8'), holder)
+    assert.equal(ledgerText(s, id), initial)
     hold.release()
     const results = await both
     assert.equal(results.filter((r) => r.code === 0).length, 1, JSON.stringify(results.map((r) => r.out)))
     assert.deepEqual(results.filter((r) => r.code !== 0).map((r) => r.out.code), ['decision_conflict'])
+    assert.ok(results.find((r) => r.code !== 0)!.code !== null)
+    const winner = results.findIndex((r) => r.code === 0)
+    const entry = entryOf(s, id, 'F-1')
+    assert.equal(entry.decision.action, 'accept')
+    assert.equal(entry.decision.proof.session, environments[winner].CLAUDE_CODE_SESSION_ID)
+    assert.deepEqual(entry.superseded, [...(initialEntry.superseded ?? []), initialEntry.decision])
+    const expected = JSON.parse(initial)
+    expected.entries[expected.entries.findIndex((e: { id: string }) => e.id === 'F-1')] = entry
+    assert.deepEqual(JSON.parse(ledgerText(s, id)), expected)
   } finally {
     hold.release()
+    await both
+    rmSync(observations, { recursive: true, force: true })
+    rmSync(other.CLAUDE_CONFIG_DIR, { recursive: true, force: true })
   }
 })
 
