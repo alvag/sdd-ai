@@ -289,6 +289,29 @@ test('con un rojo el header queda en implementing, aunque viniera de verified', 
   assert.match(planOf(repo), /\| AC-1 \| V1 \| ❌ failed \|/)
 })
 
+test('npm test con un fallo deliberado conserva la fila roja y las salidas del recibo', async () => {
+  const stdout = 'fallo deliberado de npm test\n'
+  const stderr = 'diagnóstico original del fallo\n'
+  const row = cmd('V1', ['npm', 'test'], { acs: ['AC-1', 'AC-2'], kind: 'inspection', timeout_ms: 30000 })
+  const { repo } = verifyFlow({ rows: [row], base: {
+    'package.json': JSON.stringify({ scripts: { test: `node -e "process.stdout.write('fallo deliberado de npm test\\n'); process.stderr.write('diagnóstico original del fallo\\n'); process.exitCode = 1"` } }),
+  } })
+  const { receipt, ref } = await final(repo)
+  assert.equal(receipt.green, false)
+  const [result] = receipt.rows
+  assert.equal(result.outcome, 'failed')
+  assert.deepEqual(result.execution?.argv, ['npm', 'test'])
+  assert.equal(result.execution?.exit_code, 1)
+  const dir = receiptDir(repo, receipt.id)
+  const out = join(dir, result.execution!.stdout_file), err = join(dir, result.execution!.stderr_file)
+  assert.ok(readFileSync(out, 'utf8').includes(stdout))
+  assert.ok(readFileSync(err, 'utf8').includes(stderr))
+  assert.equal(result.execution!.stdout_sha256, fileSha256(out))
+  assert.equal(result.execution!.stderr_sha256, fileSha256(err))
+  assert.ok(ref)
+  assert.deepEqual(readVerifyReceipt(repo, ref).rows, receipt.rows)
+})
+
 test('una fila que escribe en el repo, un timeout o una ruta nueva impiden el verde', async () => {
   const writes = verifyFlow({ rows: [RED_ROW, { ...BUILD_ROW, argv: [process.execPath, '-e', 'require("node:fs").writeFileSync("src/z.ts", "x")'] }] })
   const w = await final(writes.repo)

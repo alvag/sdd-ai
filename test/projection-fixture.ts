@@ -10,6 +10,7 @@ import { available, known, OBSERVATION_NAME, unknown } from '../src/projection-t
 import type { Projection, ProjectionFlow, ProjectionObservation, ProjectionRun, ProjectionRunState } from '../src/projection-types.ts'
 import type { ProjectionStage } from '../src/projection.ts'
 import type { WriterControl } from '../src/writer-store.ts'
+import { awaitObservation, ownProcesses, ScenarioError } from './scenario-readiness.ts'
 
 export const TEST_BOOT = '11111111-1111-1111-1111-111111111111'
 export const OTHER_BOOT = '22222222-2222-2222-2222-222222222222'
@@ -58,8 +59,20 @@ export function projectionFixture() {
   mkdirSync(join(root, '.sdd-ai'))
   const base = git('rev-parse', 'HEAD')
   const children = new Set<ReturnType<typeof spawn>>()
+  const owned = ownProcesses()
+  owned.directory(scratch)
+  let preparationExpired = false
+  const track = (child: ReturnType<typeof spawn>) => {
+    children.add(child)
+    if (child.pid) owned.add(child.pid)
+    const closed = new Promise<void>((resolve) => {
+      child.once('close', () => { children.delete(child); resolve() })
+      child.once('error', () => { children.delete(child); resolve() })
+    })
+    owned.completion(() => closed)
+  }
   return {
-    root, scratch, base,
+    root, scratch, base, owned, track,
     worktree(name = 'linked') {
       const path = join(scratch, name)
       git('worktree', 'add', '--detach', path, 'HEAD')
@@ -104,22 +117,37 @@ export function projectionFixture() {
       return dir
     },
     barrier(name: string) { return projectionBarrier(join(scratch, name)) },
-    start(script: string) {
+    start(script: string, limitMs = 15000) {
       const child = spawn(process.execPath, ['--input-type=module', '-e', script], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] })
-      children.add(child)
+      track(child)
       let stdout = ''; let stderr = ''
       child.stdout!.on('data', (chunk) => { stdout += String(chunk) })
       child.stderr!.on('data', (chunk) => { stderr += String(chunk) })
-      const timeout = setTimeout(() => child.kill('SIGKILL'), 15000)
+      let expired = false
+      // Excepción del fixture: este ChildProcess todavía no se recogió; no se señala un PID reutilizado.
+      const timeout = setTimeout(() => {
+        expired = true
+        preparationExpired = true
+        stderr += '\npreparation_timeout: venció el plazo del proceso de publicación\n'
+        child.kill('SIGKILL')
+      }, limitMs)
       const done = new Promise<{ code: number | null; signal: string | null; stdout: string; stderr: string }>((resolve) => {
         child.once('error', (e) => { clearTimeout(timeout); children.delete(child); resolve({ code: null, signal: null, stdout, stderr: stderr + e.message }) })
         child.once('close', (code, signal) => { clearTimeout(timeout); children.delete(child); resolve({ code, signal, stdout, stderr }) })
       })
+      owned.completion(async () => {
+        await done
+        if (expired) throw new ScenarioError('preparation_timeout', 'Venció el plazo del proceso de publicación')
+      })
       return { child, done }
     },
     dispose() {
-      for (const child of children) child.kill('SIGKILL')
-      rmSync(scratch, { recursive: true, force: true })
+      if (children.size === 0) {
+        if (preparationExpired) throw new ScenarioError('preparation_timeout', 'Venció el plazo del proceso de publicación')
+        rmSync(scratch, { recursive: true, force: true })
+        return
+      }
+      return owned.disposeOwned()
     },
   }
 }
@@ -128,11 +156,7 @@ export function projectionBarrier(path: string) {
   return {
     path,
     async arrived(timeout = 10000) {
-      const until = Date.now() + timeout
-      while (!existsSync(`${path}.arrived`)) {
-        if (Date.now() >= until) throw new Error(`no llegó a la barrera ${path}`)
-        await sleep(10)
-      }
+      await awaitObservation('acuse de la barrera de publicación', () => ({ value: existsSync(`${path}.arrived`) ? true : undefined, detail: { arrived: existsSync(`${path}.arrived`) } }), timeout)
     },
     release() { writeFileSync(`${path}.release`, '') },
   }
@@ -143,7 +167,7 @@ export function projectionBarrier(path: string) {
  * atiende un pedido con ese reloj, como `__publish`: reserva o cede. Con `systemBoot`, usa el arranque real de la
  * máquina, el mismo que un `__publish` lanzado aparte.
  */
-export function publicationScript(root: string, source: string, options: { barrier?: string; stage?: ProjectionStage; offset?: string; m0?: string; requested?: bigint; systemBoot?: boolean; measure?: string } = {}): string {
+export function publicationScript(root: string, source: string, options: { barrier?: string; barrierLimitMs?: number; stage?: ProjectionStage; offset?: string; m0?: string; requested?: bigint; systemBoot?: boolean; measure?: string } = {}): string {
   return `import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
     import { publishProjection } from ${JSON.stringify(new URL('../src/projection.ts', import.meta.url).href)};
     import { projectionDocument, projectionRun, TEST_BOOT } from ${JSON.stringify(import.meta.url)};
@@ -168,7 +192,7 @@ export function publicationScript(root: string, source: string, options: { barri
         trace('holder_' + stage, context);
         if (barrier && context.attempt === 1 && stage === ${JSON.stringify(options.stage ?? 'observed')}) {
           writeFileSync(barrier + '.arrived', String(process.pid));
-          const until = Date.now() + 30000;
+          const until = Date.now() + ${options.barrierLimitMs ?? 30000};
           while (!existsSync(barrier + '.release')) {
             if (Date.now() > until) throw new Error('barrera vencida');
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
