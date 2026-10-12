@@ -1,3 +1,4 @@
+import type { CorrectionProvenance } from '../sdd/revision.ts'
 import type { ArtifactKind } from './artifact.ts'
 import type { Candidate } from './candidate.ts'
 import type { LedgerEntry, RoundPlan } from './ledger.ts'
@@ -207,7 +208,7 @@ function changes(plan: RoundPlan, path: string, before: string, after: string): 
  * en CAMBIOS.
  */
 export function renderArtifactRoundPrompt(c: Candidate, material: string, plan: RoundPlan, entries: LedgerEntry[], cap: number,
-  before: string, after: string): string {
+  before: string, after: string, provenance?: CorrectionProvenance): string {
   const h = c.hash
   const path = artifactPath(c)
   const pick = (kind: 'verify' | 'respond') => plan.targets.filter((t) => t.kind === kind)
@@ -217,7 +218,9 @@ export function renderArtifactRoundPrompt(c: Candidate, material: string, plan: 
   const newFindings = plan.identical
     ? '- Como el artefacto no cambió, no se admite ningún hallazgo nuevo: `findings` es [].'
     : `- Un hallazgo nuevo solo se admite como regresión de la corrección, y es un defecto del artefacto: su \`of\` es ${path}. Su \`location\` puede estar en cualquier línea del artefacto, y su \`cause\` cita una línea de CAMBIOS: \`+N\` (una línea agregada o cambiada del artefacto actual) o \`-N\` (una línea borrada de la versión anterior). Una causa fuera de CAMBIOS, o un defecto de otro archivo, rechaza la respuesta entera.`
-  const instructions = `${header(c)} Esta es la ronda ${plan.n} de ${cap} de la revisión: en una ronda anterior emitiste hallazgos; el conductor corrigió los que aceptó y rechazó otros con un motivo. Ahora revisas el artefacto corregido.
+  const authorship = provenance?.author === 'producer' ? `el productor de familia ${provenance.family} corrigió los hallazgos aceptados del artefacto`
+    : provenance?.author === 'mixed' ? 'el productor y el conductor corrigieron los hallazgos aceptados del artefacto' : 'el conductor corrigió los que aceptó'
+  const instructions = `${header(c)} Esta es la ronda ${plan.n} de ${cap} de la revisión: en una ronda anterior emitiste hallazgos; ${authorship}; los hallazgos rechazados conservan el motivo del conductor. Ahora revisas el artefacto corregido.
 
 ${access(h)}
 

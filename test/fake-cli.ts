@@ -26,6 +26,73 @@ function okClaude(): void {
   process.stdout.write(fixture('claude-stream.jsonl'))
 }
 
+/** Correcciones y rondas documentales: todos los controles pertenecen al proveedor falso. */
+async function documentScript(): Promise<void> {
+  const entries = JSON.parse(readFileSync(process.env.FAKE_DOCUMENT_SCRIPT!, 'utf8')) as Array<{
+    answer?: string; session?: string; reject_resume?: boolean; startup_failure?: boolean; execution_failure?: boolean
+    barrier?: string; hang?: boolean
+  }>
+  const entry = entries[callCount() - 1]
+  if (!entry) throw new Error(`fake-cli: invocación documental no prevista ${callCount()}`)
+  const prompt = readFileSync(0, 'utf8')
+  if (process.env.FAKE_CALLS_FILE) appendFileSync(`${process.env.FAKE_CALLS_FILE}.prompts`, `${JSON.stringify(prompt)}\n`)
+  const codex = args[0] === 'exec'
+  const sessionOption = (flag: string) => { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : undefined }
+  // codexResume termina con <thread> -; Claude nombra la sesión con un flag.
+  const resume = codex ? (args[1] === 'resume' && args.at(-1) === '-' ? args.at(-2) : undefined) : sessionOption('--resume')
+  if (entry.startup_failure || (entry.reject_resume && resume !== undefined)) {
+    process.stderr.write(entry.reject_resume && resume !== undefined ? `No conversation found with session ID: ${resume}\n` : 'fake-cli: startup failed\n')
+    process.exitCode = 1
+    return
+  }
+  const session = entry.session ?? resume ?? (codex ? `DOCUMENT_THREAD_${callCount()}` : sessionOption('--session-id'))
+  if (!session) throw new Error('fake-cli: falta la sesión documental en argv')
+  // Archivos de sesión sintéticos para que sessionFile use su camino normal.
+  const locate = (dir: string): string | undefined => {
+    if (!existsSync(dir)) return undefined
+    for (const item of readdirSync(dir, { withFileTypes: true })) {
+      const file = join(dir, item.name)
+      if (item.isDirectory()) { const found = locate(file); if (found) return found }
+      else if (codex ? item.name.endsWith(`-${session}.jsonl`) : item.name === `${session}.jsonl`) return file
+    }
+    return undefined
+  }
+  const sessionFile = locate(codex ? join(process.env.CODEX_HOME!, 'sessions') : join(process.env.CLAUDE_CONFIG_DIR!, 'projects')) ?? (codex ? join(process.env.CODEX_HOME!, 'sessions', '2026', '10', '10', `rollout-2026-10-10T00-00-00-${session}.jsonl`)
+    : join(process.env.CLAUDE_CONFIG_DIR!, 'projects', '-fixture', `${session}.jsonl`)
+  )
+  mkdirSync(dirname(sessionFile), { recursive: true })
+  appendFileSync(sessionFile, `${JSON.stringify({ type: codex ? 'session_meta' : 'system', session_id: session, payload: { id: session } })}\n`)
+  process.stdout.write(`${JSON.stringify(codex ? { type: 'thread.started', thread_id: session }
+    : { type: 'system', subtype: 'init', session_id: session, model: 'fake-document', tools: [] })}\n`)
+  if (entry.barrier) {
+    writeFileSync(`${entry.barrier}.ready`, '')
+    const until = Date.now() + 60000
+    while (!existsSync(entry.barrier) && Date.now() < until) await sleep(10)
+    if (!existsSync(entry.barrier)) throw new Error(`fake-cli: barrera sin liberar ${entry.barrier}`)
+  }
+  if (entry.hang) { const timer = setInterval(() => {}, 1000); setTimeout(() => { clearInterval(timer); process.exitCode = 1 }, 60000); return }
+  if (entry.execution_failure) {
+    process.stdout.write(`${JSON.stringify(codex ? { type: 'item.started', item: { type: 'agent_message' } }
+      : { type: 'assistant', message: { content: [{ type: 'text', text: 'Trabajo iniciado.' }] } })}\n`)
+    process.stderr.write('fake-cli: execution failed\n'); process.exitCode = 1; return
+  }
+  // $HASH es la huella del candidato de la ronda; los reintentos solo traen la orden de cierre.
+  const memory = process.env.FAKE_CALLS_FILE ? `${process.env.FAKE_CALLS_FILE}.document-candidate` : undefined
+  let hash = /`candidate_hash` es exactamente (sha256:[0-9a-f]{64})/.exec(prompt)?.[1]
+  if (memory && hash) writeFileSync(memory, hash)
+  else if (memory && existsSync(memory)) hash = readFileSync(memory, 'utf8')
+  const answer = (entry.answer ?? '{}').replaceAll('$HASH', hash ?? '')
+  if (codex) {
+    const i = args.indexOf('--output-last-message')
+    if (i >= 0) writeFileSync(args[i + 1], answer)
+    process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: answer } })}\n`)
+    process.stdout.write('{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n')
+  } else {
+    process.stdout.write(`${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: answer }] } })}\n`)
+    process.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: answer })}\n`)
+  }
+}
+
 function okCodex(): void {
   if (process.env.FAKE_PROMPT_FILE) writeFileSync(process.env.FAKE_PROMPT_FILE, readFileSync(0, 'utf8'))
   process.stdout.write(fixture('codex-stream.jsonl'))
@@ -396,6 +463,9 @@ switch (process.env.FAKE_MODE) {
     break
   case 'telemetry-script':
     await telemetryScript()
+    break
+  case 'document-script':
+    await documentScript()
     break
   case 'writer':
     writer()

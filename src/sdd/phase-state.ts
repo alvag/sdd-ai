@@ -2,17 +2,18 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { dirtyPaths } from '../git.ts'
 import { withLock } from '../lock.ts'
-import { isRunId, readStatus, writeJsonAtomic } from '../runs.ts'
+import { isAlive, isRunId, readStatus, writeJsonAtomic } from '../runs.ts'
 import { type Family, type RunState, SddError, TERMINAL } from '../types.ts'
 import { activityPath, activityUnknown, harvestTreeHolds, isWriterRun, readActivityJson, readControl, readHarvest, writerRunOpenStrict } from '../writer-store.ts'
 import type { DocumentStep, PhaseStep } from './phase.ts'
 import { LOCK_FILE, flowDir, lstatOrNull, pathInvalid, readFlow } from './read.ts'
-import { type FlowStatus, type Next, headerData } from './status.ts'
+import { type FlowStatus, type Next, headerData, resolve } from './status.ts'
 import { reviewStartCommand } from '../review/standing.ts'
 import { commitNext, isCommitSha } from './commit.ts'
 import { type ChainState, classesPath, orientation } from './chain.ts'
 import { chainBaseOf, chainView, classificationDetail, redProposals } from './chain-facts.ts'
 import type { AttestationRef, VerifyReceipt, VerifyReceiptRef } from './verify-receipt.ts'
+import { type DocumentOrigin, type RevisionRecord, pendingIntent, readRevisionData, portableLaunch, revisionSupervisorPid } from './revision-record.ts'
 
 // El estado de las fases de un flujo que no se lee de sus artefactos: la última corrida, la ampliación
 // y el cierre inline, por fase. Vive en el flujo, junto al registro de aprobaciones, y se escribe bajo
@@ -38,6 +39,8 @@ export interface PhaseRecord {
   implement?: ImplementRecord
   commit?: CommitRecord
   reviews?: string[]
+  documents?: Partial<Record<DocumentStep, DocumentOrigin>>
+  revisions?: RevisionRecord
 }
 
 /** Una corrida de writer de la cadena. `implement` es el writer inicial; `fix`, una corrección desde un recibo rojo. */
@@ -144,6 +147,13 @@ function readPhaseRecordFile(root: string, id: string, strict: boolean): PhaseRe
   if (data.commit !== undefined) {
     const problem = commitProblem(data.commit)
     if (problem !== null) throw invalid(id, `commit ${problem}`)
+  }
+  try {
+    const revision = readRevisionData(file, data)
+    if (revision.documents !== undefined) data.documents = revision.documents
+    if (revision.revisions !== undefined) data.revisions = revision.revisions
+  } catch (e) {
+    throw invalid(id, (e as Error).message)
   }
   return data as unknown as PhaseRecord
 }
@@ -399,7 +409,11 @@ export function withFlowLock<T>(root: string, id: string, fn: () => T): T {
 
 /** Escribe el registro de un golpe. Va dentro de `withFlowLock`. */
 export function writePhaseRecord(root: string, id: string, r: PhaseRecord): void {
-  writeJsonAtomic(join(flowDir(root, id), PHASES_FILE), r)
+  writeJsonAtomic(join(flowDir(root, id), PHASES_FILE), { ...r,
+    ...(r.documents ? { documents: Object.fromEntries(Object.entries(r.documents).map(([step, origin]) =>
+      [step, origin ? { ...origin, launch: portableLaunch(origin.launch) } : origin])) } : {}),
+    ...(r.revisions ? { revisions: { ...r.revisions, entries: r.revisions.entries.map((e) => ({ ...e, launch: portableLaunch(e.launch) })) } } : {}),
+  })
 }
 
 /**
@@ -431,6 +445,11 @@ function runActive(root: string, run: string, strict = false): boolean {
 
 /** La corrida de fase del flujo que todavía no terminó, o `null`. */
 export function activeRun(root: string, r: PhaseRecord, strict = false): string | null {
+  // La reserva no se libera por observar un terminal: puede faltar finalizar su publicación.
+  // Solo un verbo que recupera bajo lock cierra la entrada y libera active.
+  if (r.revisions?.active) return r.revisions.active.run
+  const intent = pendingIntent(r)
+  if (intent) return intent.run
   return r.last_run !== null && runActive(root, r.last_run.id, strict) ? r.last_run.id : null
 }
 
@@ -455,6 +474,14 @@ const diskProbe = (root: string): PhaseProbe => ({
 export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'depth' | 'next'>, r: PhaseRecord,
   probe: PhaseProbe = diskProbe(root)): { command?: string; detail?: string } | null {
   const step = status.next.step
+  const revision = r.revisions?.active ?? pendingIntent(r)
+  if (revision) {
+    const status = readStatus(join(root, '.sdd-ai', 'runs', revision.run))
+    const pid = revisionSupervisorPid(root, revision.run, status.supervisor_pid)
+    const active = probe.active(revision.run) && pid !== undefined && isAlive(pid)
+    if (!active && !TERMINAL.has(status.state)) return { command: `./bin/sdd-ai cancel ${revision.run}`, detail: `la corrección de ${revision.artifact} quedó orphan` }
+    return { command: `./bin/sdd-ai wait ${revision.run}`, detail: `la corrección de ${revision.artifact} ${active ? 'sigue activa' : 'tiene un cierre pendiente'}` }
+  }
   if ((status.depth !== 'normal' && status.depth !== 'completa') || !PHASE_STEPS.includes(step)) return null
   const launch = `./bin/sdd-ai sdd phase ${id}`
   if (r.last_run !== null && probe.active(r.last_run.id)) return { command: `./bin/sdd-ai wait ${r.last_run.id}` }
@@ -477,7 +504,22 @@ export function phaseNext(root: string, id: string, status: Pick<FlowStatus, 'de
  * El `next` de un flujo con el comando de su fase o de `sdd verify`, o con el motivo por el que no hay. Un registro que no
  * se puede leer no tumba a quien lista: queda dicho en `detail`.
  */
-export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root: string, id: string, status: T): Next {
+export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'> & Partial<Pick<FlowStatus, 'blocked_reasons'>>>(root: string, id: string, status: T, snapshot?: PhaseRecord): Next {
+  const reasons = status.blocked_reasons ?? []
+  if (status.next.step === 'resolve_blockers' && reasons.length > 0 && reasons.every((r) => r.code === 'revisions_invalid')) {
+    // El registro ilegible sigue bloqueando gates y avance; next conserva el diagnóstico del paso, nunca un comando.
+    let step = status.next
+    try { step = resolve({ ...readFlow(root, id).facts, revisions: undefined }).next } catch { /* Queda el bloqueo. */ }
+    const diagnosed = { ...withPhaseNext(root, id, { depth: status.depth, next: step }, snapshot) }
+    delete diagnosed.command
+    return { ...diagnosed, detail: diagnosed.detail ?? reasons[0].detail }
+  }
+  let record: PhaseRecord | undefined; let recordError: unknown
+  try {
+    record = snapshot ?? readPhaseRecord(root, id)
+    const activity = phaseNext(root, id, status, record)
+    if (record.revisions?.active || pendingIntent(record)) return { ...status.next, ...activity }
+  } catch (e) { recordError = e }
   if (status.next.step === 'branch') return { ...status.next, command: `./bin/sdd-ai sdd branch ${id}` }
   const chained = chainNext(root, id, status)
   if (status.next.step === 'review_and_commit') {
@@ -499,7 +541,8 @@ export function withPhaseNext<T extends Pick<FlowStatus, 'depth' | 'next'>>(root
   if (status.next.step === 'verify') return { ...status.next, command: `./bin/sdd-ai sdd verify ${id}` }
   if ((status.depth !== 'normal' && status.depth !== 'completa') || !PHASE_STEPS.includes(status.next.step)) return status.next
   try {
-    const phase = phaseNext(root, id, status, readPhaseRecord(root, id))
+    if (recordError) throw recordError
+    const phase = phaseNext(root, id, status, record!)
     return phase ? { ...status.next, ...phase } : status.next
   } catch (e) {
     return { ...status.next, detail: `no se pudo leer el registro de fases: ${(e as Error).message}` }

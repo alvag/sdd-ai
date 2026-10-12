@@ -9,6 +9,7 @@ import { type DocumentContract, type DocumentStep, type PlanHeader, localIso, re
 import { withFlowLock } from './phase-state.ts'
 import { FILE_NAMES, type FlowRead, artifactHash, bytesHash, flowDir, headerHash, lstatOrNull, readFlow } from './read.ts'
 import { type Step, resolve } from './status.ts'
+import { publishRevision, type FrozenRevision } from './revision.ts'
 
 /**
  * Lo que una corrida de fase congeló al lanzarse y la publicación vuelve a comparar: el paso y la
@@ -16,6 +17,7 @@ import { type Step, resolve } from './status.ts'
  * de `plan.md`. `created_at` se fija al escribir.
  */
 export interface FrozenLaunch {
+  revision?: FrozenRevision
   task_actors?: true
   flow: string; step: DocumentStep; depth: 'normal' | 'completa'
   /** `sha256:` de los bytes de cada insumo congelado: el pedido, la spec, el plan y el contexto. */
@@ -30,8 +32,11 @@ export interface FrozenLaunch {
   criteria?: string[]
 }
 
-export type PublishCause = 'artifact_exists' | 'inputs_changed' | 'step_changed' | 'candidate_blocked' | 'write_failed'
-export type PublishOutcome = { kind: 'published'; artifact: string } | { kind: 'not_published'; cause: PublishCause; detail: string }
+export type PublishCause = 'artifact_exists' | 'inputs_changed' | 'step_changed' | 'candidate_blocked' | 'write_failed' | 'intent_unwritable' | 'publish_interrupted'
+export type PublishOutcome = { kind: 'published'; artifact: string; digest?: string; registry_pending?: true; detail?: string; blocked_reasons?: { code: string; detail: string }[] }
+  | { kind: 'no_changes'; artifact: string; cause?: undefined; detail?: undefined; blocked_reasons?: { code: string; detail: string }[] }
+  | { kind: 'conflict'; cause: 'reservation_changed' | 'implementation_started' | 'origin_missing' | 'material_changed' | 'target_changed_during_publish'; detail: string; registry_pending?: true }
+  | { kind: 'not_published'; cause: PublishCause; detail: string; registry_pending?: true }
 
 const ARTIFACT_OF: Record<DocumentStep, 'spec' | 'plan' | 'tasks'> = { specify: 'spec', plan: 'plan', tasks: 'tasks' }
 const PHASE_ORDER: readonly Step[] = ['specify', 'plan', 'tasks', 'implement']
@@ -106,6 +111,7 @@ function render(launch: FrozenLaunch, c: DocumentContract, now: Date): string {
  */
 export function publishPhase(root: string, launch: FrozenLaunch, contract: DocumentContract, now: Date = new Date(),
   then?: (outcome: PublishOutcome) => void): PublishOutcome {
+  if (launch.revision) return publishRevision(root, launch, contract, now, then)
   const artifact = ARTIFACT_OF[launch.step]
   const name = FILE_NAMES[artifact]
   const decide = (): PublishOutcome => {

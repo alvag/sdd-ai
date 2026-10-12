@@ -1,4 +1,4 @@
-import { type Stats, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { type Stats, closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { type JiraMode, loadJiraMode } from '../config.ts'
 import { hasRemote } from '../git.ts'
@@ -11,6 +11,7 @@ import {
 } from './markdown.ts'
 import { type Approval, type ApprovalLog, type Depth, type FileState, type FlowFacts, GATES, type GateId, type Next, type Reason, isDepth, resolve } from './status.ts'
 import { verifyFacts } from './verify-state.ts'
+import { pendingIntent, readRevisionFile, revisionPublicationFacts } from './revision-record.ts'
 
 /** El registro de aprobaciones vive en el flujo: viaja con él al archivarlo. */
 export const APPROVALS_FILE = 'sdd-ai-approvals.json'
@@ -154,7 +155,7 @@ const sectionState = (s: string | null): SectionState => (s === null ? 'absent' 
  * Los hechos de un flujo, y el digest de cada archivo leído: `absent`, `unreadable`, o su estado y el
  * `sha256` de sus bytes. Dos lecturas con los mismos digests leyeron lo mismo. No escribe nada.
  */
-export interface FlowRead { facts: FlowFacts; digests: Record<FileKey, string> }
+export interface FlowRead { facts: FlowFacts; digests: Record<FileKey, string> & { revisions?: string } }
 
 /** El modo de Jira del flujo: un override `"on"` u `"off"` del handoff pisa el de la config, también uno inválido. */
 function flowJira(id: string, handoffHeader: HeaderResult | null, config: JiraMode): JiraMode {
@@ -232,6 +233,27 @@ export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode
   const rel = `.plans/${id}`
   const paths = Object.fromEntries([['dir', rel], ...Object.entries(FILE_NAMES).map(([k, name]) => [k, `${rel}/${name}`])])
   const verify = planText === null ? {} : verifyFacts(root, id, planText, planHeader, fingerprints, spec ?? planText)
+  let revisionFacts: FlowFacts['revisions']
+  let phasesDigest = 'absent'
+  try {
+    const record = readRevisionFile(join(dir, 'sdd-ai-phases.json'))
+    phasesDigest = record.digest
+    const intent = pendingIntent(record)
+    const barriers = [...(record.revisions?.barriers ?? [])]
+    // Una intención puede acreditar el rename antes de la finalización del registro. Status solo lee.
+    if (intent) {
+      const key = ARTIFACTS.find((a) => intent.artifact === `.plans/${id}/${a}.md`)
+      const publication = revisionPublicationFacts(root, intent, key ? files[key].digest.replace(/^(?:present|empty):/, 'sha256:') : undefined)
+      phasesDigest = bytesHash(`${phasesDigest}\n${publication.digest}`)
+      if (publication.barrier) barriers.push({ run: intent.run, artifact: intent.artifact, gates: intent.gates, digest: intent.result_digest })
+      if (publication.detail) revisionFacts = { barriers, pending: intent, invalid: publication.detail }
+
+    }
+    if (record.revisions && !revisionFacts) revisionFacts = { barriers, ...(intent ? { pending: intent } : {}) }
+  } catch (e) {
+    phasesDigest = `unreadable:${sha256((e as Error).message)}`
+    revisionFacts = { barriers: [], invalid: (e as Error).message }
+  }
   return {
     facts: {
       id,
@@ -249,9 +271,11 @@ export function readFlow(root: string, id: string, jira: JiraMode = loadJiraMode
       hasRemote: hasRemote(root),
       jira: flowJira(id, handoffHeader, jira),
       ...verify,
+      ...(revisionFacts ? { revisions: revisionFacts } : {}),
     },
     digests: {
       spec: files.spec.digest, plan: files.plan.digest, tasks: files.tasks.digest, handoff: files.handoff.digest, approvals: approvals.digest,
+      ...(revisionFacts ? { revisions: phasesDigest } : {}),
     },
   }
 }

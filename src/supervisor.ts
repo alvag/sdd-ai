@@ -6,7 +6,7 @@ import {
   appendFileSync, closeSync, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, writeSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { basename, dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { type Outcome, type StreamFacts, classify, emptyFacts, scanLine, usageSince } from './outcome.ts'
@@ -33,6 +33,9 @@ import {
 } from './writer-store.ts'
 import { type DocumentContract, admitPlan, admitSpecify, admitTasks } from './sdd/phase.ts'
 import { readPhaseRecord, withFlowLock, writePhaseRecord } from './sdd/phase-state.ts'
+import { admitDocumentContract, documentArtifactPath, documentOpeningLaunch, relativePath, revisionRunState, runRevisionAttempts, type RevisionAttemptResult } from './phase-session.ts'
+import { type CorrectionProvenance, finishRevision } from './sdd/revision.ts'
+import { type RevisionResult, type EffectiveLaunch, readDocumentOrigins, revisionPublicationFacts } from './sdd/revision-record.ts'
 import { type FrozenLaunch, type PublishOutcome, publishPhase } from './sdd/publish.ts'
 import { closeTelemetry, perToken } from './telemetry.ts'
 
@@ -55,6 +58,7 @@ export interface JobRecord {
 }
 
 export interface ArgvFile {
+  correction_provenance?: CorrectionProvenance
   execution?: ExecutionContext
   family: Family; deadline_sec: number; grace_ms?: number
   /** El worker de `run`. Una revisión arma el de cada trabajo, con su propio temporal. */
@@ -102,6 +106,7 @@ export interface RefutationRecord {
 
 /** Una entrada de `rounds.json` por ronda lanzada, haya terminado o no. */
 export interface RoundRecord {
+  correction_provenance?: ArgvFile['correction_provenance']
   n: number; tag: string; candidate_hash: string; base_sha: string | null; head_sha: string | null
   state: RunState; reason?: string; detail?: string; started_at: string; ended_at: string
   extra: boolean; model_effective: string | null
@@ -567,7 +572,7 @@ function effectiveValue(family: Family, field: RejectedField, facts: StreamFacts
 
 const stateAndReason = (o: Outcome) => (o.reason ? `${o.state}/${o.reason}` : o.state)
 
-interface Phase<T> { last: Attempt; outcome: Outcome; review?: T; toolEvents: string[] }
+interface Phase<T> { last: Attempt; outcome: Outcome; review?: T; toolEvents: string[]; effectiveLaunch?: LaunchSpec }
 interface Fix { name: string; suffix: string; kind: AttemptKind }
 
 /**
@@ -579,7 +584,7 @@ async function admitPhase<T>(ctx: RunContext, launch: LaunchSpec, last: Attempt,
   admitFn: (text: string) => Admission<T>, fix: Fix): Promise<Phase<T>> {
   const { dir, family } = ctx
   const adm = admitAttempt(dir, last, admitFn)
-  if (adm.kind === 'admitted') return { last, outcome: last.outcome, review: adm.review, toolEvents: [] }
+  if (adm.kind === 'admitted') return { last, outcome: last.outcome, review: adm.review, toolEvents: [], effectiveLaunch: launch }
   if (adm.kind === 'unavailable') return { last, outcome: { state: 'unavailable', reason: 'reviewer_unavailable', detail: adm.reason }, toolEvents: [] }
 
   const text = renderCorrectionPrompt(readFileSync(launch.stdinFile, 'utf8'), adm.error)
@@ -598,7 +603,7 @@ async function admitPhase<T>(ctx: RunContext, launch: LaunchSpec, last: Attempt,
     return { last: fixed, outcome: { state: 'unavailable', reason: 'correction_failed', detail: stateAndReason(fixed.outcome) }, toolEvents }
   }
   const second = admitAttempt(dir, fixed, admitFn)
-  if (second.kind === 'admitted') return { last: fixed, outcome: fixed.outcome, review: second.review, toolEvents }
+  if (second.kind === 'admitted') return { last: fixed, outcome: fixed.outcome, review: second.review, toolEvents, effectiveLaunch: fixLaunch }
   if (second.kind === 'unavailable') return { last: fixed, outcome: { state: 'unavailable', reason: 'reviewer_unavailable', detail: second.reason }, toolEvents }
   return { last: fixed, outcome: { state: 'unavailable', reason: 'inadmissible_twice', detail: second.error }, toolEvents }
 }
@@ -930,6 +935,7 @@ async function superviseReview(ctx: RunContext, resumeSec: number): Promise<Stat
     model_effective: ordered[0]?.model_effective ?? null, tool_events: ordered.flatMap((r) => r.tool_events),
     launch: launchN, ...(argv.risk ? { risk: argv.risk } : {}), ...(argv.batches ? { batches: argv.batches } : {}),
     jobs: ordered, ...(refutation ? { refutation } : {}), ...(unverifiable ? { unverifiable } : {}),
+    ...(argv.correction_provenance ? { correction_provenance: argv.correction_provenance } : {}),
   })
   if (existsSync(join(dir, 'ledger.json'))) writeReceipt(dir)
   // Terminada la ronda, su avance sale del registro que se acaba de agregar y del plan del lanzamiento.
@@ -999,8 +1005,9 @@ async function superviseLaunch(dir: string, argv: ArgvFile): Promise<Status> {
 
 /** Lo que una corrida de fase deja en `phase.json`: la salida, el artefacto y lo que el gate necesita. */
 export interface PhaseResult extends FindingsChannel {
-  outcome: 'published' | 'awaiting_context' | 'closed_inline' | 'not_published' | 'not_admitted'
+  outcome: 'closed_inline' | RevisionResult['state']
   artifact?: string; assumptions: string[]; blocking_questions: string[]; missing_context: string[]; cause?: string
+  registry_pending?: true; digest?: string
 }
 
 /**
@@ -1013,6 +1020,7 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
   const { dir, argv, cancelFile } = ctx
   const phase = argv.phase
   if (!phase || !argv.launch) throw new Error('la corrida de fase no trae lo que congeló o su lanzamiento')
+  if (phase.revision) return superviseRevision(ctx, resumeSec)
   const run = basename(dir)
   const finish = (patch: Partial<Status>, result?: PhaseResult) => {
     if (result) writeJsonAtomic(join(dir, 'phase.json'), result)
@@ -1037,6 +1045,15 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
     return finish({ ...outcomeFields(admitted.outcome), ...extras }, admitted.outcome.state === 'cancelled' ? undefined : { outcome: 'not_admitted', ...empty, cause: detail })
   }
   const c = { ...admitted.review, ...(phase.findings && !('findings' in admitted.review) ? { findings_missing: true } : {}) }
+  const admittedLaunch = admitted.effectiveLaunch ?? r.current
+  const effectiveSession = sessionOf(ctx.family, admittedLaunch.args, admitted.last.facts)
+  let effectiveLaunch: EffectiveLaunch | undefined
+  try { effectiveLaunch = documentOpeningLaunch(ctx.family, admittedLaunch, effectiveSession) } catch { /* La procedencia auxiliar no altera el contrato de creación. */ }
+  if (effectiveSession) extras.session_id = effectiveSession
+  // El intento admitido puede haber cambiado de sesión durante la recuperación de admisión.
+  try {
+    if (effectiveLaunch) writeJsonAtomic(join(dir, 'producer.json'), { launch: effectiveLaunch, ...(effectiveSession ? { session_id: effectiveSession } : {}) })
+  } catch { effectiveLaunch = undefined /* La creación conserva su publicación aunque falle esta metadata. */ }
   writeJsonAtomic(join(dir, 'contract.json'), c)
   // Un cancel que llegó mientras se admitía corta antes de escribir nada en el flujo.
   if (existsSync(cancelFile)) return finish({ state: 'cancelled', ...extras })
@@ -1068,11 +1085,125 @@ async function supervisePhase(ctx: RunContext, resumeSec: number): Promise<Statu
     const entry = { ...rec.phases[step] }
     delete entry.awaiting
     if (entry.amended) entry.amended = { ...entry.amended, consumed: true }
+    const artifact = documentArtifactPath(phase.flow, step)
+    const sources = Object.entries(phase.inputs).filter(([name]) => name !== 'context').map(([name, digest]) => ({
+      path: name === 'request' ? (phase.request_path && relativePath(phase.root, phase.request_path)) || `.sdd-ai/runs/${run}/request.md` : `.plans/${phase.flow}/${name}.md`,
+      digest, copy: `.sdd-ai/runs/${run}/${name}.md`, role: name,
+    }))
+    const amendments = phase.inputs.context ? [{
+      path: phase.context_path ? relativePath(phase.root, phase.context_path) : `.sdd-ai/runs/${run}/context.md`,
+      digest: phase.inputs.context, copy: `.sdd-ai/runs/${run}/context.md`, role: 'context',
+    }] : []
     writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry } })
+    // Registrar procedencia es auxiliar: nunca convierte una creación publicada en fallo.
+    if (effectiveLaunch) {
+      const origin = { phase: step, artifact, run, family: ctx.family,
+        ...(effectiveSession ? { session_id: effectiveSession } : {}), launch: effectiveLaunch, sources, amendments,
+        ...(phase.task_actors ? { task_actors: true } : {}),
+      }
+      try {
+        // Se valida con el predicado del lector: una procedencia que no leería dejaría el registro ilegible.
+        readDocumentOrigins({ [step]: origin })
+        writePhaseRecord(phase.root, phase.flow, { ...rec, phases: { ...rec.phases, [step]: entry }, documents: { ...rec.documents, [step]: origin } })
+      } catch { /* La evidencia de la corrida sigue disponible para adopción heredada. */ }
+    }
   })
   if (out.kind === 'published') return finish({ state: 'done', ...extras }, { outcome: 'published', artifact: out.artifact, ...lists })
+  if (out.kind === 'no_changes') return finish({ state: 'done', ...extras }, { outcome: 'no_changes', artifact: out.artifact, ...lists })
   return finish({ state: 'failed', reason: 'not_published', detail: `${out.cause}: ${out.detail}`, ...extras },
     { outcome: 'not_published', ...lists, cause: `${out.cause}: ${out.detail}` })
+}
+
+/** El bucle documental fijado conserva sesión y aislamiento; no usa runAttempts ni correctionLaunch. */
+async function superviseRevision(ctx: RunContext, resumeSec: number): Promise<Status> {
+  const { dir, argv, cancelFile } = ctx
+  const phase = argv.phase!
+  const run = basename(dir)
+  let reservationError: unknown
+  let entry: import('./sdd/revision-record.ts').RevisionEntry | undefined
+  try { entry = withFlowLock(phase.root, phase.flow, () => readPhaseRecord(phase.root, phase.flow, true).revisions?.entries.find((e) => e.run === run)) } catch (e) { reservationError = e }
+  const artifact = entry?.artifact ?? `.plans/${phase.flow}/${phase.revision!.artifact}.md`
+  const attempts = new Map<string, Attempt>()
+  let deliverySaved = false
+  let deliveredAnswer: RevisionAttemptResult | undefined
+  let answer: RevisionAttemptResult
+  try {
+  if (!entry || !argv.launch) throw reservationError ?? new Error('la corrección no tiene reserva o lanzamiento')
+  answer = await runRevisionAttempts({
+    session: { family: ctx.family, launch: argv.launch, mode: entry.session_mode, session_id: entry.session_id },
+    deadline: Date.now() + argv.deadline_sec * 1000, recovery_seconds: Math.min(resumeSec, argv.deadline_sec),
+    cancelled: () => existsSync(cancelFile),
+    execute: async (launch, suffix, until) => {
+      writeJsonAtomic(join(dir, `argv${suffix || '-initial'}.json`), { ...argv, launch })
+      const a = await attempt(ctx, launch, suffix, until)
+      attempts.set(suffix, a)
+      return { outcome: a.outcome, facts: a.facts, launch,
+        text: existsSync(a.resultFile) ? readFileSync(a.resultFile, 'utf8') : '', stderr: readFileSync(a.stderrFile, 'utf8') }
+    },
+    record: (a, suffix) => recordAttempt(ctx, suffix === '-fix' ? 'correction' : suffix === '-resume' ? 'resume' : 'initial', suffix, a.launch, attempts.get(suffix)!),
+    continuation: (launch, session, suffix, prompt) => {
+      const args = ctx.family === 'claude' ? isResumeArgs(ctx.family, launch.args) ? launch.args : claudeResume(launch.args)
+        : isResumeArgs(ctx.family, launch.args) ? withResultFile(launch.args, join(dir, `result${suffix}.md`)) : codexResume(launch.args, session, join(dir, `result${suffix}.md`))
+      if (!args) throw new Error('el lanzamiento no permite reanudar la sesión fijada')
+      const stdinFile = join(dir, `prompt${suffix}.md`)
+      writeFileSync(stdinFile, prompt)
+      return { ...launch, args, stdinFile }
+    },
+    admit: (text) => admitDocumentContract(phase.step, text, phase.criteria ?? [], phase.task_actors === true),
+    correctionPrompt: (error) => renderCorrectionPrompt(readFileSync(join(dir, 'prompt.md'), 'utf8'), error),
+    closingPrompt: closingMessage('run'),
+    publish: (delivered) => {
+      deliveredAnswer = delivered
+      writeJsonAtomic(join(dir, 'contract.json'), delivered.contract)
+      writeJsonAtomic(join(dir, 'revision-result.json'), { session_id: delivered.session_id, launch: documentOpeningLaunch(ctx.family, delivered.launch!, delivered.session_id) })
+      deliverySaved = true
+    const out = publishPhase(phase.root, { ...phase, revision: { ...phase.revision!, run } }, delivered.contract!)
+    return { ...delivered.result, state: out.kind,
+      ...('cause' in out ? { cause: out.cause } : {}), ...('detail' in out ? { detail: out.detail } : {}),
+      ...('digest' in out ? { digest: out.digest } : {}), ...('registry_pending' in out ? { registry_pending: out.registry_pending } : {}),
+      ...('blocked_reasons' in out ? { blocked_reasons: out.blocked_reasons } : {}),
+    }
+    },
+  })
+  } catch (e) {
+    let result: RevisionResult = { state: 'failed', cause: entry ? 'revision_execution_failed' : 'reservation_missing', detail: (e as Error).message }
+    if (deliverySaved) {
+      result = { state: 'not_published', cause: 'write_failed', detail: (e as Error).message, registry_pending: true }
+      try {
+        const record = readPhaseRecord(phase.root, phase.flow, true)
+        const intent = record.revisions?.intent
+        if (intent?.run === run) {
+          const current = existsSync(join(phase.root, intent.artifact)) ? `sha256:${createHash('sha256').update(readFileSync(join(phase.root, intent.artifact))).digest('hex')}` : undefined
+          if (revisionPublicationFacts(phase.root, intent, current).published) result = { ...result, state: 'published', cause: undefined, digest: intent.result_digest }
+        }
+      } catch { /* La intención queda para la recuperación bajo lock. */ }
+    }
+    answer = { ...deliveredAnswer, result }
+  }
+  let result = answer.result
+  const c = answer.contract
+  try {
+  if (entry && !deliverySaved) {
+  if (c) writeJsonAtomic(join(dir, 'contract.json'), c)
+  writeJsonAtomic(join(dir, 'revision-result.json'), { ...(answer.session_id ? { session_id: answer.session_id } : {}), launch: documentOpeningLaunch(ctx.family, answer.launch ?? entry!.launch, answer.session_id) })
+  }
+  } catch (e) { result = { state: 'failed', cause: 'revision_publication_failed', detail: (e as Error).message } }
+  // Una publicación consumada con finalización fallida conserva la reserva para la recuperación.
+  if (entry && !result.registry_pending) {
+    try { withFlowLock(phase.root, phase.flow, () => {
+      result = finishRevision(phase.root, phase.flow, run, result, {
+        ...(answer.session_id ? { session_id: answer.session_id } : {}), launch: documentOpeningLaunch(ctx.family, answer.launch ?? entry!.launch, answer.session_id),
+      })
+    }) } catch (e) { result = { ...result, registry_pending: true, detail: [result.detail, `registro: ${(e as Error).message}`].filter(Boolean).join('; ') } }
+  }
+  const lists = { assumptions: c?.assumptions ?? [], blocking_questions: c?.blocking_questions ?? [], missing_context: c?.missing_context ?? [] }
+  const report: PhaseResult = { ...result, outcome: result.state, artifact, ...lists,
+    ...(c && 'findings' in c ? { findings: c.findings } : {}), ...(c && 'findings_rejected' in c ? { findings_rejected: c.findings_rejected } : {}),
+  }
+  writeJsonAtomic(join(dir, 'phase.json'), report)
+  const state = revisionRunState(result.state)
+  return setStatus(dir, { state, reason: result.cause ?? (state === 'failed' ? result.state : undefined), detail: result.detail,
+    ...(answer.session_id ? { session_id: answer.session_id } : {}), ended_at: new Date().toISOString() })
 }
 
 /**

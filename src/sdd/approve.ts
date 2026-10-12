@@ -62,6 +62,7 @@ export function approve(root: string, id: string, gate: string, now: Date, read:
   const seen = registered(observed)
   const dir = flowDir(root, id)
   return withFlowLock(root, id, () => {
+    deps.prepare?.(root, id)
     let stable: FlowRead
     try {
       stable = freezeStableWith(root, id, read, (r) => JSON.stringify(r.digests))

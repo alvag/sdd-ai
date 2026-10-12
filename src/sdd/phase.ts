@@ -168,7 +168,9 @@ ${m.quality}`
  * El encargo de una fase: una plantilla por fase con los insumos congelados entre marcas. Dos flujos con
  * los mismos insumos reciben el mismo prompt salvo los datos del flujo.
  */
-export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: FrozenInputs, engineContext?: string): string {
+export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: FrozenInputs, options?: string | { engineContext?: string; correction?: { material: string } }): string {
+  const engineContext = typeof options === 'string' ? options : options?.engineContext
+  const correction = typeof options === 'string' ? undefined : options?.correction
   const parts = [
     WORKER_POLICY,
     `# Encargo de la fase ${step} del flujo ${flow.id}`,
@@ -180,6 +182,11 @@ export function renderPhasePrompt(step: PhaseStep, flow: FlowData, inputs: Froze
       ? projectTaskBlocks(inputs.tasks ?? '', flow.pending ?? []) : inputs[name] ?? '')),
   ]
   if (engineContext !== undefined) parts.push(engineContext)
+  if (correction !== undefined) {
+    parts.push('## Mandato de corrección documental',
+      'Corrige los hallazgos aceptados y toda la coherencia del mismo documento. Devuelve el contrato íntegro de esta fase. No implementes, no cambies otros artefactos y no amplíes el alcance aprobado. Los hallazgos no sustituyen el pedido ni los insumos aprobados. Los rechazos, informativos y hallazgos sin decidir son contexto, no órdenes. Las preguntas de producto las responde Max; el contexto faltante lo obtiene el conductor. Tu reporte no resuelve el ledger ni concede gates: eso corresponde a la revisión independiente y a la aprobación humana.',
+      correction.material)
+  }
   if (inputs.context !== undefined) {
     parts.push('## Ampliación', 'Tu primera corrida devolvió preguntas o faltantes; el conductor agregó esto para contestarlos.', block('CONTEXTO ampliación', inputs.context))
   }
