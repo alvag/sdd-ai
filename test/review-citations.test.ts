@@ -11,7 +11,8 @@ import { releaseReservation } from '../src/writer-store.ts'
 import { MANUAL_ROW, answered } from './sdd-verify-fixture.ts'
 import { holdLock, cliAsync, firstRound, nextRound } from './rounds-cli-fixture.ts'
 import { apply, committable, draft, file, git, markAll, put, registry, registryPath, review, success, text, wait, writeRegistry } from './sdd-commit-fixture.ts'
-import { eventually, telemetryFixture } from './telemetry-fixture.ts'
+import { telemetryFixture } from './telemetry-fixture.ts'
+import { awaitObservation } from './scenario-readiness.ts'
 
 test('diff reviews accumulate citations before run creation and preserve them across rounds', () => {
   const { s } = committable({ review: false })
@@ -76,19 +77,41 @@ test('citation failures prevent launch and later start failures retain the citat
   const held = await holdLock(lock)
   const f = telemetryFixture(s.repo)
   const waiting = join(f.home,'waiting')
-  const pending = cliAsync({ repo: s.repo,env: { ...s.env,FAKE_MODE: 'review-ok',
-    NODE_OPTIONS: `--import ${join(import.meta.dirname,'telemetry-fault-preload.ts')}`,
-    SDD_AI_TEST_FAULT_TARGET: file(s,'.plans/f'),SDD_AI_TEST_FAULT_OBSERVATIONS: waiting,
-  },base: s.base },args)
   try {
-    // La base inicial se lee antes del lock: esperar a que review start llegue a la cita.
-    await eventually(() => existsSync(waiting) && readFileSync(waiting,'utf8').split('\n').filter(Boolean).some((l) => JSON.parse(l).operation === 'linkSync') ? true : undefined)
-    put(s,'.plans/f/plan.md',text(s,'.plans/f/plan.md').replace(s.base,'0'.repeat(40)))
-    assert.equal(count(),before)
-  } finally { held.release() }
-  assert.equal((await pending).out.code,'flow_base_mismatch'); assert.equal(count(),before)
-  put(s,'.plans/f/plan.md',text(s,'.plans/f/plan.md').replace('0'.repeat(40),s.base))
-  try {
+    const initialPlan = text(s,'.plans/f/plan.md')
+    assert.match(initialPlan,new RegExp(`^base_commit: ${s.base}$`,'m'))
+    assert.equal(existsSync(file(s,registryPath)),false)
+    const initialRuns = existsSync(runs) ? readdirSync(runs).sort() : []
+    // El registro del ejecutable falso es distinto del registro de citas ausente.
+    const initialCalls = existsSync(s.calls) ? readFileSync(s.calls,'utf8') : null
+    const holder = readFileSync(lock,'utf8')
+    const pending = cliAsync({ repo: s.repo,env: { ...s.env,FAKE_MODE: 'review-ok',
+      NODE_OPTIONS: `--import ${join(import.meta.dirname,'telemetry-fault-preload.ts')}`,
+      SDD_AI_TEST_FAULT_TARGET: lock,SDD_AI_TEST_FAULT_OBSERVATIONS: waiting,
+    },base: s.base },args)
+    try {
+      // El evento anterior a linkSync acredita llegada tras la lectura inicial, no adquisición ni ps.
+      await awaitObservation('review start llega al lock exacto de la cita', () => {
+        const events = existsSync(waiting) ? readFileSync(waiting,'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []
+        const arrived = events.some((e) => e.operation === 'linkSync' && e.path.startsWith(`${lock}.`) && /^\d+\.[a-f0-9]+\.tmp$/.test(e.path.slice(lock.length + 1)))
+        return { value: arrived ? true : undefined, detail: events }
+      })
+      assert.equal(readFileSync(lock,'utf8'),holder)
+      assert.equal(existsSync(file(s,registryPath)),false)
+      put(s,'.plans/f/plan.md',initialPlan.replace(s.base,'0'.repeat(40)))
+      assert.equal(count(),before)
+      held.release()
+      const result = await pending
+      assert.notEqual(result.code,0); assert.notEqual(result.code,null)
+      assert.equal(result.out.code,'flow_base_mismatch')
+      assert.equal(existsSync(file(s,registryPath)),false)
+      assert.deepEqual(existsSync(runs) ? readdirSync(runs).sort() : [],initialRuns)
+      assert.equal(existsSync(s.calls) ? readFileSync(s.calls,'utf8') : null,initialCalls)
+    } finally {
+      held.release()
+      await pending
+      put(s,'.plans/f/plan.md',initialPlan)
+    }
     const failedWrite = runBin(s,args,{ FAKE_MODE: 'review-ok',HOME: f.home,SDD_AI_TELEMETRY: 'off',
       NODE_OPTIONS: `--import ${join(import.meta.dirname,'telemetry-fault-preload.ts')}`,
       SDD_AI_TEST_FAULT_TARGET: file(s,registryPath),SDD_AI_TEST_FAULT_OPERATION: 'writeFileSync',SDD_AI_TEST_FAULT_OBSERVATIONS: join(f.home,'failed-write'),
@@ -101,7 +124,7 @@ test('citation failures prevent launch and later start failures retain the citat
     assert.notEqual(r.code,0); assert.equal(count(),before)
     assert.equal(registry(s).reviews.length,1)
     assert.doesNotMatch(JSON.stringify(success(runBin(s,['sdd','status','f']))),/sdd commit f/)
-  } finally { f.dispose() }
+  } finally { held.release(); f.dispose() }
 })
 
 test('citations survive later phase writer verify and commit registry writes', () => {

@@ -5,7 +5,7 @@ import type { SddError } from './types.ts'
 import { readProcess } from './writer-store.ts'
 
 // Un lock de archivo que serializa comandos sobre el mismo objeto. Nace completo y nunca se roba: quien
-// lo encuentra espera mientras su titular siga vivo, y ante un titular muerto rechaza enseguida.
+// lo encuentra espera mientras su titular siga vivo, y ante un titular muerto relee antes de rechazar.
 
 interface Holder { pid: number; lstart: string | null }
 
@@ -83,7 +83,13 @@ function acquire(file: string, busy: (() => SddError) | null): boolean {
       const holder = holderOf(file)
       if (holder === 'released') continue
       if (busy === null) return false
-      if (holder === 'orphan' || !holderAlive(holder, since)) throw busy()
+      if (holder === 'orphan') throw busy()
+      if (!holderAlive(holder, since)) {
+        const current = holderOf(file)
+        if (current === 'released') continue
+        if (current === 'orphan' || (current.pid === holder.pid && current.lstart === holder.lstart)) throw busy()
+        continue
+      }
       sleep(POLL_MS)
     }
   } finally {
