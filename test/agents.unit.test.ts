@@ -1,3 +1,5 @@
+import { copySkillSource, EXPECTED_SKILL_FILES, installedSkillPath, installSkillFixture, installMonolithicSkill, skillBytes, skillLinks, damageSkillFile } from './skill-fixture.ts'
+import * as agents from '../src/agents.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -75,7 +77,8 @@ const AGENTS_COPY = join('.agents', 'skills', 'sdd-ai', 'SKILL.md')
 function skillFixture(): { pkg: string; root: string; setSource: (text: string | Buffer) => void; setCopy: (rel: string, text: string | Buffer) => void; dispose: () => void } {
   const pkg = mkdtempSync(join(tmpdir(), 'sdd-ai-pkg-'))
   const root = mkdtempSync(join(tmpdir(), 'sdd-ai-repo-'))
-  mkdirSync(join(pkg, 'skills', 'sdd-ai'), { recursive: true })
+  copySkillSource(pkg)
+  installSkillFixture(root, pkg)
   const setSource = (text: string | Buffer): void => writeFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'), text)
   const setCopy = (rel: string, text: string | Buffer): void => {
     mkdirSync(dirname(join(root, rel)), { recursive: true })
@@ -87,7 +90,7 @@ function skillFixture(): { pkg: string; root: string; setSource: (text: string |
   }
 }
 
-const states = (root: string, pkg: string): string[] => skillCopies(root, pkg).map((c) => c.state)
+const states = (root: string, pkg: string): string[] => skillCopies(root, pkg).filter((c) => c.path.endsWith('/SKILL.md')).map((c) => c.state)
 
 test('una copia de la skill que solo difiere en el fin de línea está vigente, en los dos sentidos', () => {
   const f = skillFixture()
@@ -166,6 +169,8 @@ test('agents sync sigue escribiendo agentes con LF y copias de la skill iguales 
     const crlfSkill = Buffer.from(skill.toString('utf8').replace(/\r?\n/g, '\r\n'))
     writeFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'), crlfSkill)
     copyModSource(pkg)
+    copySkillSource(pkg)
+    writeFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'), crlfSkill)
     syncAgents(root2, pkg, profiles())
     for (const rel of [CLAUDE_COPY, AGENTS_COPY]) assert.ok(readFileSync(join(root2, rel)).equals(crlfSkill), rel)
   } finally {
@@ -182,7 +187,7 @@ test('los helpers individuales conservan estados, orden y errores de las inspecc
     const source = readSource(repo)
     const expected = agentCopies(root, repo, profiles())
     assert.deepEqual(expected, READ_ONLY_ROLES.flatMap((role) => FAMILIES.map((family) => agentCopy(root, family, role, profiles(), source))))
-    assert.deepEqual(skillCopies(root, repo), FAMILIES.map((family) => skillCopy(root, family, readSkillSource(repo))))
+    assert.deepEqual(skillCopies(root, repo).filter((copy) => copy.path.endsWith('/SKILL.md')), FAMILIES.map((family) => skillCopy(root, family, readSkillSource(repo))))
     const file = agentFile(root, 'claude', 'explore')
     writeFileSync(file, readFileSync(file, 'utf8') + '\neditado')
     assert.equal(agentCopy(root, 'claude', 'explore', profiles(), source).state, 'stale')
@@ -193,11 +198,11 @@ test('los helpers individuales conservan estados, orden y errores de las inspecc
     assert.throws(() => agentCopy(root, 'claude', 'explore', profiles(), () => { read = true; return source }), /EISDIR/)
     assert.equal(read, false, 'la copia se lee antes de obtener la fuente')
     assert.throws(() => agentsState(root, pkg, 'claude', 'explore', profiles()), /EISDIR/)
-    assert.throws(() => skillCopies(root, pkg), /ENOENT/, 'la fuente de skill se lee antes de comprobar las copias')
+    assert.ok(skillCopies(root, pkg).every((copy) => copy.state === 'unchecked' && copy.source_path), 'fuentes ausentes nunca son vigentes')
     const skill = join(root, CLAUDE_COPY)
     rmSync(skill); mkdirSync(skill)
     assert.throws(() => skillCopy(root, 'claude', readSkillSource(repo)), /EISDIR/)
-    assert.throws(() => skillCopies(root, repo), /EISDIR/)
+    assert.equal(skillCopies(root, repo)[0].state, 'unchecked')
   } finally {
     rmSync(root, { recursive: true, force: true })
     rmSync(pkg, { recursive: true, force: true })
@@ -215,4 +220,113 @@ test('los agentes generados piden reportar hallazgos solo cuando el encargo lo p
       assert.ok(generated.includes('respeta los esquemas cerrados sin añadir claves ni prosa'), `${family} ${role}`)
     }
   } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+
+test('agents sync instala y actualiza el conjunto modular en ambas familias', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-modular-sync-'))
+  const pkg = mkdtempSync(join(tmpdir(), 'sdd-ai-modular-source-'))
+  try {
+    copySkillSource(pkg)
+    copyModSource(pkg)
+    mkdirSync(join(pkg, 'agents'))
+    writeFileSync(join(pkg, 'agents/worker.md'), readFileSync(join(repo, 'agents/worker.md')))
+    // Cada archivo se leyó antes de generar siquiera el primer agente.
+    damageSkillFile(pkg, 'skills/sdd-ai/references/mod.md', 'missing')
+    assert.throws(() => syncAgents(root, pkg, profiles()), /references\/mod\.md/)
+    assert.deepEqual(agents.skillCopies(root, repo).map((copy) => copy.state), EXPECTED_SKILL_FILES.flatMap(() => ['missing', 'missing']))
+    assert.throws(() => readFileSync(agentFile(root, 'claude', 'explore')), /ENOENT/)
+    copySkillSource(pkg)
+    for (const monolithic of [false, true]) {
+      if (monolithic) installMonolithicSkill(root)
+      const outside = join(root, '.plans/existing/handoff.md')
+      mkdirSync(dirname(outside), { recursive: true })
+      writeFileSync(outside, '---\nstatus: implementing\n---\nEstado previo\n')
+      for (const family of FAMILIES) {
+        const own = join(root, installedSkillPath(family, 'custom.md'))
+        mkdirSync(dirname(own), { recursive: true }); writeFileSync(own, 'archivo ajeno')
+      }
+      const { written } = syncAgents(root, pkg, profiles())
+      for (const family of FAMILIES) {
+        assert.deepEqual(skillBytes(root, dirname(installedSkillPath(family))), skillBytes(pkg))
+        for (const path of EXPECTED_SKILL_FILES) {
+          const dest = join(root, installedSkillPath(family, path))
+          assert.ok(written.includes(dest), dest)
+          if (path !== 'SKILL.md') assert.ok(written.indexOf(dest) < written.indexOf(join(root, installedSkillPath(family))))
+          for (const target of skillLinks(path, readFileSync(dest, 'utf8'))) assert.ok(readFileSync(join(root, installedSkillPath(family, target))).length > 0)
+        }
+        assert.equal(readFileSync(join(root, installedSkillPath(family, 'custom.md')), 'utf8'), 'archivo ajeno')
+      }
+      assert.equal(readFileSync(outside, 'utf8'), '---\nstatus: implementing\n---\nEstado previo\n')
+    }
+    // Una escritura parcial no devuelve éxito; la entrada vieja no se reemplaza antes de sus apoyos.
+    writeFileSync(join(root, CLAUDE_COPY), 'bootstrap anterior')
+    damageSkillFile(root, installedSkillPath('claude', 'references/mod.md'), 'unreadable')
+    assert.throws(() => syncAgents(root, pkg, profiles()), /EISDIR/)
+    assert.equal(readFileSync(join(root, CLAUDE_COPY), 'utf8'), 'bootstrap anterior')
+    rmSync(join(root, installedSkillPath('claude', 'references/mod.md')), { recursive: true })
+    syncAgents(root, pkg, profiles())
+    assert.ok(skillCopies(root, pkg).every((copy) => copy.state === 'ok'))
+    // La interfaz opcional admite el snapshot y copia sus bytes sin releer las fuentes.
+    const snapshot = agents.skillInventory(pkg)
+    damageSkillFile(pkg, 'skills/sdd-ai/references/mod.md', 'missing')
+    syncAgents(root, pkg, profiles(), undefined, snapshot)
+    for (const family of FAMILIES) assert.equal(skillBytes(root, dirname(installedSkillPath(family)))['references/mod.md'], snapshot.find((file) => file.path === 'references/mod.md')!.bytes.toString('base64'))
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(pkg, { recursive: true, force: true }) }
+})
+
+test('la vigencia modular distingue cada archivo y tolera solo CRLF y LF', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-modular-copies-'))
+  const pkg = mkdtempSync(join(tmpdir(), 'sdd-ai-modular-source-'))
+  const targets = ['SKILL.md', 'procedures/implement.md']
+  try {
+    copySkillSource(pkg)
+    installSkillFixture(root, pkg)
+    assert.equal(skillCopies(root, pkg).length, EXPECTED_SKILL_FILES.length * 2)
+    assert.ok(skillCopies(root, pkg).every((copy) => copy.state === 'ok'))
+    for (const family of FAMILIES) for (const target of targets) {
+      const path = installedSkillPath(family, target)
+      const source = `skills/sdd-ai/${target}`
+      const bytes = readFileSync(join(pkg, source))
+      const inspect = () => skillCopies(root, pkg).find((copy) => copy.path === path)!
+      for (const damage of ['missing', 'stale', 'unreadable'] as const) {
+        damageSkillFile(root, path, damage)
+        const copy = inspect()
+        assert.equal(copy.path, path)
+        assert.equal(copy.state, damage === 'unreadable' ? 'unchecked' : damage)
+        if (damage === 'unreadable') { assert.match(copy.cause!, /EISDIR/); assert.equal(copy.source_path, undefined) }
+        assert.ok(skillCopies(root, pkg).filter((copy) => copy.path !== path).every((copy) => copy.state === 'ok'))
+        rmSync(join(root, path), { recursive: true, force: true })
+        installSkillFixture(root, pkg)
+      }
+      for (const damage of ['missing', 'unreadable'] as const) {
+        damageSkillFile(pkg, source, damage)
+        const affected = skillCopies(root, pkg).filter((copy) => copy.source_path === source)
+        assert.equal(affected.length, 2)
+        for (const copy of affected) { assert.equal(copy.state, 'unchecked'); assert.match(copy.cause!, damage === 'missing' ? /ENOENT/ : /EISDIR/) }
+        assert.ok(skillCopies(root, pkg).filter((copy) => !affected.some((bad) => bad.path === copy.path)).every((copy) => copy.state === 'ok'))
+        rmSync(join(pkg, source), { recursive: true, force: true }); writeFileSync(join(pkg, source), bytes)
+      }
+      const lf = bytes.toString('latin1').replace(/\r\n/g, '\n')
+      const crlf = lf.replace(/\n/g, '\r\n')
+      writeFileSync(join(root, path), crlf, 'latin1'); assert.equal(inspect().state, 'ok')
+      writeFileSync(join(pkg, source), crlf, 'latin1')
+      writeFileSync(join(root, path), lf, 'latin1'); assert.equal(inspect().state, 'ok')
+      for (const changed of [lf+' ', lf+'\r', lf.replace('a', 'b'), Buffer.concat([Buffer.from(lf, 'latin1'), Buffer.from([0xff])])]) {
+        writeFileSync(join(root, path), changed, 'latin1'); assert.equal(inspect().state, 'stale')
+      }
+      writeFileSync(join(pkg, source), Buffer.concat([bytes, Buffer.from([0xfe])]))
+      writeFileSync(join(root, path), Buffer.concat([bytes, Buffer.from([0xff])]))
+      assert.equal(inspect().state, 'stale', 'no normaliza bytes no UTF-8')
+      writeFileSync(join(pkg, source), bytes); installSkillFixture(root, pkg)
+      const selected = skillCopies(root, pkg, [family])
+      assert.equal(selected.length, EXPECTED_SKILL_FILES.length)
+      assert.ok(selected.every((copy) => copy.path.startsWith(dirname(installedSkillPath(family))+'/')))
+    }
+    damageSkillFile(pkg, 'skills/sdd-ai/SKILL.md', 'missing')
+    damageSkillFile(root, installedSkillPath('claude', 'procedures/verify.md'), 'unreadable')
+    const copies = skillCopies(root, pkg)
+    assert.equal(copies.find((copy) => copy.path === installedSkillPath('claude', 'procedures/verify.md'))!.state, 'unchecked')
+    assert.ok(copies.some((copy) => copy.state === 'ok'), 'otros archivos se siguen comprobando')
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(pkg, { recursive: true, force: true }) }
 })

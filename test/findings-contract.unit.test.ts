@@ -106,7 +106,7 @@ test('los prompts de fase y corrección piden findings y conservan el contrato a
 })
 
 test('la skill reproduce literalmente la plantilla vacía del registro', () => {
-  const skill = readFileSync(new URL('../skills/sdd-ai/SKILL.md', import.meta.url), 'utf8')
+  const skill = readFileSync(new URL('../skills/sdd-ai/references/findings.md', import.meta.url), 'utf8')
   const match = /```markdown sdd-ai-findings-template\n([\s\S]*?)```/.exec(skill)
   assert.ok(match)
   assert.equal(match[1], FINDINGS_TEMPLATE)

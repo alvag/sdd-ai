@@ -1,3 +1,4 @@
+import { installedSkillPath, copySkillSource } from './skill-fixture.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
@@ -222,5 +223,35 @@ test('SessionStart conserva el contexto y ordena acciones ante fuentes copias y 
   } finally {
     remove(processCwd)
     t.diagnostic(`duración del archivo de errores: ${(performance.now() - started).toFixed(0)} ms`)
+  }
+})
+
+
+test('el lanzador de SessionStart conserva fallos independientes de fuentes y copias modulares', () => {
+  for (const cli of ['claude', 'codex'] as const) {
+    const f = createPackageFixture({ payloadRepo: true })
+    try {
+      for (const damage of ['missing', 'dir'] as const) {
+        f.damageSource('skill', damage, 'procedures/start.md')
+        damageCopies(f.root, cli, { skill: 'edited', skillFile: 'procedures/verify.md' })
+        const before = snapshotCopies(f.root)
+        const payload = JSON.stringify({ hook_event_name: 'SessionStart', source: 'startup', session_id: `modules-${cli}`, cwd: f.root })
+        const result = spawnSync(process.execPath, [join(f.pkgDir, 'bin/sdd-ai-hook'), cli], {
+          cwd: f.root, env: f.env, input: payload, encoding: 'utf8', timeout: 60000,
+        })
+        assert.equal(result.status, 0, result.stderr)
+        const parsed = JSON.parse(result.stdout)
+        assert.deepEqual(checkOutput(cli, 'SessionStart', parsed), [])
+        const text = parsed.hookSpecificOutput.additionalContext as string
+        assert.ok(text.includes('skills/sdd-ai/procedures/start.md: no se pudo leer'))
+        assert.ok(text.includes(`- ${installedSkillPath(cli, 'procedures/verify.md')}: desactualizada`))
+        assert.ok(!text.includes(`- ${skillPath(cli)}:`))
+        assert.match(text, /espera su decisión/)
+        assert.equal(snapshotCopies(f.root), before)
+        remove(join(f.pkgDir, 'skills/sdd-ai/procedures/start.md'))
+        copySkillSource(f.pkgDir)
+        installCurrentCopies(f.root, f.pkgDir, f.env)
+      }
+    } finally { f.dispose() }
   }
 })

@@ -1,3 +1,4 @@
+import { copySkillSource, EXPECTED_SKILL_FILES, installedSkillPath, installMonolithicSkill, installSkillFixture, skillBytes, skillLinks, damageSkillFile } from './skill-fixture.ts'
 import { execFileSync } from 'node:child_process'
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -51,6 +52,7 @@ export function createSessionSyncFixture() {
   mkdirSync(root)
   for (const path of ['agents/worker.md', 'skills/sdd-ai/SKILL.md']) write(pkgDir, path, readFileSync(join(PACKAGE_ROOT, path)))
   copyModSource(pkgDir)
+  copySkillSource(pkgDir)
   const env = isolatedEnv(join(base, 'codex-home'))
   return { root, pkgDir, env, dispose: () => remove(base) }
 }
@@ -100,6 +102,7 @@ export interface Damage {
   agents?: 'all-missing' | 'one-missing' | 'edited' | 'unreadable'
   role?: ReadOnlyRole
   skill?: 'missing' | 'edited' | 'unreadable'
+  skillFile?: string
 }
 export function damageCopies(root: string, cli: Family, spec: Damage): void {
   if (cli === 'codex' && spec.mod) throw new Error('Codex no inspecciona la copia del mod')
@@ -127,7 +130,7 @@ export function damageCopies(root: string, cli: Family, spec: Damage): void {
     else { remove(join(root, path)); if (spec.agents === 'unreadable') mkdirSync(join(root, path)) }
   }
   if (spec.skill) {
-    const path = skillPath(cli)
+    const path = installedSkillPath(cli, spec.skillFile)
     if (spec.skill === 'edited') write(root, path, readFileSync(join(root, path), 'utf8') + '\neditado\n')
     else { remove(join(root, path)); if (spec.skill === 'unreadable') mkdirSync(join(root, path)) }
   }
@@ -169,6 +172,7 @@ export function createPackageFixture(opts: { payloadRepo: boolean }) {
   mkdirSync(pkgDir)
   for (const path of ['package.json', 'src', 'bin', 'agents', 'skills']) cpSync(join(PACKAGE_ROOT, path), join(pkgDir, path), { recursive: true })
   copyModSource(pkgDir)
+  copySkillSource(pkgDir)
   symlinkSync(join(PACKAGE_ROOT, 'node_modules'), join(pkgDir, 'node_modules'), 'dir')
   const root = opts.payloadRepo ? pkgDir : join(base, 'root')
   mkdirSync(root, { recursive: true })
@@ -181,9 +185,9 @@ export function createPackageFixture(opts: { payloadRepo: boolean }) {
   return {
     pkgDir, root, env,
     importRunHook: async () => (await import(pathToFileURL(join(pkgDir, 'src/hooks.ts')).href)).runHook as (raw: string, cli: Family) => string,
-    damageSource: (which: 'mod' | 'agents' | 'skill', how: 'missing' | 'dir' | 'invalid' | 'codex-render') => {
+    damageSource: (which: 'mod' | 'agents' | 'skill', how: 'missing' | 'dir' | 'invalid' | 'codex-render', skillFile = 'SKILL.md') => {
       if (which !== 'agents' && (how === 'invalid' || how === 'codex-render')) throw new Error('solo agents admite fuente inválida')
-      const path = paths[which]
+      const path = which === 'skill' ? `skills/sdd-ai/${skillFile}` : paths[which]
       // Sin mods/sdd-ai entero el binario no carga (src/notification.ts importa el mod): se quita un archivo fijo.
       if (how === 'missing') remove(join(pkgDir, path))
       else if (how === 'dir') { remove(join(pkgDir, path)); mkdirSync(join(pkgDir, path)) }

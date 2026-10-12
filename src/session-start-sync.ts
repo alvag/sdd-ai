@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import { type AgentSource, type RoleProfiles, agentCopy, agentRelPath, readSource, readSkillSource, renderAgent, skillCopy, skillRelPath } from './agents.ts'
+import { type AgentSource, type RoleProfiles, agentCopy, agentRelPath, readSource, renderAgent, skillCopies } from './agents.ts'
 import { MOD_ADOPTION_MESSAGE, MOD_PATH, modCopy, modInventory } from './mod-copies.ts'
 import { MOD_SYNC_COMMAND } from './mod-engine.ts'
 import { WORKERS_PATH, codexHome, loadCodexRoot, loadWorkers } from './profiles.ts'
@@ -88,13 +88,14 @@ export function renderSessionSync(
     }
   }
 
-  const skillPath = skillRelPath(cli)
-  try {
-    const skillSource = readSkillSource(pkgDir)
-    inspectCopy(skillPath, () => skillCopy(root, cli, skillSource))
-  } catch (error) {
-    sourceFailure('skills/sdd-ai/SKILL.md', error)
-    copies.push({ path: skillPath, state: 'unchecked', cause: 'depende de skills/sdd-ai/SKILL.md' })
+  for (const copy of skillCopies(root, pkgDir, [cli])) {
+    if (copy.state === 'ok') continue
+    copies.push({ path: copy.path, state: copy.state, cause: copy.source_path ? `depende de ${copy.source_path}` : copy.cause })
+    if (copy.source_path) {
+      sourceFailure(copy.source_path, copy.cause)
+    } else if (copy.state === 'unchecked') {
+      actions.add(`Revisar o quitar la copia ${copy.path} en ${root}, porque agents sync podría no poder reemplazarla.`)
+    }
   }
 
   if (!copies.length && !problems.length) return ''

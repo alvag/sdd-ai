@@ -1,3 +1,4 @@
+import { installedSkillPath } from './skill-fixture.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -325,3 +326,24 @@ test('SessionStart preserva contratos bootstrap corridas flujos y aprobaciones',
   }
 })
 
+
+
+test('SessionStart por CLI detecta procedimientos dañados con bootstrap correcto', () => {
+  for (const cli of CLIS) {
+    const f = createHookSyncFixture()
+    try {
+      for (const damage of ['missing', 'edited', 'unreadable'] as const) {
+        const path = installedSkillPath(cli, 'procedures/implement.md')
+        damageCopies(f.root, cli, { skill: damage, skillFile: 'procedures/implement.md' })
+        const before = snapshotCopies(f.root)
+        const text = fire(f.root, cli, f.env)
+        assert.ok(text.includes(`- ${path}: ${damage === 'missing' ? 'ausente' : damage === 'edited' ? 'desactualizada' : 'no se pudo comprobar'}`))
+        assert.ok(!text.includes(`- ${skillPath(cli)}:`), 'bootstrap correcto')
+        assertSelected(text, cli)
+        assert.equal(snapshotCopies(f.root), before)
+        rmSync(join(f.root, path), { recursive: true, force: true })
+        installCurrentCopies(f.root, PACKAGE_ROOT, f.env)
+      }
+    } finally { f.dispose() }
+  }
+})

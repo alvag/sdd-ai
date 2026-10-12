@@ -1,10 +1,11 @@
+import { copySkillSource, EXPECTED_SKILL_FILES, installedSkillPath, installMonolithicSkill, installSkillFixture, skillBytes, skillLinks, damageSkillFile } from './skill-fixture.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { makeRepo, telemetryOff } from './helpers.ts'
+import { makeFakeBin, makeRepo, telemetryOff } from './helpers.ts'
 import { SOURCE_ROOT, copyModSource, write } from './mod-fixture.ts'
 
 type Out = Record<string, any>
@@ -25,11 +26,17 @@ test('init y doctor informan las rutas del repo relativas y con barra normal', (
     for (const rel of ['agents/worker.md', 'skills/sdd-ai/SKILL.md', '.gitignore']) write(root, rel, readFileSync(join(SOURCE_ROOT, rel)))
     for (const rel of ['bin/sdd-ai', 'bin/sdd-ai-hook']) write(root, rel, '')
     copyModSource(root)
+    copySkillSource(root)
     // Una copia de la skill vieja y un agente que sobra.
     write(root, '.claude/skills/sdd-ai/SKILL.md', 'viejo\n')
     write(root, '.claude/agents/sdd-ai-viejo.md', '<!-- generado por sdd-ai desde agents/worker.md · no editar a mano -->\n')
+    const bin = join(home, 'bin')
+    mkdirSync(bin)
+    symlinkSync(process.execPath, join(bin, 'node'))
+    makeFakeBin(bin, 'claude')
+    makeFakeBin(bin, 'codex')
     const env = telemetryOff({
-      PATH: process.env.PATH, HOME: home, USERPROFILE: home, CODEX_HOME: join(home, 'codex'), ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      PATH: `${bin}:/usr/bin:/bin`, HOME: home, USERPROFILE: home, CODEX_HOME: join(home, 'codex'), ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
     })
     const cli = (args: string[]): { code: number | null; out: Out } => {
       const r = spawnSync(process.execPath, [join(SOURCE_ROOT, 'bin/sdd-ai'), ...args], { cwd: root, env, encoding: 'utf8', timeout: 60000 })

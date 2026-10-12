@@ -1,3 +1,4 @@
+import { copySkillSource, EXPECTED_SKILL_FILES, installedSkillPath, installMonolithicSkill, installSkillFixture, skillBytes, skillLinks, damageSkillFile } from './skill-fixture.ts'
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative } from 'node:path'
@@ -51,6 +52,7 @@ export function modFixture() {
   for (const rel of ['agents/worker.md', 'skills/sdd-ai/SKILL.md', '.gitignore']) write(root, rel, readFileSync(join(SOURCE_ROOT, rel)))
   for (const rel of ['bin/sdd-ai', 'bin/sdd-ai-hook']) write(root, rel, '')
   copyModSource(root)
+  copySkillSource(root)
   const bin = join(home, 'bin')
   mkdirSync(bin)
   makeFakeBin(bin, 'claude')

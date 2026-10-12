@@ -1,3 +1,4 @@
+import { EXPECTED_SKILL_FILES, installedSkillPath, damageSkillFile, copySkillSource } from './skill-fixture.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
@@ -26,7 +27,7 @@ test('La comprobación de SessionStart solo lee y no lanza procesos', () => {
       assert.equal(snapshotCopies(f.root), before)
       const expected = [
         ...(cli === 'claude' ? [MOD_PATH] : []),
-        ...READ_ONLY_ROLES.map((role) => agentPath(cli, role)), skillPath(cli),
+        ...READ_ONLY_ROLES.map((role) => agentPath(cli, role)), ...EXPECTED_SKILL_FILES.map((path) => installedSkillPath(cli, path)),
       ].map((path) => `- ${path}: ausente`)
       assert.deepEqual(text.split('\n').filter((line) => line.startsWith('- ')), expected)
       assert.equal(text.split(SESSION_SYNC_HEADER).length - 1, 1)
@@ -175,6 +176,7 @@ test('La comprobación aísla cada fuente configuración y copia de la CLI elegi
   // Fallos independientes simultáneos: cada fuente tiene una sola causa y su acción.
   const f = createSessionSyncFixture()
   try {
+    installCurrentCopies(f.root, f.pkgDir, f.env)
     remove(join(f.pkgDir, 'mods/sdd-ai'))
     remove(join(f.pkgDir, agentSource))
     remove(join(f.pkgDir, skillSource))
@@ -188,3 +190,61 @@ test('La comprobación aísla cada fuente configuración y copia de la CLI elegi
   } finally { f.dispose() }
 })
 
+
+
+test('SessionStart comprueba el conjunto de su familia sin escribir y conserva la decisión humana', () => {
+  for (const cli of ['claude', 'codex'] as const) {
+    const f = createSessionSyncFixture()
+    const other = cli === 'claude' ? 'codex' : 'claude'
+    const render = () => {
+      const before = snapshotCopies(f.root)
+      const text = renderSessionSync(f.root, f.pkgDir, cli, f.env)
+      assert.equal(snapshotCopies(f.root), before)
+      assert.ok(!text.includes(installedSkillPath(other)))
+      assert.ok(!text.includes(installedSkillPath(other, 'procedures/start.md')))
+      if (text) {
+        assert.match(text, /espera su decisión antes de sincronizar/)
+        assert.match(text, /sesión nueva/)
+      }
+      return text
+    }
+    try {
+      installCurrentCopies(f.root, f.pkgDir, f.env)
+      assert.equal(render(), '')
+      damageSkillFile(f.root, installedSkillPath(other, 'procedures/start.md'), 'unreadable')
+      assert.equal(render(), '', 'no inspecciona las copias de la otra familia')
+      remove(join(f.root, installedSkillPath(other, 'procedures/start.md')))
+      installCurrentCopies(f.root, f.pkgDir, f.env)
+      for (const target of ['SKILL.md', 'procedures/start.md']) {
+        const path = installedSkillPath(cli, target)
+        const source = `skills/sdd-ai/${target}`
+        const bytes = readFileSync(join(f.pkgDir, source))
+        for (const damage of ['missing', 'stale', 'unreadable'] as const) {
+          damageSkillFile(f.root, path, damage)
+          const text = render()
+          assert.ok(text.includes(`- ${path}: ${damage === 'missing' ? 'ausente' : damage === 'stale' ? 'desactualizada' : 'no se pudo comprobar'}`))
+          if (damage === 'unreadable') { assert.match(text, /EISDIR/); assert.ok(text.includes(`Revisar o quitar la copia ${path}`)) }
+          remove(join(f.root, path)); installCurrentCopies(f.root, f.pkgDir, f.env)
+        }
+        for (const damage of ['missing', 'unreadable'] as const) {
+          damageSkillFile(f.pkgDir, source, damage)
+          damageSkillFile(f.root, installedSkillPath(cli, 'procedures/verify.md'), 'stale')
+          const text = render()
+          assert.ok(text.includes(`- ${path}: no se pudo comprobar (depende de ${source})`))
+          assert.ok(text.includes(`- ${source}: no se pudo leer`))
+          assert.ok(text.includes(`checkout -- ${source}`))
+          assert.ok(text.includes(`- ${installedSkillPath(cli, 'procedures/verify.md')}: desactualizada`))
+          remove(join(f.pkgDir, source)); write(f.pkgDir, source, bytes)
+          installCurrentCopies(f.root, f.pkgDir, f.env)
+        }
+        const lf = bytes.toString('latin1').replace(/\r\n/g, '\n')
+        write(f.root, path, Buffer.from(lf.replace(/\n/g, '\r\n'), 'latin1'))
+        assert.equal(render(), '')
+        write(f.pkgDir, source, Buffer.from(lf.replace(/\n/g, '\r\n'), 'latin1'))
+        write(f.root, path, Buffer.from(lf, 'latin1'))
+        assert.equal(render(), '')
+        write(f.pkgDir, source, bytes); installCurrentCopies(f.root, f.pkgDir, f.env)
+      }
+    } finally { f.dispose() }
+  }
+})

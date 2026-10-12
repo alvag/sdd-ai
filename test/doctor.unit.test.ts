@@ -1,3 +1,4 @@
+import { copySkillSource, installSkillFixture, installedSkillPath, damageSkillFile } from './skill-fixture.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -95,9 +96,10 @@ const passing = (cmd: string, args: string[]) => {
 
 test('doctor informa la copia de la skill vieja o ausente con su ruta y agents sync', () => {
   const pkg = mkdtempSync(join(tmpdir(), 'sdd-ai-pkg-'))
-  mkdirSync(join(pkg, 'skills', 'sdd-ai'), { recursive: true })
+  copySkillSource(pkg)
   writeFileSync(join(pkg, 'skills', 'sdd-ai', 'SKILL.md'), 'skill v2\n')
   const repo = mkdtempSync(join(tmpdir(), 'sdd-ai-repo-'))
+  installSkillFixture(repo, pkg)
   const claudeCopy = '.claude/skills/sdd-ai/SKILL.md'
   const agentsCopy = '.agents/skills/sdd-ai/SKILL.md'
   for (const rel of [claudeCopy, agentsCopy]) {
@@ -106,15 +108,52 @@ test('doctor informa la copia de la skill vieja o ausente con su ruta y agents s
   }
   const fine = doctor(passing, { copies: skillCopies(repo, pkg) })
   assert.equal(fine.ok, true)
-  assert.deepEqual(fine.skill, { copies: [{ path: claudeCopy, state: 'ok' }, { path: agentsCopy, state: 'ok' }] })
+  assert.deepEqual(fine.skill && 'copies' in fine.skill ? { copies: fine.skill.copies.filter((copy) => copy.path.endsWith('/SKILL.md')) } : fine.skill, { copies: [{ path: claudeCopy, state: 'ok' }, { path: agentsCopy, state: 'ok' }] })
   writeFileSync(join(repo, agentsCopy), 'skill v1\n')
   const stale = doctor(passing, { copies: skillCopies(repo, pkg) })
   assert.equal(stale.ok, false)
-  assert.deepEqual(stale.skill, {
+  assert.deepEqual(stale.skill && 'copies' in stale.skill ? { ...stale.skill, copies: stale.skill.copies.filter((copy) => copy.path.endsWith('/SKILL.md')) } : stale.skill, {
     copies: [{ path: claudeCopy, state: 'ok' }, { path: agentsCopy, state: 'stale' }], next: './bin/sdd-ai agents sync',
   })
   rmSync(join(repo, claudeCopy))
-  assert.deepEqual(skillCopies(repo, pkg).map((c) => c.state), ['missing', 'stale'])
+  assert.deepEqual(skillCopies(repo, pkg).filter((copy) => copy.path.endsWith('/SKILL.md')).map((c) => c.state), ['missing', 'stale'])
   const skipped = doctor(passing, { skipped: 'no es un repositorio Git' })
   assert.deepEqual([skipped.ok, skipped.skill], [true, { skipped: 'no es un repositorio Git' }])
+})
+
+
+test('doctor identifica material modular ausente distinto o no comprobable', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-doctor-modular-'))
+  const pkg = mkdtempSync(join(tmpdir(), 'sdd-ai-doctor-source-'))
+  try {
+    copySkillSource(pkg)
+    installSkillFixture(root, pkg)
+    assert.equal(doctor(passing, { copies: skillCopies(root, pkg) }).ok, true)
+    for (const family of ['claude', 'codex'] as const) for (const target of ['SKILL.md', 'procedures/start.md']) {
+      const path = installedSkillPath(family, target)
+      for (const damage of ['missing', 'stale', 'unreadable'] as const) {
+        damageSkillFile(root, path, damage)
+        const report = doctor(passing, { copies: skillCopies(root, pkg) })
+        assert.equal(report.ok, false)
+        assert.ok(report.skill && 'copies' in report.skill)
+        assert.equal(report.skill.copies.find((copy) => copy.path === path)!.state, damage === 'unreadable' ? 'unchecked' : damage)
+        assert.match(report.skill.next!, /agents sync/)
+        if (damage === 'unreadable') { assert.match(report.skill.next!, /antes de sincronizar/); assert.match(report.skill.copies.find((copy) => copy.path === path)!.cause!, /EISDIR/) }
+        rmSync(join(root, path), { recursive: true, force: true }); installSkillFixture(root, pkg)
+      }
+      const source = `skills/sdd-ai/${target}`
+      const bytes = readFileSync(join(pkg, source))
+      for (const damage of ['missing', 'unreadable'] as const) {
+        damageSkillFile(pkg, source, damage)
+        damageSkillFile(root, installedSkillPath(family, 'procedures/verify.md'), 'stale')
+        const report = doctor(passing, { copies: skillCopies(root, pkg) })
+        assert.equal(report.ok, false)
+        assert.ok(report.skill && 'copies' in report.skill)
+        assert.ok(report.skill.next!.includes(source)); assert.match(report.skill.next!, /restaura o revisa primero/)
+        assert.equal(report.skill.copies.filter((copy) => copy.source_path === source).length, 2)
+        assert.equal(report.skill.copies.find((copy) => copy.path === installedSkillPath(family, 'procedures/verify.md'))!.state, 'stale')
+        rmSync(join(pkg, source), { recursive: true, force: true }); writeFileSync(join(pkg, source), bytes); installSkillFixture(root, pkg)
+      }
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(pkg, { recursive: true, force: true }) }
 })
