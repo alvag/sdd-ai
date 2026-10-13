@@ -287,28 +287,40 @@ export function nodeMetadata(text: string): { state: string | null; date: string
   return { state: field('state'), date: field('date'), summary: field('summary') }
 }
 
+export type VaultIdentity =
+  | { status: 'ok'; project: string; commit: string | null; remote: string | null }
+  | { status: 'unresolved'; candidates: string[] }
+  | { status: 'error'; reason: string }
+
+/** Comparte las señales y el registro de recall; no valida el árbol de destino de archive. */
+export function resolveVaultIdentity(root: string, vault: string, deadline = Date.now() + GIT_TIMEOUT_MS): VaultIdentity {
+  let entries: string[][]
+  try {
+    entries = readFileSync(join(vault, '.kv', 'identidades.tsv'), 'utf8').split('\n')
+      .map((line) => line.replace(/\r$/, '')).filter((line) => line.trim() && !line.startsWith('#')).map((line) => line.split('\t'))
+    if (entries.some((entry) => entry.length !== 4)) throw new Error('el registro de identidades tiene una línea sin cuatro campos')
+  } catch (e) { return { status: 'error', reason: `no se puede leer el registro de identidades del vault: ${errorMessage(e)}` } }
+  let commit: string | null
+  let remote: string | null
+  try {
+    commit = gitSignal(root, ['rev-list', '--max-parents=0', 'HEAD'], deadline)
+    remote = normalizeRemote(gitSignal(root, ['remote', 'get-url', 'origin'], deadline))
+  } catch (e) { return { status: 'error', reason: errorMessage(e) } }
+  const candidates = [...new Set(entries.filter((entry) =>
+    (commit !== null && commit === entry[2]) || (remote !== null && remote === normalizeRemote(entry[1]))).map((entry) => entry[0]))]
+  if ((!commit && !remote) || candidates.length !== 1) return { status: 'unresolved', candidates }
+  return { status: 'ok', project: candidates[0], commit, remote }
+}
+
 export function searchVault(root: string, terms: string[], deadline = Date.now() + GIT_TIMEOUT_MS): VaultSource {
   const config = loadVaultPath(root)
   if (config.kind === 'none') return { status: 'not_configured', truncated: false, flows: [] }
   if (config.kind === 'invalid') return { status: 'error', reason: config.detail, truncated: false, flows: [] }
   const base = { root: config.path, truncated: false, flows: [] }
   if (!directoryFollowingLinks(config.path)) return { ...base, status: 'error', reason: 'la raíz del vault no es un directorio legible' }
-  let entries: string[][]
-  try {
-    entries = readFileSync(join(config.path, '.kv', 'identidades.tsv'), 'utf8').split('\n')
-      .map((line) => line.replace(/\r$/, '')).filter((line) => line.trim() && !line.startsWith('#')).map((line) => line.split('\t'))
-    if (entries.some((entry) => entry.length !== 4)) throw new Error('el registro de identidades tiene una línea sin cuatro campos')
-  } catch (e) { return { ...base, status: 'error', reason: `no se puede leer el registro de identidades del vault: ${errorMessage(e)}` } }
-  let commit: string | null
-  let remote: string | null
-  try {
-    commit = gitSignal(root, ['rev-list', '--max-parents=0', 'HEAD'], deadline)
-    remote = normalizeRemote(gitSignal(root, ['remote', 'get-url', 'origin'], deadline))
-  } catch (e) { return { ...base, status: 'error', reason: errorMessage(e) } }
-  const candidates = [...new Set(entries.filter((entry) =>
-    (commit !== null && commit === entry[2]) || (remote !== null && remote === normalizeRemote(entry[1]))).map((entry) => entry[0]))]
-  if ((!commit && !remote) || candidates.length !== 1) return { ...base, status: 'unresolved', candidates }
-  const project = candidates[0]
+  const identity = resolveVaultIdentity(root, config.path, deadline)
+  if (identity.status !== 'ok') return { ...base, ...identity }
+  const project = identity.project
   const projectRoot = join(config.path, 'projects', project)
   const sdd = join(projectRoot, 'sdd')
   const names = directory(sdd) ? readdirSync(sdd).sort() : []
