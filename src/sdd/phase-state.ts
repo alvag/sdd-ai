@@ -122,6 +122,11 @@ function readPhaseRecordFile(root: string, id: string, strict: boolean): PhaseRe
     if (strict && e instanceof SddError && e.code === 'activity_unknown') throw e
     throw invalid(id, (e as Error).message)
   }
+  return validatePhaseRecord(data, id, file)
+}
+
+/** Valida también un registro preservado, sin volver a leer el origen activo. */
+export function validatePhaseRecord(data: unknown, id: string, file = `${id}/${PHASES_FILE}`): PhaseRecord {
   if (!isRecord(data) || data.schema_version !== 1) throw invalid(id, 'schema_version no es 1')
   const last = data.last_run
   if (last !== null && !(isRecord(last) && typeof last.id === 'string' && isRunId(last.id) && PHASE_STEPS.includes(String(last.step)))) {
@@ -420,7 +425,7 @@ export function writePhaseRecord(root: string, id: string, r: PhaseRecord): void
  * Si una corrida sigue sin terminal: una de proceso por su `status.json`, un writer por su cosecha. Una
  * corrida que ya no está en disco no está activa.
  */
-function runActive(root: string, run: string, strict = false): boolean {
+export function runActive(root: string, run: string, strict = false): boolean {
   if (strict) {
     // Un writer de fase: activo si ese writer sigue abierto, como en el camino normal pero sin tomar una
     // lectura fallida por ausencia.

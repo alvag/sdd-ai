@@ -127,6 +127,10 @@ export function pendingFields(root: string, fields: SyncField[]): SyncField[] {
 /** Lanza si el flujo tiene una fase o un writer abiertos, o si no se puede descartar actividad; si no, vuelve sin más. */
 export function assertNoActivity(root: string, id: string): void {
   const record = readPhaseRecord(root, id, true)
+  assertNoRecordActivity(root, id, record)
+}
+/** Las comprobaciones de approve sobre un registro ya leído y validado. */
+export function assertNoRecordActivity(root: string, id: string, record: ReturnType<typeof readPhaseRecord>): void {
   const run = activeRun(root, record, true)
   const revision = record.revisions?.active ?? pendingIntent(record)
   if (revision) {

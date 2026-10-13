@@ -43,7 +43,8 @@ export interface Attestation {
   plan_fingerprint: string; answered_at: string; proof_ref: string
 }
 
-const sha256 = (bytes: Buffer | string) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+export const verifyBytesDigest = (bytes: Buffer | string) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+const sha256 = verifyBytesDigest
 
 const SHA_CHUNK = 1024 * 1024
 
@@ -85,7 +86,7 @@ export function receiptDir(root: string, id: string): string {
   return join(verifyRoot(root), id)
 }
 
-const attestationFile = (root: string, id: string) => join(verifyRoot(root), 'attestations', `${id}.json`)
+export const attestationFile = (root: string, id: string) => join(verifyRoot(root), 'attestations', `${id}.json`)
 
 /** Publica el cuerpo del recibo de forma atómica y devuelve su referencia, con el digest del cuerpo. */
 export function writeVerifyReceipt(root: string, receipt: VerifyReceipt): VerifyReceiptRef {

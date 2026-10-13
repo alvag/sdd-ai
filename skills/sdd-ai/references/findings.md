@@ -178,18 +178,65 @@ guárdalo en la sección `## Cierre` del final del registro (o del respaldo si e
 escribir), con fecha. Ahí también queda una preservación pendiente, con su causa. Si archive se
 detiene, no escribas `## Cierre`: la entrega va en la conversación. Si no queda nada por tramitar y
 no puedes escribir en ningún lugar del flujo, declara en la conversación que el Cierre no quedó
-persistido y sigue con la copia. Si la comparación de la copia falla, anota la preservación pendiente
-en el `## Cierre` del origen, que no se retira. Usa el
-mecanismo de archivo declarado por el proyecto para copiar el directorio completo. Si declara un vault
-con knowledge-vault, invócalo después de esa persistencia, usando su configuración declarada. Sin
-mecanismo declarado no improvises una copia: declara preservación pendiente y conserva el origen.
-Compara todos los archivos de origen y copia por rutas y bytes o SHA-256; lee desde destino registro,
-resultados, pendientes y evidencia. No aceptes enlaces que dejen la evidencia exclusivamente fuera del
-flujo. Ante omisión, discrepancia o imposibilidad de verificar, declara preservación pendiente y
-conserva íntegro el origen. En proyectos que versionan `.plans/`, archive puede dejar cambios sin commit
-en registro, pendientes y evidencia después del cierre Git: avisa antes de copiar o retirar y deja al
-usuario decidir si los commitea. Retira solo después de verificar y con la aprobación exigida por el
-mecanismo. No borres automáticamente, crees otro backlog Git, migres tickets ni corrijas hallazgos.
+persistido y continúa con el procedimiento nativo siguiente. En proyectos que versionan `.plans/`, la
+persistencia de registro, pendientes y evidencia puede dejar cambios posteriores al cierre Git: avisa
+antes de congelar el inventario y deja al usuario decidir si los commitea.
+
+1. Ejecuta `sdd archive <id> --prepare`. Copia literalmente solo ledger y verdict de commit.review,
+   receipt de commit.receipt y las acreditaciones usadas mediante attestation, con su procedencia en
+   evidencia/. No importa stdout/stderr externos ni almacenes o sesiones completos. Sin commit no
+   fabrica evidencia de fases. Repetir una preparación compatible no cambia los cuerpos ni procedencia;
+   una incompatibilidad detiene sin sobrescribir.
+2. Revisa saneamiento de credenciales, tokens, datos personales y rutas privadas innecesarias en todos
+   los cuerpos preparados y el material heredado. Evalúa suficiencia y limitaciones. Con revisión
+   pendiente, evidencia insuficiente o redacción incompatible con la conservación literal de un cuerpo
+   obligatorio, no formules Archivar: presenta a Max la decisión del material fuera del verbo. No
+   recalcules hashes ni reescribas referencias o procedencia para acreditar un cuerpo editado. El
+   binario verifica integridad y fuentes disponibles; no detecta secretos ni registra esta revisión.
+3. Con vault, propón `--summary "<una línea>"` literal, no vacío y legible sin cambios por nodeMetadata.
+   Ejecuta el ensayo `sdd archive <id> [--summary "<una línea>"]`: no escribe. Presenta rutas, tamaños,
+   SHA-256, directorios vacíos, destino real, cobertura, referencias informativas, impedimentos y resumen.
+   El destino depende exclusivamente de knowledge-vault.path_vault; sin clave será
+   `.plans/archived/<id>/`, sin nodo ni commit. Configuración inválida, destino inaccesible o identidad
+   no única detienen sin fallback. El resumen ausente o incompatible y las precondiciones Git incumplidas
+   impiden presentar un ensayo como apto.
+4. Declara tu revisión de saneamiento, suficiencia y limitaciones antes de la pregunta. Solo para un
+   ensayo apto de una operación nueva presenta la pregunta canónica exacta del next, mediante el runner,
+   con Archivar y No archivar. Liga flujo, identidad, inventario, procedencia, destino real y resumen.
+   Con vault autoriza también el único commit local acotado; no pide otro digest textual ni segunda
+   autorización de retiro. Las decisiones de publicación de hallazgos anteriores siguen separadas.
+5. Con la respuesta verificable Archivar, ejecuta
+   `sdd archive <id> --apply [--summary "<la misma línea>"] [--conductor claude|codex]`.
+   Apply no prepara ni sanea. Conserva todos los archivos sin filtrar sufijos y verifica desde destino
+   rutas y bytes, incluidos evidencia/ y directorios vacíos, y termina la limpieza del área de copia
+   propia antes del commit y reclamo. Con vault crea y comprueba un único commit
+   local de nodo y documentos nuevos, sin rutas ajenas ni manifiesto, con todos los hooks desactivados
+   solo para ese comando y configuración permanente intacta. Solo después reclama y retira el origen.
+   Sin vault omite el commit. No hace push ni PR. Lee desde destino registro, resultados, pendientes y
+   evidencia; el archivo local no acredita cierre, gates ni autoridad de publicación.
+
+La autoridad, el snapshot, las intenciones y el progreso quedan en un manifiesto y registros durables
+del checkout, fuera del flujo y del commit del vault. Reanuda una operación pendiente con
+`sdd archive <id> --apply`, sin otra respuesta ni --summary; conserva el resumen original y reconoce
+el commit ya creado sin repetirlo. Un origen recreado no usa la autoridad de una operación completada.
+
+Distingue las detenciones: summary diferente rechaza el argumento sin cambiar estado ni autoridad;
+actividad escritora, locks, precondiciones Git y lecturas fallidas conservan fase reanudable. Resuelto
+el impedimento transitorio, reanuda con la misma autoridad, incluso después del commit. Un defecto del
+área exclusiva de copia permite descarte completo y recopia desde origen íntegro con la autoridad
+original, sin conservar copias defectuosas. Una discrepancia comprobada del material autorizado antes
+de publicar aborta, limpia solo esa área y consume la respuesta; una invocación posterior exige nueva
+autorización. Una limpieza interrumpida termina primero su intención registrada.
+
+Después de publicar, stagear, commitear o reclamar, una discrepancia comprobada deja `stopped` y
+conserva el origen íntegro o restante. Un destino ya publicado ausente o distinto también deja stopped
+con preservación y retiro pendientes: no se reconstruye, sobrescribe, borra ni repara desde Git.
+Presenta causa, pendientes y entradas stageadas propias, o limitación de inspección, para decisión de
+Max fuera del verbo; no limpies el índice. Una lectura fallida del destino es reanudable, no una
+diferencia demostrada. Declara los pendientes en conversación: no edites el origen autorizado tras
+fallo de apply ni añadas allí otro Cierre que cambie el inventario. Un manifiesto ilegible o incompatible
+no permite continuar retirando ni reconstruir autoridad. No hagas copia o retiro manual como alternativa.
+No crees otro backlog Git, migres tickets ni corrijas hallazgos.
 Retomar desde el vault un flujo ya archivado queda fuera de este procedimiento.
 
 La sincronización del checkout es `agents sync`, sin editar generados ni actualizar otros hosts. Doctor

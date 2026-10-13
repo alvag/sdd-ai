@@ -7,6 +7,46 @@ import { type Depth, GATES, type GateId } from '../sdd/status.ts'
 export interface QuestionOption { label: string; description: string }
 export interface Question { header: string; question: string; options: QuestionOption[] }
 
+export interface ArchiveBindingInput {
+  flow: string
+  destination: { kind: 'local' | 'vault'; documents: string; node?: string; declared_vault_root?: string; real_vault_root?: string }
+  identity: unknown
+  inventory: { directories: string[]; files: { path: string; size: number; sha256: string }[] }
+  selection: unknown
+  provenance: unknown
+  summary?: string
+}
+export interface ArchiveBinding { code: string; input: ArchiveBindingInput }
+
+/** Ordena claves de mapas; el orden de listas del contrato se conserva, salvo el inventario. */
+function archiveCanonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(archiveCanonical)
+  if (value !== null && typeof value === 'object') return Object.fromEntries(Object.entries(value)
+    .filter(([, v]) => v !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([key, v]) => [key, archiveCanonical(v)]))
+  return value
+}
+
+export function buildArchiveBinding(input: ArchiveBindingInput): ArchiveBinding {
+  const normalized = archiveCanonical({ ...input, inventory: {
+    directories: [...input.inventory.directories].sort(),
+    files: [...input.inventory.files].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0),
+  } }) as ArchiveBindingInput
+  return { input: normalized, code: createHash('sha256').update(JSON.stringify(normalized)).digest('hex') }
+}
+
+export function archiveQuestion(binding: ArchiveBinding): Question {
+  const { flow, destination } = binding.input
+  return {
+    header: 'Archivar',
+    question: `¿Archivar el flujo ${flow} en ${destination.documents}, con el inventario presentado${destination.kind === 'vault' ? ', su resumen y un único commit local acotado del vault sin hooks' : ''}, y retirar su origen? (código ${binding.code})`,
+    options: [
+      { label: 'Archivar', description: 'Autoriza preservar, verificar y retirar este inventario; no autoriza publicación remota ni cierre' },
+      { label: 'No archivar', description: 'Conserva el origen sin archivar ni retirar' },
+    ],
+  }
+}
+
 export const GATE_OPTIONS = { approve: 'Aprobar', decline: 'No aprobar' } as const
 export const DISPUTE_OPTIONS = { accept: 'Aceptar el hallazgo', reject: 'Mantener el rechazo' } as const
 export const extraOptions = (n: number) => ({ launch: `Lanzar la ronda ${n}`, leave: 'Dejar la revisión como está' })

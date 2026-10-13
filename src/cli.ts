@@ -58,6 +58,7 @@ import {
 } from './types.ts'
 import { type Freshness, type ReviewRequest, REVIEW_LOCK, converged, freshness, untrackedOf } from './review/standing.ts'
 import { applyCommit, planCommit } from './sdd/commit.ts'
+import { applyArchive, prepareArchive, previewArchive } from './sdd/archive.ts'
 import { approve } from './sdd/approve.ts'
 import { type ApproveDeps, ApprovalSyncPending, REAL_DEPS, assertNoActivity } from './sdd/approve-sync.ts'
 import { assertBranchApplicable, branchApply, branchPreview } from './sdd/branch.ts'
@@ -3027,6 +3028,16 @@ async function sdd(args: string[], env: Env, cwd: string, deps?: { approve?: App
   if (sub === 'branch') return sddBranch(rest, env, cwd)
   if (sub === 'phase') return sddPhase(rest, env, cwd)
   if (sub === 'commit') return sddCommit(rest, env, cwd)
+  if (sub === 'archive') {
+    const { values, positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true,
+      options: { prepare: { type: 'boolean' }, apply: { type: 'boolean' }, summary: { type: 'string' }, conductor: { type: 'string' } } })
+    if (positionals.length !== 1 || !isFlowId(positionals[0]) || (values.prepare && values.apply)) throw new SddError('usage',
+      'sdd archive recibe un id y modos --prepare/--apply excluyentes', { next: './bin/sdd-ai sdd archive <id> [--prepare | --apply] [--summary <una línea>] [--conductor claude|codex]' })
+    const root = repoRoot(cwd), flow = positionals[0], conductor = conductorFlag(values.conductor)
+    if (values.prepare) return { code: 0, out: { flow, ...prepareArchive(root, flow) } }
+    const out = values.apply ? applyArchive(root, flow, { summary: values.summary, env, conductor }) : previewArchive(root, flow, values.summary)
+    return { code: ['stopped', 'blocked', 'aborted'].includes(String(out.state)) ? 1 : 0, out }
+  }
   if (sub === 'status') {
     const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { json: { type: 'boolean', default: false } } })
     if (positionals.length > 1) throw new SddError('usage', 'sdd status recibe un solo id', { next: './bin/sdd-ai sdd status [<id>]' })
