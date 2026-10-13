@@ -9,7 +9,7 @@ const root = join(import.meta.dirname, '..')
 test('el bootstrap modular cubre Step y resuelve todos sus procedimientos y apoyos', () => {
   const bootstrap = readFileSync(join(root, 'skills/sdd-ai/SKILL.md'), 'utf8')
   const status = readFileSync(join(root, 'src/sdd/status.ts'), 'utf8')
-  const step = status.match(/export type Step = ([\s\S]*?)\n\/\*\*/)
+  const step = status.match(/export const STEPS = \[([\s\S]*?)\] as const/)
   assert.ok(step)
   const steps = [...step[1].matchAll(/'([^']+)'/g)].map((match) => match[1]).sort()
   const expected: Record<string, string> = {

@@ -80,7 +80,7 @@ import { FILE_NAMES, type FlowRead, LOCK_FILE, artifactHash, bytesHash, flowDir,
 import { recoverPendingRestore, restoreIntentOpen } from './sdd/restore.ts'
 import { isFlowId } from './sdd/id.ts'
 import { assertNoBlockers, checkApplyInput, readAntecedents, renderAntecedents, startApply, startChecks, startPreview } from './sdd/start.ts'
-import { headerData, resolve as resolveFlow } from './sdd/status.ts'
+import { headerData, resolve as resolveFlow, STEPS } from './sdd/status.ts'
 import { detailedFlowView, nextOf } from './sdd/view.ts'
 import { type ManualRow, type VerificationRow, readVerification } from './sdd/verification-contract.ts'
 import { type TreeGuard, attestRow, prepareVerify, runBaseline, runFinal } from './sdd/verify.ts'
@@ -3039,10 +3039,24 @@ async function sdd(args: string[], env: Env, cwd: string, deps?: { approve?: App
     return { code: ['stopped', 'blocked', 'aborted'].includes(String(out.state)) ? 1 : 0, out }
   }
   if (sub === 'status') {
-    const { positionals } = parseArgs({ args: rest, strict: true, allowPositionals: true, options: { json: { type: 'boolean', default: false } } })
+    const { values, positionals, tokens } = parseArgs({ args: rest, strict: true, allowPositionals: true, tokens: true,
+      options: { json: { type: 'boolean', default: false }, step: { type: 'string' } } })
+    if (tokens.filter((t) => t.kind === 'option' && t.name === 'step').length > 1) {
+      throw new SddError('usage', '--step solo puede aparecer una vez')
+    }
+    if (values.step !== undefined && positionals.length > 0) {
+      throw new SddError('usage', '--step solo se admite en el listado sin id')
+    }
+    if (values.step !== undefined && !(STEPS as readonly string[]).includes(values.step)) {
+      throw new SddError('usage', `Paso desconocido ${JSON.stringify(values.step)}; pasos admitidos: ${STEPS.join(', ')}`)
+    }
     if (positionals.length > 1) throw new SddError('usage', 'sdd status recibe un solo id', { next: './bin/sdd-ai sdd status [<id>]' })
     const root = repoRoot(cwd)
-    if (positionals.length === 0) return { code: 0, out: { flows: listFlows(root).map((e) => ({ ...e, next: withPhaseNext(root, e.id, e) })) } }
+    if (positionals.length === 0) {
+      const entries = listFlows(root).map((e) => ({ ...e, next: withPhaseNext(root, e.id, e) }))
+      const flows = values.step === undefined ? entries : entries.filter((e) => e.next.step === values.step)
+      return { code: 0, out: { flows } }
+    }
     const view = detailedFlowView(root, positionals[0])
     return { code: view.blocked_reasons.some((r) => r.code === 'revisions_invalid') ? 1 : 0, out: view }
   }

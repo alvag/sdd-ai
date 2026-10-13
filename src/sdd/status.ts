@@ -61,8 +61,9 @@ export type GateState = 'pending' | 'approved' | 'approved_unfingerprinted' | 's
 export interface Reason { code: string; detail: string }
 export interface GateView { gate: GateId; artifacts: string[]; state: GateState }
 export interface GateResolution { depth: Depth | null; gates: GateView[]; blocked: Reason[]; notes: Reason[] }
-export type Step = 'no_artifacts' | 'depth' | 'specify' | 'branch' | 'plan' | 'tasks' | 'gate' | 'external_gate'
-  | 'implement' | 'verify' | 'review_and_commit' | 'push' | 'open_pr' | 'archive' | 'resolve_blockers'
+export const STEPS = ['no_artifacts', 'depth', 'specify', 'branch', 'plan', 'tasks', 'gate', 'external_gate',
+  'implement', 'verify', 'review_and_commit', 'push', 'open_pr', 'archive', 'resolve_blockers'] as const
+export type Step = (typeof STEPS)[number]
 /** `command` y `detail` los agrega la CLI en un paso de fase: `resolve` nunca los escribe. */
 export interface Next { step: Step; gate?: GateId; artifacts?: string[]; task?: string; command?: string; detail?: string }
 export interface FlowStatus {
