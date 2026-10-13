@@ -79,6 +79,277 @@ function tree(root: string, dir = root, acc: string[] = []): string[] {
   return acc
 }
 
+// Catálogo independiente del productor: un cambio accidental en STEPS no cambia lo esperado.
+const statusSteps = ['no_artifacts', 'depth', 'specify', 'branch', 'plan', 'tasks', 'gate', 'external_gate',
+  'implement', 'verify', 'review_and_commit', 'push', 'open_pr', 'archive', 'resolve_blockers'] as const
+const stepArgs = (step: string): string[][] => [['--step', step], [`--step=${step}`]]
+const statusList = (repo: string) => {
+  const result = sdd(repo, 'status')
+  assert.equal(result.code, 0, JSON.stringify(result.out))
+  return result.out.flows as Array<Record<string, any>>
+}
+const selectedStatus = (repo: string, flows: Array<Record<string, any>>, step: string, ...args: string[]) => {
+  const result = sdd(repo, 'status', ...args)
+  assert.equal(result.code, 0, JSON.stringify(result.out))
+  const expected = flows.filter((entry) => entry.next.step === step)
+  assert.deepEqual(result.out, { flows: expected })
+  assert.deepEqual(result.out.flows.map((entry: Record<string, any>) => entry.id), expected.map((entry) => entry.id))
+  return result
+}
+const usageStatus = (repo: string, args: string[]) => {
+  const result = sdd(repo, 'status', ...args)
+  assert.equal(result.code, 2, JSON.stringify(result.out))
+  assert.equal(result.out.state, 'error')
+  assert.equal(result.out.code, 'usage')
+  return result.out.message as string
+}
+const phaseFixture = (repo: string, id: string, record: Record<string, unknown>) =>
+  writeFileSync(join(repo, '.plans', id, 'sdd-ai-phases.json'), JSON.stringify(record))
+const emptyPhaseFixture = () => ({ schema_version: 1, last_run: null, phases: {} })
+const planFixture = (repo: string, id: string) => writeFlow(repo, id, {
+  'spec.md': SPEC, 'handoff.md': handoff().replace('phase: implementing', `phase: implementing\nbranch: feature/${id}`),
+})
+
+test('sdd status --step admite los quince pasos y ambas sintaxis con y sin --json', () => {
+  const repo = makeRepo()
+  for (const step of statusSteps) for (const args of stepArgs(step)) for (const json of [[], ['--json']]) {
+    const result = sdd(repo, 'status', ...args, ...json)
+    assert.equal(result.code, 0, `${args}: ${JSON.stringify(result.out)}`)
+    assert.deepEqual(result.out, { flows: [] })
+  }
+})
+
+test('sdd status --step conserva exactamente la seleccion del listado calculado', () => {
+  const repo = makeRepo()
+  planFixture(repo, 'a-plan')
+  completa(repo, 'b-implement')
+  planFixture(repo, 'c-plan')
+  phaseFixture(repo, 'c-plan', { ...emptyPhaseFixture(), phases: { plan: { inline: { run: 'R2', at: '2026-10-13T00:00:00Z' } } } })
+  const flows = statusList(repo)
+  assert.deepEqual(flows.map((entry) => entry.id), ['a-plan', 'b-implement', 'c-plan'])
+  assert.equal(flows[0].next.step, 'plan')
+  assert.notEqual(flows[1].next.step, 'plan')
+  assert.equal(flows[2].next.step, 'plan')
+  assert.equal(flows[0].next.command, './bin/sdd-ai sdd phase a-plan')
+  assert.match(flows[2].next.detail, /inline/)
+  assert.match(flows[1].next.detail, /cambios sin commitear/)
+  for (const step of statusSteps) for (const args of stepArgs(step)) {
+    selectedStatus(repo, flows, step, ...args, '--json')
+  }
+})
+
+test('sdd status --step devuelve flows vacio sin coincidencias ni flujos listables', () => {
+  const populated = makeRepo()
+  completa(populated)
+  const reference = statusList(populated)
+  assert.ok(reference.length > 0)
+  assert.ok(reference.every((entry) => entry.next.step !== 'push'))
+  const excluded = makeRepo()
+  completa(excluded, 'archived/old')
+  writeFlow(excluded, 'notes', { 'notes.md': '# Notas\n' })
+  writeFileSync(join(excluded, '.plans', 'loose.md'), '# Suelto\n')
+  for (const repo of [populated, makeRepo(), excluded]) for (const args of stepArgs('push')) {
+    const result = sdd(repo, 'status', ...args)
+    assert.equal(result.code, 0)
+    assert.deepEqual(result.out, { flows: [] })
+  }
+})
+
+test('sdd status --step rechaza valores invalidos ausentes y repetidos con diagnostico', () => {
+  const repo = makeRepo()
+  for (const value of ['unknown-step', 'PLAN', ' plan', 'plan ', '']) for (const args of stepArgs(value)) {
+    const message = usageStatus(repo, args)
+    assert.ok(message.includes(JSON.stringify(value)), message)
+    for (const step of statusSteps) assert.ok(message.includes(step), message)
+  }
+  for (const args of [
+    ['--step', 'plan', '--step', 'plan'], ['--step', 'plan', '--step', 'tasks'],
+    ['--step=plan', '--step=plan'], ['--step=plan', '--step=tasks'],
+    ['--step', 'plan', '--step=plan'], ['--step=plan', '--step', 'tasks'],
+  ]) assert.equal(usageStatus(repo, args), '--step solo puede aparecer una vez')
+  assert.equal(usageStatus(repo, ['--step']), "Option '--step <value>' argument missing")
+  const ambiguous = usageStatus(repo, ['--step', '--json'])
+  assert.ok(ambiguous.includes("Option '--step' argument is ambiguous"))
+  assert.ok(ambiguous.includes("Did you forget to specify the option argument for '--step'?"))
+  // Después de --, el texto no es una segunda opción: conserva el diagnóstico de combinación con id.
+  assert.equal(usageStatus(repo, ['--step=plan', '--', '--step=plan']), '--step solo se admite en el listado sin id')
+})
+
+test('sdd status --step con id rechaza todos los ordenes y ambas sintaxis', () => {
+  const repo = makeRepo()
+  completa(repo, 'existing')
+  for (const id of ['existing', 'missing']) for (const option of stepArgs('plan')) {
+    for (const args of [[id, ...option], [...option, id]]) for (const json of [[], ['--json']]) {
+      assert.equal(usageStatus(repo, [...args, ...json]), '--step solo se admite en el listado sin id')
+    }
+  }
+})
+
+test('sdd status sin --step conserva listado detalle y errores con y sin --json', () => {
+  const repo = makeRepo()
+  completa(repo, 'ok')
+  specOnly(repo, 'a-gate')
+  completa(repo, 'archived/old')
+  writeFlow(repo, 'notes', { 'notes.md': '# Notas\n' })
+  writeFileSync(join(repo, '.plans', 'loose.md'), '# Suelto\n')
+  const invalid = 'x'.repeat(129)
+  mkdirSync(join(repo, '.plans', invalid))
+  const flows = statusList(repo)
+  assert.deepEqual(flows.map((entry) => entry.id), ['a-gate', 'ok', invalid])
+  assert.equal(flows[0].next.step, 'gate')
+  assert.equal(flows[1].depth, 'completa')
+  assert.equal(flows[1].next.step, 'implement')
+  assert.equal(flows[1].next.task, 'T2')
+  assert.match(flows[1].next.detail, /cambios sin commitear/)
+  assert.equal(flows[1].blocked, false)
+  assert.deepEqual(flows[1].blocked_reasons, [])
+  assert.deepEqual(codes(flows[2].blocked_reasons), ['id_invalid'])
+  assert.equal(flows[2].blocked, true)
+  assert.deepEqual(flows[2].next, { step: 'resolve_blockers' })
+  for (const entry of flows) assert.deepEqual(Object.keys(entry), ['id', 'depth', 'next', 'blocked', 'blocked_reasons'])
+  assert.deepEqual(sdd(repo, 'status', '--json'), { code: 0, out: { flows } })
+  const detail = sdd(repo, 'status', 'ok')
+  assert.equal(detail.code, 0)
+  assert.equal(detail.out.id, 'ok')
+  assert.equal(detail.out.depth, 'completa')
+  assert.deepEqual(detail.out.next, flows[1].next)
+  assert.deepEqual(detail.out.tasks, { total: 2, done: 1, pending: 1, first_pending: '**T2 — segunda** · cubre: AC-1' })
+  assert.deepEqual(detail.out.gates.map((gate: { state: string }) => gate.state), ['approved_unfingerprinted', 'approved_unfingerprinted', 'approved_unfingerprinted'])
+  assert.equal(detail.out.paths.spec, '.plans/ok/spec.md')
+  assert.deepEqual(sdd(repo, 'status', 'ok', '--json'), detail)
+  for (const [id, exit, code] of [['sub/x', 2, 'usage'], ['missing', 1, 'flow_not_found']] as const) {
+    const plain = sdd(repo, 'status', id)
+    assert.equal(plain.code, exit)
+    assert.equal(plain.out.state, 'error')
+    assert.equal(plain.out.code, code)
+    assert.equal(typeof plain.out.message, 'string')
+    assert.deepEqual(sdd(repo, 'status', id, '--json'), plain)
+  }
+  for (const json of [[], ['--json']]) assert.equal(usageStatus(repo, ['ok', 'missing', ...json]), 'sdd status recibe un solo id')
+})
+
+test('sdd status --step conserva guardas entradas bloqueadas y errores globales', () => {
+  const repo = makeRepo()
+  completa(repo, 'ok')
+  const invalid = 'x'.repeat(129)
+  mkfifo(join(writeFlow(repo, invalid, {}), 'spec.md'))
+  mkfifo(join(writeFlow(repo, 'fifo', { 'plan.md': plan('planned'), 'handoff.md': handoff() }), 'spec.md'))
+  const outside = outsideDir()
+  mkfifo(join(outside, 'spec.md'))
+  symlinkSync(outside, join(repo, '.plans', 'linked'))
+  symlinkSync(join(outside, 'spec.md'), join(writeFlow(repo, 'artifact-link', { 'plan.md': plan('planned') }), 'spec.md'))
+  const locked = join(completa(repo, 'locked'), 'spec.md')
+  chmodSync(locked, 0o000)
+  try {
+    const flows = statusList(repo)
+    for (const [id, code] of [['fifo', 'artifact_unreadable'], ['linked', 'path_invalid'],
+      ['artifact-link', 'path_invalid'], [invalid, 'id_invalid']]) {
+      const entry = flows.find((entry) => entry.id === id)!
+      assert.equal(entry.blocked, true)
+      assert.deepEqual(codes(entry.blocked_reasons), [code])
+      assert.deepEqual(entry.next, { step: 'resolve_blockers' })
+    }
+    let readable = false
+    try { readFileSync(locked); readable = true } catch { /* El permiso impide leer en hosts sin privilegios. */ }
+    if (!readable) assert.deepEqual(codes(flows.find((entry) => entry.id === 'locked')!.blocked_reasons), ['artifact_unreadable'])
+    for (const step of statusSteps) selectedStatus(repo, flows, step, '--step', step)
+  } finally { chmodSync(locked, 0o600) }
+  for (const kind of ['link', 'file']) {
+    const other = makeRepo()
+    if (kind === 'link') symlinkSync(outside, join(other, '.plans'))
+    else writeFileSync(join(other, '.plans'), 'not a directory')
+    const plain = sdd(other, 'status')
+    assert.equal(plain.code, 2)
+    assert.equal(plain.out.code, 'path_invalid')
+    assert.equal(plain.out.state, 'error')
+    for (const args of stepArgs('resolve_blockers')) assert.deepEqual(sdd(other, 'status', ...args), plain)
+  }
+})
+
+test('sdd status --step usa el paso final con revisiones invalidas y corrida activa', () => {
+  const repo = makeRepo()
+  planFixture(repo, 'broken')
+  writeFileSync(join(repo, '.plans', 'broken', 'sdd-ai-phases.json'), '{')
+  mkfifo(join(writeFlow(repo, 'blocked', { 'plan.md': plan('planned') }), 'spec.md'))
+  planFixture(repo, 'active')
+  phaseFixture(repo, 'active', { ...emptyPhaseFixture(), last_run: { id: 'R1', step: 'plan' } })
+  const run = join(repo, '.sdd-ai', 'runs', 'R1')
+  mkdirSync(run, { recursive: true })
+  writeFileSync(join(run, 'status.json'), JSON.stringify({ state: 'running' }))
+  planFixture(repo, 'minimal')
+  phaseFixture(repo, 'minimal', emptyPhaseFixture())
+  planFixture(repo, 'absent')
+  const flows = statusList(repo)
+  const broken = flows.find((entry) => entry.id === 'broken')!
+  assert.equal(broken.blocked, true)
+  assert.deepEqual(codes(broken.blocked_reasons), ['revisions_invalid'])
+  assert.equal(broken.next.step, 'plan')
+  assert.notEqual(broken.next.step, 'resolve_blockers')
+  assert.equal(broken.next.command, undefined)
+  assert.match(broken.next.detail, /registro de fases/)
+  assert.equal(flows.find((entry) => entry.id === 'blocked')!.next.step, 'resolve_blockers')
+  assert.equal(flows.find((entry) => entry.id === 'active')!.next.command, './bin/sdd-ai wait R1')
+  for (const id of ['minimal', 'absent']) assert.equal(flows.find((entry) => entry.id === id)!.next.command, `./bin/sdd-ai sdd phase ${id}`)
+  for (const step of statusSteps) {
+    const result = selectedStatus(repo, flows, step, '--step', step)
+    if (step === broken.next.step) assert.ok(result.out.flows.some((entry: { id: string }) => entry.id === 'broken'))
+    if (step === 'resolve_blockers') assert.ok(result.out.flows.every((entry: { id: string }) => entry.id !== 'broken'))
+  }
+})
+
+test('sdd status --step no cambia artefactos fases aprobaciones ni corridas', () => {
+  const withRun = makeRepo()
+  completa(withRun)
+  phaseFixture(withRun, 'f', { ...emptyPhaseFixture(), last_run: { id: 'R1', step: 'implement' } })
+  writeFileSync(join(withRun, '.plans', 'f', 'sdd-ai-approvals.json'), JSON.stringify({ schema_version: 1, approvals: [] }))
+  const run = join(withRun, '.sdd-ai', 'runs', 'R1')
+  mkdirSync(run, { recursive: true })
+  writeFileSync(join(run, 'status.json'), JSON.stringify({ state: 'running' }))
+  const withoutRun = makeRepo()
+  completa(withoutRun)
+  const snapshot = (repo: string) => {
+    const inventory = files(repo)
+    const bytes: Record<string, string> = {}
+    const visit = (dir: string) => {
+      for (const name of readdirSync(dir).sort()) {
+        const path = join(dir, name), st = lstatSync(path)
+        if (st.isDirectory()) visit(path)
+        else if (st.isFile()) bytes[relative(repo, path)] = readFileSync(path).toString('base64')
+      }
+    }
+    visit(repo)
+    return { inventory, bytes }
+  }
+  for (const repo of [withRun, withoutRun]) {
+    Object.assign(envOf(repo), { SDD_AI_PROJECTION: 'off', SDD_AI_TELEMETRY: 'off' })
+    const beforeReference = snapshot(repo)
+    const flows = statusList(repo)
+    assert.deepEqual(snapshot(repo), beforeReference)
+    const matching = flows[0].next.step as string
+    const absent = statusSteps.find((step) => flows.every((entry) => entry.next.step !== step))!
+    assert.ok(flows.some((entry) => entry.next.step === matching))
+    assert.ok(absent)
+    for (const step of [matching, absent]) for (const args of stepArgs(step)) {
+      const before = snapshot(repo)
+      const result = selectedStatus(repo, flows, step, ...args)
+      if (step === matching) assert.ok(result.out.flows.length > 0)
+      else assert.deepEqual(result.out, { flows: [] })
+      assert.deepEqual(snapshot(repo), before)
+    }
+    for (const [args, diagnostic] of [
+      [['--step', 'unknown-step'], '"unknown-step"'],
+      [['--step=plan', '--step=plan'], '--step solo puede aparecer una vez'],
+      [['f', '--step=plan'], '--step solo se admite en el listado sin id'],
+      [['--step'], "Option '--step <value>' argument missing"],
+    ] as Array<[string[], string]>) {
+      const before = snapshot(repo)
+      assert.ok(usageStatus(repo, args).includes(diagnostic))
+      assert.deepEqual(snapshot(repo), before)
+    }
+    if (repo === withoutRun) assert.equal(existsSync(join(repo, '.sdd-ai')), false)
+  }
+})
+
 test('sdd status lee el flujo sin escribir nada, no crea .sdd-ai y acepta --json', () => {
   const repo = makeRepo()
   completa(repo)

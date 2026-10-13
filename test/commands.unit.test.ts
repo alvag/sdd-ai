@@ -9,6 +9,21 @@ const W = posix.resolve('/w')
 const resolve = posix.resolve
 const targets = (command: string, cwd: string) => commitTargets(command, cwd, 'linux')
 
+test('status con --step no liga flujos y status con id conserva su binding', () => {
+  for (const option of ['--step plan', '--step=plan']) for (const json of ['', ' --json']) {
+    for (const args of [option, `f1 ${option}`, `${option} f1`]) {
+      const command = `./bin/sdd-ai sdd status ${args}${json}`
+      assert.equal(bindingCommand(command), undefined, command)
+      assert.equal(invokesBinding(command, 'linux'), false, command)
+    }
+  }
+  for (const args of ['f1', 'f1 --json', '--json f1']) {
+    const command = `./bin/sdd-ai sdd status ${args}`
+    assert.deepEqual(bindingCommand(command), { verb: 'status', id: 'f1' })
+    assert.equal(invokesBinding(command, 'linux'), true)
+  }
+})
+
 test('bindingCommand reconoce las formas del binario solo en el primer tramo', () => {
   const binds: [string, 'status' | 'approve' | 'phase'][] = [
     ['sdd-ai sdd status f1', 'status'],
