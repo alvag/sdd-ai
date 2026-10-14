@@ -139,14 +139,55 @@ test('SessionStart indica una recuperación y la adopción correcta bajo decisi�
         assert.doesNotMatch(sync, /acciones previas/)
         assert.match(sync, /Para recuperar las copias, ejecutar en el worktree afectado/)
         if (cli === 'codex') {
-          assert.match(sync, /Codex, abrir una sesión nueva/)
+          assert.match(sync, /Codex 0\.162\.1 en macOS/)
           assert.doesNotMatch(sync, /reload-plugins|Claude Code/)
+          if ('agents' in spec) assert.match(sync, /primera carga o carga previa desconocida → \/fork/)
+          else assert.doesNotMatch(sync, /\/fork|\/new/)
         } else {
-          if ('mod' in spec) assert.match(sync, /corre \/reload-plugins; una sesión nueva lo carga al arrancar/)
-          if ('agents' in spec || 'skill' in spec) {
-            assert.match(sync, /abrir una sesión nueva; no está comprobado que \/reload-plugins los cargue/)
-            if ('mod' in spec) assert.ok(sync.indexOf('Para cargar sdd-ai-mod') < sync.indexOf('Para adoptar los agentes'))
-          } else assert.doesNotMatch(sync, /no está comprobado/)
+          if ('mod' in spec) assert.match(sync, /operación previa comprobada del mod → adopción automática/)
+          if ('agents' in spec) assert.match(sync, /Agentes: \/reload-plugins en primera carga, carga previa desconocida y actualización; comprueba con Agent.*la adopción automática de agentes no es fiable/)
+          if ('skill' in spec) assert.match(sync, /Skill y apoyos: primera carga o carga previa desconocida → \/reload-plugins; actualización con operación previa comprobada → adopción automática/)
+          if (!('agents' in spec || 'skill' in spec)) assert.doesNotMatch(sync, /^(Agentes|Skill y apoyos):/m)
+        }
+      }
+    } finally { f.dispose() }
+  }
+})
+
+test('SessionStart integra la orientación para copias ausentes y desactualizadas', () => {
+  for (const cli of CLIS) {
+    const f = createHookSyncFixture()
+    try {
+      for (const state of ['missing', 'stale']) for (const component of ['agents', 'skill', 'combined']) {
+        installCurrentCopies(f.root, PACKAGE_ROOT, f.env)
+        if (component !== 'skill') damageCopies(f.root, cli, { agents: state === 'missing' ? 'one-missing' : 'edited' })
+        if (component !== 'agents') damageCopies(f.root, cli, { skill: state === 'missing' ? 'missing' : 'edited' })
+        const before = snapshotCopies(f.root)
+        const sync = block(fire(f.root, cli, f.env))
+        assert.equal(snapshotCopies(f.root), before)
+        assertSelected(sync, cli)
+        assert.match(sync, state === 'missing' ? /: ausente/ : /: desactualizada/)
+        assert.match(sync, /Archivos, hashes y contadores no acreditan carga/)
+        assert.match(sync, /writer reservado, espera el cese comprobado y la cosecha/)
+        assert.match(sync, /cessation_uncertain, detente sin escrituras.*pregunta al usuario; no liberes la reserva/)
+        assert.match(sync, /espera su decisión antes de sincronizar/)
+        if (cli === 'claude') {
+          if (component !== 'skill') assert.match(sync, /Agentes: \/reload-plugins en primera carga, carga previa desconocida y actualización; comprueba con Agent.*la adopción automática de agentes no es fiable/)
+          if (component !== 'agents') assert.match(sync, /Skill y apoyos: primera carga o carga previa desconocida → \/reload-plugins; actualización con operación previa comprobada → adopción automática/)
+          assert.match(sync, /\/exit y claude --resume <id>/)
+          assert.doesNotMatch(sync, /\/fork|\/new|sdd status <id>/)
+        } else {
+          assert.doesNotMatch(sync, /\/reload-plugins|\/reload-skills/)
+          if (component === 'skill') {
+            assert.match(sync, /Skill y apoyos: adopción automática en primera carga y actualización/)
+            assert.doesNotMatch(sync, /\/fork|\/new|sdd status <id>/)
+          } else {
+            assert.match(sync, /primera carga o carga previa desconocida → \/fork y Use current Git worktree/)
+            assert.match(sync, /Actualización con agentes previamente operativos comprobados → adopción automática/)
+            assert.match(sync, /Resume del hilo original no adopta agentes nuevos/)
+            assert.match(sync, /Después de \/fork o \/new, ejecuta \.\/bin\/sdd-ai sdd status <id>/)
+            assert.match(sync, /Antes de \/fork o \/new, recibe las corridas nativas abiertas de esta sesión/)
+          }
         }
       }
     } finally { f.dispose() }

@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import { type AgentSource, type RoleProfiles, agentCopy, agentRelPath, readSource, renderAgent, skillCopies } from './agents.ts'
-import { MOD_ADOPTION_MESSAGE, MOD_PATH, modCopy, modInventory } from './mod-copies.ts'
+import { MOD_PATH, modCopy, modInventory } from './mod-copies.ts'
+import { adoptionGuidance, type AdoptionComponent } from './agent-adoption.ts'
 import { MOD_SYNC_COMMAND } from './mod-engine.ts'
 import { WORKERS_PATH, codexHome, loadCodexRoot, loadWorkers } from './profiles.ts'
 import { nativeProfiles } from './resolve.ts'
@@ -109,13 +110,10 @@ export function renderSessionSync(
     // "Después de las acciones previas" solo si las hay: sin ellas, la frase confunde (repro de AC-11).
     const sync = `ejecutar en el worktree afectado: cd ${quote(root)} && ${MOD_SYNC_COMMAND}`
     lines.push(actions.size ? `Después de las acciones previas, ${sync}` : `Para recuperar las copias, ${sync}`)
-    if (cli === 'codex') lines.push('Para adoptar las copias en Codex, abrir una sesión nueva.')
-    else {
-      if (copies.some((copy) => copy.path === MOD_PATH)) lines.push(MOD_ADOPTION_MESSAGE)
-      if (copies.some((copy) => copy.path !== MOD_PATH)) {
-        lines.push('Para adoptar los agentes o la skill en Claude Code, abrir una sesión nueva; no está comprobado que /reload-plugins los cargue.')
-      }
-    }
+    const components = new Set<AdoptionComponent>()
+    const agentPaths = new Set(READ_ONLY_ROLES.map((role) => agentRelPath(cli, role)))
+    for (const copy of copies) components.add(copy.path === MOD_PATH ? 'mod' : agentPaths.has(copy.path) ? 'agents' : 'skill')
+    lines.push(adoptionGuidance(cli, [...components]))
   }
   return lines.join('\n')
 }

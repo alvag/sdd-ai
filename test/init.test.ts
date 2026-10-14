@@ -163,9 +163,40 @@ test('init instala y actualiza la skill modular sin modificar un flujo existente
     }
     assert.deepEqual(Object.fromEntries(Object.keys(state).map((path) => [path, readFileSync(join(c.repo, path)).toString('base64')])), preserved)
     for (const [path, content] of before) if (path.startsWith('.plans/') || path.startsWith('.sdd-ai/runs/')) assert.equal(read(c, path), content)
-    assert.match(applied.out.closing, /Reabre la sesión/)
+    assert.match(applied.out.closing, /primera carga o carga previa desconocida → \/reload-plugins/)
+    assert.match(applied.out.closing, /Skill y apoyos: adopción automática en primera carga y actualización/)
     assert.ok(applied.out.doctor.skill.copies.every((copy: Out) => copy.state === 'ok'))
     assert.equal(applied.out.doctor.skill.copies.length, EXPECTED_SKILL_FILES.length * 2)
+  }
+})
+
+test('init conserva la orientación condicionada de adopción', () => {
+  const c = checkout({ bins: [] })
+  const answers = { telemetry: 'off' as const }
+  const options = { exec: fakeExec, command: (digest?: string) => `./bin/sdd-ai init${digest ? ` --apply --digest ${digest}` : ''}` }
+  const plan = init.planInit(c.repo, answers, c.env, options)
+  const applied = init.applyInit(c.repo, answers, plan.digest, c.env, options)
+  const [claude, codex] = applied.closing.split('Codex 0.162.1 en macOS:')
+  assert.ok(codex)
+  assert.match(claude, /Claude Code 2\.1\.296 en macOS/)
+  assert.match(claude, /Agentes: \/reload-plugins en primera carga, carga previa desconocida y actualización; comprueba con Agent.*la adopción automática de agentes no es fiable/)
+  assert.match(claude, /Skill y apoyos: primera carga o carga previa desconocida → \/reload-plugins/)
+  assert.match(claude, /\/reload-skills solo adopta la skill; no es un paso adicional obligatorio/)
+  assert.match(claude, /\/exit y claude --resume <id>.*misma terminal/)
+  assert.doesNotMatch(claude, /\/fork|\/new|sdd status <id>/)
+  assert.match(codex, /Skill y apoyos: adopción automática en primera carga y actualización; no requieren un hilo nuevo/)
+  assert.match(codex, /primera carga o carga previa desconocida → \/fork y Use current Git worktree/)
+  assert.match(codex, /Actualización con agentes previamente operativos comprobados → adopción automática/)
+  assert.match(codex, /\/new adopta agentes y pierde la conversación/)
+  assert.match(codex, /Resume del hilo original no adopta agentes nuevos/)
+  assert.match(codex, /Después de \/fork o \/new, ejecuta \.\/bin\/sdd-ai sdd status <id>/)
+  assert.match(codex, /Antes de \/fork o \/new, recibe las corridas nativas abiertas de esta sesión/)
+  assert.doesNotMatch(codex, /\/reload-plugins|\/reload-skills/)
+  for (const text of [claude, codex]) {
+    assert.match(text, /writer reservado, espera el cese comprobado y la cosecha/)
+    assert.match(text, /cessation_uncertain, detente sin escrituras/)
+    assert.match(text, /otras versiones o sistemas.*carecen de verificación actual/)
+    assert.doesNotMatch(text, /Reabre la sesión/)
   }
 })
 

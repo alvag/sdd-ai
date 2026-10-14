@@ -8,7 +8,8 @@ import { type SkillFile, agentName, agentsState, leftoverAgents, skillCopies, sk
 import { parseCrossModel, parseJiraMode } from './config.ts'
 import { type Exec, cliVersion, defaultExec, detectClis, doctor, olderVersion } from './doctor.ts'
 import { gitDirs } from './git.ts'
-import { MOD_ADOPTION_MESSAGE, MOD_PATH, MOD_RUNTIME_FILES, type ModFile, assertModCopyInside, modChanges, modCopy, modInventory } from './mod-copies.ts'
+import { MOD_PATH, MOD_RUNTIME_FILES, type ModFile, assertModCopyInside, modChanges, modCopy, modInventory } from './mod-copies.ts'
+import { allAdoptionGuidance } from './agent-adoption.ts'
 import { DEFAULT_PROFILES, type WorkersFile, loadCodexCatalog, loadCodexRoot, parseWorkers } from './profiles.ts'
 import { roleProfiles } from './resolve.ts'
 import { type Family, READ_ONLY_ROLES, RETIRED_ROLES, ROLES, type Role, SddError } from './types.ts'
@@ -597,8 +598,7 @@ export function applyInit(root: string, answers: InitAnswers, digest: string, en
   }
   const closing = [
     `Los perfiles de ${WORKERS_PATH} y las claves de la config que init no pregunta se cambian a mano.`,
-    ...(agents === null ? [] : ['Reabre la sesión para que el CLI cargue los agentes y la skill.']),
-    ...(plan.agents.some((change) => change.path.startsWith(`${MOD_PATH}/`)) ? [MOD_ADOPTION_MESSAGE] : []),
+    ...(agents === null ? [] : [allAdoptionGuidance(plan.agents.some((change) => change.path.startsWith(`${MOD_PATH}/`)))]),
   ].join(' ')
   return {
     mode: 'applied', root, written, agents, workers: plan.workers, notes: plan.notes,

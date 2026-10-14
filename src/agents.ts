@@ -33,6 +33,7 @@ export const SKILL_FILES: readonly string[] = [
   'procedures/review-and-commit.md',
   'procedures/close.md',
   'references/dispatch.md',
+  'references/adoption.md',
   'references/reception.md',
   'references/document-phases.md',
   'references/document-revision.md',

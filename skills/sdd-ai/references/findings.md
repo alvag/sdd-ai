@@ -240,7 +240,8 @@ No crees otro backlog Git, migres tickets ni corrijas hallazgos.
 Retomar desde el vault un flujo ya archivado queda fuera de este procedimiento.
 
 La sincronización del checkout es `agents sync`, sin editar generados ni actualizar otros hosts. Doctor
-informa copias stale/missing; reabre la sesión para cargar la skill nueva. Las comprobaciones reales
+informa copias stale/missing; carga la skill nueva según runner y condición en [adopción](adoption.md),
+con sesión nueva como fallback. Las comprobaciones reales
 que lancen Claude son del conductor. Un rollback no borra registros: termina de recibir corridas con
 findings usando una versión compatible antes de volver a un binario que rechace ese campo.
 

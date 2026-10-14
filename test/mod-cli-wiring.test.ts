@@ -4,6 +4,12 @@ import { MOD_ADOPTION_MESSAGE, MOD_PATH } from '../src/mod-copies.ts'
 import { modFixture, write } from './mod-fixture.ts'
 
 test('doctor and agents sync report the mod copy and its adoption', () => {
+  assert.match(MOD_ADOPTION_MESSAGE, /Claude Code 2\.1\.296 en macOS/)
+  assert.match(MOD_ADOPTION_MESSAGE, /primera carga o carga previa desconocida → \/reload-plugins/)
+  assert.match(MOD_ADOPTION_MESSAGE, /actualización con operación previa comprobada del mod → adopción automática/)
+  assert.match(MOD_ADOPTION_MESSAGE, /alternativa adicional comprobada/)
+  assert.match(MOD_ADOPTION_MESSAGE, /sesión nueva es el fallback/)
+  assert.match(MOD_ADOPTION_MESSAGE, /otras versiones o sistemas.*carecen de verificación actual/)
   const c = modFixture()
   try {
     assert.equal(c.cli(['doctor']).out.mod.copies[0].state, 'missing')

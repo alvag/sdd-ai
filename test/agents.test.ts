@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   type RoleProfiles, agentsState, parseAgentSource, renderClaudeAgent, renderCodexAgent, sourceHash, syncAgents,
 } from '../src/agents.ts'
@@ -125,6 +125,80 @@ test('agents sync no genera sdd-ai-implement', () => {
   const codex = readdirSync(join(repo, '.codex', 'agents'))
   assert.deepEqual(claude.sort(), READ_ONLY_ROLES.map((role) => `sdd-ai-${role}.md`).sort())
   assert.deepEqual(codex.sort(), READ_ONLY_ROLES.map((role) => `sdd-ai-${role}.toml`).sort())
+})
+
+test('agents sync orienta adopción por runner componente y carga previa', () => {
+  const repo = makeRepo()
+  const r = spawnSync(process.execPath, [join(import.meta.dirname, '..', 'bin/sdd-ai'), 'agents', 'sync'], {
+    cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')), SDD_AI_PROJECTION: 'off' },
+  })
+  assert.equal(r.status, 0, r.stderr)
+  const next: string = JSON.parse(r.stdout).next
+  const [claude, codex] = next.split('Codex 0.162.1 en macOS:')
+  assert.ok(codex)
+  assert.match(claude, /Claude Code 2\.1\.296 en macOS/)
+  const agents = claude.split('\n').find((line) => line.startsWith('Agentes:'))!
+  assert.match(agents, /Agentes: \/reload-plugins en primera carga, carga previa desconocida y actualización; comprueba con Agent.*la adopción automática de agentes no es fiable/)
+  assert.doesNotMatch(agents, /adopción automática, con \/reload-plugins como alternativa/)
+  const skill = claude.split('\n').find((line) => line.startsWith('Skill y apoyos:'))!
+  assert.match(skill, /primera carga o carga previa desconocida → \/reload-plugins/)
+  assert.match(skill, /actualización con operación previa comprobada → adopción automática/)
+  assert.match(skill, /alternativa adicional comprobada/)
+  assert.match(claude, /\/reload-skills solo adopta la skill; no es un paso adicional obligatorio/)
+  assert.match(claude, /\/exit y claude --resume <id>.*comando mostrado.*misma terminal/)
+  assert.match(claude, /conserva el id y la conversación/)
+  assert.doesNotMatch(claude, /\/fork|\/new|sdd status <id>/)
+  assert.match(codex, /Skill y apoyos: adopción automática en primera carga y actualización; no requieren un hilo nuevo/)
+  assert.match(codex, /Agentes: primera carga o carga previa desconocida → \/fork y Use current Git worktree/)
+  assert.match(codex, /Actualización con agentes previamente operativos comprobados → adopción automática/)
+  assert.match(codex, /Conserva conversación y terminal, crea un hilo nuevo y cambia CODEX_THREAD_ID/)
+  assert.match(codex, /\/new adopta agentes y pierde la conversación/)
+  assert.match(codex, /Resume del hilo original no adopta agentes nuevos/)
+  assert.match(codex, /Después de \/fork o \/new, ejecuta \.\/bin\/sdd-ai sdd status <id>/)
+  assert.match(codex, /Antes de \/fork o \/new, recibe las corridas nativas abiertas de esta sesión/)
+  assert.match(codex, /Si la adopción automática de la skill falla o no está verificada en tu entorno, conserva una sesión nueva como fallback/)
+  assert.match(codex, /Mod: no aplicable; el mod no opera en Codex/)
+  assert.doesNotMatch(codex, /\/reload-plugins|\/reload-skills/)
+  for (const block of [claude, codex]) {
+    assert.match(block, /uso efectivo de la skill y sus apoyos, invocación real del agente/)
+    assert.match(block, /Archivos, hashes y contadores no acreditan carga/)
+    assert.match(block, /otras versiones o sistemas.*carecen de verificación actual/)
+    assert.match(block, /writer reservado, espera el cese comprobado y la cosecha/)
+    assert.match(block, /cessation_uncertain, detente sin escrituras.*pregunta al usuario; no liberes la reserva/)
+    assert.match(block, /no autoriza reparación automática, recuperación ni gates humanos/)
+    assert.doesNotMatch(block, /reabre la sesión para que|sincroniza inmediatamente|repara automáticamente/)
+  }
+})
+
+test('agents sync conserva artefactos y registros del flujo', () => {
+  const repo = makeRepo()
+  const state: Record<string, string> = {
+    '.plans/synthetic/handoff.md': '---\nprofundidad: normal\nstatus: implementing\n---\n',
+    '.plans/synthetic/spec.md': '# Spec sintética\n',
+    '.plans/synthetic/plan.md': '# Plan sintético\n',
+    '.plans/synthetic/tasks.md': '# Tasks\n- [x] T1\n',
+    '.plans/synthetic/sdd-ai-approvals.json': '{"schema_version":1,"approvals":[{"gate":"spec","fingerprint":"fixture"}]}\n',
+    '.plans/synthetic/sdd-ai-phases.json': '{"schema_version":1,"phases":[{"run_id":"synthetic-run"}]}\n',
+    '.sdd-ai/runs/synthetic-run/request.json': '{"flow":"synthetic","root":"fixture-checkout","session":"fixture-session","role":"explore"}\n',
+    '.sdd-ai/runs/synthetic-run/status.json': '{"state":"done"}\n',
+    '.sdd-ai/runs/synthetic-run/result.md': 'Resultado sintético\n',
+    '.sdd-ai/runs/synthetic-run/delivered.json': '{"session":"fixture-session"}\n',
+  }
+  for (const [path, bytes] of Object.entries(state)) {
+    mkdirSync(dirname(join(repo, path)), { recursive: true })
+    writeFileSync(join(repo, path), bytes)
+  }
+  const snapshot = () => readdirSync(repo, { recursive: true, withFileTypes: true })
+    .filter((e) => e.isFile())
+    .map((e) => join(e.parentPath, e.name).slice(repo.length + 1))
+    .filter((path) => path.startsWith('.plans/') || path.startsWith('.sdd-ai/runs/'))
+    .sort().map((path) => [path, readFileSync(join(repo, path)).toString('base64')])
+  const before = snapshot()
+  const r = spawnSync(process.execPath, [join(import.meta.dirname, '..', 'bin/sdd-ai'), 'agents', 'sync'], {
+    cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, CODEX_HOME: mkdtempSync(join(tmpdir(), 'sdd-ai-codexhome-')), SDD_AI_PROJECTION: 'off' },
+  })
+  assert.equal(r.status, 0, r.stderr)
+  assert.deepEqual(snapshot(), before)
 })
 
 test('agents sync rechaza un flag desconocido o un posicional sobrante sin tocar las copias', () => {

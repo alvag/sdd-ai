@@ -15,6 +15,23 @@ const repo = join(import.meta.dirname, '..')
 
 const FAMILIES: readonly Family[] = ['claude', 'codex']
 
+test('la guía de adopción se distribuye con la skill en ambas familias', () => {
+  const root = mkdtempSync(join(tmpdir(), 'sdd-ai-adoption-guide-'))
+  try {
+    const result = syncAgents(root, repo, profiles())
+    const path = 'references/adoption.md'
+    const bytes = readFileSync(join(repo, 'skills/sdd-ai', path))
+    for (const family of FAMILIES) {
+      const installed = installedSkillPath(family, path)
+      assert.ok(result.written.includes(join(root, installed)))
+      assert.deepEqual(readFileSync(join(root, installed)), bytes)
+      const targets = skillLinks(path, bytes.toString('utf8'))
+      assert.ok(targets.length > 0)
+      for (const target of targets) assert.ok(readFileSync(join(root, installedSkillPath(family, target))).length > 0, target)
+    }
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 function profiles(): RoleProfiles {
   return Object.fromEntries(READ_ONLY_ROLES.map((r) => [r, { claude: { model: 'opus' }, codex: { model: 'gpt-6-sol' } }])) as RoleProfiles
 }

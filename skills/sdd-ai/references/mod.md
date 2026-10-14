@@ -1,6 +1,6 @@
 <!-- Origen: mods/sdd-ai/README.md: compatibilidad, instalación, espera y señal/fallos/rollback. Traslado de la base a70c7da. -->
 
-Apoyos: ninguno. Lee los que correspondan antes de la operación; errores al fallar, recepción al recibir, revisión antes de decidir y los demás al usar su contrato.
+Apoyos: [adopción](adoption.md). Lee los que correspondan antes de la operación; errores al fallar, recepción al recibir, revisión antes de decidir, adopción al instalar, actualizar o retomar (sus guardas preceden a la sincronización), y los demás al usar su contrato.
 
 ## Compatibilidad y estado de comprobación
 
@@ -37,6 +37,20 @@ y aplicar el plan aprobado con su digest. La fuente está en `mods/sdd-ai/`; la
 copia generada está en `.claude/skills/sdd-ai-mod/` y se distribuye incluso
 cuando la familia seleccionada es Codex. La copia contiene el manifiesto,
 `hooks/` y `types/`, sin los tests.
+
+### Resultados con Claude Code 2.1.296 en macOS
+
+Con **Claude Code 2.1.296 en macOS**, primera carga o carga previa desconocida del mod
+usa `/reload-plugins`. Actualización con mod previamente operativo comprobado se adopta
+automáticamente; `/reload-plugins` adicional también se comprobó sin duplicación. Los archivos
+no acreditan carga: observa operación del mod antes de actualizar. Si falla o carece de verificación,
+conserva sesión nueva como fallback: `/exit` y `claude --resume <id>` usando el comando mostrado
+al salir en la misma terminal; en ese entorno conserva id y conversación. Consulta [adopción](adoption.md).
+El mod no opera en Codex aunque se distribuya su copia. No extiendas garantías a otras versiones o sistemas.
+Con writer reservado espera cese comprobado y cosecha antes de sync; ante `cessation_uncertain`,
+detente sin escrituras ni liberación autónoma y pregunta al usuario.
+
+### Antecedentes históricos
 
 Una **sesión nueva de Claude Code** en el checkout preparado y de confianza
 carga el mod al arrancar. En una sesión ya abierta, `/reload-plugins` lo carga,

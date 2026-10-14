@@ -1,6 +1,6 @@
 <!-- Origen: SKILL.md:1505–1615. Traslado de la base a70c7da. -->
 
-Apoyos: [errors](errors.md); [mod](mod.md); [writer](writer.md). Lee los que correspondan antes de la operación; errores al fallar, recepción al recibir, revisión antes de decidir y los demás al usar su contrato.
+Apoyos: [errors](errors.md); [mod](mod.md); [writer](writer.md); [adopción](adoption.md). Lee los que correspondan antes de la operación; errores al fallar, recepción al recibir, revisión antes de decidir, adopción para el closing tras sincronizar, y los demás al usar su contrato. Adoptar no exige init ni cambios de preferencias.
 
 ## 11. Preparar el checkout: `init`
 
@@ -91,8 +91,8 @@ sdd-ai ahí es la instalación global.
    `init --apply --digest <digest>` con los mismos flags. Escribe exactamente lo que mostró el
    ensayo. Si sale `digest_mismatch`, algo cambió desde entonces: vuelve a ensayar y muéstrale el
    plan nuevo.
-5. **Cierra** con lo que diga `closing` y el reporte de `doctor`. Si se sincronizaron agentes, hay que
-   reabrir la sesión.
+5. **Cierra** con lo que diga `closing` y el reporte de `doctor`. Si se sincronizaron copias, sigue
+   [adopción](adoption.md) por runner, componente y carga observada; sesión nueva queda como fallback.
 
 En un worktree nuevo, `init` propone copiar la config y los perfiles del checkout principal (`seed`),
 y `--from <ruta>` elige otro checkout. Como el worktree no tiene `node_modules`, corre desde él
