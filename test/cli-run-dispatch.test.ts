@@ -1,12 +1,58 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { readStatus } from '../src/runs.ts'
 import { READ_ONLY_ROLES, TERMINAL } from '../src/types.ts'
 import { findingsInstructions } from '../src/findings.ts'
 import { withWorkerPolicy } from '../src/worker-policy.ts'
 import { type Setup, setup, cli, pick, nativeOf, AS_CODEX, runsIn, requestOf } from './cli-run-fixture.ts'
+
+test('agents_stale orienta ausencia y actualización en ambas familias', () => {
+  for (const family of ['claude', 'codex'] as const) {
+    const s = setup({ families: `[${family}]` })
+    const env = family === 'codex' ? AS_CODEX : {}
+    for (const condition of ['missing', 'stale']) {
+      if (condition === 'stale') {
+        assert.equal(cli(s, ['agents', 'sync'], env).code, 0)
+        writeFileSync(join(s.repo, `.${family}/agents/sdd-ai-explore.${family === 'claude' ? 'md' : 'toml'}`), 'copia distinta\n')
+      }
+      const r = cli(s, ['run', '--prompt-file', s.prompt], env)
+      assert.equal(r.code, 1, r.stderr)
+      assert.deepEqual([r.out.state, r.out.reason], ['launch_failed', 'agents_stale'])
+      assert.equal(r.out.detail, condition === 'missing' ? 'no existe el agente generado' : 'el agente generado no coincide con sus fuentes')
+      assert.equal(readStatus(join(s.repo, '.sdd-ai/runs', r.out.id)).state, 'launch_failed')
+      const entire = JSON.stringify(r.out) + r.stderr
+      const next: string = r.out.next
+      assert.match(next, /\.\/bin\/sdd-ai agents sync/)
+      assert.match(next, /Archivos, hashes y contadores no acreditan carga/)
+      assert.match(next, /invocación real del agente/)
+      assert.match(next, /writer reservado, espera el cese comprobado y la cosecha/)
+      assert.match(next, /cessation_uncertain, detente sin escrituras.*pregunta al usuario; no liberes la reserva/)
+      assert.match(next, /no autoriza reparación automática, recuperación ni gates humanos/)
+      assert.match(next, /otras versiones o sistemas.*carecen de verificación actual/)
+      assert.doesNotMatch(next, /sincroniza inmediatamente|repara automáticamente|reabre la sesión para que/)
+      if (family === 'claude') {
+        assert.doesNotMatch(entire, /\/fork|\/new/)
+        assert.doesNotMatch(next, /sdd status <id>/)
+        assert.match(next, /Agentes: \/reload-plugins en primera carga, carga previa desconocida y actualización; comprueba con Agent.*la adopción automática de agentes no es fiable/)
+        assert.doesNotMatch(next, /Agentes: primera carga o carga previa desconocida/)
+        assert.match(next, /\/exit y claude --resume <id>.*misma terminal/)
+        assert.match(next, /conserva el id y la conversación/)
+      } else {
+        assert.doesNotMatch(entire, /\/reload-plugins|\/reload-skills/)
+        assert.match(next, /Agentes: primera carga o carga previa desconocida → \/fork y Use current Git worktree/)
+        assert.match(next, /Actualización con agentes previamente operativos comprobados → adopción automática/)
+        assert.match(next, /crea un hilo nuevo y cambia CODEX_THREAD_ID/)
+        assert.match(next, /\/new adopta agentes y pierde la conversación/)
+        assert.match(next, /Resume del hilo original no adopta agentes nuevos/)
+        assert.match(next, /Después de \/fork o \/new, ejecuta \.\/bin\/sdd-ai sdd status <id>/)
+        assert.match(next, /Antes de \/fork o \/new, recibe las corridas nativas abiertas de esta sesión/)
+        assert.match(next, /el mod no opera en Codex/)
+      }
+    }
+  }
+})
 
 test('run por proceso responde en menos de 1 s', () => {
   // Un worker que nunca termina: si run esperara al worker, este test no respondería a tiempo.

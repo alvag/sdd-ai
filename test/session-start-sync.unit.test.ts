@@ -17,6 +17,62 @@ const syncCount = (text: string) => text.split('./bin/sdd-ai agents sync').lengt
 const agentSource = 'agents/worker.md'
 const skillSource = 'skills/sdd-ai/SKILL.md'
 
+test('SessionStart orienta componentes sin inferir carga de las copias', () => {
+  for (const cli of ['claude', 'codex'] as const) {
+    const f = createSessionSyncFixture()
+    try {
+      const components = cli === 'claude' ? ['agents', 'skill', 'mod', 'combined'] : ['agents', 'skill', 'combined']
+      for (const component of components) for (const state of ['missing', 'stale']) {
+        installCurrentCopies(f.root, f.pkgDir, f.env)
+        if (component === 'agents' || component === 'combined') damageCopies(f.root, cli, { agents: state === 'missing' ? 'one-missing' : 'edited' })
+        if (component === 'skill' || component === 'combined') damageCopies(f.root, cli, { skill: state === 'missing' ? 'missing' : 'edited' })
+        if (cli === 'claude' && (component === 'mod' || component === 'combined')) damageCopies(f.root, cli, { mod: state === 'missing' ? 'missing' : 'changed' })
+        const before = snapshotCopies(f.root)
+        const text = renderSessionSync(f.root, f.pkgDir, cli, f.env)
+        assert.equal(snapshotCopies(f.root), before)
+        assert.match(text, state === 'missing' ? /: ausente/ : /: desactualizada/)
+        assert.match(text, /espera su decisión antes de sincronizar/)
+        assert.match(text, /Archivos, hashes y contadores no acreditan carga; missing, stale y ok describen disco, no sesión/)
+        assert.match(text, /uso efectivo de la skill y sus apoyos, invocación real del agente/)
+        assert.match(text, /writer reservado, espera el cese comprobado y la cosecha/)
+        assert.match(text, /cessation_uncertain, detente sin escrituras.*pregunta al usuario; no liberes la reserva/)
+        assert.match(text, /no autoriza reparación automática, recuperación ni gates humanos/)
+        assert.match(text, /otras versiones o sistemas.*carecen de verificación actual/)
+        assert.doesNotMatch(text, /sincroniza inmediatamente|repara automáticamente|reabre la sesión para que/)
+        if (cli === 'claude') {
+          assert.doesNotMatch(text, /\/fork|\/new|sdd status <id>/)
+          assert.match(text, /Claude Code 2\.1\.296 en macOS/)
+          if (component === 'agents' || component === 'combined') {
+            assert.match(text, /Agentes: \/reload-plugins en primera carga, carga previa desconocida y actualización; comprueba con Agent.*la adopción automática de agentes no es fiable/)
+            assert.doesNotMatch(text, /Agentes: primera carga o carga previa desconocida/)
+          }
+          if (component === 'skill' || component === 'combined') {
+            assert.match(text, /Skill y apoyos: primera carga o carga previa desconocida → \/reload-plugins; actualización con operación previa comprobada → adopción automática/)
+            assert.match(text, /\/reload-skills solo adopta la skill; no es un paso adicional obligatorio/)
+          }
+          if (component === 'mod' || component === 'combined') assert.match(text, /primera carga o carga previa desconocida → \/reload-plugins; actualización con operación previa comprobada del mod → adopción automática/)
+          assert.match(text, /\/exit y claude --resume <id>.*misma terminal/)
+        } else {
+          assert.doesNotMatch(text, /\/reload-plugins|\/reload-skills|Claude Code/)
+          assert.match(text, /Codex 0\.162\.1 en macOS/)
+          assert.match(text, /el mod no opera en Codex/)
+          if (component === 'skill') {
+            assert.doesNotMatch(text, /\/fork|\/new|sdd status <id>/)
+            assert.match(text, /Skill y apoyos: adopción automática en primera carga y actualización; no requieren un hilo nuevo/)
+          } else {
+            assert.match(text, /Agentes: primera carga o carga previa desconocida → \/fork y Use current Git worktree/)
+            assert.match(text, /Actualización con agentes previamente operativos comprobados → adopción automática/)
+            assert.match(text, /Conserva conversación y terminal, crea un hilo nuevo y cambia CODEX_THREAD_ID/)
+            assert.match(text, /\/new adopta agentes y pierde la conversación/)
+            assert.match(text, /Resume del hilo original no adopta agentes nuevos/)
+            assert.match(text, /Después de \/fork o \/new, ejecuta \.\/bin\/sdd-ai sdd status <id>/)
+          }
+        }
+      }
+    } finally { f.dispose() }
+  }
+})
+
 test('La comprobación de SessionStart solo lee y no lanza procesos', () => {
   const f = createSessionSyncFixture()
   try {

@@ -16,9 +16,9 @@ export const MOD_RUNTIME_FILES: readonly string[] = MOD_FIXED_FILES.map((path) =
 export const ENGINE_PATHS: ReadonlySet<string> = new Set(['.claude-plugin/types', 'tsconfig.json'])
 /** El sufijo del temporal con el que se escribe cada archivo de la copia antes de renombrarlo. */
 const TEMPORARY_SUFFIX = '.sdd-ai-tmp'
-// La adopción automática se observó solo con 2.1.289. En 2.1.290 cambiar o retirar la copia requiere
-// /reload-plugins o una sesión nueva; no se garantiza adopción automática en otras versiones.
-export const MOD_ADOPTION_MESSAGE = 'Para cargar sdd-ai-mod en una sesión de Claude Code ya abierta en este checkout, corre /reload-plugins; una sesión nueva lo carga al arrancar.'
+// Investigación de adopción: 2.1.296 en macOS. Los antecedentes de 2.1.289–2.1.291 se conservan
+// en references/mod.md; no se extienden garantías a versiones o sistemas no comprobados.
+export const MOD_ADOPTION_MESSAGE = 'Mod sdd-ai-mod — Claude Code 2.1.296 en macOS: primera carga o carga previa desconocida → /reload-plugins; actualización con operación previa comprobada del mod → adopción automática, con /reload-plugins como alternativa adicional comprobada. Una sesión nueva es el fallback; en otras versiones o sistemas estas vías carecen de verificación actual. El mod no opera en Codex.'
 export interface ModFile { path: string; bytes: Buffer; sha256: string }
 export interface ModCopy { path: string; state: 'ok' | 'missing' | 'stale' }
 export interface ModChange { path: string; state: 'missing' | 'stale' | 'leftover' }

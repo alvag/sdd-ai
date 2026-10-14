@@ -16,7 +16,8 @@ import { type Runner, answersFor, detectRunner, readTail, sessionFile } from './
 import { detectConductor } from './conductor.ts'
 import { effectiveFamilies, loadCrossModel, loadJiraMode, parseFamiliesFlag } from './config.ts'
 import { type AgentCheck, type ModCheck, type SkillCheck, doctor } from './doctor.ts'
-import { MOD_ADOPTION_MESSAGE, modCopy, modInventory } from './mod-copies.ts'
+import { modCopy, modInventory } from './mod-copies.ts'
+import { adoptionGuidance, allAdoptionGuidance } from './agent-adoption.ts'
 import { type ModEngineContext, inspectModEngine, modEngineContext } from './mod-engine.ts'
 import { buildIndex, currentBranch, dirtyPaths, entryDiff, gitDirs, headCommit, indexEntries, readGitState, readHeadState, repoRoot } from './git.ts'
 import { type InitAnswers, applyInit, planInit } from './init.ts'
@@ -268,7 +269,7 @@ async function run(args: string[], env: Env, cwd: string): Promise<Result> {
     if (state !== 'ok') {
       const detail = state === 'missing' ? 'no existe el agente generado' : 'el agente generado no coincide con sus fuentes'
       markDelivered(dir, setStatus(dir, { state: 'launch_failed', reason: 'agents_stale', detail }), env)
-      return { code: 1, out: { id, state: 'launch_failed', reason: 'agents_stale', detail, next: './bin/sdd-ai agents sync y reabrir la sesión' } }
+      return { code: 1, out: { id, state: 'launch_failed', reason: 'agents_stale', detail, next: `Propón ./bin/sdd-ai agents sync respetando la reserva del writer; después adopta el agente afectado.\n${adoptionGuidance(resolution.family, ['agents'])}` } }
     }
     const native: NativeProfile = { agent: agentName(role), family: resolution.family, role }
     // El agente generado trae el perfil de su rol. Lo que la corrida resolvió distinto (un override, la
@@ -2217,7 +2218,7 @@ function agents(args: string[], env: Env, cwd: string): Result {
   parseArgs({ args: args.slice(1), strict: true, allowPositionals: false, options: {} })
   const root = repoRoot(cwd)
   const { written, removed } = syncAgents(root, PKG_DIR, nativeProfiles(root, env))
-  return { code: 0, out: { written, removed, next: `reabre la sesión para que el CLI cargue los agentes y la skill. ${MOD_ADOPTION_MESSAGE}` } }
+  return { code: 0, out: { written, removed, next: allAdoptionGuidance() } }
 }
 
 function checkoutBin(root: string): string {

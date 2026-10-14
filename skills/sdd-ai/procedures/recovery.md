@@ -1,8 +1,14 @@
 <!-- Origen: SKILL.md:873–906. Traslado de la base a70c7da. -->
 
-Apoyos: [errors](../references/errors.md); [reception](../references/reception.md); [writer](../references/writer.md). Lee los que correspondan antes de la operación; errores al fallar, recepción al recibir, revisión antes de decidir y los demás al usar su contrato.
+Apoyos: [errors](../references/errors.md); [reception](../references/reception.md); [writer](../references/writer.md); [adopción](../references/adoption.md). Lee los que correspondan antes de la operación; errores al fallar, recepción al recibir, revisión antes de decidir, adopción al adoptar copias y retomar un flujo existente, y los demás al usar su contrato.
 
 ## 9. El estado de un flujo SDD
+
+Al retomar consulta `./bin/sdd-ai sdd status <id>`. Solo en Codex, después de `/fork` o `/new`,
+esa consulta liga la sesión nueva al flujo antes de continuar o recibir; no acredita entrega ni
+transferencia nativa. Adoptar no autoriza reparar, recibir o aprobar. Antes de sincronizar con writer
+reservado espera cese comprobado y cosecha; ante `cessation_uncertain`, detente sin escrituras en
+el árbol ni liberación por tu cuenta y pregunta al usuario.
 
 `sdd status` calcula el estado de un flujo de `.plans/<id>/` desde sus archivos, en solo lectura: su
 profundidad, sus gates, sus tasks, el paso siguiente y lo que lo bloquea. `sdd approve` registra la

@@ -94,6 +94,8 @@ test('init closing names the mod only when its copy changes', () => {
     const closing = c.apply(c.dry().digest).closing
     assert.equal(closing.includes(MOD_ADOPTION_MESSAGE), true)
     assert.match(closing, /\/reload-plugins/)
+    assert.match(closing, /operación previa comprobada del mod → adopción automática/)
+    assert.match(closing, /sesión nueva es el fallback/)
     write(c.root, `${MOD_PATH}/hooks/leftover.ts`, 'obsolete')
     assert.equal(c.apply(c.dry().digest).closing.includes(MOD_ADOPTION_MESSAGE), true)
     write(c.root, `${MOD_PATH}/.claude-plugin/types/claude-code/index.d.ts`, 'engine')

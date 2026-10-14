@@ -1,6 +1,6 @@
 <!-- Origen: SKILL.md:677–715. Traslado de la base a70c7da. -->
 
-Apoyos: [mod](mod.md). Lee los que correspondan antes de la operación; errores al fallar, recepción al recibir, revisión antes de decidir y los demás al usar su contrato.
+Apoyos: [mod](mod.md); [adopción](adoption.md). Lee los que correspondan antes de la operación; errores al fallar, recepción al recibir, revisión antes de decidir, adopción después de sincronizar, y los demás al usar su contrato.
 
 ## 7. Si algo falla
 
@@ -20,11 +20,14 @@ Apoyos: [mod](mod.md). Lee los que correspondan antes de la operación; errores 
   `tree_dirty`) y el cese incierto están en [writer](writer.md).
 - **Rol `pr`**: ahora se llama `code-review`. El error de migración vale para `--role pr` y para una
   clave `pr:` en `.sdd-ai/workers.yml`; no edites la config sin permiso.
-- **`agents_stale`**: los agentes generados están desactualizados. Propón
-  `./bin/sdd-ai agents sync` (en Codex, con escalamiento: escribe en `.codex/`) y reabrir la sesión.
+- **`agents_stale`**: el agente generado falta o está desactualizado; el error conserva
+  `launch_failed` y no acredita lanzamiento. Propón `./bin/sdd-ai agents sync` (en Codex,
+  con escalamiento: escribe en `.codex/`), después de la decisión humana y las guardas de writer.
+  Adopta según la familia afectada y la carga observada en [adopción](adoption.md).
 - **`doctor` con la skill `stale` o `missing`**: una copia de esta skill (`.claude/skills/` o
   `.agents/skills/`) no coincide con su fuente, o falta, y el CLI está leyendo otra versión. Se
-  corrige igual: `./bin/sdd-ai agents sync` y reabrir la sesión.
+  corrige con `./bin/sdd-ai agents sync` tras decisión humana y las guardas de writer; adopta la
+  skill según runner y condición en [adopción](adoption.md), sin exigir hilo nuevo solo para la skill de Codex.
 - **`config_missing`**: muestra el bloque que trae `next` y pregunta si lo creas. No escribas la
   config sin permiso.
 - Para cortar una corrida: `./bin/sdd-ai cancel <id>`. En una revisión detiene el trabajo en curso y
@@ -38,8 +41,8 @@ Apoyos: [mod](mod.md). Lee los que correspondan antes de la operación; errores 
   revisor Claude dejan un directorio de proyecto en `~/.claude/projects/`: el binario solo borra su
   temporal del sistema.
 
-Después de cada `./bin/sdd-ai agents sync` hay que reabrir la sesión para que el CLI cargue los
-agentes y esta skill.
+Después de cada `./bin/sdd-ai agents sync`, sigue [adopción](adoption.md) por runner, componente
+y carga previa observada. Sesión nueva permanece como fallback; no anula las alternativas comprobadas.
 
 
-La vigencia comprende SKILL.md, procedures/ y references/. Ante material ausente o distinto, comunica sus rutas y propone `agents sync`; con fuente no comprobable, restaura o revisa primero la fuente; con copia ilegible, atiéndela antes de sincronizar. Espera la decisión humana antes de reparar y abre una sesión nueva para adoptar. No inventes instrucciones sustitutas.
+La vigencia comprende SKILL.md, procedures/ y references/. Ante material ausente o distinto, comunica sus rutas y propone `agents sync`; con fuente no comprobable, restaura o revisa primero la fuente; con copia ilegible, atiéndela antes de sincronizar. Espera la decisión humana antes de reparar y consulta [adopción](adoption.md) para adoptar con sus condiciones y fallback. Con writer reservado espera cese comprobado y cosecha; ante `cessation_uncertain`, detente sin escrituras ni liberación autónoma y pregunta al usuario. No inventes instrucciones sustitutas.
