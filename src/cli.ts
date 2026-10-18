@@ -69,7 +69,7 @@ import {
   appendReviewRef, closeChain, implementOf, readPhaseRecord, withFlowLock, withPhaseNext, writePhaseRecord,
 } from './sdd/phase-state.ts'
 import {
-  type ChainState, FIX_PROMPT_BUDGET, TAIL_BYTES, checkClassification, classesPath, harvestNeedsMarkHint, lastLink, markHint, orientation, redRows, renderContinuationPrompt,
+  type ChainState, FIX_PROMPT_BUDGET, TAIL_BYTES, checkClassification, classesPath, harvestNeedsMarkHint, lastLink, markHint, orientation, redRows, renderContinuationPrompt, renderReopenPrompt,
   renderFixPrompt, renderResumePrompt,
 } from './sdd/chain.ts'
 import {
@@ -2337,6 +2337,8 @@ interface ImplementPhase {
   blocks?: boolean
   /** El archivo de clases del conductor, con ruta absoluta. */
   classes?: string
+  /** El retorno al writer: las tasks acreditadas que se devuelven y el material del conductor, con su ruta relativa y sus bytes. */
+  reopen?: { tasks: string[]; material: { path: string; bytes: Buffer } }
 }
 
 /** Una corrida de la cadena lista para registrar y lanzar. */
@@ -2344,6 +2346,8 @@ interface ChainLaunch {
   kind: RunKind; chain: string | null; parent: string | null; launchFrom?: LaunchFrom; resumes?: string
   pending: string[]; prompt: string; mode: 'resume' | 'fresh' | 'initial'; origin?: string; base: string
   fix?: NonNullable<WriterControl['phase']>['fix']
+  /** El retorno: las tasks reabiertas, el material congelado (ruta y digest) y los bytes que se copian junto al encargo. */
+  reopen?: { tasks: string[]; context: { path: string; digest: string }; bytes: Buffer }
 }
 
 const refusal = (code: string, message: string, next: string, detail?: string) => new SddError(code, message, { next, ...(detail ? { detail } : {}) })
@@ -2370,6 +2374,7 @@ async function chainLaunch(p: ImplementPhase): Promise<Result> {
   const revision = record.revisions?.active ?? pendingIntent(record)
   if (revision) throw new SddError('revision_running', `la corrección de ${revision.artifact} sigue activa`, { next: `./bin/sdd-ai wait ${revision.run}` })
   let view = chainView(root, id, read)
+  if (p.reopen) return reopenLaunch(p, view)
   // Un writer anterior a las cadenas queda en el registro como una cadena cerrada: su cosecha no es padre.
   if (view.legacy && view.state.chain?.terminal) {
     const [entry] = view.state.chain.entries
@@ -2416,6 +2421,55 @@ async function chainLaunch(p: ImplementPhase): Promise<Result> {
       throw refusal('chain_complete', 'el último eslabón de la cadena está completo: no hay otra corrida que lanzar',
         `${markHint(s.unmarked)} y corre ./bin/sdd-ai sdd verify ${id}`)
   }
+}
+
+/**
+ * El retorno al writer: decide sin escribir nada, con la cadena como está. Primero una cadena cerrada (toma,
+ * terminal o legacy), antes de mirar `next`; después `next`; después cada task. Si todo pasa, lanza el retorno
+ * como una continuación que reanuda la sesión, con las reabiertas y las pendientes del writer.
+ */
+async function reopenLaunch(p: ImplementPhase, view: ChainView): Promise<Result> {
+  const { root, id } = p
+  const reopen = p.reopen!
+  const s = view.state
+  const closed = () => refusal('chain_closed', 'la cadena está cerrada: no hay eslabón al que devolver tasks', takeoverNext(id))
+  if (s.terminal !== null || view.legacy || s.last?.kind === 'takeover' || s.derived !== null) throw closed()
+  const next = s.next
+  switch (next.kind) {
+    case 'takeover':
+    case 'conductor':
+      throw refusal('chain_closed', next.why, takeoverNext(id))
+    case 'wait':
+      throw new SddError('phase_running', `el flujo ${id} tiene una corrida de fase activa: ${next.run}`, { next: `./bin/sdd-ai wait ${next.run}` })
+    case 'orphan':
+      throw refusal('launch_incomplete', `la corrida ${next.run} quedó registrada sin control`, `./bin/sdd-ai cancel ${next.run}`)
+    case 'resume':
+      throw refusal('reopen_not_apt', `la corrida ${next.run} se cortó antes de cerrar: no es padre de un retorno`, `reanúdala: ./bin/sdd-ai sdd phase ${id}; o ${takeoverNext(id)}`)
+    case 'coordinate':
+      if (view.input.actorErrors?.length) throw refusal('task_actor_invalid', next.why, `corrige tasks.md y consulta ./bin/sdd-ai sdd status ${id}`)
+      throw refusal('coordination_pending', next.why, `resuélvelo y vuelve a consultar ./bin/sdd-ai sdd status ${id}`)
+    case 'start':
+      throw refusal('reopen_invalid', 'la cadena no tiene un eslabón vivo al que devolver tasks', `consulta ./bin/sdd-ai sdd status ${id}`)
+    default:
+  }
+  const last = s.last as RunEntry
+  const writerPending = view.input.writerPending
+  for (const t of reopen.tasks) {
+    const why = !s.scope.includes(t) ? 'está fuera del alcance congelado de la cadena'
+      : !s.covered.includes(t) ? 'la cadena no la tiene acreditada'
+      : !view.input.open.includes(t) ? 'está marcada en tasks.md o no existe: desmárcala antes de devolverla'
+      : writerPending === undefined || !writerPending.includes(t) ? 'no es del writer en el artefacto vigente'
+      : null
+    if (why !== null) throw refusal('reopen_invalid', `no se puede devolver ${t}: ${why}`, `consulta ./bin/sdd-ai sdd status ${id}`)
+  }
+  const pending = s.scope.filter((t) => reopen.tasks.includes(t) || (s.left.includes(t) && writerPending!.includes(t)))
+  const digest = bytesHash(reopen.material.bytes)
+  return launchLink(p, s, {
+    kind: 'continuation', chain: s.chain!.id, parent: last.run, launchFrom: { run: last.run }, pending, mode: 'resume',
+    origin: writerSessionOrigin(root, last.run), base: chainBase(root, id, s),
+    prompt: renderReopenPrompt(id, reopen.tasks, pending, reopen.material.bytes.toString('utf8')),
+    reopen: { tasks: reopen.tasks, context: { path: reopen.material.path, digest }, bytes: reopen.material.bytes },
+  })
 }
 
 /** Los bytes congelados de spec, plan y tasks y sus huellas: cada corrida congela los suyos al lanzarse. */
@@ -2560,6 +2614,8 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
   if (l.mode !== 'initial' && l.origin) {
     const ok = checkResumable(root, env, l.origin, l.mode)
     if (!ok.ok) {
+      // Un retorno sin sesión no deja rastro: ni cierra la cadena ni registra un evento; la salida es la toma.
+      if (l.reopen) throw refusal('resume_unavailable', `no se puede reanudar la sesión del writer: ${ok.why}`, takeoverNext(id))
       const at = new Date().toISOString()
       // Sin la sesión, una corrida cortada o un fix solo se cierran con la toma; una continuación todavía puede ir en bloques.
       if (l.mode === 'resume' && (l.resumes !== undefined || l.kind === 'fix')) {
@@ -2602,14 +2658,21 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
   const promptDir = join(flowDir(root, id), 'runs', run)
   const promptCopy = join(promptDir, 'encargo.md')
   const promptTmp = `${promptCopy}.${process.pid}.tmp`
+  const materialCopy = join(promptDir, 'material.md')
   let chain: string
   try {
     mkdirSync(promptDir, { recursive: true })
     writeFileSync(promptTmp, text)
     renameSync(promptTmp, promptCopy)
+    if (l.reopen) {
+      const materialTmp = `${materialCopy}.${process.pid}.tmp`
+      writeFileSync(materialTmp, l.reopen.bytes)
+      renameSync(materialTmp, materialCopy)
+    }
     chain = appendEntry(root, id, l.chain, {
       kind: l.kind, run, parent: l.parent, base: l.base, at, pending: l.pending, launch, ...(l.resumes ? { resumes: l.resumes } : {}),
       ...(l.fix ? { receipt: l.fix.receipt } : {}),
+      ...(l.reopen ? { reopened: { tasks: l.reopen.tasks, context: l.reopen.context } } : {}),
     })
   } catch (e) {
     rmSync(promptDir, { recursive: true, force: true })
@@ -2636,6 +2699,7 @@ async function launchLink(p: ImplementPhase, s: ChainState, l: ChainLaunch): Pro
   }
   const out = result.out as Record<string, unknown>
   return { code: result.code, out: { ...out, flow: id, step: 'implement', kind: l.kind, chain, pending: l.pending,
+    ...(l.reopen ? { reopened: l.reopen.tasks, material: { path: l.reopen.context.path, digest: l.reopen.context.digest, copy: relative(root, materialCopy) } } : {}),
     ...(engine?.warnings.length ? { warnings: engine.warnings } : {}) } }
 }
 
@@ -2851,12 +2915,12 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
     args, strict: true, allowPositionals: true,
     options: {
       request: { type: 'string' }, context: { type: 'string' }, families: { type: 'string' }, conductor: { type: 'string' }, deadline: { type: 'string' },
-      classes: { type: 'string' }, blocks: { type: 'boolean' },
+      classes: { type: 'string' }, blocks: { type: 'boolean' }, reopen: { type: 'string' },
       revise: { type: 'string' }, review: { type: 'string' }, decisions: { type: 'string' }, 'new-session': { type: 'boolean' },
     },
   })
   if (positionals.length !== 1) {
-    throw new SddError('usage', 'sdd phase recibe un solo id', { next: './bin/sdd-ai sdd phase <id> [--request <archivo>] [--context <archivo>] [--classes <archivo>] [--blocks]' })
+    throw new SddError('usage', 'sdd phase recibe un solo id', { next: './bin/sdd-ai sdd phase <id> [--request <archivo>] [--context <archivo>] [--classes <archivo>] [--blocks] [--reopen <T-ids> --context <archivo>]' })
   }
   if (env.SDD_AI_WORKER === '1') throw new SddError('recursion', 'sdd-ai no se lanza desde un worker', { next: 'responde el encargo sin delegar' })
   const id = positionals[0]
@@ -2866,7 +2930,7 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
 
   const root = repoRoot(cwd)
   if (values.revise !== undefined) {
-    if (values.request !== undefined || values.classes !== undefined || values.blocks !== undefined || values.families !== undefined) throw phaseUsage('--revise no se combina con --request, --classes, --blocks ni --families')
+    if (values.request !== undefined || values.classes !== undefined || values.blocks !== undefined || values.families !== undefined || values.reopen !== undefined) throw phaseUsage('--revise no se combina con --request, --classes, --blocks, --families ni --reopen')
     if (!['spec', 'plan', 'tasks'].includes(values.revise)) throw phaseUsage('--revise solo admite spec, plan o tasks')
     return phaseRevision({ root, env, id, artifact: values.revise as RevisionArtifact, review: values.review,
       context: values.context, decisions: values.decisions, new_session: values['new-session'] === true, deadline,
@@ -2895,14 +2959,28 @@ async function sddPhase(args: string[], env: Env, cwd: string): Promise<Result> 
   const depth = status.depth
   const conductor = detectConductor(env, { conductor: values.conductor })
   if (step === 'implement' || chainStep) {
-    if (values.request !== undefined || values.context !== undefined) throw phaseUsage('--request y --context no se usan en implement')
+    if (values.request !== undefined) throw phaseUsage('--request no se usa en implement')
+    if (values.context !== undefined && values.reopen === undefined) throw phaseUsage('--context en implement solo acompaña a --reopen')
+    let reopen: ImplementPhase['reopen']
+    if (values.reopen !== undefined) {
+      if (chainStep) throw phaseUsage('--reopen devuelve tasks al writer: va en el paso implement, no en verify')
+      if (values.context === undefined) throw phaseUsage('--reopen requiere --context con el material que describe el defecto')
+      if (values.blocks !== undefined || values.classes !== undefined || values.families !== undefined) throw phaseUsage('--reopen no se combina con --blocks, --classes ni --families')
+      const tasks = values.reopen.split(',')
+      if (tasks.some((t) => !/^T\d+$/.test(t)) || new Set(tasks).size !== tasks.length) {
+        throw phaseUsage(`--reopen espera una lista de ids T<n> separados por comas, sin vacíos ni repetidos: ${values.reopen}`)
+      }
+      const material = readMaterial(root, values.context, 'el material del retorno', true)
+      reopen = { tasks, material: { path: material.path, bytes: material.bytes } }
+    }
     const classes = values.classes === undefined ? undefined : isAbsolute(values.classes) ? values.classes : resolvePath(cwd, values.classes)
     return phaseImplement({
       root, env, id, read, depth, conductor, families: values.families, deadline, step: chainStep ? 'verify' : 'implement',
-      ...(values.blocks ? { blocks: true } : {}), ...(classes !== undefined ? { classes } : {}),
+      ...(values.blocks ? { blocks: true } : {}), ...(classes !== undefined ? { classes } : {}), ...(reopen ? { reopen } : {}),
     })
   }
   if (values.classes !== undefined || values.blocks) throw phaseUsage('--classes y --blocks van en implement o en verify')
+  if (values.reopen !== undefined) throw phaseUsage('--reopen va en el paso implement de la cadena')
 
   const doc = step as DocumentStep
   if (doc === 'plan') {

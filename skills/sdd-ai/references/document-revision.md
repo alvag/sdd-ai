@@ -23,7 +23,7 @@ La devolución admite `normal` y `completa`, un documento existente y un product
 comprobado. Puede solicitarse desde su gate o una fase posterior, también tras aprobarlo, siempre
 antes de empezar implementación: sin writer de implement lanzado, tasks marcadas ni recibo de
 verify. Que el siguiente paso diga `implement` no significa que ya empezó. Quedan fuera `corta`,
-`implement` y `fix`. `--revise` no se combina con `--request`, `--classes`, `--blocks` o `--families`;
+`implement` y `fix`. `--revise` no se combina con `--request`, `--classes`, `--blocks`, `--families` o `--reopen`;
 `--review`, `--decisions` y `--new-session` requieren `--revise`.
 
 Toda devolución nueva exige `--review`, también después de `no_changes`. La revisión debe ser de

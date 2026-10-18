@@ -69,6 +69,8 @@ export interface RunEntry {
   pending?: string[]
   /** El recibo rojo del que parte un `fix`. */
   receipt?: { id: string; digest: string }
+  /** El retorno al writer: las tasks ya acreditadas que se devuelven (incluidas en `pending`) y el material congelado del conductor. */
+  reopened?: { tasks: string[]; context: { path: string; digest: string } }
 }
 /** La toma del conductor: el árbol que declaró vive en el almacén, y acá queda su referencia. */
 export interface TakeoverEntry { kind: 'takeover'; id: string; parent: string | null; at: string; map: { ref: string; digest: string }; reason?: string }
@@ -184,7 +186,7 @@ function entryOfChainProblem(e: unknown): string | null {
     return null
   }
   if (!RUN_KINDS.includes(String(e.kind))) return `tiene el tipo desconocido ${JSON.stringify(e.kind)}`
-  const extra = onlyKeys(e, ['kind', 'run', 'parent', 'resumes', 'base', 'at', 'pending', 'receipt', 'launch'])
+  const extra = onlyKeys(e, ['kind', 'run', 'parent', 'resumes', 'base', 'at', 'pending', 'receipt', 'launch', 'reopened'])
   if (extra) return `trae la clave desconocida ${extra}`
   if (e.launch !== undefined) {
     const l = e.launch
@@ -198,6 +200,18 @@ function entryOfChainProblem(e: unknown): string | null {
   if (e.pending !== undefined && !texts(e.pending)) return 'tiene pending que no es una lista de tasks'
   // Una corrección nombra el recibo del que sale; las demás corridas no parten de un recibo.
   if (e.kind === 'fix' ? !receiptRef(e.receipt) : e.receipt !== undefined) return e.kind === 'fix' ? 'es una corrección sin recibo con id y digest' : 'trae un recibo y no es una corrección'
+  if (e.reopened !== undefined) {
+    const r = e.reopened
+    if (e.kind !== 'continuation' || e.resumes !== undefined || e.pending === undefined) return 'trae reopened y no es una continuación con pending, o reanuda otra corrida'
+    if (!isRecord(r) || onlyKeys(r, ['tasks', 'context'])) return 'tiene reopened con claves incorrectas'
+    const pending = e.pending as string[]
+    const tasks = r.tasks as string[]
+    if (!texts(tasks) || tasks.length === 0 || new Set(tasks).size !== tasks.length || !tasks.every((t) => pending.includes(t))) {
+      return 'tiene reopened.tasks que no es una lista no vacía, sin repetir y incluida en pending'
+    }
+    const c = r.context
+    if (!isRecord(c) || Object.keys(c).length !== 2 || onlyKeys(c, ['path', 'digest']) || !text(c.path) || !digested(c)) return 'tiene reopened.context sin path y digest'
+  }
   return null
 }
 
