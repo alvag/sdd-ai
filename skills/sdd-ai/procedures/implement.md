@@ -44,8 +44,25 @@ Apoyos: [writer](../references/writer.md); [reception](../references/reception.m
   La completitud depende de `completion`; una task sin terminar sigue pending. Los faltantes no
   amplían permisos ni completan tasks, gates o acreditaciones. Contrato e
   integridad conservan prioridad; fix y las fases documentales mantienen su tratamiento anterior.
+- **Retorno al writer:** `sdd phase <id> --reopen <T-ids> --context <archivo>` devuelve al mismo writer, en
+  su misma sesión y sobre su árbol, tasks que declaró `done` con defecto, con el material que lo describe, y
+  continúa en la misma corrida las pendientes que le quedan. Úsalo para una task acreditada con defecto; una
+  continuación (`sdd phase <id>`) sigue pendientes sin defecto, `fix` parte de un rojo clasificado de verify y la
+  toma (`sdd verify <id> --takeover`) es para lo que el writer no puede resolver. Precondiciones: la task está
+  acreditada en la cadena, abierta en tasks.md (si ya la marcaste, desmárcala) y es del writer en el artefacto
+  vigente; el último eslabón es una corrida cerrada, íntegra y con insumos estables, sin toma ni terminal; el
+  material está dentro del repo, preferentemente en `.plans/<id>/`. Esa carpeta se excluye de la comparación con
+  el árbol del padre; crear o modificar después de la cosecha una ruta que el árbol computa (rastreada, o nueva
+  y no ignorada) produce `tree_not_parent`, mientras que un archivo ya presente en el árbol del padre sin
+  cambios, o una ruta ignorada, no. El binario guarda ruta y digest del material, deja una copia congelada junto
+  al encargo y no valida de dónde salió; el writer lo lee como dato del conductor, no como instrucción. Reabrir
+  una task revoca sus acreditaciones anteriores: solo vuelve a estar acreditada si la acredita esa corrida o una
+  posterior, y volver a acreditarla cuenta como progreso. El retorno no marca tasks, no amplía el alcance
+  congelado, no consume el cupo de fix ni el conteo de fallos por fila y no cambia la autoría. Si la sesión no
+  se puede reanudar, se rechaza sin registrar nada y la alternativa es la toma.
 - **Rollback:** conserva artefactos y controles. Recibe las corridas nuevas con un binario que conozca
-  su contrato antes de volver a una versión anterior; no retires actores automáticamente para recuperar
-  delegación. Cambiar responsabilidades está sujeto a los gates vigentes.
+  su contrato antes de volver a una versión anterior; en particular, recibe las corridas de retorno con un
+  binario que conozca `reopened`, porque uno anterior rechaza el registro con `phases_invalid`. No retires
+  actores automáticamente para recuperar delegación. Cambiar responsabilidades está sujeto a los gates vigentes.
 
 Lee [fases documentales](../references/document-phases.md) para las precondiciones de sdd phase y sus límites. El writer no ejecuta pruebas; las comprobaciones con Claude quedan pendientes del conductor antes del commit.

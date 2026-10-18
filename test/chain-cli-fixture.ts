@@ -58,7 +58,33 @@ export function redFlow(rows: unknown[], writers: object[] = []): { s: ChainSetu
   return { s, receipt: red.out.receipt, first }
 }
 
-export const LOUD_ROW = (id: string) => ({
+/** Dónde deja el conductor el material de un retorno: bajo `.plans/f/`, que la comparación del árbol excluye. */
+export const DEFECT = '.plans/f/defecto.md'
+
+export const writeDefect = (s: ChainSetup, content: string | Buffer = 'T5 devuelve 1 y debe devolver 2.\n', path = DEFECT) => {
+  writeFileSync(join(s.repo, path), content)
+  return path
+}
+
+/** `sdd phase f --reopen <tasks> --context <material>` con el material por defecto. */
+export const reopenRun = (s: ChainSetup, tasks = 'T5,T7', context = DEFECT) => runBin(s, ['sdd', 'phase', 'f', '--reopen', tasks, '--context', context])
+
+/**
+ * Un flujo de 11 tasks con el writer inicial ya cosechado: declara T1 a T9 `done` y T10 y T11 `pending`. T5 y T7 quedan
+ * acreditadas (con defecto, para el escenario del retorno) y abiertas en tasks.md. `writers` son los que siguen.
+ */
+export function reopenFlow(writers: object[] = [], rows?: unknown[]): { s: ChainSetup; first: string } {
+  const done = Array.from({ length: 9 }, (_, i) => `T${i + 1}`)
+  const s = chainSetup({
+    writers: [{ actions: [{ write: 'src/t5.ts', content: 't5 con defecto\n' }, { write: 'src/t7.ts', content: 't7 con defecto\n' }], report: implReport(done, ['T10', 'T11']) }, ...writers],
+  })
+  chainFlow(s, { tasks: 11, ...(rows ? { rows } : {}) })
+  const first = runBin(s, ['sdd', 'phase', 'f']).out.id
+  runBin(s, ['wait', first, '--max', '30'])
+  return { s, first }
+}
+
+export const LOUD_ROW =(id: string) => ({
   id, acs: ['AC-1'], kind: 'build', obligation: 'none', obligation_reason: 'fixture de cadena',
   argv: [process.execPath, '-e', `process.stdout.write('${id}-'.repeat(3000)); process.exit(1)`], timeout_ms: 30000, expect: { exit_code: 0 },
 })
